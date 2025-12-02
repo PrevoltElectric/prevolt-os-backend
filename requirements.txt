@@ -1,5 +1,5 @@
 flask
 gunicorn
 twilio
-openai
+openai>=1.55.0
 requests
