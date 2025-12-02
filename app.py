@@ -1,6 +1,5 @@
 import os
 import requests
-from io import BytesIO
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 from openai import OpenAI
@@ -16,7 +15,7 @@ def home():
 
 
 # -------------------------------
-# Transcription Helper (Twilio -> Whisper-1)
+# Transcription Helper (Twilio → Whisper-1)
 # -------------------------------
 def transcribe_recording(recording_url: str) -> str:
     """
@@ -24,10 +23,9 @@ def transcribe_recording(recording_url: str) -> str:
     then sends it to OpenAI Whisper (whisper-1) for transcription.
     """
 
-    # Twilio default recording format = WAV
     audio_url = recording_url + ".wav"
 
-    # Authenticate with Twilio to download recording
+    # Authenticate with Twilio to download audio
     resp = requests.get(
         audio_url,
         stream=True,
@@ -40,13 +38,13 @@ def transcribe_recording(recording_url: str) -> str:
 
     tmp_path = "/tmp/prevolt_voicemail.wav"
 
-    # Save to a temporary file on disk
+    # Save WAV audio to disk
     with open(tmp_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             if chunk:
                 f.write(chunk)
 
-    # Now call the OpenAI Speech-to-Text API (whisper-1)
+    # Transcribe with Whisper
     with open(tmp_path, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
             model="whisper-1",
@@ -56,9 +54,41 @@ def transcribe_recording(recording_url: str) -> str:
     return transcript.text
 
 
+# -------------------------------
+# Clean-up Layer (Fix misheard words)
+# -------------------------------
+def clean_transcript_text(raw_text: str) -> str:
+    """
+    Uses AI to correct transcription errors, misheard electrical terms,
+    and normalize grammar while preserving meaning.
+    """
+
+    try:
+        cleaned = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an assistant that cleans up voicemail transcriptions. "
+                        "Fix misheard words (especially electrical terminology), grammar, "
+                        "and produce a corrected version without changing meaning. "
+                        "Example: 'illogical work' → 'electrical work'."
+                    )
+                },
+                {"role": "user", "content": raw_text}
+            ]
+        ).choices[0].message.content
+
+        return cleaned.strip()
+
+    except Exception as e:
+        print("Cleanup FAILED:", repr(e))
+        return raw_text  # fallback
+
 
 # -------------------------------
-# Incoming Call → Send to Voicemail
+# Incoming Call → Voicemail Recording
 # -------------------------------
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
@@ -83,7 +113,7 @@ def incoming_call():
 
 
 # -------------------------------
-# Voicemail Complete → Transcribe & Log
+# Voicemail Complete → Transcribe + Clean + Log
 # -------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
@@ -96,13 +126,19 @@ def voicemail_complete():
     print("Recording:", recording_url)
     print("Duration:", duration)
 
-    transcript_text = None
     try:
-        transcript_text = transcribe_recording(recording_url)
-        print("Transcript:")
-        print(transcript_text)
+        # Step 1: raw transcription
+        raw_text = transcribe_recording(recording_url)
+        print("\nRaw Transcript:")
+        print(raw_text)
+
+        # Step 2: cleaned transcription
+        cleaned_text = clean_transcript_text(raw_text)
+        print("\nCleaned Transcript:")
+        print(cleaned_text)
+
     except Exception as e:
-        print("Transcription FAILED:")
+        print("\nTranscription FAILED:")
         print(repr(e))
 
     response = VoiceResponse()
@@ -111,7 +147,7 @@ def voicemail_complete():
 
 
 # -------------------------------
-# Render Fallback (local dev mode)
+# Render Fallback (for local dev)
 # -------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
