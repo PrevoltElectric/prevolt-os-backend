@@ -27,8 +27,15 @@ def transcribe_recording(recording_url: str) -> str:
     # Twilio default recording format = WAV
     audio_url = recording_url + ".wav"
 
-    # Download audio stream safely
-    resp = requests.get(audio_url, stream=True)
+    # Authenticate with Twilio to download recording
+    resp = requests.get(
+        audio_url,
+        stream=True,
+        auth=(
+            os.environ.get("TWILIO_ACCOUNT_SID"),
+            os.environ.get("TWILIO_AUTH_TOKEN")
+        )
+    )
     resp.raise_for_status()
 
     tmp_path = "/tmp/prevolt_voicemail.wav"
@@ -42,12 +49,12 @@ def transcribe_recording(recording_url: str) -> str:
     # Now call the OpenAI Speech-to-Text API (whisper-1)
     with open(tmp_path, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
-            model="whisper-1",   # Stable transcription model
+            model="whisper-1",
             file=audio_file,
         )
 
-    # transcript.text is the actual text string
     return transcript.text
+
 
 
 # -------------------------------
