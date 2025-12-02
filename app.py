@@ -17,24 +17,20 @@ def home():
 # Transcription Helper
 # -------------------------------
 def transcribe_recording(recording_url):
-    """
-    Downloads voicemail audio from Twilio and sends it
-    to OpenAI Whisper (gpt-4o-transcribe) for transcription.
-    """
+    # Twilio gives .wav files by default
+    audio_url = recording_url + ".wav"
 
-    # Twilio requires ".mp3" appended to get the audio file
-    audio_url = recording_url + ".mp3"
-
-    # Download audio bytes
+    # Download WAV audio
     audio_data = requests.get(audio_url).content
 
-    # Send to OpenAI transcription model
+    # Send to OpenAI Whisper (gpt-4o-transcribe)
     transcript = openai.audio.transcriptions.create(
         model="gpt-4o-transcribe",
-        file=("voicemail.mp3", audio_data),
+        file=("voicemail.wav", audio_data),
     )
 
     return transcript.text
+
 
 
 # -------------------------------
