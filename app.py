@@ -4,7 +4,7 @@ from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 from openai import OpenAI
 
-# Initialize OpenAI client using environment variable
+# Initialize OpenAI client
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 app = Flask(__name__)
@@ -14,18 +14,18 @@ def home():
     return "Prevolt OS running"
 
 
-# -------------------------------
-# Transcription Helper (Twilio → Whisper-1)
-# -------------------------------
+# ---------------------------------------------------------
+# STEP 1 — Transcription Helper (Twilio → Whisper-1)
+# ---------------------------------------------------------
 def transcribe_recording(recording_url: str) -> str:
     """
-    Downloads the Twilio WAV recording to /tmp,
-    then sends it to OpenAI Whisper (whisper-1) for transcription.
+    Downloads the Twilio WAV recording securely using Basic Auth,
+    saves it to /tmp, then submits it to OpenAI Whisper (whisper-1).
     """
 
     audio_url = recording_url + ".wav"
 
-    # Authenticate with Twilio to download audio
+    # Auth with Twilio (Required to get the audio file)
     resp = requests.get(
         audio_url,
         stream=True,
@@ -38,7 +38,7 @@ def transcribe_recording(recording_url: str) -> str:
 
     tmp_path = "/tmp/prevolt_voicemail.wav"
 
-    # Save WAV audio to disk
+    # Save audio to temporary file
     with open(tmp_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             if chunk:
@@ -48,19 +48,18 @@ def transcribe_recording(recording_url: str) -> str:
     with open(tmp_path, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
             model="whisper-1",
-            file=audio_file,
+            file=audio_file
         )
 
     return transcript.text
 
 
-# -------------------------------
-# Clean-up Layer (Fix misheard words)
-# -------------------------------
+# ---------------------------------------------------------
+# STEP 2 — Cleanup Layer (Fix mistakes, misheard words)
+# ---------------------------------------------------------
 def clean_transcript_text(raw_text: str) -> str:
     """
-    Uses AI to correct transcription errors, misheard electrical terms,
-    and normalize grammar while preserving meaning.
+    Uses AI to correct misheard electrical terms and improve readability.
     """
 
     try:
@@ -71,9 +70,8 @@ def clean_transcript_text(raw_text: str) -> str:
                     "role": "system",
                     "content": (
                         "You are an assistant that cleans up voicemail transcriptions. "
-                        "Fix misheard words (especially electrical terminology), grammar, "
-                        "and produce a corrected version without changing meaning. "
-                        "Example: 'illogical work' → 'electrical work'."
+                        "Fix misheard words (especially electrical terminology), refine grammar, "
+                        "and preserve the caller's meaning. Be concise and accurate."
                     )
                 },
                 {"role": "user", "content": raw_text}
@@ -87,9 +85,53 @@ def clean_transcript_text(raw_text: str) -> str:
         return raw_text  # fallback
 
 
-# -------------------------------
-# Incoming Call → Voicemail Recording
-# -------------------------------
+# ---------------------------------------------------------
+# STEP 3 — Lead Analysis Engine (Core Prevolt Logic)
+# ---------------------------------------------------------
+def analyze_lead(cleaned_text: str) -> dict:
+    """
+    Evaluates the cleaned transcript and assigns:
+    - Work type
+    - Complexity score
+    - Customer seriousness
+    - Price sensitivity
+    - Red flags
+    - Final classification (HIGH / MEDIUM / LOW / REJECT)
+    - Recommended action
+    """
+
+    try:
+        analysis = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Prevolt OS, an expert electrical lead evaluator. "
+                        "Analyze the voicemail and determine customer intent, seriousness, "
+                        "price sensitivity, potential red flags, and classify the lead as "
+                        "HIGH VALUE, MEDIUM VALUE, LOW VALUE, or REJECT. "
+                        "Follow Kyle Prevost’s filtering rules strictly: "
+                        "No price shoppers, no tire kickers, no rebate-based budgets, "
+                        "no 'just looking for quotes', no customers dictating process, "
+                        "no photo requests (automatic rejection), and no low-value work unless urgent. "
+                        "Recommend one action: SEND_TEXT_1, SEND_TEXT_2, IGNORE, BLOCK, or HUMAN_REVIEW."
+                    )
+                },
+                {"role": "user", "content": cleaned_text}
+            ]
+        ).choices[0].message.content
+
+        return {"analysis": analysis}
+
+    except Exception as e:
+        print("Lead Analysis FAILED:", repr(e))
+        return {"analysis": None}
+
+
+# ---------------------------------------------------------
+# Incoming Call → Direct to Voicemail
+# ---------------------------------------------------------
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
     response = VoiceResponse()
@@ -108,13 +150,12 @@ def incoming_call():
     )
 
     response.hangup()
-
     return Response(str(response), mimetype="text/xml")
 
 
-# -------------------------------
-# Voicemail Complete → Transcribe + Clean + Log
-# -------------------------------
+# ---------------------------------------------------------
+# Voicemail Complete → Transcribe → Clean → Analyze
+# ---------------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
     recording_url = request.form.get("RecordingUrl")
@@ -123,22 +164,27 @@ def voicemail_complete():
 
     print("\n----- NEW VOICEMAIL -----")
     print("From:", caller)
-    print("Recording:", recording_url)
+    print("Recording URL:", recording_url)
     print("Duration:", duration)
 
     try:
-        # Step 1: raw transcription
+        # Step 1 — Raw Whisper transcription
         raw_text = transcribe_recording(recording_url)
         print("\nRaw Transcript:")
         print(raw_text)
 
-        # Step 2: cleaned transcription
+        # Step 2 — Clean corrected transcript
         cleaned_text = clean_transcript_text(raw_text)
         print("\nCleaned Transcript:")
         print(cleaned_text)
 
+        # Step 3 — Lead evaluation
+        analysis = analyze_lead(cleaned_text)
+        print("\nLead Analysis:")
+        print(analysis["analysis"])
+
     except Exception as e:
-        print("\nTranscription FAILED:")
+        print("Voicemail Pipeline FAILED:")
         print(repr(e))
 
     response = VoiceResponse()
@@ -146,10 +192,9 @@ def voicemail_complete():
     return Response(str(response), mimetype="text/xml")
 
 
-# -------------------------------
-# Render Fallback (for local dev)
-# -------------------------------
+# ---------------------------------------------------------
+# Local Dev Mode Fallback
+# ---------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
