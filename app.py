@@ -39,6 +39,7 @@ conversations = {}
 #   "scheduled_date": str | None,
 #   "scheduled_time": str | None,
 #   "address": str | None,
+#   "final_confirmation_sent": bool,
 # }
 
 
@@ -144,18 +145,7 @@ def clean_transcript_text(raw_text: str) -> str:
 def generate_initial_sms(cleaned_text: str) -> dict:
     """
     Generates the FIRST outbound SMS to a new caller based on their voicemail.
-    Must follow Prevolt rules:
-      - Start with 'Hi, this is Prevolt Electric —' (only for this first message).
-      - Do NOT ask them to repeat the voicemail.
-      - Choose the correct appointment type:
-          * $195 evaluation visit for installs / upgrades / quotes.
-          * $395 troubleshoot/repair for active issues / problems.
-          * Whole-home inspection (price band $375–$600) for full-house requests.
-      - For whole-home inspection: ask square footage and mention range, but do NOT
-        give an exact price yet.
-      - Be short, professional, and decisive.
-      - No mention of being automated or AI.
-      - No Kyle, just Prevolt Electric.
+    Must follow Prevolt rules.
     Returns a dict:
       {
          "sms_body": str,
@@ -229,8 +219,197 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 
 # ---------------------------------------------------
+# Prompt Building Blocks for Inbound Replies
+# ---------------------------------------------------
+FLOW_RULES = """
+===================================================
+STRICT CONVERSATION FLOW RULES
+===================================================
+1. NEVER repeat a question already asked.
+2. NEVER restart the conversation.
+3. NEVER ask again for date, time, or address if it is already stored.
+4. NEVER repeat earlier sentences or restate prices once given.
+5. ALWAYS move the conversation forward.
+6. ALWAYS end with a question unless this is the final confirmation message.
+7. If the customer gives a date AND a time → accept it ONCE and stop asking.
+8. If the customer gives an address → accept it ONCE and do not re-request it.
+9. When date + time + address are all collected → send a FINAL confirmation statement with no question mark.
+10. KEEP all messages short, human, and natural — not robotic.
+11. NEVER quote their text or mention AI/automation.
+12. NEVER repeat reassurance lines. Only use each once if applicable.
+"""
+
+SCHEDULING_RULES = """
+===================================================
+SCHEDULING RULES — 9AM TO 5PM ONLY (NON-EMERGENCY)
+===================================================
+• Prevolt Electric only schedules NON-emergency appointments between 9am and 5pm.
+• If the customer proposes a time within that window (for example “3pm”) → accept it.
+• If the customer proposes a time outside that window (for example “7pm” or “8:30pm”):
+     “We typically schedule between 9am and 5pm. What time in that window works for you?”
+• NEVER keep asking for a “time between 9am and 5pm” once the customer has already provided a valid time.
+• Do NOT convert weekdays into numbered calendar dates.
+• If the weekday is clear but the time is missing, ask ONCE:
+     “Got it — what time works for you on that day between 9am and 5pm?”
+"""
+
+EMERGENCY_RULES = """
+===================================================
+EMERGENCY RULE
+===================================================
+If BOTH:
+• The voicemail indicates an active electrical issue (loss of power, burning, sparking, overheating, tripping, outage, tree damage to service, downed line), AND
+• The customer uses urgent wording (“now”, “ASAP”, “immediately”, “right away”, “today if possible”)
+THEN respond with something like:
+     “We can prioritize this. What’s the earliest time today you can meet us at the property?”
+Use emergency logic ONLY in true emergency cases.
+Do NOT repeat that same question after the customer has answered it.
+If they answer “now”, “I’m home now”, or similar, treat that as “as soon as possible today” and move on to collecting any missing details (usually the address).
+"""
+
+DATE_RULES = """
+===================================================
+DATE INTERPRETATION RULES
+===================================================
+• NEVER invent or calculate calendar dates.
+• If the customer says “next Wednesday” → treat it as Wednesday.
+• If the customer says “next Friday” → treat it as Friday.
+• Do NOT translate weekdays into specific numbered dates.
+• If the day is ambiguous, ask ONCE for clarification.
+"""
+
+TENANT_RULE = """
+===================================================
+TENANT RULE (IMPORTANT)
+===================================================
+If the customer says anything like:
+• “talk to my tenant”
+• “my tenant will schedule”
+• “text my tenant”
+Respond ONLY with:
+“For scheduling and service details, we can only coordinate directly with you as the property owner. You’re welcome to share any details with your tenant.”
+Never offer alternatives and never ask follow-up questions tied to the tenant.
+"""
+
+VALUE_RULES = """
+===================================================
+VALUE & REASSURANCE (TROUBLESHOOT ONLY)
+===================================================
+Use this reassurance ONLY for TROUBLESHOOT_395, and only ONCE after they show interest in moving forward:
+
+“Most minor issues are handled during the troubleshoot visit, and we’re usually able to diagnose the problem within the first hour. If anything major is found, we’ll provide a written quote before any work begins.”
+
+NEVER include this for:
+• EVAL_195
+• WHOLE_HOME_INSPECTION
+"""
+
+APPOINTMENT_LOGIC = """
+===================================================
+APPOINTMENT LOGIC
+===================================================
+If they simply ask a standalone question (service area, insurance, availability):
+→ Answer naturally and DO NOT push scheduling in the same message.
+
+If they show intent to move forward:
+→ Use the correct appointment type and state the price ONCE:
+
+• EVAL_195:
+    “The first step is a $195 on-site evaluation visit.”
+• TROUBLESHOOT_395:
+    “For active issues, we schedule a $395 troubleshoot/repair visit.”
+• WHOLE_HOME_INSPECTION:
+    - If square footage is given → calculate exact price:
+        <1500 sq ft → 375
+        1500–2400 → 475
+        >2400 → 600
+      Then clearly state the price once.
+    - If square footage is not given → ask ONCE:
+        “What’s the square footage of the home?”
+
+After stating the appointment type and price once → DO NOT restate the price again in later messages.
+"""
+
+DETECTION_RULES = """
+===================================================
+AUTO-DETECTION (DATE / TIME / ADDRESS)
+===================================================
+You MUST detect and extract:
+• scheduled_date (weekday or date expression)
+• scheduled_time
+• address
+
+Rules:
+• If the customer changes date/time/address → update to the new value.
+• NEVER ask for the same detail twice once it is stored.
+• Only ask for missing pieces (for example, if you have date + time but no address, just ask for the address).
+"""
+
+OUTPUT_SPEC = """
+===================================================
+OUTPUT FORMAT
+===================================================
+Respond ONLY in valid JSON:
+{
+  "sms_body": "...",
+  "scheduled_date": "... or null",
+  "scheduled_time": "... or null",
+  "address": "... or null",
+  "final_confirmation": true or false
+}
+"""
+
+
+# ---------------------------------------------------
 # Step 4 — Generate Reply for Inbound SMS / WhatsApp
 # ---------------------------------------------------
+def build_inbound_system_prompt(
+    cleaned_transcript: str,
+    category: str,
+    appointment_type: str,
+    initial_sms: str,
+    scheduled_date: str | None,
+    scheduled_time: str | None,
+    address: str | None,
+) -> str:
+    """
+    Builds the full system prompt for the inbound flow using modular rule blocks.
+    """
+    context_block = f"""
+===================================================
+CONTEXT
+===================================================
+Original voicemail: {cleaned_transcript}
+Category: {category}
+Appointment type: {appointment_type}
+Initial outbound SMS: {initial_sms}
+Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
+"""
+
+    header = (
+        "You are Prevolt OS, the SMS assistant for Prevolt Electric. "
+        "Continue an existing text conversation naturally. Your job is to move the "
+        "conversation forward, avoid repetition, keep things human, and help the "
+        "customer schedule cleanly when appropriate.\n"
+    )
+
+    system_prompt = (
+        header
+        + FLOW_RULES
+        + SCHEDULING_RULES
+        + EMERGENCY_RULES
+        + DATE_RULES
+        + TENANT_RULE
+        + VALUE_RULES
+        + APPOINTMENT_LOGIC
+        + DETECTION_RULES
+        + context_block
+        + OUTPUT_SPEC
+    )
+
+    return system_prompt
+
+
 def generate_reply_for_inbound(
     cleaned_transcript: str,
     category: str,
@@ -249,135 +428,20 @@ def generate_reply_for_inbound(
       "sms_body": "...",
       "scheduled_date": "... or null",
       "scheduled_time": "... or null",
-      "address": "... or null"
+      "address": "... or null",
+      "final_confirmation": bool
     }
     """
     try:
-        system_prompt = f"""
-You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue an existing text conversation naturally. Your job is to move the conversation forward, avoid repetition, avoid robotic wording, and help the customer schedule cleanly.
-
-===================================================
-STRICT CONVERSATION FLOW RULES
-===================================================
-1. NEVER repeat a question already asked.
-2. NEVER restart the conversation.
-3. NEVER ask again for date, time, or address if already provided.
-4. NEVER repeat earlier sentences or restate prices once given.
-5. ALWAYS move the conversation forward.
-6. ALWAYS end with a question unless this is the final confirmation.
-7. If customer gives a date AND a time → accept it ONCE and stop asking.
-8. If customer gives an address → accept it ONCE and do not re-request it.
-9. When date + time + address are all collected → send a FINAL confirmation statement with no question mark.
-10. If customer replies “yes / sounds good / confirmed” after final confirmation → send NOTHING further.
-11. KEEP all messages short, human, and natural — not robotic.
-12. NEVER quote their text or mention AI/automation.
-13. NEVER repeat reassurance lines. Only use each once if applicable.
-
-===================================================
-SCHEDULING RULES — 9AM TO 5PM ONLY
-===================================================
-• Prevolt Electric only schedules NON-emergency appointments between 9am and 5pm.
-• If the customer proposes a time outside that window:
-     “We typically schedule between 9am and 5pm. What time in that window works for you?”
-• NEVER accept times like 6pm, 7pm, 8pm, or 9pm unless it is explicitly an emergency.
-
-===================================================
-EMERGENCY RULE
-===================================================
-If:
-• The voicemail indicates an active electrical issue (loss of power, burning, sparking, overheating, tripping, outage), AND
-• The customer uses urgent wording (“now”, “ASAP”, “immediately”, “right away”)
-THEN:
-     “We can prioritize this. What’s the earliest time today you can meet us at the property?”
-Use emergency logic ONLY in true emergency cases.
-
-===================================================
-DATE INTERPRETATION RULES
-===================================================
-• NEVER invent or calculate calendar dates.
-• If customer says “next Wednesday” → treat it exactly as that (Wednesday).
-• If customer says “next Friday” → treat it exactly as Friday.
-• Do NOT convert weekdays into numbered calendar dates.
-• If unclear, ask ONCE:
-     “Got it — what time works for you on Wednesday?”
-
-===================================================
-TENANT RULE (IMPORTANT)
-===================================================
-If the customer says anything like:
-• “talk to my tenant”
-• “my tenant will schedule”
-• “text my tenant”
-Respond ONLY with:
-“For scheduling and service details, we can only coordinate directly with you as the property owner. You’re welcome to share any details with your tenant.”
-Never offer alternatives and never ask follow-up questions tied to the tenant.
-
-===================================================
-VALUE & REASSURANCE (TROUBLESHOOT ONLY)
-===================================================
-Use this reassurance ONLY for TROUBLESHOOT_395, and only ONCE after they show interest in moving forward:
-
-“Most minor issues are handled during the troubleshoot visit, and we’re usually able to diagnose the problem within the first hour. If anything major is found, we’ll provide a written quote before any work begins.”
-
-NEVER include this for:
-• EVAL_195
-• WHOLE_HOME_INSPECTION
-
-===================================================
-APPOINTMENT LOGIC
-===================================================
-If they simply ask a standalone question (service area, insurance, availability):
-→ Answer naturally and DO NOT push scheduling in the same message.
-
-If they show intent to move forward:
-→ Use correct appointment type and state price ONCE:
-
-• EVAL_195:
-    “The first step is a $195 on-site evaluation visit.”
-• TROUBLESHOOT_395:
-    “For active issues, we schedule a $395 troubleshoot/repair visit.”
-• WHOLE_HOME_INSPECTION:
-    - If square footage given → calculate exact price:
-        <1500 sq ft → 375
-        1500–2400 → 475
-        >2400 → 600
-    - If not given → ask ONCE for square footage.
-
-After stating the appointment type once → DO NOT restate the price.
-
-===================================================
-AUTO-DETECTION (DATE / TIME / ADDRESS)
-===================================================
-Detect:
-• date
-• time
-• address
-
-Rules:
-• If the customer changes date/time/address → update to the new value.
-• NEVER ask for the same detail twice.
-• Store extracted values in JSON output.
-
-===================================================
-CONTEXT
-===================================================
-Original voicemail: {cleaned_transcript}
-Category: {category}
-Appointment type: {appointment_type}
-Initial outbound SMS: {initial_sms}
-Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
-
-===================================================
-OUTPUT FORMAT
-===================================================
-Respond ONLY in valid JSON:
-{{
-  "sms_body": "...",
-  "scheduled_date": "... or null",
-  "scheduled_time": "... or null",
-  "address": "... or null"
-}}
-"""
+        system_prompt = build_inbound_system_prompt(
+            cleaned_transcript=cleaned_transcript,
+            category=category,
+            appointment_type=appointment_type,
+            initial_sms=initial_sms,
+            scheduled_date=scheduled_date,
+            scheduled_time=scheduled_time,
+            address=address,
+        )
 
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -387,13 +451,15 @@ Respond ONLY in valid JSON:
             ],
         )
 
-        data = json.loads(completion.choices[0].message.content)
+        raw_content = completion.choices[0].message.content
+        data = json.loads(raw_content)
 
         return {
             "sms_body": data.get("sms_body") or "",
             "scheduled_date": data.get("scheduled_date"),
             "scheduled_time": data.get("scheduled_time"),
             "address": data.get("address"),
+            "final_confirmation": bool(data.get("final_confirmation", False)),
         }
 
     except Exception as e:
@@ -403,8 +469,8 @@ Respond ONLY in valid JSON:
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
             "address": address,
+            "final_confirmation": False,
         }
-
 
 
 # ---------------------------------------------------
@@ -480,6 +546,7 @@ def voicemail_complete():
             "scheduled_date": None,
             "scheduled_time": None,
             "address": None,
+            "final_confirmation_sent": False,
         }
 
     except Exception as e:
@@ -488,6 +555,38 @@ def voicemail_complete():
     response = VoiceResponse()
     response.hangup()
     return Response(str(response), mimetype="text/xml")
+
+
+# ---------------------------------------------------
+# Helper: simple confirmation detection
+# ---------------------------------------------------
+CONFIRMATION_WORDS = [
+    "yes",
+    "yep",
+    "yeah",
+    "sounds good",
+    "that works",
+    "works for me",
+    "ok",
+    "okay",
+    "perfect",
+    "confirmed",
+    "see you then",
+    "see you there",
+    "great",
+]
+
+
+def is_simple_confirmation(text: str) -> bool:
+    t = text.strip().lower()
+    # Exact short words:
+    if t in {"yes", "yep", "yeah", "ok", "okay"}:
+        return True
+    # Phrase / substring confirmations:
+    for phrase in CONFIRMATION_WORDS:
+        if phrase in t:
+            return True
+    return False
 
 
 # ---------------------------------------------------
@@ -508,6 +607,15 @@ def incoming_sms():
     print("Body:", body)
 
     convo = conversations.get(from_number)
+
+    # If we have a convo and already sent a final confirmation,
+    # and this inbound text is just "yes / sounds good / ok"
+    # → DO NOT call OpenAI and DO NOT send any further reply.
+    if convo and convo.get("final_confirmation_sent"):
+        if is_simple_confirmation(body):
+            print("Final confirmation already sent; simple confirmation received. No reply.")
+            resp = MessagingResponse()  # empty <Response/>
+            return Response(str(resp), mimetype="text/xml")
 
     if not convo:
         # No voicemail context — treat as generic inbound text
@@ -545,6 +653,7 @@ def incoming_sms():
     new_date = ai_reply.get("scheduled_date")
     new_time = ai_reply.get("scheduled_time")
     new_address = ai_reply.get("address")
+    final_confirmation = bool(ai_reply.get("final_confirmation", False))
 
     # Update stored state if model extracted anything new
     if new_date:
@@ -553,12 +662,15 @@ def incoming_sms():
         convo["scheduled_time"] = new_time
     if new_address:
         convo["address"] = new_address
+    if final_confirmation:
+        convo["final_confirmation_sent"] = True
 
     print("Reply SMS:", reply_text)
     print(
         "Stored state -> date:", convo.get("scheduled_date"),
         "| time:", convo.get("scheduled_time"),
         "| address:", convo.get("address"),
+        "| final_confirmation_sent:", convo.get("final_confirmation_sent"),
     )
 
     # Respond via TwiML so Twilio sends the SMS / WhatsApp message
@@ -605,5 +717,3 @@ def cron_followups():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
