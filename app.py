@@ -1,27 +1,42 @@
 import os
 import json
+import time
 import requests
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from openai import OpenAI
 
-# -------------------------------
-# Global Clients & Config
-# -------------------------------
-openai_api_key = os.environ.get("OPENAI_API_KEY")
-twilio_account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-twilio_auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
-twilio_from_number = os.environ.get("TWILIO_FROM_NUMBER")
+# ---------------------------------------------------
+# Environment & Clients
+# ---------------------------------------------------
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 
-client = OpenAI(api_key=openai_api_key)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 twilio_client = (
-    Client(twilio_account_sid, twilio_auth_token)
-    if twilio_account_sid and twilio_auth_token
+    Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
     else None
 )
 
 app = Flask(__name__)
+
+# In-memory conversation store (per caller)
+# In production you’d replace this with a real database.
+conversations = {}
+# conversations[phone] = {
+#   "cleaned_transcript": str,
+#   "category": str,
+#   "appointment_type": str,
+#   "initial_sms": str,
+#   "first_sms_time": float,
+#   "replied": bool,
+#   "followup_sent": bool
+# }
 
 
 @app.route("/")
@@ -29,9 +44,29 @@ def home():
     return "Prevolt OS running"
 
 
-# ---------------------------------------------------------
-# STEP 1 — Transcription Helper (Twilio → Whisper-1)
-# ---------------------------------------------------------
+# ---------------------------------------------------
+# Utility: Send SMS via Twilio
+# ---------------------------------------------------
+def send_sms(to_number: str, body: str) -> None:
+    if not twilio_client or not TWILIO_FROM_NUMBER:
+        print("Twilio not configured; SMS not sent.")
+        print("Intended SMS to", to_number, ":", body)
+        return
+
+    try:
+        msg = twilio_client.messages.create(
+            body=body,
+            from_=TWILIO_FROM_NUMBER,
+            to=to_number,
+        )
+        print("SMS sent. SID:", msg.sid)
+    except Exception as e:
+        print("Failed to send SMS:", repr(e))
+
+
+# ---------------------------------------------------
+# Step 1 — Transcription (Twilio → Whisper)
+# ---------------------------------------------------
 def transcribe_recording(recording_url: str) -> str:
     """
     Downloads the Twilio WAV recording securely using Basic Auth,
@@ -39,25 +74,22 @@ def transcribe_recording(recording_url: str) -> str:
     """
     audio_url = recording_url + ".wav"
 
-    # Auth with Twilio (Required to get the audio file)
     resp = requests.get(
         audio_url,
         stream=True,
-        auth=(twilio_account_sid, twilio_auth_token),
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
     )
     resp.raise_for_status()
 
     tmp_path = "/tmp/prevolt_voicemail.wav"
 
-    # Save audio to temporary file
     with open(tmp_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             if chunk:
                 f.write(chunk)
 
-    # Transcribe with Whisper
     with open(tmp_path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
+        transcript = openai_client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
         )
@@ -65,24 +97,25 @@ def transcribe_recording(recording_url: str) -> str:
     return transcript.text
 
 
-# ---------------------------------------------------------
-# STEP 2 — Cleanup Layer (Fix mistakes, misheard words)
-# ---------------------------------------------------------
+# ---------------------------------------------------
+# Step 2 — Cleanup (fix mishears, polish text)
+# ---------------------------------------------------
 def clean_transcript_text(raw_text: str) -> str:
     """
-    Uses AI to correct misheard electrical terms and improve readability.
+    Uses AI to correct minor transcription errors, especially for electrical terms,
+    and improve readability while preserving meaning.
     """
     try:
-        completion = client.chat.completions.create(
+        completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are an assistant that cleans up voicemail transcriptions "
-                        "for an electrical contractor. Fix misheard words (especially "
-                        "electrical terminology), refine grammar, and preserve meaning. "
-                        "Do NOT add new information."
+                        "You clean up voicemail transcriptions for an electrical contractor. "
+                        "Fix obvious transcription mistakes and electrical terminology, "
+                        "improve grammar slightly, but do not change the caller's intent "
+                        "or add new information."
                     ),
                 },
                 {"role": "user", "content": raw_text},
@@ -92,135 +125,179 @@ def clean_transcript_text(raw_text: str) -> str:
         return cleaned.strip()
     except Exception as e:
         print("Cleanup FAILED:", repr(e))
-        return raw_text  # fallback
+        return raw_text
 
 
-# ---------------------------------------------------------
-# STEP 3 — Lead Analysis Engine (Core Prevolt Logic)
-# ---------------------------------------------------------
-def analyze_lead(cleaned_text: str) -> dict:
+# ---------------------------------------------------
+# Step 3 — Generate Initial SMS (dynamic, personalized)
+# ---------------------------------------------------
+def generate_initial_sms(cleaned_text: str) -> dict:
     """
-    Evaluates the cleaned transcript and returns a structured JSON dict:
-    {
-      "summary": str,
-      "work_type": str,
-      "complexity_score": int,
-      "seriousness_score": int,
-      "price_sensitivity_score": int,
-      "red_flags": [str],
-      "final_classification": "HIGH" | "MEDIUM" | "LOW" | "REJECT",
-      "recommended_action": "SEND_TEXT_1" | "SEND_TEXT_2" | "IGNORE" | "BLOCK" | "HUMAN_REVIEW"
-    }
+    Generates the FIRST outbound SMS to a new caller based on their voicemail.
+    Must follow Prevolt rules:
+      - Start with 'Hi, this is Prevolt Electric —' (only for this first message).
+      - Do NOT ask them to repeat the voicemail.
+      - Choose the correct appointment type:
+          * $195 evaluation visit for installs / upgrades / quotes.
+          * $395 troubleshoot/repair for active issues / problems.
+          * Whole-home inspection (price band $375–$600) for full-house requests.
+      - For whole-home inspection: ask square footage and mention range, but do NOT
+        give an exact price yet.
+      - Be short, professional, and decisive.
+      - No mention of being automated or AI.
+      - No Kyle, just Prevolt Electric.
+    Returns a dict:
+      {
+         "sms_body": str,
+         "category": str,
+         "appointment_type": "EVAL_195" | "TROUBLESHOOT_395" | "WHOLE_HOME_INSPECTION" | "OTHER"
+      }
     """
     try:
-        completion = client.chat.completions.create(
+        completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are Prevolt OS, an expert electrical lead evaluator for "
-                        "Prevolt Electric. Analyze the voicemail and return ONLY a JSON "
-                        "object with these exact fields:\n"
-                        "{\n"
-                        '  "summary": str,\n'
-                        '  "work_type": str,\n'
-                        '  "complexity_score": int,\n'
-                        '  "seriousness_score": int,\n'
-                        '  "price_sensitivity_score": int,\n'
-                        '  "red_flags": [str],\n'
-                        '  "final_classification": "HIGH" | "MEDIUM" | "LOW" | "REJECT",\n'
-                        '  "recommended_action": "SEND_TEXT_1" | "SEND_TEXT_2" | "IGNORE" | "BLOCK" | "HUMAN_REVIEW"\n'
-                        "}\n"
+                        "You are Prevolt OS, the SMS assistant for Prevolt Electric, a high-end "
+                        "electrical contractor in Connecticut and Massachusetts. You write the FIRST "
+                        "outbound text message to a new customer after reviewing their voicemail transcript.\n\n"
                         "Rules:\n"
-                        "- Prevolt does NOT chase work or beg.\n"
-                        "- Be strict about price shoppers, rebate-capped jobs, people asking for free quotes, "
-                        "and low-value work unless clearly urgent.\n"
-                        "- Mention of sending photos or asking you to review photos is a red flag.\n"
-                        "- Use REJECT when the lead is clearly not worth pursuing.\n"
-                        "- Recommended_action should reflect your final judgment."
+                        "1. The message MUST start with: 'Hi, this is Prevolt Electric —'.\n"
+                        "2. Do NOT ask the customer to repeat what they said in the voicemail.\n"
+                        "3. Use the transcript to understand what they want (EV charger, panel upgrade, "
+                        "transfer switch, active problem, whole-home inspection, etc.).\n"
+                        "4. Choose an appointment type:\n"
+                        "   - Use 'EVAL_195' when they want an install, upgrade, panel work, generator/transfer switch, "
+                        "     EV charger, or need a quote / evaluation for a specific project. Clearly state:\n"
+                        "       'The first step is a $195 on-site evaluation visit.'\n"
+                        "   - Use 'TROUBLESHOOT_395' when there is an active problem: burning smell, flickering, "
+                        "     tripping breakers, partial power loss, overheating, or clear symptoms. State:\n"
+                        "       'For active issues, we schedule a $395 troubleshoot/repair visit.'\n"
+                        "   - Use 'WHOLE_HOME_INSPECTION' if they clearly want the entire home inspected or mention "
+                        "     a full-house electrical inspection. Ask for square footage and mention:\n"
+                        "       'Whole-home inspections range from $375 to $600 depending on the size of the home.'\n"
+                        "     Do NOT give an exact price yet.\n"
+                        "   - Use 'OTHER' if the request is clearly outside scope or not a good fit. In that case, "
+                        "     politely indicate it's not a service you offer or not a good fit, and do not push to schedule.\n"
+                        "5. Do not ask for photos. Do not give detailed quotes over text.\n"
+                        "6. Keep the tone professional, confident, and concise.\n"
+                        "7. Do NOT mention that you are automated or AI.\n"
+                        "8. Do NOT use any personal names. Just Prevolt Electric.\n\n"
+                        "Output STRICT JSON ONLY in this format:\n"
+                        "{\n"
+                        '  \"sms_body\": \"...\",\n'
+                        '  \"category\": \"EV_CHARGER\" | \"PANEL\" | \"GENERATOR\" | \"TROUBLESHOOT\" | \"WHOLE_HOME\" | \"OTHER\",\n'
+                        '  \"appointment_type\": \"EVAL_195\" | \"TROUBLESHOOT_395\" | \"WHOLE_HOME_INSPECTION\" | \"OTHER\"\n'
+                        "}\n"
                     ),
                 },
                 {"role": "user", "content": cleaned_text},
             ],
         )
         content = completion.choices[0].message.content
-        analysis = json.loads(content)
-        return analysis
+        data = json.loads(content)
+        return {
+            "sms_body": data.get("sms_body", "").strip(),
+            "category": data.get("category", "OTHER"),
+            "appointment_type": data.get("appointment_type", "OTHER"),
+        }
     except Exception as e:
-        print("Lead Analysis FAILED:", repr(e))
-        # If parsing failed, log raw content if available
-        try:
-            print("Raw analysis content:", content)
-        except Exception:
-            pass
-        return {}
-
-
-# ---------------------------------------------------------
-# STEP 4 — SMS Follow-Up Engine (Text #1 / #2)
-# ---------------------------------------------------------
-def maybe_send_followup_sms(caller: str, cleaned_text: str, analysis: dict) -> None:
-    """
-    Uses the analysis dict to decide whether to send an SMS follow-up
-    and which template to use.
-    """
-    if not twilio_client:
-        print("Twilio client not configured; SMS not sent.")
-        return
-
-    if not twilio_from_number:
-        print("TWILIO_FROM_NUMBER not set; SMS not sent.")
-        return
-
-    if not analysis:
-        print("No analysis available; defaulting to HUMAN_REVIEW (no SMS).")
-        return
-
-    final_class = analysis.get("final_classification", "").upper()
-    action = analysis.get("recommended_action", "").upper()
-    summary = analysis.get("summary", "your electrical project")
-
-    print(f"\nDecision: class={final_class}, action={action}")
-
-    # Hard filters
-    if final_class == "REJECT" or action in ("IGNORE", "BLOCK"):
-        print("Lead rejected or set to ignore/block. No SMS sent.")
-        return
-
-    # Decide message body
-    if action == "SEND_TEXT_1":
-        body = (
-            "Hi, this is Prevolt Electric. We received your message about "
-            f"{summary}. Our first step is a $195 on-site visit to diagnose and "
-            "quote your project. Would you like to schedule that visit?"
+        print("Initial SMS generation FAILED:", repr(e))
+        # Fallback generic text if something breaks
+        fallback = (
+            "Hi, this is Prevolt Electric — I received your message. "
+            "The next step is scheduling a visit so we can evaluate the work properly. "
+            "The standard evaluation visit is $195. What day works for you?"
         )
-    elif action == "SEND_TEXT_2":
-        # Slightly softer follow-up template placeholder
-        body = (
-            "Hi, this is Prevolt Electric following up on your message about "
-            f"{summary}. If you’d like to move forward, our standard process is "
-            "a $195 on-site visit to evaluate and provide a written quote."
-        )
-    else:
-        # HUMAN_REVIEW or unknown → for now, do not auto-text
-        print("Action is HUMAN_REVIEW or unknown. No SMS sent automatically.")
-        return
+        return {
+            "sms_body": fallback,
+            "category": "OTHER",
+            "appointment_type": "EVAL_195",
+        }
 
+
+# ---------------------------------------------------
+# Step 4 — Generate Reply for Inbound SMS
+# ---------------------------------------------------
+def generate_reply_for_inbound(
+    cleaned_transcript: str,
+    category: str,
+    appointment_type: str,
+    initial_sms: str,
+    inbound_text: str,
+) -> str:
+    """
+    Generates the NEXT SMS in an ongoing thread.
+    Behavior rules:
+      - This is NOT the first message → do NOT start with 'Hi, this is Prevolt Electric —'.
+      - Use the original voicemail transcript and the initial SMS to maintain context.
+      - If the customer asks a simple question (e.g. 'Do you work in Windsor?', 'Are you insured?'),
+        answer briefly and do NOT push scheduling in the same message. Wait for their next reply.
+      - If they show intent to move forward (e.g. 'Okay, what's next?', 'Can we schedule?', 'That works'),
+        then mention the correct appointment type and invite scheduling.
+      - For whole-home inspections:
+          * If they provide square footage, you may now give an exact price using bands:
+              - Under 1500 sq ft → $375
+              - 1500–2400 sq ft → $475
+              - Over 2400 sq ft → $600
+          * Then invite scheduling.
+      - No photos, no detailed quotes over text.
+      - No mention of Kyle, no mention of automation.
+      - Keep it short, professional, and natural.
+    """
     try:
-        msg = twilio_client.messages.create(
-            body=body,
-            from_=twilio_from_number,
-            to=caller,
+        system_prompt = (
+            "You are Prevolt OS, the SMS assistant for Prevolt Electric. "
+            "You are continuing an existing text conversation with a customer.\n\n"
+            "Context:\n"
+            f"- Original voicemail transcript: {cleaned_transcript}\n"
+            f"- Classified category: {category}\n"
+            f"- Appointment type: {appointment_type}\n"
+            f"- First outbound SMS you already sent: {initial_sms}\n\n"
+            "Rules:\n"
+            "1. This is NOT the first message. Do NOT start with 'Hi, this is Prevolt Electric —'.\n"
+            "2. Answer the customer's latest message naturally.\n"
+            "3. If the message is a simple question (e.g. about service area, licensing, timing), "
+            "   answer it briefly and do NOT push scheduling in the same message. Wait for their next reply.\n"
+            "4. If they clearly express interest in moving forward or ask what the next step is, "
+            "   then you may mention the correct appointment type and invite scheduling.\n"
+            "5. Appointment types:\n"
+            "   - 'EVAL_195': say 'The first step is a $195 on-site evaluation visit.'\n"
+            "   - 'TROUBLESHOOT_395': say 'For active issues, we schedule a $395 troubleshoot/repair visit.'\n"
+            "   - 'WHOLE_HOME_INSPECTION':\n"
+            "       * If they provide home square footage, compute exact price using:\n"
+            "           - Under 1500 sq ft → $375\n"
+            "           - 1500–2400 sq ft → $475\n"
+            "           - Over 2400 sq ft → $600\n"
+            "         Then tell them the inspection price and invite scheduling.\n"
+            "       * If they haven't yet provided square footage and it is needed, you may ask for it.\n"
+            "6. No asking for photos. No giving detailed project quotes over text.\n"
+            "7. No mentioning Kyle, no mentioning automation or AI.\n"
+            "8. Keep messages short, professional, and in plain language.\n\n"
+            "Output STRICT JSON ONLY: {\"sms_body\": \"...\"}"
         )
-        print(f"Follow-up SMS sent. SID: {msg.sid}")
+
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": inbound_text},
+            ],
+        )
+        content = completion.choices[0].message.content
+        data = json.loads(content)
+        sms_body = data.get("sms_body", "").strip()
+        return sms_body or "Got it."
     except Exception as e:
-        print("Failed to send SMS:", repr(e))
+        print("Inbound reply generation FAILED:", repr(e))
+        return "Got it."
 
 
-# ---------------------------------------------------------
-# Incoming Call → Direct to Voicemail
-# ---------------------------------------------------------
+# ---------------------------------------------------
+# Voice: Incoming Call → Send to Voicemail
+# ---------------------------------------------------
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
     response = VoiceResponse()
@@ -242,9 +319,9 @@ def incoming_call():
     return Response(str(response), mimetype="text/xml")
 
 
-# ---------------------------------------------------------
-# Voicemail Complete → Transcribe → Clean → Analyze → SMS
-# ---------------------------------------------------------
+# ---------------------------------------------------
+# Voice: Voicemail Complete → Transcribe → SMS #1
+# ---------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
     recording_url = request.form.get("RecordingUrl")
@@ -254,39 +331,134 @@ def voicemail_complete():
     print("\n----- NEW VOICEMAIL -----")
     print("From:", caller)
     print("Recording URL:", recording_url)
-    print("Duration:", duration)
+    print("Duration (sec):", duration)
 
     try:
-        # Step 1 — Raw transcription
+        # Step 1: Transcribe
         raw_text = transcribe_recording(recording_url)
         print("\nRaw Transcript:")
         print(raw_text)
 
-        # Step 2 — Cleaned transcript
+        # Step 2: Clean transcript
         cleaned_text = clean_transcript_text(raw_text)
         print("\nCleaned Transcript:")
         print(cleaned_text)
 
-        # Step 3 — Lead analysis
-        analysis = analyze_lead(cleaned_text)
-        print("\nLead Analysis (JSON):")
-        print(json.dumps(analysis, indent=2))
+        # Step 3: Generate initial SMS
+        sms_info = generate_initial_sms(cleaned_text)
+        sms_body = sms_info["sms_body"]
+        category = sms_info["category"]
+        appointment_type = sms_info["appointment_type"]
 
-        # Step 4 — Optional SMS follow-up
-        maybe_send_followup_sms(caller, cleaned_text, analysis)
+        print("\nInitial SMS Info:")
+        print(json.dumps(sms_info, indent=2))
+
+        # Send first SMS to caller
+        send_sms(caller, sms_body)
+
+        # Store conversation state
+        conversations[caller] = {
+            "cleaned_transcript": cleaned_text,
+            "category": category,
+            "appointment_type": appointment_type,
+            "initial_sms": sms_body,
+            "first_sms_time": time.time(),
+            "replied": False,
+            "followup_sent": False,
+        }
 
     except Exception as e:
-        print("Voicemail Pipeline FAILED:")
-        print(repr(e))
+        print("Voicemail pipeline FAILED:", repr(e))
 
     response = VoiceResponse()
     response.hangup()
     return Response(str(response), mimetype="text/xml")
 
 
-# ---------------------------------------------------------
-# Local Dev Mode Fallback
-# ---------------------------------------------------------
+# ---------------------------------------------------
+# SMS: Incoming SMS Webhook (Twilio Messaging)
+# ---------------------------------------------------
+@app.route("/incoming-sms", methods=["POST"])
+def incoming_sms():
+    from_number = request.form.get("From")
+    body = request.form.get("Body", "").strip()
+
+    print("\n----- INCOMING SMS -----")
+    print("From:", from_number)
+    print("Body:", body)
+
+    convo = conversations.get(from_number)
+
+    if not convo:
+        # No prior voicemail context; treat as generic inbound text
+        # You could expand this later, but keep it simple for now.
+        resp = MessagingResponse()
+        resp.message(
+            "Hi, this is Prevolt Electric — thanks for reaching out. "
+            "What electrical work are you looking to have done?"
+        )
+        return Response(str(resp), mimetype="text/xml")
+
+    # Mark that the customer has replied
+    convo["replied"] = True
+
+    cleaned_transcript = convo["cleaned_transcript"]
+    category = convo["category"]
+    appointment_type = convo["appointment_type"]
+    initial_sms = convo["initial_sms"]
+
+    # Generate a context-aware reply
+    reply_text = generate_reply_for_inbound(
+        cleaned_transcript=cleaned_transcript,
+        category=category,
+        appointment_type=appointment_type,
+        initial_sms=initial_sms,
+        inbound_text=body,
+    )
+
+    print("Reply SMS:", reply_text)
+
+    # Respond via TwiML so Twilio sends the SMS
+    resp = MessagingResponse()
+    resp.message(reply_text)
+    return Response(str(resp), mimetype="text/xml")
+
+
+# ---------------------------------------------------
+# Follow-up Cron: 10-minute auto check-in
+# ---------------------------------------------------
+@app.route("/cron-followups", methods=["GET"])
+def cron_followups():
+    """
+    Simple cron-style endpoint:
+    Call this from an external scheduler (e.g. every minute).
+    For any caller who received an initial SMS, has not replied in 10+ minutes,
+    and has not already received a follow-up, send:
+
+        'Just checking in — still interested?'
+    """
+    now = time.time()
+    sent_count = 0
+
+    for phone, convo in conversations.items():
+        if convo.get("replied"):
+            continue
+        if convo.get("followup_sent"):
+            continue
+
+        first_time = convo.get("first_sms_time", 0)
+        if first_time and (now - first_time) >= 600:  # 10 minutes
+            followup = "Just checking in — still interested?"
+            send_sms(phone, followup)
+            convo["followup_sent"] = True
+            sent_count += 1
+
+    return f"Follow-up check complete. Sent {sent_count} follow-up message(s)."
+
+
+# ---------------------------------------------------
+# Local Dev Fallback
+# ---------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
