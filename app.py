@@ -51,6 +51,7 @@ def send_sms(to_number: str, body: str) -> None:
     """
     For now, all outbound messages go to your WhatsApp
     so we can bypass A2P carrier filtering.
+    NOTE: `to_number` is ignored in this testing mode.
     """
     if not twilio_client:
         print("Twilio not configured; WhatsApp message not sent.")
@@ -58,18 +59,17 @@ def send_sms(to_number: str, body: str) -> None:
         return
 
     try:
-        whatsapp_from = "whatsapp:+14155238886"   # Twilio Sandbox number
-        whatsapp_to = "whatsapp:+18609701727"  # <-- PUT YOUR NUMBER HERE
+        whatsapp_from = "whatsapp:+14155238886"  # Twilio Sandbox number
+        whatsapp_to = "whatsapp:+18609701727"    # Your cell via WhatsApp
 
         msg = twilio_client.messages.create(
             body=body,
             from_=whatsapp_from,
-            to=whatsapp_to
+            to=whatsapp_to,
         )
         print("WhatsApp sent. SID:", msg.sid)
     except Exception as e:
         print("Failed to send WhatsApp message:", repr(e))
-
 
 
 # ---------------------------------------------------
@@ -227,7 +227,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 
 # ---------------------------------------------------
-# Step 4 — Generate Reply for Inbound SMS
+# Step 4 — Generate Reply for Inbound SMS / WhatsApp
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript: str,
@@ -237,73 +237,61 @@ def generate_reply_for_inbound(
     inbound_text: str,
 ) -> str:
     """
-    Generates the NEXT SMS in an ongoing thread.
-    Behavior rules:
-      - This is NOT the first message → do NOT start with 'Hi, this is Prevolt Electric —'.
-      - Use the original voicemail transcript and the initial SMS to maintain context.
-      - If the customer asks a simple question (e.g. 'Do you work in Windsor?', 'Are you insured?'),
-        answer briefly and do NOT push scheduling in the same message. Wait for their next reply.
-      - If they show intent to move forward (e.g. 'Okay, what's next?', 'Can we schedule?', 'That works'),
-        then mention the correct appointment type and invite scheduling.
-      - For whole-home inspections:
-          * If they provide square footage, you may now give an exact price using bands:
-              - Under 1500 sq ft → $375
-              - 1500–2400 sq ft → $475
-              - Over 2400 sq ft → $600
-          * Then invite scheduling.
-      - No photos, no detailed quotes over text.
-      - No mention of Kyle, no mention of automation.
-      - Keep it short, professional, and natural.
+    Generates the NEXT message in an ongoing thread.
+
+    Key behavior:
+      - This is NOT the first message (no 'Hi, this is Prevolt Electric —').
+      - Uses voicemail + initial SMS as context.
+      - Handles simple questions without forcing scheduling.
+      - Handles scheduling flow without repeating questions.
     """
     try:
-       system_prompt = (
-    "You are Prevolt OS, the SMS assistant for Prevolt Electric. "
-    "You are continuing an existing text conversation with a customer.\n\n"
+        system_prompt = (
+            "You are Prevolt OS, the SMS assistant for Prevolt Electric. "
+            "You are continuing an existing text conversation with a customer.\n\n"
 
-    "CRITICAL FLOW RULES:\n"
-    "1. NEVER repeat the same question twice.\n"
-    "2. NEVER restart the conversation.\n"
-    "3. NEVER ask again for information the customer already provided.\n"
-    "4. NEVER repeat sentences from earlier messages.\n"
-    "5. ALWAYS move the conversation forward.\n"
-    "6. If the customer gives a date AND time → CONFIRM it and stop asking again.\n"
-    "7. If the customer gives an address → do NOT ask for it again.\n"
-    "8. If both time and address are provided → send a FINAL confirmation message.\n"
-    "9. Keep responses short, natural, and human.\n"
-    "10. NEVER start with 'Hi, this is Prevolt Electric —' (first message only).\n"
-    "11. NEVER mention automation, AI, or quote back their text.\n\n"
+            "CRITICAL FLOW RULES:\n"
+            "1. NEVER repeat the same question twice.\n"
+            "2. NEVER restart the conversation.\n"
+            "3. NEVER ask again for information the customer already provided.\n"
+            "4. NEVER repeat sentences from earlier messages.\n"
+            "5. ALWAYS move the conversation forward.\n"
+            "6. If the customer gives a date AND time, CONFIRM it and do NOT ask for time again.\n"
+            "7. If the customer gives an address, do NOT ask for it again.\n"
+            "8. If both time and address are provided, send a FINAL confirmation message only.\n"
+            "9. Keep responses short, natural, and human.\n"
+            "10. NEVER start with 'Hi, this is Prevolt Electric —' (that is only for the first message).\n"
+            "11. NEVER mention automation or AI, and do not quote back their full text.\n\n"
 
-    "YOUR CONTEXT:\n"
-    f"- Original voicemail transcript: {cleaned_transcript}\n"
-    f"- Classified category: {category}\n"
-    f"- Appointment type: {appointment_type}\n"
-    f"- First outbound SMS already sent: {initial_sms}\n\n"
+            "CONTEXT:\n"
+            f"- Original voicemail transcript: {cleaned_transcript}\n"
+            f"- Classified category: {category}\n"
+            f"- Appointment type: {appointment_type}\n"
+            f"- First outbound SMS already sent: {initial_sms}\n\n"
 
-    "APPOINTMENT LOGIC (KEEP ALL OF THESE RULES):\n"
-    "• If this is a simple question (service area, licensing, availability, etc.), "
-    "  answer the question directly and DO NOT push scheduling in that message.\n"
-    "• If they’re ready to move forward or ask what’s next, use the correct appointment type:\n"
-    "   - EVAL_195 → say: 'The first step is a $195 on-site evaluation visit.'\n"
-    "   - TROUBLESHOOT_395 → say: 'For active issues, we schedule a $395 troubleshoot/repair visit.'\n"
-    "   - WHOLE_HOME_INSPECTION →\n"
-    "       * If square footage is provided, calculate price:\n"
-    "           - Under 1500 sq ft → $375\n"
-    "           - 1500–2400 sq ft → $475\n"
-    "           - Over 2400 sq ft → $600\n"
-    "       * If square footage is NOT provided, ask for it ONCE.\n"
-    "• No photos. No project quotes over text.\n"
-    "• No mentioning Kyle. No mentioning automation. No repeating the voicemail.\n\n"
+            "APPOINTMENT LOGIC:\n"
+            "• If the customer's message is a simple question (service area, licensing, timing, etc.), "
+            "  answer it directly and DO NOT push scheduling in that same message.\n"
+            "• If they show intent to move forward or ask what the next step is, use the correct appointment type:\n"
+            "   - EVAL_195 → say: 'The first step is a $195 on-site evaluation visit.'\n"
+            "   - TROUBLESHOOT_395 → say: 'For active issues, we schedule a $395 troubleshoot/repair visit.'\n"
+            "   - WHOLE_HOME_INSPECTION →\n"
+            "       * If they provide home square footage, calculate price using:\n"
+            "           - Under 1500 sq ft → $375\n"
+            "           - 1500–2400 sq ft → $475\n"
+            "           - Over 2400 sq ft → $600\n"
+            "       * If square footage is NOT provided yet, you may ask for it ONCE.\n"
+            "• Do NOT ask for photos. Do NOT give detailed project quotes over text.\n"
+            "• Do NOT mention Kyle, automation, or AI.\n\n"
 
-    "CONVERSATION BEHAVIOR:\n"
-    "• If they confirm a time → acknowledge and proceed.\n"
-    "• If they give the address → acknowledge and proceed.\n"
-    "• If they have provided EVERYTHING needed (time + address) → "
-    "  send a final confirmation and do NOT ask additional questions.\n"
-    "• Messages must sound like a real human scheduler.\n\n"
+            "CONVERSATION BEHAVIOR:\n"
+            "• If they confirm a time, acknowledge it and proceed.\n"
+            "• If they provide an address, acknowledge it and proceed.\n"
+            "• If they have provided BOTH time and address, send a final confirmation and do not ask more questions.\n"
+            "• Messages must sound like a real human scheduler, not a robot.\n\n"
 
-    "Output STRICT JSON ONLY: {\"sms_body\": \"...\"}"
-)
-
+            "Output STRICT JSON ONLY: {\"sms_body\": \"...\"}"
+        )
 
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -379,10 +367,10 @@ def voicemail_complete():
         print("\nInitial SMS Info:")
         print(json.dumps(sms_info, indent=2))
 
-        # Send first SMS to caller
+        # Send first SMS (actually WhatsApp in testing mode)
         send_sms(caller, sms_body)
 
-        # Store conversation state
+        # Store conversation state (keyed by caller E.164 number)
         conversations[caller] = {
             "cleaned_transcript": cleaned_text,
             "category": category,
@@ -409,9 +397,8 @@ def incoming_sms():
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
-    # 🔥 FIX: Normalize WhatsApp numbers so conversations map correctly
-    # WhatsApp sends "whatsapp:+18609701727"
-    # We store "+18609701727"
+    # Normalize WhatsApp numbers so they map to stored conversations
+    # WhatsApp sends 'whatsapp:+1860XXXXXXX', we store '+1860XXXXXXX'
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
 
@@ -422,7 +409,7 @@ def incoming_sms():
     convo = conversations.get(from_number)
 
     if not convo:
-        # No voicemail context — treat as generic inbound text
+        # No prior voicemail context; treat as generic inbound text
         resp = MessagingResponse()
         resp.message(
             "Hi, this is Prevolt Electric — thanks for reaching out. "
@@ -447,9 +434,9 @@ def incoming_sms():
         inbound_text=body,
     )
 
-    print("Reply SMS:", reply_text)
+    print("Reply SMS/WA:", reply_text)
 
-    # Respond via TwiML for Twilio to send it (SMS or WhatsApp automatically)
+    # Respond via TwiML so Twilio sends the message (SMS or WhatsApp)
     resp = MessagingResponse()
     resp.message(reply_text)
     return Response(str(resp), mimetype="text/xml")
