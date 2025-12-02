@@ -45,23 +45,31 @@ def home():
 
 
 # ---------------------------------------------------
-# Utility: Send SMS via Twilio
+# Utility: Send outbound message via WhatsApp (for testing)
 # ---------------------------------------------------
 def send_sms(to_number: str, body: str) -> None:
-    if not twilio_client or not TWILIO_FROM_NUMBER:
-        print("Twilio not configured; SMS not sent.")
-        print("Intended SMS to", to_number, ":", body)
+    """
+    For now, all outbound messages go to your WhatsApp
+    so we can bypass A2P carrier filtering.
+    """
+    if not twilio_client:
+        print("Twilio not configured; WhatsApp message not sent.")
+        print("Intended WhatsApp to your phone:", body)
         return
 
     try:
+        whatsapp_from = "whatsapp:+14155238886"   # Twilio Sandbox number
+        whatsapp_to = "whatsapp:+18609701727"  # <-- PUT YOUR NUMBER HERE
+
         msg = twilio_client.messages.create(
             body=body,
-            from_=TWILIO_FROM_NUMBER,
-            to=to_number,
+            from_=whatsapp_from,
+            to=whatsapp_to
         )
-        print("SMS sent. SID:", msg.sid)
+        print("WhatsApp sent. SID:", msg.sid)
     except Exception as e:
-        print("Failed to send SMS:", repr(e))
+        print("Failed to send WhatsApp message:", repr(e))
+
 
 
 # ---------------------------------------------------
