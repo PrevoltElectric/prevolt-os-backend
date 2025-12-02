@@ -1,5 +1,6 @@
 import os
 import requests
+from io import BytesIO
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 import openai
@@ -13,24 +14,33 @@ app = Flask(__name__)
 def home():
     return "Prevolt OS running"
 
+
 # -------------------------------
 # Transcription Helper
 # -------------------------------
 def transcribe_recording(recording_url):
-    # Twilio gives .wav files by default
+    """
+    Downloads the WAV audio from Twilio, wraps it in a BytesIO object,
+    and sends it to OpenAI Whisper for transcription.
+    """
+
+    # Twilio default recording = WAV
     audio_url = recording_url + ".wav"
 
-    # Download WAV audio
-    audio_data = requests.get(audio_url).content
+    # Download audio file
+    audio_bytes = requests.get(audio_url).content
 
-    # Send to OpenAI Whisper (gpt-4o-transcribe)
+    # Wrap in BytesIO so OpenAI sees a real file
+    audio_file = BytesIO(audio_bytes)
+    audio_file.name = "voicemail.wav"  # REQUIRED for proper format detection
+
+    # Send to OpenAI Whisper
     transcript = openai.audio.transcriptions.create(
         model="gpt-4o-transcribe",
-        file=("voicemail.wav", audio_data),
+        file=audio_file
     )
 
     return transcript.text
-
 
 
 # -------------------------------
@@ -72,7 +82,6 @@ def voicemail_complete():
     print("Recording:", recording_url)
     print("Duration:", duration)
 
-    # Attempt transcription
     try:
         transcript_text = transcribe_recording(recording_url)
         print("Transcript:")
@@ -81,17 +90,15 @@ def voicemail_complete():
         print("Transcription FAILED:", str(e))
         transcript_text = None
 
-    # Placeholder for next steps (scoring / SMS automation)
-    # Step 4 and Step 5 will plug in here.
-
     response = VoiceResponse()
     response.hangup()
     return Response(str(response), mimetype="text/xml")
 
 
 # -------------------------------
-# Render Fallback (if gunicorn fails)
+# Render Fallback (local run)
 # -------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
