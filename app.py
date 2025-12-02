@@ -384,22 +384,27 @@ def voicemail_complete():
 
 
 # ---------------------------------------------------
-# SMS: Incoming SMS Webhook (Twilio Messaging)
+# SMS / WhatsApp: Incoming Message Webhook (Twilio Messaging)
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
-    from_number = request.form.get("From")
+    from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
-    print("\n----- INCOMING SMS -----")
+    # 🔥 FIX: Normalize WhatsApp numbers so conversations map correctly
+    # WhatsApp sends "whatsapp:+18609701727"
+    # We store "+18609701727"
+    if from_number.startswith("whatsapp:"):
+        from_number = from_number.replace("whatsapp:", "")
+
+    print("\n----- INCOMING SMS/WA MESSAGE -----")
     print("From:", from_number)
     print("Body:", body)
 
     convo = conversations.get(from_number)
 
     if not convo:
-        # No prior voicemail context; treat as generic inbound text
-        # You could expand this later, but keep it simple for now.
+        # No voicemail context — treat as generic inbound text
         resp = MessagingResponse()
         resp.message(
             "Hi, this is Prevolt Electric — thanks for reaching out. "
@@ -426,7 +431,7 @@ def incoming_sms():
 
     print("Reply SMS:", reply_text)
 
-    # Respond via TwiML so Twilio sends the SMS
+    # Respond via TwiML for Twilio to send it (SMS or WhatsApp automatically)
     resp = MessagingResponse()
     resp.message(reply_text)
     return Response(str(resp), mimetype="text/xml")
