@@ -35,7 +35,10 @@ conversations = {}
 #   "initial_sms": str,
 #   "first_sms_time": float,
 #   "replied": bool,
-#   "followup_sent": bool
+#   "followup_sent": bool,
+#   "scheduled_date": str | None,
+#   "scheduled_time": str | None,
+#   "address": str | None,
 # }
 
 
@@ -51,7 +54,6 @@ def send_sms(to_number: str, body: str) -> None:
     """
     For now, all outbound messages go to your WhatsApp
     so we can bypass A2P carrier filtering.
-    NOTE: `to_number` is ignored in this testing mode.
     """
     if not twilio_client:
         print("Twilio not configured; WhatsApp message not sent.")
@@ -60,7 +62,7 @@ def send_sms(to_number: str, body: str) -> None:
 
     try:
         whatsapp_from = "whatsapp:+14155238886"  # Twilio Sandbox number
-        whatsapp_to = "whatsapp:+18609701727"    # Your cell via WhatsApp
+        whatsapp_to = "whatsapp:+18609701727"    # <-- YOUR CELL HERE
 
         msg = twilio_client.messages.create(
             body=body,
@@ -235,62 +237,78 @@ def generate_reply_for_inbound(
     appointment_type: str,
     initial_sms: str,
     inbound_text: str,
-) -> str:
+    scheduled_date: str | None,
+    scheduled_time: str | None,
+    address: str | None,
+) -> dict:
     """
     Generates the NEXT message in an ongoing thread.
 
-    Key behavior:
-      - This is NOT the first message (no 'Hi, this is Prevolt Electric —').
-      - Uses voicemail + initial SMS as context.
-      - Handles simple questions without forcing scheduling.
-      - Handles scheduling flow without repeating questions.
+    Returns dict:
+    {
+      "sms_body": "...",
+      "scheduled_date": "... or null",
+      "scheduled_time": "... or null",
+      "address": "... or null"
+    }
     """
     try:
         system_prompt = (
             "You are Prevolt OS, the SMS assistant for Prevolt Electric. "
             "You are continuing an existing text conversation with a customer.\n\n"
-
-            "CRITICAL FLOW RULES:\n"
+            "CRITICAL FLOW RULES (DO ALL OF THESE):\n"
             "1. NEVER repeat the same question twice.\n"
             "2. NEVER restart the conversation.\n"
             "3. NEVER ask again for information the customer already provided.\n"
-            "4. NEVER repeat sentences from earlier messages.\n"
+            "4. NEVER repeat big chunks of earlier messages.\n"
             "5. ALWAYS move the conversation forward.\n"
-            "6. If the customer gives a date AND time, CONFIRM it and do NOT ask for time again.\n"
-            "7. If the customer gives an address, do NOT ask for it again.\n"
-            "8. If both time and address are provided, send a FINAL confirmation message only.\n"
-            "9. Keep responses short, natural, and human.\n"
-            "10. NEVER start with 'Hi, this is Prevolt Electric —' (that is only for the first message).\n"
-            "11. NEVER mention automation or AI, and do not quote back their full text.\n\n"
-
-            "CONTEXT:\n"
+            "6. If the customer gives a specific time, CONFIRM it and do NOT ask for time again.\n"
+            "7. If the customer gives a date (like 'next Tuesday'), CONFIRM it and do NOT ask again.\n"
+            "8. If the customer gives an address, do NOT ask for address again.\n"
+            "9. If you already have date, time, and address, send a clear final confirmation and stop asking questions.\n"
+            "10. Keep responses short, natural, and human.\n"
+            "11. Do NOT start with 'Hi, this is Prevolt Electric —' (that is ONLY for the first message).\n"
+            "12. Do NOT mention automation, AI, or that you are a bot.\n\n"
+            "CONTEXT FROM THE VOICEMAIL AND FIRST MESSAGE:\n"
             f"- Original voicemail transcript: {cleaned_transcript}\n"
             f"- Classified category: {category}\n"
             f"- Appointment type: {appointment_type}\n"
             f"- First outbound SMS already sent: {initial_sms}\n\n"
-
-            "APPOINTMENT LOGIC:\n"
-            "• If the customer's message is a simple question (service area, licensing, timing, etc.), "
-            "  answer it directly and DO NOT push scheduling in that same message.\n"
-            "• If they show intent to move forward or ask what the next step is, use the correct appointment type:\n"
+            "CURRENT STORED DETAILS (THESE ARE ALREADY KNOWN):\n"
+            f"- scheduled_date: {scheduled_date}\n"
+            f"- scheduled_time: {scheduled_time}\n"
+            f"- address: {address}\n\n"
+            "APPOINTMENT LOGIC (KEEP ALL OF THESE RULES):\n"
+            "• If this is a simple question (service area, licensing, availability, etc.), "
+            "  answer the question directly and DO NOT push scheduling in that same message.\n"
+            "• If they’re ready to move forward or ask what’s next, use the correct appointment type:\n"
             "   - EVAL_195 → say: 'The first step is a $195 on-site evaluation visit.'\n"
             "   - TROUBLESHOOT_395 → say: 'For active issues, we schedule a $395 troubleshoot/repair visit.'\n"
             "   - WHOLE_HOME_INSPECTION →\n"
-            "       * If they provide home square footage, calculate price using:\n"
+            "       * If square footage is provided, calculate price:\n"
             "           - Under 1500 sq ft → $375\n"
             "           - 1500–2400 sq ft → $475\n"
             "           - Over 2400 sq ft → $600\n"
-            "       * If square footage is NOT provided yet, you may ask for it ONCE.\n"
-            "• Do NOT ask for photos. Do NOT give detailed project quotes over text.\n"
-            "• Do NOT mention Kyle, automation, or AI.\n\n"
-
-            "CONVERSATION BEHAVIOR:\n"
-            "• If they confirm a time, acknowledge it and proceed.\n"
-            "• If they provide an address, acknowledge it and proceed.\n"
-            "• If they have provided BOTH time and address, send a final confirmation and do not ask more questions.\n"
-            "• Messages must sound like a real human scheduler, not a robot.\n\n"
-
-            "Output STRICT JSON ONLY: {\"sms_body\": \"...\"}"
+            "       * If square footage is NOT provided and you need it, ask for it ONCE.\n"
+            "• No photos. No detailed project quotes over text.\n"
+            "• No mentioning Kyle. No mentioning automation. No repeating the voicemail.\n\n"
+            "AUTO-DETECTION & MEMORY RULES:\n"
+            "• Read the customer's latest message and auto-detect if they gave:\n"
+            "   - a date (example: 'next Tuesday', '12/6', 'tomorrow').\n"
+            "   - a time (example: '2pm', '9:30 AM', 'tomorrow morning at 8').\n"
+            "   - an address (anything that clearly looks like a street address).\n"
+            "• If they provide a new date / time / address, include it in your JSON output.\n"
+            "• If they change the time or date, update to the NEW value.\n"
+            "• If all three are present (date, time, address), send a short final confirmation:\n"
+            "   something like: 'Perfect, we’ll see you on [date] at [time] at [address].'\n\n"
+            "OUTPUT FORMAT (STRICT JSON ONLY):\n"
+            "{\n"
+            '  \"sms_body\": \"your message back to the customer\",\n'
+            '  \"scheduled_date\": \"date you detected or null if none\",\n'
+            '  \"scheduled_time\": \"time you detected or null if none\",\n'
+            '  \"address\": \"address you detected or null if none\"\n'
+            "}\n"
+            "Do NOT include any extra keys. Do NOT include explanations. JSON ONLY."
         )
 
         completion = openai_client.chat.completions.create(
@@ -302,11 +320,35 @@ def generate_reply_for_inbound(
         )
         content = completion.choices[0].message.content
         data = json.loads(content)
-        sms_body = data.get("sms_body", "").strip()
-        return sms_body or "Got it."
+
+        # Normalise empty strings to None
+        sms_body = (data.get("sms_body") or "").strip()
+        scheduled_date_out = data.get("scheduled_date")
+        scheduled_time_out = data.get("scheduled_time")
+        address_out = data.get("address")
+
+        if isinstance(scheduled_date_out, str) and not scheduled_date_out.strip():
+            scheduled_date_out = None
+        if isinstance(scheduled_time_out, str) and not scheduled_time_out.strip():
+            scheduled_time_out = None
+        if isinstance(address_out, str) and not address_out.strip():
+            address_out = None
+
+        return {
+            "sms_body": sms_body or "Got it.",
+            "scheduled_date": scheduled_date_out,
+            "scheduled_time": scheduled_time_out,
+            "address": address_out,
+        }
+
     except Exception as e:
         print("Inbound reply generation FAILED:", repr(e))
-        return "Got it."
+        return {
+            "sms_body": "Got it.",
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
+        }
 
 
 # ---------------------------------------------------
@@ -367,10 +409,10 @@ def voicemail_complete():
         print("\nInitial SMS Info:")
         print(json.dumps(sms_info, indent=2))
 
-        # Send first SMS (actually WhatsApp in testing mode)
+        # Send first SMS (currently via WhatsApp sandbox)
         send_sms(caller, sms_body)
 
-        # Store conversation state (keyed by caller E.164 number)
+        # Store conversation state
         conversations[caller] = {
             "cleaned_transcript": cleaned_text,
             "category": category,
@@ -379,6 +421,9 @@ def voicemail_complete():
             "first_sms_time": time.time(),
             "replied": False,
             "followup_sent": False,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
         }
 
     except Exception as e:
@@ -397,8 +442,8 @@ def incoming_sms():
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
-    # Normalize WhatsApp numbers so they map to stored conversations
-    # WhatsApp sends 'whatsapp:+1860XXXXXXX', we store '+1860XXXXXXX'
+    # Normalise WhatsApp numbers so conversations map correctly
+    # WhatsApp sends "whatsapp:+1860xxxxxxx"
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
 
@@ -409,7 +454,7 @@ def incoming_sms():
     convo = conversations.get(from_number)
 
     if not convo:
-        # No prior voicemail context; treat as generic inbound text
+        # No voicemail context — treat as generic inbound text
         resp = MessagingResponse()
         resp.message(
             "Hi, this is Prevolt Electric — thanks for reaching out. "
@@ -424,19 +469,43 @@ def incoming_sms():
     category = convo["category"]
     appointment_type = convo["appointment_type"]
     initial_sms = convo["initial_sms"]
+    scheduled_date = convo.get("scheduled_date")
+    scheduled_time = convo.get("scheduled_time")
+    address = convo.get("address")
 
-    # Generate a context-aware reply
-    reply_text = generate_reply_for_inbound(
+    # Generate a context-aware reply + updated state
+    ai_reply = generate_reply_for_inbound(
         cleaned_transcript=cleaned_transcript,
         category=category,
         appointment_type=appointment_type,
         initial_sms=initial_sms,
         inbound_text=body,
+        scheduled_date=scheduled_date,
+        scheduled_time=scheduled_time,
+        address=address,
     )
 
-    print("Reply SMS/WA:", reply_text)
+    reply_text = ai_reply.get("sms_body", "Got it.").strip() or "Got it."
+    new_date = ai_reply.get("scheduled_date")
+    new_time = ai_reply.get("scheduled_time")
+    new_address = ai_reply.get("address")
 
-    # Respond via TwiML so Twilio sends the message (SMS or WhatsApp)
+    # Update stored state if model extracted anything new
+    if new_date:
+        convo["scheduled_date"] = new_date
+    if new_time:
+        convo["scheduled_time"] = new_time
+    if new_address:
+        convo["address"] = new_address
+
+    print("Reply SMS:", reply_text)
+    print(
+        "Stored state -> date:", convo.get("scheduled_date"),
+        "| time:", convo.get("scheduled_time"),
+        "| address:", convo.get("address"),
+    )
+
+    # Respond via TwiML so Twilio sends the SMS / WhatsApp message
     resp = MessagingResponse()
     resp.message(reply_text)
     return Response(str(resp), mimetype="text/xml")
@@ -480,4 +549,5 @@ def cron_followups():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
