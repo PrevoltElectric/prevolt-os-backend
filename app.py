@@ -35,6 +35,8 @@ GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 DISPATCH_ORIGIN_ADDRESS = os.environ.get("DISPATCH_ORIGIN_ADDRESS")
 TECH_CURRENT_ADDRESS = os.environ.get("TECH_CURRENT_ADDRESS")
 
+# Max allowed travel window for auto-booking
+MAX_TRAVEL_MINUTES = 75
 
 # ---------------------------------------------------
 # Square Service Variation IDs (Final Verified)
