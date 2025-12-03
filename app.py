@@ -26,31 +26,28 @@ TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 
 SQUARE_ACCESS_TOKEN = os.environ.get("SQUARE_ACCESS_TOKEN")
 SQUARE_LOCATION_ID = os.environ.get("SQUARE_LOCATION_ID")
-SQUARE_TEAM_MEMBER_ID = os.environ.get("SQUARE_TEAM_MEMBER_ID")  # required for bookings
+SQUARE_TEAM_MEMBER_ID = os.environ.get("SQUARE_TEAM_MEMBER_ID")  # for bookings
 
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
-DISPATCH_ORIGIN_ADDRESS = os.environ.get("DISPATCH_ORIGIN_ADDRESS")  # e.g. "Granby, CT"
-TECH_CURRENT_ADDRESS = os.environ.get("TECH_CURRENT_ADDRESS")        # optional live tech location
+DISPATCH_ORIGIN_ADDRESS = os.environ.get("DISPATCH_ORIGIN_ADDRESS")
+TECH_CURRENT_ADDRESS = os.environ.get("TECH_CURRENT_ADDRESS")
 
 # ---------------------------------------------------
-# Square service variations (final from Square catalog)
+# Square service variation data (final and verified)
 # ---------------------------------------------------
-# On-Site Electrical Evaluation & Quote Visit ($195)
 SERVICE_VARIATION_EVAL_ID = "IPCUF6EPOYGWJUEFUZOXL2AZ"
 SERVICE_VARIATION_EVAL_VERSION = 1764725435505
 
-# Full-Home Electrical Safety Inspection
 SERVICE_VARIATION_INSPECTION_ID = "EGGYZF6JRHFBWKRWEKWB2WYI"
 SERVICE_VARIATION_INSPECTION_VERSION = 1764719028312
 
-# 24/7 Electrical Troubleshooting & Diagnostics ($395)
 SERVICE_VARIATION_TROUBLESHOOT_ID = "I6XYKSUWBOQJ3WPNES4LG5WG"
 SERVICE_VARIATION_TROUBLESHOOT_VERSION = 1764718988109
 
-# Non-emergency booking window (local time)
-BOOKING_START_HOUR = 9    # 9:00
-BOOKING_END_HOUR = 16     # 16:00 (4pm)
-MAX_TRAVEL_MINUTES = 60   # hard cap on drive time for auto-book
+# Non-emergency booking window
+BOOKING_START_HOUR = 9
+BOOKING_END_HOUR = 16
+MAX_TRAVEL_MINUTES = 60
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 twilio_client = (
@@ -61,58 +58,34 @@ twilio_client = (
 
 app = Flask(__name__)
 
-# Conversation memory
+# Stored conversations
 conversations = {}
-# conversations[phone] = {
-#   "cleaned_transcript": ...,
-#   "category": ...,
-#   "appointment_type": ...,
-#   "initial_sms": ...,
-#   "first_sms_time": ...,
-#   "replied": ...,
-#   "followup_sent": ...,
-#   "scheduled_date": ...,
-#   "scheduled_time": ...,
-#   "address": ...,
-#   "booking_created": bool,
-#   "square_booking_id": str | None
-# }
 
 
 # ---------------------------------------------------
-# Utility: Send outbound message via WhatsApp (testing)
+# Send WhatsApp SMS
 # ---------------------------------------------------
 def send_sms(to_number: str, body: str) -> None:
-    """
-    Force all outbound messages to WhatsApp sandbox to bypass A2P filtering.
-    Currently always sends to your cell via WhatsApp sandbox.
-    """
     if not twilio_client:
-        print("Twilio not configured; WhatsApp message not sent.")
-        print("Intended WhatsApp:", body)
+        print("Twilio not configured; skipping WhatsApp send.")
+        print("Intended:", body)
         return
-
     try:
-        whatsapp_from = "whatsapp:+14155238886"  # Twilio Sandbox
-        whatsapp_to = "whatsapp:+18609701727"    # <-- YOUR CELL
-
         msg = twilio_client.messages.create(
             body=body,
-            from_=whatsapp_from,
-            to=whatsapp_to,
+            from_="whatsapp:+14155238886",
+            to="whatsapp:+18609701727",
         )
         print("WhatsApp sent. SID:", msg.sid)
-
     except Exception as e:
-        print("Failed to send WhatsApp message:", repr(e))
+        print("SMS send error:", repr(e))
 
 
 # ---------------------------------------------------
-# Step 1 — Transcription (Twilio → Whisper)
+# Step 1 — Transcription
 # ---------------------------------------------------
 def transcribe_recording(recording_url: str) -> str:
     audio_url = recording_url + ".wav"
-
     resp = requests.get(
         audio_url,
         stream=True,
@@ -121,22 +94,20 @@ def transcribe_recording(recording_url: str) -> str:
     resp.raise_for_status()
 
     tmp_path = "/tmp/prevolt_voicemail.wav"
-
     with open(tmp_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
+        for chunk in resp.iter_content(8192):
             f.write(chunk)
 
-    with open(tmp_path, "rb") as audio_file:
+    with open(tmp_path, "rb") as f:
         transcript = openai_client.audio.transcriptions.create(
             model="whisper-1",
-            file=audio_file,
+            file=f,
         )
-
     return transcript.text
 
 
 # ---------------------------------------------------
-# Step 2 — Cleanup (improve clarity)
+# Step 2 — Cleanup transcription
 # ---------------------------------------------------
 def clean_transcript_text(raw_text: str) -> str:
     try:
@@ -146,17 +117,15 @@ def clean_transcript_text(raw_text: str) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You clean up voicemail transcriptions for an electrical contractor. "
-                        "Fix obvious transcription mistakes and electrical terminology, "
-                        "improve grammar slightly, but preserve meaning. Do NOT add info."
+                        "Clean up voicemail text for an electrical contractor. "
+                        "Fix wording, transcription mistakes, and electrical terms but do NOT add new info."
                     ),
                 },
                 {"role": "user", "content": raw_text},
             ],
         )
         return completion.choices[0].message.content.strip()
-    except Exception as e:
-        print("Cleanup FAILED:", repr(e))
+    except:
         return raw_text
 
 
@@ -171,38 +140,33 @@ def generate_initial_sms(cleaned_text: str) -> dict:
                 {
                     "role": "system",
                     "content": (
-                        "You are Prevolt OS, the SMS assistant for Prevolt Electric. "
-                        "Generate the FIRST outbound SMS after reading voicemail.\n\n"
+                        "You are Prevolt OS. Generate the FIRST SMS.\n"
                         "Rules:\n"
-                        "• MUST start with: 'Hi, this is Prevolt Electric —'\n"
-                        "• NEVER ask them to repeat their voicemail.\n"
-                        "• Determine correct appointment type:\n"
-                        "   - Installs/quotes/upgrades → EVAL_195\n"
-                        "   - Active problems → TROUBLESHOOT_395\n"
-                        "   - Whole house inspection → WHOLE_HOME_INSPECTION\n"
-                        "• Mention price once only.\n"
-                        "• No photos. No AI mentions. No Kyle.\n\n"
-                        "Return STRICT JSON with keys: sms_body, category, appointment_type."
+                        "- Must start with: 'Hi, this is Prevolt Electric —'\n"
+                        "- NEVER ask them to repeat voicemail\n"
+                        "- Detect appointment type:\n"
+                        "   Installs/quotes → EVAL_195\n"
+                        "   Active issues → TROUBLESHOOT_395\n"
+                        "   Whole home requests → WHOLE_HOME_INSPECTION\n"
+                        "- Mention price once\n"
+                        "- No photos. No AI mentions. No Kyle.\n"
+                        "Return strict JSON: sms_body, category, appointment_type."
                     ),
                 },
                 {"role": "user", "content": cleaned_text},
             ],
         )
-
         data = json.loads(completion.choices[0].message.content)
-
         return {
-            "sms_body": data["sms_body"].strip(),
+            "sms_body": data["sms_body"],
             "category": data["category"],
             "appointment_type": data["appointment_type"],
         }
-
-    except Exception as e:
-        print("Initial SMS FAILED:", repr(e))
+    except Exception:
         return {
             "sms_body": (
                 "Hi, this is Prevolt Electric — I received your message. "
-                "The next step is a $195 on-site consultation and quote visit. What day works for you?"
+                "The next step is a $195 evaluation visit. What day works for you?"
             ),
             "category": "OTHER",
             "appointment_type": "EVAL_195",
@@ -210,7 +174,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 
 # ---------------------------------------------------
-# Step 4 — Generate Replies (THE BRAIN)
+# Step 4 — Generate Replies (Brain)
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -221,114 +185,75 @@ def generate_reply_for_inbound(
     scheduled_date,
     scheduled_time,
     address,
-) -> dict:
-
-    # Current local date for automatic date conversion (Option A)
+):
     try:
+        # local date for Option A date conversion
         if ZoneInfo:
             tz = ZoneInfo("America/New_York")
         else:
             tz = timezone(timedelta(hours=-5))
         now_local = datetime.now(tz)
-    except Exception:
-        now_local = datetime.utcnow()
 
-    today_date_str = now_local.strftime("%Y-%m-%d")
-    today_weekday = now_local.strftime("%A")
+        today_date_str = now_local.strftime("%Y-%m-%d")
+        today_weekday = now_local.strftime("%A")
 
-    try:
         system_prompt = f"""
-You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
+You are Prevolt OS. Continue SMS conversation naturally.
 
-Today is {today_date_str}, which is a {today_weekday} in America/New_York local time.
+Today is {today_date_str}, a {today_weekday}, local time America/New_York.
 
-===================================================
-STRICT CONVERSATION FLOW RULES
-===================================================
-1. NEVER repeat a question already asked.
-2. NEVER restart the conversation.
-3. NEVER ask again for date, time, or address if already collected.
-4. NEVER restate prices.
-5. ALWAYS move the conversation forward.
-6. If customer gives date AND time → accept once.
-7. If customer gives address → accept once.
-8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
-9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
-10. No AI mentions. No quoting their text.
-11. Keep messages short and human.
+STRICT RULES:
+1. Never repeat a question.
+2. Never restart conversation.
+3. Never re-ask for date/time/address already collected.
+4. Never restate prices.
+5. If customer gives date+time → accept once.
+6. When date+time+address complete → final confirmation (NO question mark).
+7. After customer confirms → send nothing further.
+8. No AI mentions.
 
-===================================================
-SCHEDULING RULES (9am–4pm ONLY, LOCAL TIME)
-===================================================
-• Normal, non-emergency appointments are scheduled between 9:00 and 16:00 local time.
-• If the customer proposes outside that window for a non-emergency:
+SCHEDULING RULES:
+• Non-emergency visits: 9am–4pm
+• TROUBLESHOOT_395 can be outside the window & weekends
+• If they propose outside window on non-emergency:
   “We typically schedule between 9am and 4pm. What time in that window works for you?”
-• Troubleshoot/emergency appointments (TROUBLESHOOT_395) can be outside that window if needed.
 
-===================================================
-AUTOMATIC DATE CONVERSION (OPTION A)
-===================================================
-Use today's date ({today_date_str}, {today_weekday}) to convert natural phrases into an exact date:
-• Examples: "this Thursday", "next Tuesday", "tomorrow", "in two weeks", "on July 10th", etc.
-• ALWAYS convert to an explicit calendar date in 'YYYY-MM-DD' format.
-• Do NOT ask the customer to restate the date in numbers if you can infer it.
-• If they say things like "next Thursday at 10am" or "this Friday around 2pm",
-  treat that as BOTH a date AND a time and store them without asking again.
-• Only ask follow-up questions for the piece that is missing:
-  - If you know the time but not the date → ask ONLY for the date.
-  - If you know the date but not the time → ask ONLY for the time.
+OPTION A DATE CONVERSION:
+Convert natural phrases (“this Thursday”, “next Tuesday”, “tomorrow at 10”) into:
+- scheduled_date = YYYY-MM-DD
+- scheduled_time = HH:MM 24-hour
+Only ask for missing part.
 
-===================================================
-EMERGENCY RULE
-===================================================
-If voicemail indicates an active issue AND customer says “now / ASAP / immediately”:
-Use:
+EMERGENCY RULE:
+If active issue & customer says ASAP/now:
 “We can prioritize this. What’s the earliest time today you can meet us at the property?”
 
-===================================================
-TENANT RULE
-===================================================
-If: “my tenant will schedule” → ONLY say:
+TENANT RULE:
+If they say “my tenant will schedule”:
 “For scheduling and service details, we can only coordinate directly with you as the property owner.”
 
-===================================================
-VALUE / REASSURANCE (TROUBLESHOOT ONLY)
-===================================================
-Use ONCE:
+REASSURANCE (troubleshoot only, ONCE):
 “Most minor issues are handled during the troubleshoot visit, and we’re usually able to diagnose within the first hour.”
 
-===================================================
-AUTO-DETECTION
-===================================================
-You must detect and store:
-• scheduled_date
-• scheduled_time
-• address
+AUTO-DETECTION REQUIRED:
+Detect and store:
+- scheduled_date (YYYY-MM-DD)
+- scheduled_time (HH:MM)
+- address
 
-FORMAT REQUIREMENTS:
-• scheduled_date MUST be 'YYYY-MM-DD' (example: 2025-12-03)
-• scheduled_time MUST be 'HH:MM' in 24-hour local time (example: 14:30)
-If you don't know yet, use null.
-
-If a customer changes date, time, or address later → update the stored value.
-
-===================================================
-CONTEXT
-===================================================
+CONTEXT:
 Original voicemail: {cleaned_transcript}
 Category: {category}
 Appointment type: {appointment_type}
-Initial SMS: {initial_sms}
-Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
+Initial: {initial_sms}
+Stored values: date={scheduled_date}, time={scheduled_time}, address={address}
 
-===================================================
-OUTPUT FORMAT (STRICT JSON)
-===================================================
+RETURN STRICT JSON:
 {{
-  "sms_body": "...",
-  "scheduled_date": "YYYY-MM-DD or null",
-  "scheduled_time": "HH:MM or null",
-  "address": "string or null"
+ "sms_body": "...",
+ "scheduled_date": "YYYY-MM-DD or null",
+ "scheduled_time": "HH:MM or null",
+ "address": "string or null"
 }}
 """
 
@@ -339,11 +264,9 @@ OUTPUT FORMAT (STRICT JSON)
                 {"role": "user", "content": inbound_text},
             ],
         )
-
         return json.loads(completion.choices[0].message.content)
 
-    except Exception as e:
-        print("Inbound reply FAILED:", repr(e))
+    except Exception:
         return {
             "sms_body": "Got it.",
             "scheduled_date": scheduled_date,
@@ -353,18 +276,11 @@ OUTPUT FORMAT (STRICT JSON)
 
 
 # ---------------------------------------------------
-# Google Maps helper
+# Google Maps
 # ---------------------------------------------------
 def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
-    """
-    Uses Google Maps Distance Matrix API to estimate travel time in minutes.
-    Returns None on failure.
-    """
-    if not GOOGLE_MAPS_API_KEY:
+    if not GOOGLE_MAPS_API_KEY or not origin or not destination:
         return None
-    if not origin or not destination:
-        return None
-
     try:
         params = {
             "origins": origin,
@@ -377,28 +293,18 @@ def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
             timeout=8,
         )
         data = resp.json()
-        rows = data.get("rows", [])
-        if not rows:
+        elem = data["rows"][0]["elements"][0]
+        if elem["status"] != "OK":
             return None
-        elements = rows[0].get("elements", [])
-        if not elements:
-            return None
-        elem = elements[0]
-        if elem.get("status") != "OK":
-            return None
-        seconds = elem["duration"]["value"]
-        return seconds / 60.0
-    except Exception as e:
-        print("Travel time computation failed:", repr(e))
+        return elem["duration"]["value"] / 60.0
+    except:
         return None
 
 
 # ---------------------------------------------------
-# Square helpers
+# Square Helpers
 # ---------------------------------------------------
-def square_headers() -> dict:
-    if not SQUARE_ACCESS_TOKEN:
-        raise RuntimeError("SQUARE_ACCESS_TOKEN not configured")
+def square_headers():
     return {
         "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -406,88 +312,61 @@ def square_headers() -> dict:
     }
 
 
-def square_create_or_get_customer(phone: str, address: str | None = None) -> str | None:
-    """
-    Very simple customer create-or-get by phone number.
-    """
+def square_create_or_get_customer(phone, address=None) -> str | None:
     if not SQUARE_ACCESS_TOKEN:
-        print("Square not configured; skipping customer create.")
         return None
 
+    # search by phone
     try:
-        # Try search by phone
-        search_payload = {
-            "query": {
-                "filter": {
-                    "phone_number": {"exact": phone.replace("whatsapp:", "")}
-                }
-            }
-        }
         resp = requests.post(
             "https://connect.squareup.com/v2/customers/search",
             headers=square_headers(),
-            json=search_payload,
+            json={"query": {"filter": {"phone_number": {"exact": phone}}}},
             timeout=10,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            customers = data.get("customers", [])
-            if customers:
-                return customers[0]["id"]
-    except Exception as e:
-        print("Square search customer failed:", repr(e))
+        data = resp.json()
+        if "customers" in data and data["customers"]:
+            return data["customers"][0]["id"]
+    except:
+        pass
 
-    # Create new customer
+    # create
     try:
-        customer_payload = {
+        payload = {
             "idempotency_key": str(uuid.uuid4()),
             "given_name": "Prevolt Lead",
-            "phone_number": phone.replace("whatsapp:", ""),
+            "phone_number": phone,
         }
         if address:
-            customer_payload["address"] = {"address_line_1": address}
+            payload["address"] = {"address_line_1": address}
 
         resp = requests.post(
             "https://connect.squareup.com/v2/customers",
             headers=square_headers(),
-            json=customer_payload,
+            json=payload,
             timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data["customer"]["id"]
-    except Exception as e:
-        print("Square create customer failed:", repr(e))
+        return resp.json()["customer"]["id"]
+    except:
         return None
 
 
 def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
-    """
-    Parse 'YYYY-MM-DD' and 'HH:MM' into aware datetime in America/New_York,
-    then convert to UTC for Square.
-    """
     if not date_str or not time_str:
         return None
     try:
-        local_naive = datetime.strptime(
-            f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
-        )
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
         if ZoneInfo:
-            local = local_naive.replace(tzinfo=ZoneInfo("America/New_York"))
+            dt = dt.replace(tzinfo=ZoneInfo("America/New_York"))
         else:
-            # Fallback: assume -05:00 (no DST handling)
-            local = local_naive.replace(tzinfo=timezone(timedelta(hours=-5)))
-        # Convert to UTC and drop tzinfo for Square's expected format
-        return local.astimezone(timezone.utc).replace(tzinfo=None)
-    except Exception as e:
-        print("Failed to parse local datetime:", repr(e))
+            dt = dt.replace(tzinfo=timezone(timedelta(hours=-5)))
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except:
         return None
 
 
-def map_appointment_type_to_service_variation(appointment_type: str):
-    """
-    Map internal appointment_type to (service_variation_id, service_variation_version).
-    """
+def map_service_variation(appointment_type: str):
     if appointment_type == "EVAL_195":
         return SERVICE_VARIATION_EVAL_ID, SERVICE_VARIATION_EVAL_VERSION
     if appointment_type == "WHOLE_HOME_INSPECTION":
@@ -499,29 +378,23 @@ def map_appointment_type_to_service_variation(appointment_type: str):
 
 def is_weekend(date_str: str) -> bool:
     try:
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        # Monday=0 ... Sunday=6
-        return d.weekday() >= 5
-    except Exception:
+        return datetime.strptime(date_str, "%Y-%m-%d").weekday() >= 5
+    except:
         return False
 
 
 def is_within_normal_hours(time_str: str) -> bool:
     try:
-        t = datetime.strptime(time_str, "%H:%M").time()
-        return BOOKING_START_HOUR <= t.hour <= BOOKING_END_HOUR
-    except Exception:
+        hour = int(time_str.split(":")[0])
+        return BOOKING_START_HOUR <= hour <= BOOKING_END_HOUR
+    except:
         return False
 
 
+# ---------------------------------------------------
+# Create Square Booking (FINAL)
+# ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict) -> None:
-    """
-    Create a Square booking once we have date, time, and address.
-    - No duplicates (idempotency by phone+datetime+appt_type)
-    - Weekend rule: only TROUBLESHOOT_395 on weekends
-    - Non-emergency: 9–4 only
-    - Travel time: skip auto-book if drive time > MAX_TRAVEL_MINUTES
-    """
     if convo.get("booking_created"):
         return
 
@@ -533,70 +406,59 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     if not (scheduled_date and scheduled_time and address):
         return
 
-    service_variation_id, service_variation_version = map_appointment_type_to_service_variation(
-        appointment_type
-    )
-    if not service_variation_id or service_variation_version is None:
-        print("Unknown appointment_type; cannot map to service variation:", appointment_type)
+    variation_id, variation_version = map_service_variation(appointment_type)
+    if not variation_id:
+        print("Unknown appointment type, cannot map:", appointment_type)
         return
 
-    # Weekend rule: only TROUBLESHOOT_395 allowed Sat/Sun
+    # Weekend rule
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
-        print("Weekend non-emergency booking blocked:", phone, scheduled_date)
+        print("Weekend blocked:", scheduled_date)
         return
 
-    # Non-emergency time window rule (9–4)
-    if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(
-        scheduled_time
-    ):
-        print("Non-emergency time outside 9–4; booking not auto-created:", phone, scheduled_time)
+    # Weekday time rule
+    if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(scheduled_time):
+        print("Outside 9–4 window:", scheduled_time)
         return
 
-    if not SQUARE_ACCESS_TOKEN or not SQUARE_LOCATION_ID or not SQUARE_TEAM_MEMBER_ID:
-        print("Square configuration incomplete; skipping booking creation.")
-        return
-
-    start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
-    if not start_at_utc:
-        print("Could not parse scheduled date/time; skipping booking.")
-        return
-
-    # Dynamic travel-time limit (up to MAX_TRAVEL_MINUTES) using tech's current location if available
+    # Travel time limit
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
     if origin:
-        travel_minutes = compute_travel_time_minutes(origin, address)
-        if travel_minutes is not None:
-            print(
-                f"Estimated travel from origin '{origin}' to job '{address}': "
-                f"~{travel_minutes:.1f} minutes for {phone}"
-            )
-            if travel_minutes > MAX_TRAVEL_MINUTES:
-                print(
-                    f"Travel time {travel_minutes:.1f} exceeds {MAX_TRAVEL_MINUTES} minutes; "
-                    f"skipping automatic booking for {phone}."
-                )
-                return
+        travel = compute_travel_time_minutes(origin, address)
+        if travel and travel > MAX_TRAVEL_MINUTES:
+            print("Travel too long:", travel, "minutes")
+            return
 
     customer_id = square_create_or_get_customer(phone, address)
     if not customer_id:
-        print("No customer_id; cannot create booking.")
+        print("Customer missing; cannot create booking.")
         return
 
-    idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
+    start_utc = parse_local_datetime(scheduled_date, scheduled_time)
+    if not start_utc:
+        print("Bad datetime; cannot book.")
+        return
 
+    # REQUIRED BY SQUARE FOR CUSTOMER_LOCATION
     booking_payload = {
-        "idempotency_key": idempotency_key,
+        "idempotency_key": f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}",
         "booking": {
             "location_id": SQUARE_LOCATION_ID,
             "customer_id": customer_id,
-            "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "start_at": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
-            "customer_note": f"Auto-booked by Prevolt OS. Customer address: {address}",
+
+            # SQUARE REQUIRED:
+            "address": {
+                "address_line_1": address
+            },
+
+            "customer_note": f"Auto-booked by Prevolt OS. Address: {address}",
             "appointment_segments": [
                 {
-                    "duration_minutes": 60,  # all three are 60-minute visits
-                    "service_variation_id": service_variation_id,
-                    "service_variation_version": service_variation_version,
+                    "duration_minutes": 60,
+                    "service_variation_id": variation_id,
+                    "service_variation_version": variation_version,
                     "team_member_id": SQUARE_TEAM_MEMBER_ID,
                 }
             ],
@@ -611,49 +473,46 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             timeout=10,
         )
         if resp.status_code not in (200, 201):
-            print("Square booking create failed:", resp.status_code, resp.text)
+            print("Square booking failed:", resp.status_code, resp.text)
             return
-        data = resp.json()
-        booking = data.get("booking")
-        booking_id = booking.get("id") if booking else None
+
+        booking_id = resp.json().get("booking", {}).get("id")
         convo["booking_created"] = True
         convo["square_booking_id"] = booking_id
-        print(
-            f"Square booking created for {phone}: {booking_id} "
-            f"{scheduled_date} {scheduled_time} ({appointment_type})"
-        )
+        print(f"Square booking created:", booking_id)
+
     except Exception as e:
-        print("Square booking exception:", repr(e))
+        print("Booking exception:", repr(e))
 
 
 # ---------------------------------------------------
-# Voice: Incoming Call
+# Voice Call Handler
 # ---------------------------------------------------
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
-    response = VoiceResponse()
-    response.say(
+    resp = VoiceResponse()
+    resp.say(
         "Thanks for calling Prevolt Electric. "
         "Please leave your name, address, and a brief description of your project. "
         "We will text you shortly."
     )
-    response.record(
+    resp.record(
         max_length=60,
-        play_beep=True,
         trim="do-not-trim",
+        play_beep=True,
         action="/voicemail-complete",
     )
-    response.hangup()
-    return Response(str(response), mimetype="text/xml")
+    resp.hangup()
+    return Response(str(resp), mimetype="text/xml")
 
 
 # ---------------------------------------------------
-# Voicemail Complete → Transcribe → Initial SMS
+# Voicemail → Transcribe → SMS
 # ---------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
-    recording_url = request.form.get("RecordingUrl")
     caller = request.form.get("From")
+    recording_url = request.form.get("RecordingUrl")
 
     try:
         raw = transcribe_recording(recording_url)
@@ -678,27 +537,26 @@ def voicemail_complete():
         }
 
     except Exception as e:
-        print("Voicemail fail:", repr(e))
+        print("Voicemail error:", repr(e))
 
-    response = VoiceResponse()
-    response.hangup()
-    return Response(str(response), mimetype="text/xml")
+    resp = VoiceResponse()
+    resp.hangup()
+    return Response(str(resp), mimetype="text/xml")
 
 
 # ---------------------------------------------------
-# Incoming SMS / WhatsApp
+# Incoming SMS Handler
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
     from_number = request.form.get("From", "")
-    body = request.form.get("Body", "").strip()
+    inbound = request.form.get("Body", "").strip()
 
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
 
     convo = conversations.get(from_number)
 
-    # Cold inbound with no voicemail history
     if not convo:
         resp = MessagingResponse()
         resp.message(
@@ -710,17 +568,17 @@ def incoming_sms():
     convo["replied"] = True
 
     ai_reply = generate_reply_for_inbound(
-        cleaned_transcript=convo["cleaned_transcript"],
-        category=convo["category"],
-        appointment_type=convo["appointment_type"],
-        initial_sms=convo["initial_sms"],
-        inbound_text=body,
-        scheduled_date=convo.get("scheduled_date"),
-        scheduled_time=convo.get("scheduled_time"),
-        address=convo.get("address"),
+        convo["cleaned_transcript"],
+        convo["category"],
+        convo["appointment_type"],
+        convo["initial_sms"],
+        inbound,
+        convo.get("scheduled_date"),
+        convo.get("scheduled_time"),
+        convo.get("address"),
     )
 
-    sms_body = ai_reply.get("sms_body", "").strip()
+    sms_body = ai_reply.get("sms_body", "")
 
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
@@ -729,13 +587,11 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # Attempt booking once we have a complete date + time + address
     try:
         maybe_create_square_booking(from_number, convo)
     except Exception as e:
-        print("maybe_create_square_booking failed:", repr(e))
+        print("Booking creation failed:", repr(e))
 
-    # If final confirmation matched → stop responding
     if sms_body == "":
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
@@ -745,31 +601,26 @@ def incoming_sms():
 
 
 # ---------------------------------------------------
-# Follow-up Cron (10 minutes)
+# 10-minute Follow-up
 # ---------------------------------------------------
 @app.route("/cron-followups", methods=["GET"])
 def cron_followups():
     now = time.time()
-    sent_count = 0
-
+    sent = 0
     for phone, convo in conversations.items():
-        if convo.get("replied"):
-            continue
-        if convo.get("followup_sent"):
-            continue
-
-        if now - convo.get("first_sms_time", 0) >= 600:
-            send_sms(phone, "Just checking in — still interested?")
-            convo["followup_sent"] = True
-            sent_count += 1
-
-    return f"Sent {sent_count} follow-up(s)."
+        if not convo.get("replied") and not convo.get("followup_sent"):
+            if now - convo.get("first_sms_time", 0) >= 600:
+                send_sms(phone, "Just checking in — still interested?")
+                convo["followup_sent"] = True
+                sent += 1
+    return f"Sent {sent} follow-ups."
 
 
 # ---------------------------------------------------
-# Local Dev
+# Local Run
 # ---------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
