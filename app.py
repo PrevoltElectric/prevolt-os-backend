@@ -729,132 +729,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     except Exception as e:
         print("Square booking exception:", repr(e))
 
-# ---------------------------------------------------
-# Square Service Debug — Dump All Appointment Services
-# ---------------------------------------------------
-def square_dump_services_debug():
-    """
-    Dumps ALL APPOINTMENT_SERVICE catalog items from Square
-    into square_debug_services.json so you can inspect IDs,
-    versions, names, and details.
-    """
-    if not SQUARE_ACCESS_TOKEN:
-        print("Square credentials missing; debug dump skipped.")
-        return
 
-    url = "https://connect.squareup.com/v2/catalog/list"
-
-    try:
-        resp = requests.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
-                "Accept": "application/json",
-            },
-            params={
-                # Only load appointment services (not retail store items)
-                "types": "APPOINTMENT_SERVICE",
-            },
-            timeout=10,
-        )
-
-        data = resp.json()
-
-        # Save to a local file (useful for development)
-        with open("square_debug_services.json", "w", encoding="utf-8") as f:
-            f.write(json.dumps(data, indent=4))
-
-        print("✔ square_debug_services.json updated (APPOINTMENT_SERVICE only)")
-
-    except Exception as e:
-        print("Service debug dump failed:", repr(e))
-
-
-# ---------------------------------------------------
-# Square Debug Route — View All Appointment Services
-# ---------------------------------------------------
-@app.route("/debug/services", methods=["GET"])
-def debug_services():
-    """
-    Returns a JSON dump of ALL APPOINTMENT_SERVICE objects from Square.
-
-    Production:
-        https://prevolt-os-backend.onrender.com/debug/services
-
-    Local:
-        http://127.0.0.1:5000/debug/services
-    """
-    if not SQUARE_ACCESS_TOKEN:
-        return ("Square credentials missing", 500)
-
-    url = "https://connect.squareup.com/v2/catalog/list"
-
-    try:
-        resp = requests.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
-                "Accept": "application/json",
-            },
-            params={
-                "types": "APPOINTMENT_SERVICE",
-            },
-            timeout=10,
-        )
-        data = resp.json()
-
-        return (
-            json.dumps(data, indent=4),
-            200,
-            {"Content-Type": "application/json"},
-        )
-
-    except Exception as e:
-        return (f"Error: {repr(e)}", 500)
-
-
-
-# ---------------------------------------------------
-# Square Debug Route — View All Services via Browser
-# ---------------------------------------------------
-@app.route("/debug/services", methods=["GET"])
-def debug_services():
-    """
-    Returns the ENTIRE Square catalog (ITEM + ITEM_VARIATION) in JSON format.
-
-    On Render (production):
-        https://prevolt-os-backend.onrender.com/debug/services
-
-    Locally:
-        http://127.0.0.1:5000/debug/services
-    """
-    if not SQUARE_ACCESS_TOKEN:
-        return ("Square credentials are missing", 500)
-
-    url = "https://connect.squareup.com/v2/catalog/list"
-
-    try:
-        resp = requests.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
-                "Accept": "application/json",
-            },
-            params={
-                "types": "ITEM,ITEM_VARIATION",
-            },
-            timeout=10,
-        )
-        data = resp.json()
-
-        return (
-            json.dumps(data, indent=4),
-            200,
-            {"Content-Type": "application/json"},
-        )
-
-    except Exception as e:
-        return (f"Error: {repr(e)}", 500)
 
 
 # ---------------------------------------------------
@@ -876,6 +751,72 @@ def incoming_call():
     )
     response.hangup()
     return Response(str(response), mimetype="text/xml")
+# ---------------------------------------------------
+# Square Debug Route — Return ONLY the 3 Key Services
+# ---------------------------------------------------
+@app.route("/debug/prevolt-services", methods=["GET"])
+def debug_prevolt_services():
+    """
+    Returns the EXACT 3 appointment services we need:
+      • On-Site Electrical Evaluation & Quote Visit
+      • Full-Home Electrical Safety Inspection
+      • 24/7 Electrical Troubleshooting & Diagnostics
+
+    Output includes:
+      - service ID
+      - service version
+      - each variation ID + version
+    """
+
+    TARGET_NAMES = {
+        "On-Site Electrical Evaluation & Quote Visit",
+        "Full-Home Electrical Safety Inspection",
+        "24/7 Electrical Troubleshooting & Diagnostics"
+    }
+
+    if not SQUARE_ACCESS_TOKEN:
+        return ("Square credentials missing", 500)
+
+    url = "https://connect.squareup.com/v2/catalog/list"
+
+    try:
+        # Pull the entire catalog (we filter manually)
+        resp = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        objects = data.get("objects", [])
+
+        results = []
+
+        for obj in objects:
+            if obj.get("type") != "APPOINTMENT_SERVICE":
+                continue
+
+            svc = obj.get("appointment_service_data", {})
+            name = svc.get("name", "")
+
+            if name in TARGET_NAMES:
+                results.append({
+                    "service_name": name,
+                    "service_id": obj.get("id"),
+                    "service_version": obj.get("version"),
+                    "variations": svc.get("variations", [])
+                })
+
+        return (
+            json.dumps(results, indent=4),
+            200,
+            {"Content-Type": "application/json"},
+        )
+
+    except Exception as e:
+        return (f"Error: {repr(e)}", 500)
 
 
 # ---------------------------------------------------
