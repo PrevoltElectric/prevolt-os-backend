@@ -35,47 +35,18 @@ TECH_CURRENT_ADDRESS = os.environ.get("TECH_CURRENT_ADDRESS")        # optional 
 # ---------------------------------------------------
 # Square service variation data (final and verified)
 # ---------------------------------------------------
+
+# $195 On-Site Electrical Evaluation & Quote Visit
 SERVICE_VARIATION_EVAL_ID = "IPCUF6EPOYGWJUEFUZOXL2AZ"
 SERVICE_VARIATION_EVAL_VERSION = 1764725435505
 
-SERVICE_VARIATION_INSPECTION_ID = "EGGYZF6JRHFBWKRWEKWB2WYI"
-SERVICE_VARIATION_INSPECTION_VERSION = 1764719028312
+# Whole-Home Electrical Safety Inspection (variable pricing)
+SERVICE_VARIATION_INSPECTION_ID = "LYK646AH4NAESCFUZL6PUTZ2"
+SERVICE_VARIATION_INSPECTION_VERSION = 1764725393938
 
-SERVICE_VARIATION_TROUBLESHOOT_ID = "I6XYKSUWBOQJ3WPNES4LG5WG"
-SERVICE_VARIATION_TROUBLESHOOT_VERSION = 1764718988109
-
-# Non-emergency booking window (local time)
-BOOKING_START_HOUR = 9   # 9:00
-BOOKING_END_HOUR = 16    # 16:00 (4pm)
-MAX_TRAVEL_MINUTES = 60  # max 1 hour travel
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-twilio_client = (
-    Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
-    else None
-)
-
-app = Flask(__name__)
-
-# Conversation memory (in-memory for now)
-conversations = {}
-# conversations[phone] = {
-#   "cleaned_transcript": ...,
-#   "category": ...,
-#   "appointment_type": ...,
-#   "initial_sms": ...,
-#   "first_sms_time": ...,
-#   "replied": ...,
-#   "followup_sent": ...,
-#   "scheduled_date": ...,
-#   "scheduled_time": ...,
-#   "address": ... (raw freeform from customer),
-#   "normalized_address": {...} or None,
-#   "booking_created": bool,
-#   "square_booking_id": str | None,
-#   "state_prompt_sent": bool,
-# }
+# $395 24/7 Electrical Troubleshooting & Diagnostics
+SERVICE_VARIATION_TROUBLESHOOT_ID = "64IQNJYO3H6XNTLPIHABDJOQ"
+SERVICE_VARIATION_TROUBLESHOOT_VERSION = 1762464315698
 
 
 # ---------------------------------------------------
