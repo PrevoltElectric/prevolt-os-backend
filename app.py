@@ -751,72 +751,30 @@ def incoming_call():
     )
     response.hangup()
     return Response(str(response), mimetype="text/xml")
-# ---------------------------------------------------
-# Square Debug Route — Return ONLY the 3 Key Services
-# ---------------------------------------------------
-@app.route("/debug/prevolt-services", methods=["GET"])
-def debug_prevolt_services():
-    """
-    Returns the EXACT 3 appointment services we need:
-      • On-Site Electrical Evaluation & Quote Visit
-      • Full-Home Electrical Safety Inspection
-      • 24/7 Electrical Troubleshooting & Diagnostics
+[
+  {
+    "matched_as": "EVALUATION",
+    "service_name": "On-site Electrical Evaluation",
+    "service_id": "XXXXXX",
+    "service_version": 1234,
+    "variations": [...]
+  },
+  {
+    "matched_as": "TROUBLESHOOT",
+    "service_name": "24/7 Troubleshooting & Diagnostic",
+    "service_id": "YYYYYY",
+    "service_version": 5678,
+    "variations": [...]
+  },
+  {
+    "matched_as": "INSPECTION",
+    "service_name": "Full Home Electrical Safety Inspection",
+    "service_id": "ZZZZZZ",
+    "service_version": 1357,
+    "variations": [...]
+  }
+]
 
-    Output includes:
-      - service ID
-      - service version
-      - each variation ID + version
-    """
-
-    TARGET_NAMES = {
-        "On-Site Electrical Evaluation & Quote Visit",
-        "Full-Home Electrical Safety Inspection",
-        "24/7 Electrical Troubleshooting & Diagnostics"
-    }
-
-    if not SQUARE_ACCESS_TOKEN:
-        return ("Square credentials missing", 500)
-
-    url = "https://connect.squareup.com/v2/catalog/list"
-
-    try:
-        # Pull the entire catalog (we filter manually)
-        resp = requests.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
-                "Accept": "application/json",
-            },
-            timeout=10,
-        )
-        data = resp.json()
-        objects = data.get("objects", [])
-
-        results = []
-
-        for obj in objects:
-            if obj.get("type") != "APPOINTMENT_SERVICE":
-                continue
-
-            svc = obj.get("appointment_service_data", {})
-            name = svc.get("name", "")
-
-            if name in TARGET_NAMES:
-                results.append({
-                    "service_name": name,
-                    "service_id": obj.get("id"),
-                    "service_version": obj.get("version"),
-                    "variations": svc.get("variations", [])
-                })
-
-        return (
-            json.dumps(results, indent=4),
-            200,
-            {"Content-Type": "application/json"},
-        )
-
-    except Exception as e:
-        return (f"Error: {repr(e)}", 500)
 
 
 # ---------------------------------------------------
