@@ -748,6 +748,23 @@ def cron_followups():
             sent_count += 1
 
     return f"Sent {sent_count} follow-up(s)."
+@app.route("/debug-square-services", methods=["GET"])
+def debug_square_services():
+    """
+    Fetch all Square catalog objects and filter for appointment services.
+    This reveals the REAL service_variation_id and version you need.
+    """
+    try:
+        resp = requests.post(
+            "https://connect.squareup.com/v2/catalog/search",
+            headers=square_headers(),
+            json={"types": ["ITEM", "ITEM_VARIATION"]},
+            timeout=10,
+        )
+        data = resp.json()
+        return data
+    except Exception as e:
+        return {"error": repr(e)}, 500
 
 
 # ---------------------------------------------------
