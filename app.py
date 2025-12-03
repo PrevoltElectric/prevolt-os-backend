@@ -765,6 +765,60 @@ def debug_square_services():
         return data
     except Exception as e:
         return {"error": repr(e)}, 500
+@app.route("/debug-eval", methods=["GET"])
+def debug_eval():
+    try:
+        resp = requests.post(
+            "https://connect.squareup.com/v2/catalog/search",
+            headers=square_headers(),
+            json={
+                "query": {
+                    "text_query": {
+                        "keywords": ["On-Site Electrical Evaluation"]
+                    }
+                }
+            },
+            timeout=10,
+        )
+        return resp.json()
+    except Exception as e:
+        return {"error": repr(e)}, 500
+@app.route("/debug-inspection", methods=["GET"])
+def debug_inspection():
+    try:
+        resp = requests.post(
+            "https://connect.squareup.com/v2/catalog/search",
+            headers=square_headers(),
+            json={
+                "query": {
+                    "text_query": {
+                        "keywords": ["Electrical Safety Inspection"]
+                    }
+                }
+            },
+            timeout=10,
+        )
+        return resp.json()
+    except Exception as e:
+        return {"error": repr(e)}, 500
+@app.route("/debug-troubleshoot", methods=["GET"])
+def debug_troubleshoot():
+    try:
+        resp = requests.post(
+            "https://connect.squareup.com/v2/catalog/search",
+            headers=square_headers(),
+            json={
+                "query": {
+                    "text_query": {
+                        "keywords": ["Troubleshooting"]
+                    }
+                }
+            },
+            timeout=10,
+        )
+        return resp.json()
+    except Exception as e:
+        return {"error": repr(e)}, 500
 
 
 # ---------------------------------------------------
