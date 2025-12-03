@@ -568,88 +568,6 @@ def square_create_or_get_customer(phone: str, address_struct: dict | None = None
         return None
 
 
-# ---------------------------------------------------
-# Square Service Debug — dump all appointment services
-# ---------------------------------------------------
-def square_dump_services_debug():
-    """
-    Dumps the ENTIRE Square Appointments Service Catalog
-    to square_debug_services.json any time it's called.
-    """
-    if not SQUARE_ACCESS_TOKEN or not SQUARE_LOCATION_ID:
-        print("Square credentials missing; debug service dump skipped.")
-        return
-
-    url = f"https://connect.squareup.com/v2/locations/{SQUARE_LOCATION_ID}/services"
-
-    try:
-        resp = requests.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
-                "Accept": "application/json",
-            },
-            timeout=10,
-        )
-        data = resp.json()
-
-        with open("square_debug_services.json", "w") as f:
-            f.write(json.dumps(data, indent=4))
-
-        print("✔ square_debug_services.json updated")
-
-    except Exception as e:
-        print("Service debug dump failed:", repr(e))
-
-
-def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
-    """
-    Parse 'YYYY-MM-DD' and 'HH:MM' into aware datetime in America/New_York,
-    then convert to UTC for Square.
-    """
-    if not date_str or not time_str:
-        return None
-    try:
-        local_naive = datetime.strptime(
-            f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
-        )
-        if ZoneInfo:
-            local = local_naive.replace(tzinfo=ZoneInfo("America/New_York"))
-        else:
-            # Fallback: assume -05:00 (no DST handling)
-            local = local_naive.replace(tzinfo=timezone(timedelta(hours=-5)))
-        # Convert to UTC and drop tzinfo for Square's expected format
-        return local.astimezone(timezone.utc).replace(tzinfo=None)
-    except Exception as e:
-        print("Failed to parse local datetime:", repr(e))
-        return None
-
-
-def map_appointment_type_to_variation(appointment_type: str):
-    if appointment_type == "EVAL_195":
-        return SERVICE_VARIATION_EVAL_ID, SERVICE_VARIATION_EVAL_VERSION
-    if appointment_type == "WHOLE_HOME_INSPECTION":
-        return SERVICE_VARIATION_INSPECTION_ID, SERVICE_VARIATION_INSPECTION_VERSION
-    if appointment_type == "TROUBLESHOOT_395":
-        return SERVICE_VARIATION_TROUBLESHOOT_ID, SERVICE_VARIATION_TROUBLESHOOT_VERSION
-    return None, None
-
-
-def is_weekend(date_str: str) -> bool:
-    try:
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        # Monday=0 ... Sunday=6
-        return d.weekday() >= 5
-    except Exception:
-        return False
-
-
-def is_within_normal_hours(time_str: str) -> bool:
-    try:
-        t = datetime.strptime(time_str, "%H:%M").time()
-        return BOOKING_START_HOUR <= t.hour <= BOOKING_END_HOUR
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------
@@ -811,6 +729,39 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     except Exception as e:
         print("Square booking exception:", repr(e))
 
+# ---------------------------------------------------
+# Square Debug Route — View All Services via Browser
+# ---------------------------------------------------
+@app.route("/debug/services", methods=["GET"])
+def debug_services():
+    """
+    Returns the ENTIRE Square Appointments service catalog in JSON format.
+    Open this in your browser:
+        http://127.0.0.1:5000/debug/services
+    """
+    if not SQUARE_ACCESS_TOKEN or not SQUARE_LOCATION_ID:
+        return ("Square credentials are missing", 500)
+
+    url = f"https://connect.squareup.com/v2/locations/{SQUARE_LOCATION_ID}/services"
+
+    try:
+        resp = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        return (
+            json.dumps(data, indent=4),
+            200,
+            {"Content-Type": "application/json"},
+        )
+
+    except Exception as e:
+        return (f"Error: {repr(e)}", 500)
 
 # ---------------------------------------------------
 # Voice: Incoming Call
