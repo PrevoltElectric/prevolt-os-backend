@@ -3,7 +3,7 @@ import json
 import time
 import uuid
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
@@ -438,9 +438,9 @@ def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
             local = local_naive.replace(tzinfo=ZoneInfo("America/New_York"))
         else:
             # Fallback: assume -05:00 (no DST handling)
-            from datetime import timezone, timedelta as _td
-            local = local_naive.replace(tzinfo=timezone(_td(hours=-5)))
-        return local.astimezone(datetime.utc).replace(tzinfo=None)
+            local = local_naive.replace(tzinfo=timezone(timedelta(hours=-5)))
+        # Convert to UTC and drop tzinfo for Square's expected format
+        return local.astimezone(timezone.utc).replace(tzinfo=None)
     except Exception as e:
         print("Failed to parse local datetime:", repr(e))
         return None
@@ -646,6 +646,7 @@ def incoming_sms():
 
     convo = conversations.get(from_number)
 
+    # Cold inbound with no voicemail history
     if not convo:
         resp = MessagingResponse()
         resp.message(
