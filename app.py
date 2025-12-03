@@ -30,6 +30,7 @@ SQUARE_TEAM_MEMBER_ID = os.environ.get("SQUARE_TEAM_MEMBER_ID")  # required for 
 
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 DISPATCH_ORIGIN_ADDRESS = os.environ.get("DISPATCH_ORIGIN_ADDRESS")  # e.g. "Granby, CT"
+TECH_CURRENT_ADDRESS = os.environ.get("TECH_CURRENT_ADDRESS")        # optional live tech location
 
 # Prevolt service IDs (from your booking URLs)
 SERVICE_ID_EVAL = "2AANQPVPZDC5KK32LIA24MKW"          # On-Site Electrical Evaluation & Quote
@@ -37,8 +38,9 @@ SERVICE_ID_HOME_INSPECTION = "WA4NC3LKHU2JM2K4EWOYFOFZ"  # Full-Home Electrical 
 SERVICE_ID_TROUBLESHOOT = "5FMVM7VONJ6SVGVZN6AKZFNW"     # 24/7 Electrical Troubleshooting & Diagnostics
 
 # Non-emergency booking window (local time)
-BOOKING_START_HOUR = 9   # 9:00
-BOOKING_END_HOUR = 16    # 16:00 (4pm)
+BOOKING_START_HOUR = 9    # 9:00
+BOOKING_END_HOUR = 16     # 16:00 (4pm)
+MAX_TRAVEL_MINUTES = 60   # hard cap on drive time for auto-book
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 twilio_client = (
@@ -211,9 +213,24 @@ def generate_reply_for_inbound(
     address,
 ) -> dict:
 
+    # Current local date for automatic date conversion (Option A)
+    try:
+        if ZoneInfo:
+            tz = ZoneInfo("America/New_York")
+        else:
+            tz = timezone(timedelta(hours=-5))
+        now_local = datetime.now(tz)
+    except Exception:
+        now_local = datetime.utcnow()
+
+    today_date_str = now_local.strftime("%Y-%m-%d")
+    today_weekday = now_local.strftime("%A")
+
     try:
         system_prompt = f"""
 You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
+
+Today is {today_date_str}, which is a {today_weekday} in America/New_York local time.
 
 ===================================================
 STRICT CONVERSATION FLOW RULES
@@ -237,6 +254,19 @@ SCHEDULING RULES (9am–4pm ONLY, LOCAL TIME)
 • If the customer proposes outside that window for a non-emergency:
   “We typically schedule between 9am and 4pm. What time in that window works for you?”
 • Troubleshoot/emergency appointments (TROUBLESHOOT_395) can be outside that window if needed.
+
+===================================================
+AUTOMATIC DATE CONVERSION (OPTION A)
+===================================================
+Use today's date ({today_date_str}, {today_weekday}) to convert natural phrases into an exact date:
+• Examples: "this Thursday", "next Tuesday", "tomorrow", "in two weeks", "on July 10th", etc.
+• ALWAYS convert to an explicit calendar date in 'YYYY-MM-DD' format.
+• Do NOT ask the customer to restate the date in numbers if you can infer it.
+• If they say things like "next Thursday at 10am" or "this Friday around 2pm",
+  treat that as BOTH a date AND a time and store them without asking again.
+• Only ask follow-up questions for the piece that is missing:
+  - If you know the time but not the date → ask ONLY for the date.
+  - If you know the date but not the time → ask ONLY for the time.
 
 ===================================================
 EMERGENCY RULE
@@ -313,13 +343,11 @@ OUTPUT FORMAT (STRICT JSON)
 
 
 # ---------------------------------------------------
-# Google Maps helper (optional)
+# Google Maps helper
 # ---------------------------------------------------
 def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
     """
     Uses Google Maps Distance Matrix API to estimate travel time in minutes.
-    This is a hook for future use with dynamic tech locations.
-    For now, you can set DISPATCH_ORIGIN_ADDRESS or pass a tech address.
     Returns None on failure.
     """
     if not GOOGLE_MAPS_API_KEY:
@@ -479,6 +507,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     - No duplicates (idempotency by phone+datetime+appt_type)
     - Weekend rule: only TROUBLESHOOT_395 on weekends
     - Non-emergency: 9–4 only
+    - Travel time: skip auto-book if drive time > MAX_TRAVEL_MINUTES
     """
     if convo.get("booking_created"):
         return
@@ -517,14 +546,21 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Could not parse scheduled date/time; skipping booking.")
         return
 
-    # Optional travel-time hook (currently using dispatch origin as best-effort)
-    if DISPATCH_ORIGIN_ADDRESS:
-        travel_minutes = compute_travel_time_minutes(DISPATCH_ORIGIN_ADDRESS, address)
+    # Dynamic travel-time limit (up to MAX_TRAVEL_MINUTES) using tech's current location if available
+    origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+    if origin:
+        travel_minutes = compute_travel_time_minutes(origin, address)
         if travel_minutes is not None:
             print(
-                f"Estimated travel from dispatch to job: ~{travel_minutes:.1f} minutes "
-                f"for {phone} at {address}"
+                f"Estimated travel from origin '{origin}' to job '{address}': "
+                f"~{travel_minutes:.1f} minutes for {phone}"
             )
+            if travel_minutes > MAX_TRAVEL_MINUTES:
+                print(
+                    f"Travel time {travel_minutes:.1f} exceeds {MAX_TRAVEL_MINUTES} minutes; "
+                    f"skipping automatic booking for {phone}."
+                )
+                return
 
     customer_id = square_create_or_get_customer(phone, address)
     if not customer_id:
