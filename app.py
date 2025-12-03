@@ -729,6 +729,81 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     except Exception as e:
         print("Square booking exception:", repr(e))
 
+# ---------------------------------------------------
+# Square Debug Route — Find Prevolt Service Variations
+# ---------------------------------------------------
+@app.route("/debug/prevolt-services", methods=["GET"])
+def debug_prevolt_services():
+    """
+    Returns ONLY the 3 Prevolt service variations we rely on:
+      • On-Site Electrical Evaluation & Quote Visit
+      • Full-Home Electrical Safety Inspection
+      • 24/7 Electrical Troubleshooting & Diagnostics
+
+    URL on Render:
+        https://prevolt-os-backend.onrender.com/debug/prevolt-services
+    """
+    if not SQUARE_ACCESS_TOKEN:
+        return ("Square credentials missing", 500)
+
+    url = "https://connect.squareup.com/v2/catalog/search"
+
+    payload = {
+        "object_types": ["ITEM", "ITEM_VARIATION"]
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=12,
+        )
+
+        data = resp.json()
+        objects = data.get("objects", [])
+
+        TARGET_NAMES = {
+            "On-Site Electrical Evaluation & Quote Visit": "EVALUATION",
+            "Full-Home Electrical Safety Inspection": "INSPECTION",
+            "24/7 Electrical Troubleshooting & Diagnostics": "TROUBLESHOOT",
+        }
+
+        results = []
+
+        for obj in objects:
+            if obj.get("type") != "ITEM":
+                continue
+
+            item_name = obj.get("item_data", {}).get("name", "")
+            if item_name not in TARGET_NAMES:
+                continue
+
+            matched_as = TARGET_NAMES[item_name]
+            item_id = obj.get("id")
+            item_version = obj.get("version")
+            variations = obj.get("item_data", {}).get("variations", [])
+
+            results.append({
+                "matched_as": matched_as,
+                "service_name": item_name,
+                "service_id": item_id,
+                "service_version": item_version,
+                "variations": variations,
+            })
+
+        return (
+            json.dumps(results, indent=4),
+            200,
+            {"Content-Type": "application/json"},
+        )
+
+    except Exception as e:
+        return (f"Error: {repr(e)}", 500)
 
 
 
