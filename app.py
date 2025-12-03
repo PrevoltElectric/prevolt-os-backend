@@ -1,12 +1,20 @@
 import os
 import json
 import time
+import uuid
 import requests
+from datetime import datetime
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from openai import OpenAI
+
+try:
+    # Python 3.9+
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 # ---------------------------------------------------
 # Environment & Clients
@@ -15,6 +23,22 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
+
+SQUARE_ACCESS_TOKEN = os.environ.get("SQUARE_ACCESS_TOKEN")
+SQUARE_LOCATION_ID = os.environ.get("SQUARE_LOCATION_ID")
+SQUARE_TEAM_MEMBER_ID = os.environ.get("SQUARE_TEAM_MEMBER_ID")  # required for bookings
+
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+DISPATCH_ORIGIN_ADDRESS = os.environ.get("DISPATCH_ORIGIN_ADDRESS")  # e.g. "Granby, CT"
+
+# Prevolt service IDs (from your booking URLs)
+SERVICE_ID_EVAL = "2AANQPVPZDC5KK32LIA24MKW"          # On-Site Electrical Evaluation & Quote
+SERVICE_ID_HOME_INSPECTION = "WA4NC3LKHU2JM2K4EWOYFOFZ"  # Full-Home Electrical Safety Inspection
+SERVICE_ID_TROUBLESHOOT = "5FMVM7VONJ6SVGVZN6AKZFNW"     # 24/7 Electrical Troubleshooting & Diagnostics
+
+# Non-emergency booking window (local time)
+BOOKING_START_HOUR = 9   # 9:00
+BOOKING_END_HOUR = 16    # 16:00 (4pm)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 twilio_client = (
@@ -37,7 +61,9 @@ conversations = {}
 #   "followup_sent": ...,
 #   "scheduled_date": ...,
 #   "scheduled_time": ...,
-#   "address": ...
+#   "address": ...,
+#   "booking_created": bool,
+#   "square_booking_id": str | None
 # }
 
 
@@ -47,6 +73,7 @@ conversations = {}
 def send_sms(to_number: str, body: str) -> None:
     """
     Force all outbound messages to WhatsApp sandbox to bypass A2P filtering.
+    Currently always sends to your cell via WhatsApp sandbox.
     """
     if not twilio_client:
         print("Twilio not configured; WhatsApp message not sent.")
@@ -143,7 +170,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
                         "   - Whole house inspection → WHOLE_HOME_INSPECTION\n"
                         "• Mention price once only.\n"
                         "• No photos. No AI mentions. No Kyle.\n\n"
-                        "Return STRICT JSON."
+                        "Return STRICT JSON with keys: sms_body, category, appointment_type."
                     ),
                 },
                 {"role": "user", "content": cleaned_text},
@@ -163,7 +190,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         return {
             "sms_body": (
                 "Hi, this is Prevolt Electric — I received your message. "
-                "The next step is a $195 evaluation visit. What day works for you?"
+                "The next step is a $195 on-site consultation and quote visit. What day works for you?"
             ),
             "category": "OTHER",
             "appointment_type": "EVAL_195",
@@ -204,10 +231,12 @@ STRICT CONVERSATION FLOW RULES
 11. Keep messages short and human.
 
 ===================================================
-SCHEDULING RULES (9am–5pm ONLY)
+SCHEDULING RULES (9am–4pm ONLY, LOCAL TIME)
 ===================================================
-If customer proposes outside window:
-“ We typically schedule between 9am and 5pm. What time in that window works for you?”
+• Normal, non-emergency appointments are scheduled between 9:00 and 16:00 local time.
+• If the customer proposes outside that window for a non-emergency:
+  “We typically schedule between 9am and 4pm. What time in that window works for you?”
+• Troubleshoot/emergency appointments (TROUBLESHOOT_395) can be outside that window if needed.
 
 ===================================================
 EMERGENCY RULE
@@ -231,12 +260,17 @@ Use ONCE:
 ===================================================
 AUTO-DETECTION
 ===================================================
-Detect and store:
-• date
-• time
+You must detect and store:
+• scheduled_date
+• scheduled_time
 • address
 
-If changed → update.
+FORMAT REQUIREMENTS:
+• scheduled_date MUST be 'YYYY-MM-DD' (example: 2025-12-03)
+• scheduled_time MUST be 'HH:MM' in 24-hour local time (example: 14:30)
+If you don't know yet, use null.
+
+If a customer changes date, time, or address later → update the stored value.
 
 ===================================================
 CONTEXT
@@ -248,13 +282,13 @@ Initial SMS: {initial_sms}
 Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
 
 ===================================================
-OUTPUT FORMAT
+OUTPUT FORMAT (STRICT JSON)
 ===================================================
 {{
   "sms_body": "...",
-  "scheduled_date": "... or null",
-  "scheduled_time": "... or null",
-  "address": "... or null"
+  "scheduled_date": "YYYY-MM-DD or null",
+  "scheduled_time": "HH:MM or null",
+  "address": "string or null"
 }}
 """
 
@@ -276,6 +310,268 @@ OUTPUT FORMAT
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
+
+# ---------------------------------------------------
+# Google Maps helper (optional)
+# ---------------------------------------------------
+def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
+    """
+    Uses Google Maps Distance Matrix API to estimate travel time in minutes.
+    This is a hook for future use with dynamic tech locations.
+    For now, you can set DISPATCH_ORIGIN_ADDRESS or pass a tech address.
+    Returns None on failure.
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        return None
+    if not origin or not destination:
+        return None
+
+    try:
+        params = {
+            "origins": origin,
+            "destinations": destination,
+            "key": GOOGLE_MAPS_API_KEY,
+        }
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/distancematrix/json",
+            params=params,
+            timeout=8,
+        )
+        data = resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            return None
+        elements = rows[0].get("elements", [])
+        if not elements:
+            return None
+        elem = elements[0]
+        if elem.get("status") != "OK":
+            return None
+        seconds = elem["duration"]["value"]
+        return seconds / 60.0
+    except Exception as e:
+        print("Travel time computation failed:", repr(e))
+        return None
+
+
+# ---------------------------------------------------
+# Square helpers
+# ---------------------------------------------------
+def square_headers() -> dict:
+    if not SQUARE_ACCESS_TOKEN:
+        raise RuntimeError("SQUARE_ACCESS_TOKEN not configured")
+    return {
+        "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def square_create_or_get_customer(phone: str, address: str | None = None) -> str | None:
+    """
+    Very simple customer create-or-get by phone number.
+    """
+    if not SQUARE_ACCESS_TOKEN:
+        print("Square not configured; skipping customer create.")
+        return None
+
+    try:
+        # Try search by phone
+        search_payload = {
+            "query": {
+                "filter": {
+                    "phone_number": {"exact": phone.replace("whatsapp:", "")}
+                }
+            }
+        }
+        resp = requests.post(
+            "https://connect.squareup.com/v2/customers/search",
+            headers=square_headers(),
+            json=search_payload,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            customers = data.get("customers", [])
+            if customers:
+                return customers[0]["id"]
+    except Exception as e:
+        print("Square search customer failed:", repr(e))
+
+    # Create new customer
+    try:
+        customer_payload = {
+            "idempotency_key": str(uuid.uuid4()),
+            "given_name": "Prevolt Lead",
+            "phone_number": phone.replace("whatsapp:", ""),
+        }
+        if address:
+            customer_payload["address"] = {"address_line_1": address}
+
+        resp = requests.post(
+            "https://connect.squareup.com/v2/customers",
+            headers=square_headers(),
+            json=customer_payload,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["customer"]["id"]
+    except Exception as e:
+        print("Square create customer failed:", repr(e))
+        return None
+
+
+def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
+    """
+    Parse 'YYYY-MM-DD' and 'HH:MM' into aware datetime in America/New_York,
+    then convert to UTC for Square.
+    """
+    if not date_str or not time_str:
+        return None
+    try:
+        local_naive = datetime.strptime(
+            f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
+        )
+        if ZoneInfo:
+            local = local_naive.replace(tzinfo=ZoneInfo("America/New_York"))
+        else:
+            # Fallback: assume -05:00 (no DST handling)
+            from datetime import timezone, timedelta as _td
+            local = local_naive.replace(tzinfo=timezone(_td(hours=-5)))
+        return local.astimezone(datetime.utc).replace(tzinfo=None)
+    except Exception as e:
+        print("Failed to parse local datetime:", repr(e))
+        return None
+
+
+def map_appointment_type_to_service_id(appointment_type: str) -> str | None:
+    if appointment_type == "EVAL_195":
+        return SERVICE_ID_EVAL
+    if appointment_type == "WHOLE_HOME_INSPECTION":
+        return SERVICE_ID_HOME_INSPECTION
+    if appointment_type == "TROUBLESHOOT_395":
+        return SERVICE_ID_TROUBLESHOOT
+    return None
+
+
+def is_weekend(date_str: str) -> bool:
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        # Monday=0 ... Sunday=6
+        return d.weekday() >= 5
+    except Exception:
+        return False
+
+
+def is_within_normal_hours(time_str: str) -> bool:
+    try:
+        t = datetime.strptime(time_str, "%H:%M").time()
+        return BOOKING_START_HOUR <= t.hour <= BOOKING_END_HOUR
+    except Exception:
+        return False
+
+
+def maybe_create_square_booking(phone: str, convo: dict) -> None:
+    """
+    Create a Square booking once we have date, time, and address.
+    - No duplicates (idempotency by phone+datetime+appt_type)
+    - Weekend rule: only TROUBLESHOOT_395 on weekends
+    - Non-emergency: 9–4 only
+    """
+    if convo.get("booking_created"):
+        return
+
+    scheduled_date = convo.get("scheduled_date")
+    scheduled_time = convo.get("scheduled_time")
+    address = convo.get("address")
+    appointment_type = convo.get("appointment_type")
+
+    if not (scheduled_date and scheduled_time and address):
+        return
+
+    service_id = map_appointment_type_to_service_id(appointment_type)
+    if not service_id:
+        print("Unknown appointment_type; cannot map to service:", appointment_type)
+        return
+
+    # Weekend rule: only TROUBLESHOOT_395 allowed Sat/Sun
+    if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
+        print("Weekend non-emergency booking blocked:", phone, scheduled_date)
+        return
+
+    # Non-emergency time window rule (9–4)
+    if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(
+        scheduled_time
+    ):
+        print("Non-emergency time outside 9–4; booking not auto-created:", phone, scheduled_time)
+        return
+
+    if not SQUARE_ACCESS_TOKEN or not SQUARE_LOCATION_ID or not SQUARE_TEAM_MEMBER_ID:
+        print("Square configuration incomplete; skipping booking creation.")
+        return
+
+    start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
+    if not start_at_utc:
+        print("Could not parse scheduled date/time; skipping booking.")
+        return
+
+    # Optional travel-time hook (currently using dispatch origin as best-effort)
+    if DISPATCH_ORIGIN_ADDRESS:
+        travel_minutes = compute_travel_time_minutes(DISPATCH_ORIGIN_ADDRESS, address)
+        if travel_minutes is not None:
+            print(
+                f"Estimated travel from dispatch to job: ~{travel_minutes:.1f} minutes "
+                f"for {phone} at {address}"
+            )
+
+    customer_id = square_create_or_get_customer(phone, address)
+    if not customer_id:
+        print("No customer_id; cannot create booking.")
+        return
+
+    idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
+
+    booking_payload = {
+        "idempotency_key": idempotency_key,
+        "booking": {
+            "location_id": SQUARE_LOCATION_ID,
+            "customer_id": customer_id,
+            "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "location_type": "CUSTOMER_LOCATION",
+            "customer_note": f"Auto-booked by Prevolt OS. Customer address: {address}",
+            "appointment_segments": [
+                {
+                    "duration_minutes": 60,  # All three are effectively 60-minute segments
+                    "service_variation_id": service_id,
+                    "team_member_id": SQUARE_TEAM_MEMBER_ID,
+                }
+            ],
+        },
+    }
+
+    try:
+        resp = requests.post(
+            "https://connect.squareup.com/v2/bookings",
+            headers=square_headers(),
+            json=booking_payload,
+            timeout=10,
+        )
+        if resp.status_code not in (200, 201):
+            print("Square booking create failed:", resp.status_code, resp.text)
+            return
+        data = resp.json()
+        booking = data.get("booking")
+        booking_id = booking.get("id") if booking else None
+        convo["booking_created"] = True
+        convo["square_booking_id"] = booking_id
+        print(
+            f"Square booking created for {phone}: {booking_id} "
+            f"{scheduled_date} {scheduled_time} ({appointment_type})"
+        )
+    except Exception as e:
+        print("Square booking exception:", repr(e))
 
 
 # ---------------------------------------------------
@@ -325,6 +621,8 @@ def voicemail_complete():
             "scheduled_date": None,
             "scheduled_time": None,
             "address": None,
+            "booking_created": False,
+            "square_booking_id": None,
         }
 
     except Exception as e:
@@ -377,6 +675,12 @@ def incoming_sms():
         convo["scheduled_time"] = ai_reply["scheduled_time"]
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
+
+    # Attempt booking once we have a complete date + time + address
+    try:
+        maybe_create_square_booking(from_number, convo)
+    except Exception as e:
+        print("maybe_create_square_booking failed:", repr(e))
 
     # If final confirmation matched → stop responding
     if sms_body == "":
