@@ -568,6 +568,40 @@ def square_create_or_get_customer(phone: str, address_struct: dict | None = None
         return None
 
 
+# ---------------------------------------------------
+# Square Service Debug — dump all appointment services
+# ---------------------------------------------------
+def square_dump_services_debug():
+    """
+    Dumps the ENTIRE Square Appointments Service Catalog
+    to square_debug_services.json any time it's called.
+    """
+    if not SQUARE_ACCESS_TOKEN or not SQUARE_LOCATION_ID:
+        print("Square credentials missing; debug service dump skipped.")
+        return
+
+    url = f"https://connect.squareup.com/v2/locations/{SQUARE_LOCATION_ID}/services"
+
+    try:
+        resp = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+        data = resp.json()
+
+        with open("square_debug_services.json", "w") as f:
+            f.write(json.dumps(data, indent=4))
+
+        print("✔ square_debug_services.json updated")
+
+    except Exception as e:
+        print("Service debug dump failed:", repr(e))
+
+
 def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
     """
     Parse 'YYYY-MM-DD' and 'HH:MM' into aware datetime in America/New_York,
@@ -627,6 +661,10 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     Square bookings CANNOT include the 'country' field inside booking.address.
     Customer profiles CAN include country, but bookings cannot.
     """
+
+    # Refresh service debug log on every booking attempt
+    square_dump_services_debug()
+
     if convo.get("booking_created"):
         return
 
@@ -772,7 +810,6 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
     except Exception as e:
         print("Square booking exception:", repr(e))
-
 
 
 # ---------------------------------------------------
