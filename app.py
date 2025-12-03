@@ -614,10 +614,8 @@ def is_within_normal_hours(time_str: str) -> bool:
 def maybe_create_square_booking(phone: str, convo: dict) -> None:
     """
     Create a Square booking once we have date, time, and address.
-    - No duplicates (idempotency by phone+datetime+appt_type)
-    - Weekend rule: only TROUBLESHOOT_395 on weekends
-    - Non-emergency: 9–4 only
-    - Address normalization via Google Maps, with CT/MA question if needed.
+    Square bookings CANNOT include the 'country' field inside booking.address.
+    Customer profiles CAN include country, but bookings cannot.
     """
     if convo.get("booking_created"):
         return
@@ -628,7 +626,6 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     appointment_type = convo.get("appointment_type")
 
     if not (scheduled_date and scheduled_time and raw_address):
-        # missing something; do nothing
         return
 
     variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
@@ -636,31 +633,27 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Unknown appointment_type; cannot map:", appointment_type)
         return
 
-    # Weekend rule: only TROUBLESHOOT_395 allowed Sat/Sun
+    # Weekend rule
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
         print("Weekend non-emergency booking blocked:", phone, scheduled_date)
         return
 
-    # Non-emergency time window rule (9–4)
-    if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(
-        scheduled_time
-    ):
+    # Time window rule (non-emergency)
+    if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(scheduled_time):
         print("Non-emergency time outside 9–4; booking not auto-created:", phone, scheduled_time)
         return
 
-    if not SQUARE_ACCESS_TOKEN or not SQUARE_LOCATION_ID or not SQUARE_TEAM_MEMBER_ID:
+    if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
         print("Square configuration incomplete; skipping booking creation.")
         return
 
-    # Normalize address: reuse if we already have a normalized_address
+    # Normalize or reuse
     addr_struct = convo.get("normalized_address")
-
     if not addr_struct:
         status, addr_struct = normalize_address(raw_address)
         if status == "ok":
             convo["normalized_address"] = addr_struct
         elif status == "needs_state":
-            # Ask CT vs MA once, then wait for reply
             if not convo.get("state_prompt_sent"):
                 send_sms(
                     phone,
@@ -673,7 +666,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             print("Address normalization failed; cannot create booking for:", raw_address)
             return
 
-    # Optional travel-time hook (using tech or dispatch origin)
+    # Travel time check
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
     if origin:
         destination_for_travel = (
@@ -692,17 +685,35 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
                 print("Travel exceeds max; skipping auto-book.")
                 return
 
+    # Create or find customer (customers CAN include country)
     customer_id = square_create_or_get_customer(phone, addr_struct)
     if not customer_id:
         print("No customer_id; cannot create booking.")
         return
 
+    # Convert local → UTC
     start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
     if not start_at_utc:
         print("Could not parse scheduled date/time; skipping booking.")
         return
 
     idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
+
+    # ---------- *** CRITICAL FIX *** ----------
+    # Square booking.address MUST NOT include "country"
+    # Only these fields are permitted:
+    #   address_line_1, address_line_2, locality,
+    #   administrative_district_level_1, postal_code
+    booking_address = {
+        "address_line_1": addr_struct["address_line_1"],
+        "locality": addr_struct["locality"],
+        "administrative_district_level_1": addr_struct["administrative_district_level_1"],
+        "postal_code": addr_struct["postal_code"],
+    }
+    # (Optional) Only include line_2 if present
+    if "address_line_2" in addr_struct and addr_struct["address_line_2"]:
+        booking_address["address_line_2"] = addr_struct["address_line_2"]
+    # -----------------------------------------
 
     booking_payload = {
         "idempotency_key": idempotency_key,
@@ -711,17 +722,13 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             "customer_id": customer_id,
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
-            "address": {
-                "address_line_1": addr_struct["address_line_1"],
-                "locality": addr_struct["locality"],
-                "administrative_district_level_1": addr_struct["administrative_district_level_1"],
-                "postal_code": addr_struct["postal_code"],
-                "country": addr_struct.get("country", "US"),
-            },
-            "customer_note": f"Auto-booked by Prevolt OS. Raw address from customer: {raw_address}",
+            "address": booking_address,   # <-- FIXED
+            "customer_note": (
+                f"Auto-booked by Prevolt OS. Raw address from customer: {raw_address}"
+            ),
             "appointment_segments": [
                 {
-                    "duration_minutes": 60,  # All three are effectively 60-minute segments
+                    "duration_minutes": 60,
                     "service_variation_id": variation_id,
                     "service_variation_version": variation_version,
                     "team_member_id": SQUARE_TEAM_MEMBER_ID,
@@ -740,17 +747,22 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         if resp.status_code not in (200, 201):
             print("Square booking create failed:", resp.status_code, resp.text)
             return
+
         data = resp.json()
         booking = data.get("booking")
         booking_id = booking.get("id") if booking else None
+
         convo["booking_created"] = True
         convo["square_booking_id"] = booking_id
+
         print(
             f"Square booking created for {phone}: {booking_id} "
             f"{scheduled_date} {scheduled_time} ({appointment_type})"
         )
+
     except Exception as e:
         print("Square booking exception:", repr(e))
+
 
 
 # ---------------------------------------------------
