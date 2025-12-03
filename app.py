@@ -730,19 +730,22 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Square booking exception:", repr(e))
 
 # ---------------------------------------------------
-# Square Debug Route — View All Services via Browser
+# Square Service Debug — dump all appointment services
+# (via Catalog API, not locations/services)
 # ---------------------------------------------------
-@app.route("/debug/services", methods=["GET"])
-def debug_services():
+def square_dump_services_debug():
     """
-    Returns the ENTIRE Square Appointments service catalog in JSON format.
-    Open this in your browser:
-        http://127.0.0.1:5000/debug/services
-    """
-    if not SQUARE_ACCESS_TOKEN or not SQUARE_LOCATION_ID:
-        return ("Square credentials are missing", 500)
+    Uses the Square Catalog API to dump ALL catalog items and item variations
+    (including your appointment services) into square_debug_services.json.
 
-    url = f"https://connect.squareup.com/v2/locations/{SQUARE_LOCATION_ID}/services"
+    You can open that file locally and search for your emergency / eval / inspection
+    services by name to grab their current variation IDs and versions.
+    """
+    if not SQUARE_ACCESS_TOKEN:
+        print("Square credentials missing; debug service dump skipped.")
+        return
+
+    url = "https://connect.squareup.com/v2/catalog/list"
 
     try:
         resp = requests.get(
@@ -751,9 +754,56 @@ def debug_services():
                 "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
                 "Accept": "application/json",
             },
+            params={
+                # Limit to items + item variations (where your services live)
+                "types": "ITEM,ITEM_VARIATION",
+            },
             timeout=10,
         )
         data = resp.json()
+
+        with open("square_debug_services.json", "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=4))
+
+        print("✔ square_debug_services.json updated (via /v2/catalog/list)")
+
+    except Exception as e:
+        print("Service debug dump failed:", repr(e))
+
+
+# ---------------------------------------------------
+# Square Debug Route — View All Services via Browser
+# ---------------------------------------------------
+@app.route("/debug/services", methods=["GET"])
+def debug_services():
+    """
+    Returns the ENTIRE Square catalog (ITEM + ITEM_VARIATION) in JSON format.
+
+    On Render (production):
+        https://prevolt-os-backend.onrender.com/debug/services
+
+    Locally:
+        http://127.0.0.1:5000/debug/services
+    """
+    if not SQUARE_ACCESS_TOKEN:
+        return ("Square credentials are missing", 500)
+
+    url = "https://connect.squareup.com/v2/catalog/list"
+
+    try:
+        resp = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+                "Accept": "application/json",
+            },
+            params={
+                "types": "ITEM,ITEM_VARIATION",
+            },
+            timeout=10,
+        )
+        data = resp.json()
+
         return (
             json.dumps(data, indent=4),
             200,
@@ -762,6 +812,7 @@ def debug_services():
 
     except Exception as e:
         return (f"Error: {repr(e)}", 500)
+
 
 # ---------------------------------------------------
 # Voice: Incoming Call
