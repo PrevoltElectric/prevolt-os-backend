@@ -60,6 +60,20 @@ app = Flask(__name__)
 
 # Stored conversations
 conversations = {}
+# conversations[phone] = {
+#   "cleaned_transcript": ...,
+#   "category": ...,
+#   "appointment_type": ...,
+#   "initial_sms": ...,
+#   "first_sms_time": ...,
+#   "replied": ...,
+#   "followup_sent": ...,
+#   "scheduled_date": ...,
+#   "scheduled_time": ...,
+#   "address": ... (raw freeform text from user),
+#   "booking_created": bool,
+#   "square_booking_id": str | None
+# }
 
 
 # ---------------------------------------------------
@@ -125,7 +139,8 @@ def clean_transcript_text(raw_text: str) -> str:
             ],
         )
         return completion.choices[0].message.content.strip()
-    except:
+    except Exception as e:
+        print("Cleanup FAILED:", repr(e))
         return raw_text
 
 
@@ -162,7 +177,8 @@ def generate_initial_sms(cleaned_text: str) -> dict:
             "category": data["category"],
             "appointment_type": data["appointment_type"],
         }
-    except Exception:
+    except Exception as e:
+        print("Initial SMS FAILED:", repr(e))
         return {
             "sms_body": (
                 "Hi, this is Prevolt Electric — I received your message. "
@@ -222,7 +238,7 @@ OPTION A DATE CONVERSION:
 Convert natural phrases (“this Thursday”, “next Tuesday”, “tomorrow at 10”) into:
 - scheduled_date = YYYY-MM-DD
 - scheduled_time = HH:MM 24-hour
-Only ask for missing part.
+Only ask for the missing part.
 
 EMERGENCY RULE:
 If active issue & customer says ASAP/now:
@@ -239,7 +255,7 @@ AUTO-DETECTION REQUIRED:
 Detect and store:
 - scheduled_date (YYYY-MM-DD)
 - scheduled_time (HH:MM)
-- address
+- address (freeform; do NOT overthink formatting)
 
 CONTEXT:
 Original voicemail: {cleaned_transcript}
@@ -266,7 +282,8 @@ RETURN STRICT JSON:
         )
         return json.loads(completion.choices[0].message.content)
 
-    except Exception:
+    except Exception as e:
+        print("Inbound reply FAILED:", repr(e))
         return {
             "sms_body": "Got it.",
             "scheduled_date": scheduled_date,
@@ -276,7 +293,7 @@ RETURN STRICT JSON:
 
 
 # ---------------------------------------------------
-# Google Maps
+# Google Maps — travel time
 # ---------------------------------------------------
 def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
     if not GOOGLE_MAPS_API_KEY or not origin or not destination:
@@ -297,14 +314,117 @@ def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
         if elem["status"] != "OK":
             return None
         return elem["duration"]["value"] / 60.0
-    except:
+    except Exception as e:
+        print("Travel time failed:", repr(e))
         return None
+
+
+# ---------------------------------------------------
+# Google Maps — address normalization (CT/MA bias)
+# ---------------------------------------------------
+def normalize_address(raw_address: str) -> dict | None:
+    """
+    Take a freeform address string (e.g. '45 Dickerman Ave windsor locks')
+    and normalize it into a Square-ready address dict:
+    {
+      "address_line_1": "...",
+      "locality": "...",
+      "administrative_district_level_1": "CT" or "MA",
+      "postal_code": "...."
+    }
+
+    We bias towards CT and MA, without asking the customer for ZIP.
+    """
+    if not GOOGLE_MAPS_API_KEY or not raw_address:
+        return None
+
+    def geocode_with_components(state: str | None):
+        try:
+            params = {
+                "address": raw_address,
+                "key": GOOGLE_MAPS_API_KEY,
+            }
+            # Constrain to US + state when provided
+            if state:
+                params["components"] = f"country:US|administrative_area:{state}"
+            else:
+                params["components"] = "country:US"
+
+            resp = requests.get(
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params=params,
+                timeout=8,
+            )
+            data = resp.json()
+            if data.get("status") != "OK":
+                return None
+            results = data.get("results", [])
+            if not results:
+                return None
+            return results[0]
+        except Exception as e:
+            print("Geocode error:", repr(e))
+            return None
+
+    # Try CT then MA, then general US
+    result = (
+        geocode_with_components("CT")
+        or geocode_with_components("MA")
+        or geocode_with_components(None)
+    )
+
+    if not result:
+        print("Unable to normalize address from:", raw_address)
+        return None
+
+    components = result.get("address_components", [])
+    line1 = None
+    city = None
+    state = None
+    zipcode = None
+
+    for comp in components:
+        types = comp.get("types", [])
+        if "street_number" in types:
+            if line1 is None:
+                line1 = comp["long_name"]
+        if "route" in types:
+            if line1 is None:
+                line1 = comp["long_name"]
+            else:
+                line1 = f"{line1} {comp['long_name']}"
+        if "locality" in types:
+            city = comp["long_name"]
+        if "postal_town" in types and city is None:
+            city = comp["long_name"]
+        if "administrative_area_level_1" in types:
+            state = comp["short_name"]
+        if "postal_code" in types:
+            zipcode = comp["long_name"]
+
+    # If state is still not CT/MA, but we know we only operate there, don't force-book
+    if state not in ("CT", "MA"):
+        print("Normalized state is not CT/MA:", state, "from raw:", raw_address)
+        return None
+
+    if not (line1 and city and state and zipcode):
+        print("Incomplete normalized address:", line1, city, state, zipcode)
+        return None
+
+    return {
+        "address_line_1": line1,
+        "locality": city,
+        "administrative_district_level_1": state,
+        "postal_code": zipcode,
+    }
 
 
 # ---------------------------------------------------
 # Square Helpers
 # ---------------------------------------------------
 def square_headers():
+    if not SQUARE_ACCESS_TOKEN:
+        raise RuntimeError("SQUARE_ACCESS_TOKEN not set")
     return {
         "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -312,7 +432,7 @@ def square_headers():
     }
 
 
-def square_create_or_get_customer(phone, address=None) -> str | None:
+def square_create_or_get_customer(phone: str, address_struct: dict | None = None) -> str | None:
     if not SQUARE_ACCESS_TOKEN:
         return None
 
@@ -325,10 +445,10 @@ def square_create_or_get_customer(phone, address=None) -> str | None:
             timeout=10,
         )
         data = resp.json()
-        if "customers" in data and data["customers"]:
+        if data.get("customers"):
             return data["customers"][0]["id"]
-    except:
-        pass
+    except Exception as e:
+        print("Square search customer failed:", repr(e))
 
     # create
     try:
@@ -337,8 +457,13 @@ def square_create_or_get_customer(phone, address=None) -> str | None:
             "given_name": "Prevolt Lead",
             "phone_number": phone,
         }
-        if address:
-            payload["address"] = {"address_line_1": address}
+        if address_struct:
+            payload["address"] = {
+                "address_line_1": address_struct.get("address_line_1"),
+                "locality": address_struct.get("locality"),
+                "administrative_district_level_1": address_struct.get("administrative_district_level_1"),
+                "postal_code": address_struct.get("postal_code"),
+            }
 
         resp = requests.post(
             "https://connect.squareup.com/v2/customers",
@@ -348,7 +473,8 @@ def square_create_or_get_customer(phone, address=None) -> str | None:
         )
         resp.raise_for_status()
         return resp.json()["customer"]["id"]
-    except:
+    except Exception as e:
+        print("Square create customer failed:", repr(e))
         return None
 
 
@@ -362,7 +488,8 @@ def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
         else:
             dt = dt.replace(tzinfo=timezone(timedelta(hours=-5)))
         return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    except:
+    except Exception as e:
+        print("Failed to parse datetime:", repr(e))
         return None
 
 
@@ -379,7 +506,7 @@ def map_service_variation(appointment_type: str):
 def is_weekend(date_str: str) -> bool:
     try:
         return datetime.strptime(date_str, "%Y-%m-%d").weekday() >= 5
-    except:
+    except Exception:
         return False
 
 
@@ -387,12 +514,12 @@ def is_within_normal_hours(time_str: str) -> bool:
     try:
         hour = int(time_str.split(":")[0])
         return BOOKING_START_HOUR <= hour <= BOOKING_END_HOUR
-    except:
+    except Exception:
         return False
 
 
 # ---------------------------------------------------
-# Create Square Booking (FINAL)
+# Create Square Booking (with normalized address)
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict) -> None:
     if convo.get("booking_created"):
@@ -400,10 +527,10 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
     scheduled_date = convo.get("scheduled_date")
     scheduled_time = convo.get("scheduled_time")
-    address = convo.get("address")
+    raw_address = convo.get("address")
     appointment_type = convo.get("appointment_type")
 
-    if not (scheduled_date and scheduled_time and address):
+    if not (scheduled_date and scheduled_time and raw_address):
         return
 
     variation_id, variation_version = map_service_variation(appointment_type)
@@ -421,15 +548,29 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Outside 9–4 window:", scheduled_time)
         return
 
+    # Normalize address using Google Maps (CT/MA biased)
+    addr_struct = normalize_address(raw_address)
+    if not addr_struct:
+        print("Address normalization failed; cannot create booking for:", raw_address)
+        return
+
     # Travel time limit
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
     if origin:
-        travel = compute_travel_time_minutes(origin, address)
-        if travel and travel > MAX_TRAVEL_MINUTES:
-            print("Travel too long:", travel, "minutes")
-            return
+        destination_for_travel = (
+            f"{addr_struct['address_line_1']}, "
+            f"{addr_struct['locality']}, "
+            f"{addr_struct['administrative_district_level_1']} "
+            f"{addr_struct['postal_code']}"
+        )
+        travel = compute_travel_time_minutes(origin, destination_for_travel)
+        if travel is not None:
+            print(f"Estimated travel {travel:.1f} minutes from '{origin}' to '{destination_for_travel}'")
+            if travel > MAX_TRAVEL_MINUTES:
+                print("Travel too long; skipping auto-book.")
+                return
 
-    customer_id = square_create_or_get_customer(phone, address)
+    customer_id = square_create_or_get_customer(phone, addr_struct)
     if not customer_id:
         print("Customer missing; cannot create booking.")
         return
@@ -439,7 +580,6 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Bad datetime; cannot book.")
         return
 
-    # REQUIRED BY SQUARE FOR CUSTOMER_LOCATION
     booking_payload = {
         "idempotency_key": f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}",
         "booking": {
@@ -447,13 +587,14 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             "customer_id": customer_id,
             "start_at": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
-
-            # SQUARE REQUIRED:
+            # Square requires full address for CUSTOMER_LOCATION
             "address": {
-                "address_line_1": address
+                "address_line_1": addr_struct["address_line_1"],
+                "locality": addr_struct["locality"],
+                "administrative_district_level_1": addr_struct["administrative_district_level_1"],
+                "postal_code": addr_struct["postal_code"],
             },
-
-            "customer_note": f"Auto-booked by Prevolt OS. Address: {address}",
+            "customer_note": f"Auto-booked by Prevolt OS. Raw address from customer: {raw_address}",
             "appointment_segments": [
                 {
                     "duration_minutes": 60,
@@ -479,7 +620,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         booking_id = resp.json().get("booking", {}).get("id")
         convo["booking_created"] = True
         convo["square_booking_id"] = booking_id
-        print(f"Square booking created:", booking_id)
+        print("Square booking created:", booking_id)
 
     except Exception as e:
         print("Booking exception:", repr(e))
