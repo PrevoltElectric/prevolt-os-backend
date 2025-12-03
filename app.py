@@ -32,10 +32,20 @@ GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 DISPATCH_ORIGIN_ADDRESS = os.environ.get("DISPATCH_ORIGIN_ADDRESS")  # e.g. "Granby, CT"
 TECH_CURRENT_ADDRESS = os.environ.get("TECH_CURRENT_ADDRESS")        # optional live tech location
 
-# Prevolt service IDs (from your booking URLs)
-SERVICE_ID_EVAL = "2AANQPVPZDC5KK32LIA24MKW"          # On-Site Electrical Evaluation & Quote
-SERVICE_ID_HOME_INSPECTION = "WA4NC3LKHU2JM2K4EWOYFOFZ"  # Full-Home Electrical Safety Inspection
-SERVICE_ID_TROUBLESHOOT = "5FMVM7VONJ6SVGVZN6AKZFNW"     # 24/7 Electrical Troubleshooting & Diagnostics
+# ---------------------------------------------------
+# Square service variations (final from Square catalog)
+# ---------------------------------------------------
+# On-Site Electrical Evaluation & Quote Visit ($195)
+SERVICE_VARIATION_EVAL_ID = "IPCUF6EPOYGWJUEFUZOXL2AZ"
+SERVICE_VARIATION_EVAL_VERSION = 1764725435505
+
+# Full-Home Electrical Safety Inspection
+SERVICE_VARIATION_INSPECTION_ID = "EGGYZF6JRHFBWKRWEKWB2WYI"
+SERVICE_VARIATION_INSPECTION_VERSION = 1764719028312
+
+# 24/7 Electrical Troubleshooting & Diagnostics ($395)
+SERVICE_VARIATION_TROUBLESHOOT_ID = "I6XYKSUWBOQJ3WPNES4LG5WG"
+SERVICE_VARIATION_TROUBLESHOOT_VERSION = 1764718988109
 
 # Non-emergency booking window (local time)
 BOOKING_START_HOUR = 9    # 9:00
@@ -474,14 +484,17 @@ def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
         return None
 
 
-def map_appointment_type_to_service_id(appointment_type: str) -> str | None:
+def map_appointment_type_to_service_variation(appointment_type: str):
+    """
+    Map internal appointment_type to (service_variation_id, service_variation_version).
+    """
     if appointment_type == "EVAL_195":
-        return SERVICE_ID_EVAL
+        return SERVICE_VARIATION_EVAL_ID, SERVICE_VARIATION_EVAL_VERSION
     if appointment_type == "WHOLE_HOME_INSPECTION":
-        return SERVICE_ID_HOME_INSPECTION
+        return SERVICE_VARIATION_INSPECTION_ID, SERVICE_VARIATION_INSPECTION_VERSION
     if appointment_type == "TROUBLESHOOT_395":
-        return SERVICE_ID_TROUBLESHOOT
-    return None
+        return SERVICE_VARIATION_TROUBLESHOOT_ID, SERVICE_VARIATION_TROUBLESHOOT_VERSION
+    return None, None
 
 
 def is_weekend(date_str: str) -> bool:
@@ -520,9 +533,11 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     if not (scheduled_date and scheduled_time and address):
         return
 
-    service_id = map_appointment_type_to_service_id(appointment_type)
-    if not service_id:
-        print("Unknown appointment_type; cannot map to service:", appointment_type)
+    service_variation_id, service_variation_version = map_appointment_type_to_service_variation(
+        appointment_type
+    )
+    if not service_variation_id or service_variation_version is None:
+        print("Unknown appointment_type; cannot map to service variation:", appointment_type)
         return
 
     # Weekend rule: only TROUBLESHOOT_395 allowed Sat/Sun
@@ -579,8 +594,9 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             "customer_note": f"Auto-booked by Prevolt OS. Customer address: {address}",
             "appointment_segments": [
                 {
-                    "duration_minutes": 60,  # All three are effectively 60-minute segments
-                    "service_variation_id": service_id,
+                    "duration_minutes": 60,  # all three are 60-minute visits
+                    "service_variation_id": service_variation_id,
+                    "service_variation_version": service_variation_version,
                     "team_member_id": SQUARE_TEAM_MEMBER_ID,
                 }
             ],
@@ -748,77 +764,6 @@ def cron_followups():
             sent_count += 1
 
     return f"Sent {sent_count} follow-up(s)."
-@app.route("/debug-square-services", methods=["GET"])
-def debug_square_services():
-    """
-    Fetch all Square catalog objects and filter for appointment services.
-    This reveals the REAL service_variation_id and version you need.
-    """
-    try:
-        resp = requests.post(
-            "https://connect.squareup.com/v2/catalog/search",
-            headers=square_headers(),
-            json={"types": ["ITEM", "ITEM_VARIATION"]},
-            timeout=10,
-        )
-        data = resp.json()
-        return data
-    except Exception as e:
-        return {"error": repr(e)}, 500
-@app.route("/debug-eval", methods=["GET"])
-def debug_eval():
-    try:
-        resp = requests.post(
-            "https://connect.squareup.com/v2/catalog/search",
-            headers=square_headers(),
-            json={
-                "query": {
-                    "text_query": {
-                        "keywords": ["On-Site Electrical Evaluation"]
-                    }
-                }
-            },
-            timeout=10,
-        )
-        return resp.json()
-    except Exception as e:
-        return {"error": repr(e)}, 500
-@app.route("/debug-inspection", methods=["GET"])
-def debug_inspection():
-    try:
-        resp = requests.post(
-            "https://connect.squareup.com/v2/catalog/search",
-            headers=square_headers(),
-            json={
-                "query": {
-                    "text_query": {
-                        "keywords": ["Electrical Safety Inspection"]
-                    }
-                }
-            },
-            timeout=10,
-        )
-        return resp.json()
-    except Exception as e:
-        return {"error": repr(e)}, 500
-@app.route("/debug-troubleshoot", methods=["GET"])
-def debug_troubleshoot():
-    try:
-        resp = requests.post(
-            "https://connect.squareup.com/v2/catalog/search",
-            headers=square_headers(),
-            json={
-                "query": {
-                    "text_query": {
-                        "keywords": ["Troubleshooting"]
-                    }
-                }
-            },
-            timeout=10,
-        )
-        return resp.json()
-    except Exception as e:
-        return {"error": repr(e)}, 500
 
 
 # ---------------------------------------------------
@@ -827,3 +772,4 @@ def debug_troubleshoot():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
