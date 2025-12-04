@@ -155,75 +155,108 @@ def transcribe_recording(recording_url: str) -> str:
 
 
 # ---------------------------------------------------
-# Step 2 — Cleanup (improve clarity)
+# Step 3 — Generate Initial SMS (with Emergency Override)
 # ---------------------------------------------------
-def clean_transcript_text(raw_text: str) -> str:
+def generate_initial_sms(cleaned_text: str) -> dict:
     """
-    Cleans up Whisper voicemail text:
-    • Fix obvious transcription errors
-    • Improve grammar slightly
-    • Correct electrical terms (breaker, panel, service drop, meter, etc.)
-    • Preserve ALL meaning (never add information)
-    • Tag emergency phrases so later stages cannot misclassify the call
+    Generates the FIRST outbound SMS after voicemail,
+    with emergency override logic to force TROUBLESHOOT_395
+    when outage/urgent language is detected.
     """
 
+    # ----------------------------------------
+    # Emergency phrase detection (voicemail)
+    # ----------------------------------------
+    emergency_markers = [
+        "no power",
+        "power is out",
+        "power outage",
+        "tree took my main",
+        "tree took the main",
+        "sparks",
+        "burning smell",
+        "burnt smell",
+        "breaker keeps tripping",
+        "main breaker tripped",
+        "urgent",
+        "asap",
+        "immediate",
+        "right now",
+        "i need somebody tonight",
+        "need someone tonight",
+        "emergency",
+        "electrical fire",
+        "smoke",
+        "[emergency_trigger]"  # injected by Step 2 rewrite
+    ]
+
+    cleaned_lower = cleaned_text.lower()
+    is_emergency = any(key in cleaned_lower for key in emergency_markers)
+
+    # ----------------------------------------
+    # HARD OVERRIDE: Emergency → TROUBLESHOOT_395
+    # ----------------------------------------
+    if is_emergency:
+        sms_body = (
+            "Hi, this is Prevolt Electric — we're sorry to hear about the electrical issue. "
+            "We can send a technician to troubleshoot and repair the problem as soon as possible. "
+            "Our service for troubleshooting starts at $395. What time can you be at the property?"
+        )
+
+        return {
+            "sms_body": sms_body,
+            "category": "EMERGENCY",
+            "appointment_type": "TROUBLESHOOT_395",
+        }
+
+    # ----------------------------------------
+    # NON-EMERGENCY → Use LLM classification
+    # ----------------------------------------
     try:
-        # --------------------------------------------
-        # AI Cleanup
-        # --------------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You clean up voicemail transcriptions for an electrical contractor. "
-                        "Fix obvious transcription mistakes, stabilize grammar, and correct common "
-                        "electrical terminology errors (breaker, panel, service line, service drop, "
-                        "meter, main wires, feeder, outage). "
-                        "Do NOT invent details, change facts, or soften emergency statements. "
-                        "Preserve all original intent exactly."
+                        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
+                        "Generate ONLY the FIRST outbound SMS after reading voicemail.\n\n"
+                        "Rules:\n"
+                        "• MUST start with: 'Hi, this is Prevolt Electric —'\n"
+                        "• NEVER ask customer to repeat their voicemail.\n"
+                        "• Determine correct appointment type:\n"
+                        "   - Installs/quotes/upgrades → EVAL_195\n"
+                        "   - Active problems (non-emergency) → TROUBLESHOOT_395\n"
+                        "   - Whole home inspection → WHOLE_HOME_INSPECTION\n"
+                        "• Mention price once only.\n"
+                        "• No photos. No AI mentions. No Kyle.\n\n"
+                        "Return STRICT JSON with keys: sms_body, category, appointment_type."
                     ),
                 },
-                {"role": "user", "content": raw_text},
+                {"role": "user", "content": cleaned_text},
             ],
         )
 
-        cleaned = completion.choices[0].message.content.strip()
+        data = json.loads(completion.choices[0].message.content)
 
-        # --------------------------------------------
-        # Emergency phrase safeguard (critical)
-        # Ensures later steps always classify emergencies correctly,
-        # even if Whisper hallucinated “reminder / tomorrow”.
-        # --------------------------------------------
-        emergency_keywords = [
-            "no power",
-            "power is out",
-            "tree took",
-            "tree ripped",
-            "tree fell on",
-            "sparks",
-            "smoke",
-            "burning smell",
-            "smell burning",
-            "fire",
-            "arcing",
-            "breaker keeps tripping",
-            "electrical emergency",
-            "danger",
-            "hazard",
-        ]
-
-        lower = cleaned.lower()
-        if any(k in lower for k in emergency_keywords):
-            # Inject a tag ONLY to influence logic — does not alter text.
-            cleaned = cleaned + " [EMERGENCY_TRIGGER]"
-
-        return cleaned
+        return {
+            "sms_body": data["sms_body"].strip(),
+            "category": data["category"],
+            "appointment_type": data["appointment_type"],
+        }
 
     except Exception as e:
-        print("Cleanup FAILED:", repr(e))
-        return raw_text
+        print("Initial SMS FAILED:", repr(e))
+        return {
+            "sms_body": (
+                "Hi, this is Prevolt Electric — I received your message. "
+                "The next step is a $195 on-site consultation and quote visit. "
+                "What day works for you?"
+            ),
+            "category": "OTHER",
+            "appointment_type": "EVAL_195",
+        }
+
 
 
 # ---------------------------------------------------
