@@ -317,18 +317,17 @@ def get_today_available_slot(appointment_type: str) -> str | None:
 
 
 
-def get_next_available_day_slot(appointment_type: str) -> tuple[str, str] | None:
+def get_next_available_day_slot(appointment_type: str):
     """
     Finds the next day with ANY availability.
     Returns tuple: (YYYY-MM-DD, HH:MM)
-    Returns None if totally unavailable (rare).
     """
 
     try:
         tz = ZoneInfo("America/New_York")
         now_local = datetime.now(tz)
 
-        for offset in range(1, 10):  # search next 10 days max
+        for offset in range(1, 10):  # search next 10 days
             day = (now_local + timedelta(days=offset)).strftime("%Y-%m-%d")
             slots = get_square_availability(day, appointment_type)
 
@@ -341,6 +340,7 @@ def get_next_available_day_slot(appointment_type: str) -> tuple[str, str] | None
     except Exception as e:
         print("get_next_available_day_slot FAILED:", repr(e))
         return None
+
 
 
 
@@ -370,10 +370,9 @@ def compute_emergency_arrival_time(now_local, travel_minutes):
 
 
 # ====================================================================
-# ====================================================================
 #                    >>>>>  SECTION 4 FULLY PATCHED  <<<<<
 # ====================================================================
-# ====================================================================
+
 def contains_any(msg, terms):
     return any(t in msg for t in terms)
 
@@ -382,8 +381,10 @@ def is_customer_confirmation(msg):
     return any(c == msg or c in msg for c in confirmations)
 
 def is_customer_address_only(msg):
-    # Super lightweight detector — prevents noise during booking
-    return any(char.isdigit() for char in msg) and any(street in msg for street in ["st", "street", "rd", "road", "ave", "avenue", "ct", "lane", "dr"])
+    # Very lightweight address detector — prevents noise during booking
+    return any(char.isdigit() for char in msg) and any(
+        street in msg for street in ["st", "street", "rd", "road", "ave", "avenue", "ct", "lane", "dr"]
+    )
 
 def ready_to_finalize(conv, date, time, address):
     return (
@@ -396,9 +397,9 @@ def ready_to_finalize(conv, date, time, address):
 
 def build_llm_prompt(cleaned_transcript, category, appointment_type, initial_sms, scheduled_date, scheduled_time, address, today_date_str, today_weekday):
     return f"""
-You are Prevolt OS...
+You are Prevolt OS, the SMS assistant for Prevolt Electric.
 
-(…same as your previous, unchanged…)
+(Your full existing system prompt goes here — unchanged.)
 """
 
 # ---------------------------------------------------
@@ -422,6 +423,7 @@ def generate_reply_for_inbound(
 
     phone = request.form.get("From", "").replace("whatsapp:", "")
     inbound_lower = inbound_text.strip().lower()
+
     conversations.setdefault(phone, {})
 
     # ===============================================================
@@ -436,7 +438,7 @@ def generate_reply_for_inbound(
         }
 
     # ===============================================================
-    # 0) UNIVERSAL CLEANERS & STATE-LOCK PROTECTIONS
+    # UNIVERSAL STATE CLEANUP
     # ===============================================================
     if is_customer_confirmation(inbound_lower):
         conversations[phone]["final_confirmation_sent"] = True
@@ -448,7 +450,6 @@ def generate_reply_for_inbound(
         }
 
     if is_customer_address_only(inbound_lower) and not address:
-        # Normalize incoming address if possible
         normalized = normalize_possible_address(inbound_text)
         if normalized:
             conversations[phone]["normalized_address"] = normalized
@@ -466,6 +467,7 @@ def generate_reply_for_inbound(
 
     if contains_any(inbound_lower, immediate_terms):
 
+        # round to next 5 min
         minute = (now_local.minute + 4) // 5 * 5
         if minute == 60:
             now_local = now_local.replace(hour=now_local.hour + 1, minute=0)
@@ -557,7 +559,7 @@ def generate_reply_for_inbound(
         }
 
     # ===============================================================
-    # 3) HOME-TODAY / FREE-ALL-DAY LOGIC
+    # 3) HOME TODAY / FREE ALL DAY LOGIC
     # ===============================================================
     home_terms = [
         "im home today", "home today", "available today", "any time today",
@@ -578,10 +580,12 @@ def generate_reply_for_inbound(
                 "address": None,
             }
 
+        # Try same-day availability
         slot = get_today_available_slot(appointment_type)
 
         if slot is None:
             nxt = get_next_available_day_slot(appointment_type)
+
             if not nxt:
                 return {
                     "sms_body": "We're booked solid for several days. Want a sooner opening notification?",
@@ -590,13 +594,17 @@ def generate_reply_for_inbound(
                     "address": address,
                 }
 
+            # IMPORTANT — tuple unpacking FIX
+            nxt_date, nxt_time = nxt
+
             return {
-                "sms_body": f"We’re booked today, but next opening is {nxt['date']} at {nxt['time']}. Does that work?",
+                "sms_body": f"We’re booked today, but our next opening is {nxt_date} at {nxt_time}. Does that work?",
                 "scheduled_date": None,
                 "scheduled_time": None,
                 "address": address,
             }
 
+        # Same-day opening exists
         conversations[phone]["scheduled_date"] = today_date_str
         conversations[phone]["scheduled_time"] = slot
         conversations[phone]["autobooked"] = True
@@ -609,7 +617,7 @@ def generate_reply_for_inbound(
         }
 
     # ===============================================================
-    # 4) AUTOBOOK FINAL CONFIRMATION (SAFEST VERSION)
+    # 4) AUTOBOOK FINAL CONFIRMATION
     # ===============================================================
     if ready_to_finalize(conversations[phone], scheduled_date, scheduled_time, address):
 
