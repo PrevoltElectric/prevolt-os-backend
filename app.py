@@ -323,7 +323,6 @@ def generate_reply_for_inbound(
     # ---------------------------------------------------
     # NON-EMERGENCY FLOW → full AI logic
     # ---------------------------------------------------
-
     system_prompt = f"""
 You are Prevolt OS, the SMS assistant for Prevolt Electric.
 Continue the conversation naturally.
