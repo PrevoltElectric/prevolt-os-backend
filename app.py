@@ -231,6 +231,45 @@ def generate_reply_for_inbound(
         now_local = datetime.now(tz)
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday = now_local.strftime("%A")
+        # ---------------------------------------------------
+        # Session Reset Logic (prevents ghost-state)
+        # ---------------------------------------------------
+        phone = request.form.get("From", "").replace("whatsapp:", "")
+        last_time = conversations.get(phone, {}).get("first_sms_time")
+        should_reset = False
+
+        # Reset if conversation is older than 60 minutes
+        if last_time:
+            elapsed_minutes = (now_local - last_time).total_seconds() / 60
+            if elapsed_minutes > 60:
+                should_reset = True
+
+        # Reset if user signals a brand-new issue
+        if inbound_text.strip().lower() in [
+            "hi", "hello", "hey",
+            "new issue", "another issue",
+            "new problem", "i need help",
+            "i have a new problem",
+        ]:
+            should_reset = True
+
+        if should_reset:
+            conversations[phone] = {
+                "cleaned_transcript": cleaned_transcript,
+                "category": category,
+                "appointment_type": appointment_type,
+                "initial_sms": initial_sms,
+                "first_sms_time": now_local,
+                "replied": False,
+                "followup_sent": False,
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": None,
+                "normalized_address": None,
+                "booking_created": False,
+                "square_booking_id": None,
+                "state_prompt_sent": False,
+            }
 
         system_prompt = """
 You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
@@ -6040,21 +6079,15 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
     idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
 
-    # ---------- *** CRITICAL FIX *** ----------
     # Square booking.address MUST NOT include "country"
-    # Only these fields are permitted:
-    #   address_line_1, address_line_2, locality,
-    #   administrative_district_level_1, postal_code
     booking_address = {
         "address_line_1": addr_struct["address_line_1"],
         "locality": addr_struct["locality"],
         "administrative_district_level_1": addr_struct["administrative_district_level_1"],
         "postal_code": addr_struct["postal_code"],
     }
-    # (Optional) Only include line_2 if present
     if "address_line_2" in addr_struct and addr_struct["address_line_2"]:
         booking_address["address_line_2"] = addr_struct["address_line_2"]
-    # -----------------------------------------
 
     booking_payload = {
         "idempotency_key": idempotency_key,
@@ -6063,7 +6096,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             "customer_id": customer_id,
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
-            "address": booking_address,   # <-- FIXED
+            "address": booking_address,
             "customer_note": (
                 f"Auto-booked by Prevolt OS. Raw address from customer: {raw_address}"
             ),
@@ -6101,9 +6134,28 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             f"{scheduled_date} {scheduled_time} ({appointment_type})"
         )
 
+        # ---------------------------------------------------
+        # Reset conversation AFTER successful booking
+        # ---------------------------------------------------
+        conversations[phone] = {
+            "cleaned_transcript": None,
+            "category": None,
+            "appointment_type": None,
+            "initial_sms": None,
+            "first_sms_time": None,
+            "replied": False,
+            "followup_sent": False,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
+            "normalized_address": None,
+            "booking_created": True,
+            "square_booking_id": booking_id,
+            "state_prompt_sent": False,
+        }
+
     except Exception as e:
         print("Square booking exception:", repr(e))
-
 
 
 # ---------------------------------------------------
