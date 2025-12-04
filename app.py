@@ -490,11 +490,10 @@ OUTPUT FORMAT (STRICT JSON)
 
     return json.loads(completion.choices[0].message.content)
 
+# ===================================================
+# SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
+# ===================================================
 
-
-===================================================
-SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
-===================================================
 
 ## SRB-1 — Scheduling, Time, Dispatch & Emergency Engine  
 (The primary logic block governing all scheduling behavior in Prevolt OS.)
