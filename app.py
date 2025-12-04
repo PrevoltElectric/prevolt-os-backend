@@ -369,15 +369,15 @@ def generate_reply_for_inbound(
         last_time = conversations.get(phone, {}).get("first_sms_time")
         should_reset = False
 
-        # Reset if conversation is older than 60 minutes
+        # Reset if the prior conversation is older than 60 minutes
         if last_time:
             try:
-                # Ensure last_time is a datetime
+                # Safety: ensure last_time is a datetime, not a float
                 elapsed_minutes = (now_local - last_time).total_seconds() / 60
                 if elapsed_minutes > 60:
                     should_reset = True
             except Exception:
-                # If corrupted/old format → force reset
+                # Corrupted/old format → reset for safety
                 should_reset = True
 
         # Reset if user signals a brand-new issue
@@ -407,6 +407,91 @@ def generate_reply_for_inbound(
                 "square_booking_id": None,
                 "state_prompt_sent": False,
             }
+                # Perform reset if needed
+        if should_reset:
+            conversations[phone] = {
+                "cleaned_transcript": cleaned_transcript,
+                "category": category,
+                "appointment_type": appointment_type,
+                "initial_sms": initial_sms,
+                "first_sms_time": now_local,
+                "replied": False,
+                "followup_sent": False,
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": None,
+                "normalized_address": None,
+                "booking_created": False,
+                "square_booking_id": None,
+                "state_prompt_sent": False,
+            }
+
+        # ---------------------------------------------------
+        # Emergency "I'm home right now" override
+        # (Prevents the model from asking for extra day/time
+        #  and forces same-day, ASAP scheduling.)
+        # ---------------------------------------------------
+        inbound_lower = inbound_text.strip().lower()
+
+        immediate_phrases = [
+            "im home right now",
+            "i'm home right now",
+            "im home now",
+            "i'm home now",
+            "im home",
+            "i'm home",
+            "im here",
+            "i'm here",
+            "right now",
+            "asap",
+            "as soon as possible",
+            "as soon as you can",
+            "asap as possible",
+            "you come now",
+            "can you come now",
+            "can you come tonight",
+            "come tonight",
+            "whenever you can get here",
+            "whenever you can",
+        ]
+
+        if appointment_type == "TROUBLESHOOT_395" and any(
+            p in inbound_lower for p in immediate_phrases
+        ):
+            # Force same-day date
+            if not scheduled_date:
+                scheduled_date = today_date_str
+
+            # Force time = current local time rounded to next 5 minutes
+            if not scheduled_time:
+                minute = ((now_local.minute + 4) // 5) * 5
+                hour = now_local.hour
+                if minute >= 60:
+                    minute -= 60
+                    hour += 1
+                scheduled_time = f"{hour:02d}:{minute:02d}"
+
+            # Choose message based on whether we already have an address
+            if not address:
+                sms_body = (
+                    "Got it — we’ll prioritize this and head over as soon as possible. "
+                    "What’s the address where we’ll be coming out?"
+                )
+            else:
+                sms_body = (
+                    f"Got it — we’ll prioritize this and head over as soon as possible. "
+                    f"We have you at {address}."
+                )
+
+            # Short-circuit: do NOT call the model for this turn
+            return {
+                "sms_body": sms_body,
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": address,
+            }
+
+
 
         system_prompt = """
 You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
