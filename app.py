@@ -297,6 +297,58 @@ def generate_reply_for_inbound(
     inbound_lower = inbound_text.strip().lower()
 
     # ---------------------------------------------------
+    # IMMEDIATE-ARRIVAL LOGIC ("NOW", "ASAP", "I'M HOME NOW")
+    # ---------------------------------------------------
+    immediate_terms = [
+        "now", "right now", "im home now", "i am home now", "home now",
+        "asap", "as soon as possible", "come now", "come asap",
+        "i'm available now", "available now", "can someone come now",
+        "whenever you can get here"
+    ]
+
+    if any(term in inbound_lower for term in immediate_terms):
+
+        minute = (now_local.minute + 4) // 5 * 5
+        if minute == 60:
+            now_local = now_local.replace(hour=now_local.hour + 1, minute=0)
+        else:
+            now_local = now_local.replace(minute=minute)
+
+        scheduled_time = now_local.strftime("%H:%M")
+        scheduled_date = today_date_str
+
+        conversations.setdefault(phone, {})
+        conversations[phone]["scheduled_time"] = scheduled_time
+        conversations[phone]["scheduled_date"] = scheduled_date
+
+        if not address:
+            return {
+                "sms_body": (
+                    "Got it — we can send someone out shortly. "
+                    "What’s the address where we’re heading?"
+                ),
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": None,
+            }
+
+        maybe_create_square_booking(phone, {
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        })
+
+        return {
+            "sms_body": (
+                "You're all set — we’ll head out shortly. "
+                "A Square confirmation will follow."
+            ),
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+    # ---------------------------------------------------
     # Emergency indicators (MEDIUM sensitivity)
     # ---------------------------------------------------
     emergency_indicators = [
@@ -332,6 +384,7 @@ def generate_reply_for_inbound(
         scheduled_date = today_date_str
         scheduled_time = emergency_time
 
+        conversations.setdefault(phone, {})
         conversations[phone]["scheduled_date"] = scheduled_date
         conversations[phone]["scheduled_time"] = scheduled_time
 
@@ -361,7 +414,7 @@ def generate_reply_for_inbound(
         }
 
     # ---------------------------------------------------
-    # NON-EMERGENCY FLOW → full AI logic
+    # NON-EMERGENCY FLOW (LLM)
     # ---------------------------------------------------
     system_prompt = f"""
 You are Prevolt OS, the SMS assistant for Prevolt Electric.
