@@ -517,7 +517,6 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
-       }
 
     # ===============================================================
     # 3) NON-EMERGENCY: “I’m home today” LOGIC
