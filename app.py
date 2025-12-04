@@ -156,14 +156,6 @@ def transcribe_recording(recording_url: str) -> str:
 # Step 2 — Cleanup (improve clarity)
 # ---------------------------------------------------
 def clean_transcript_text(raw_text: str) -> str:
-    """
-    Cleans up a voicemail transcript:
-    - Fix obvious Whisper mistakes
-    - Keep electrical terminology intact
-    - Keep all facts (name, location, issue)
-    - NEVER add or invent details
-    - Make it easier for the AI to extract the emergency information
-    """
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -172,75 +164,77 @@ def clean_transcript_text(raw_text: str) -> str:
                     "role": "system",
                     "content": (
                         "You clean up voicemail transcriptions for an electrical contractor. "
-                        "Fix obvious transcription mistakes, preserve electrical terminology, "
-                        "improve grammar slightly, but DO NOT add or infer information. "
-                        "Preserve all names, addresses, symptoms, and urgency keywords exactly."
+                        "Fix obvious transcription mistakes and electrical terminology, "
+                        "improve grammar slightly, but preserve the customer's meaning EXACTLY. "
+                        "Do NOT add details. Do NOT change the problem description."
                     ),
                 },
                 {"role": "user", "content": raw_text},
             ],
         )
         return completion.choices[0].message.content.strip()
-
     except Exception as e:
         print("Cleanup FAILED:", repr(e))
         return raw_text
 
 
+
 # ---------------------------------------------------
-# Step 3 — Generate Initial SMS (with Emergency Override)
+# Step 3 — Generate Initial SMS (Ultra-Deterministic Classifier)
 # ---------------------------------------------------
 def generate_initial_sms(cleaned_text: str) -> dict:
-    """
-    Generates the FIRST outbound SMS after voicemail,
-    with emergency override logic to force TROUBLESHOOT_395
-    when outage/urgent language is detected.
-    """
-
-    # ----------------------------------------
-    # Emergency phrase detection (voicemail)
-    # ----------------------------------------
-    emergency_markers = [
-        "no power",
-        "power is out",
-        "power outage",
-        "tree took my main",
-        "tree took the main",
-        "sparks",
-        "burning smell",
-        "burnt smell",
-        "breaker keeps tripping",
-        "main breaker tripped",
-        "urgent",
-        "asap",
-        "immediate",
-        "right now",
-        "i need somebody tonight",
-        "need someone tonight",
-        "emergency",
-        "electrical fire",
-        "smoke",
-        "[emergency_trigger]"  # injected by Step 2 rewrite
-    ]
-
-    cleaned_lower = cleaned_text.lower()
-    is_emergency = any(key in cleaned_lower for key in emergency_markers)
-
-    # ----------------------------------------
-    # HARD OVERRIDE: Emergency → TROUBLESHOOT_395
-    # ----------------------------------------
-    if is_emergency:
-        sms_body = (
-            "Hi, this is Prevolt Electric — we're sorry to hear about the electrical issue. "
-            "We can send a technician to troubleshoot and repair the problem as soon as possible. "
-            "Our service for troubleshooting starts at $395. What time can you be at the property?"
+    try:
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
+                        "Your job is to classify the voicemail into EXACTLY ONE appointment type.\n\n"
+                        "APPOINTMENT TYPE RULES (DO NOT GUESS):\n"
+                        "1. TROUBLESHOOT_395 = ANY active problem, urgent issue, outage, burning smell, fire, "
+                        "   wires down, tree damage, main wires pulled, breaker tripping, no power, partial power, "
+                        "   anything dangerous, anything affecting existing equipment.\n"
+                        "2. WHOLE_HOME_INSPECTION = ONLY when caller explicitly says: "
+                        "   'inspection', 'whole home inspection', 'electrical inspection', "
+                        "   or requests a safety inspection for insurance or buying a home.\n"
+                        "3. EVAL_195 = Quotes, upgrades, installs, adding circuits, panel upgrades, EV chargers, "
+                        "   generator installs, renovations, pricing requests, or non-emergency consultations.\n\n"
+                        "NEVER misclassify outages as inspections or evals. When in doubt between eval and troubleshoot → choose TROUBLESHOOT.\n"
+                        "NEVER soften or second-guess. Use hard classification logic ONLY based on the voicemail.\n\n"
+                        "SMS RULES:\n"
+                        "• Must begin with: 'Hi, this is Prevolt Electric —'\n"
+                        "• Mention the price ONCE.\n"
+                        "• No small talk, no emojis, no fluff.\n"
+                        "• Do NOT ask them to repeat the voicemail.\n\n"
+                        "Return STRICT JSON: {sms_body, category, appointment_type}."
+                    ),
+                },
+                {"role": "user", "content": cleaned_text},
+            ],
         )
 
+        data = json.loads(completion.choices[0].message.content)
+
         return {
-            "sms_body": sms_body,
-            "category": "EMERGENCY",
-            "appointment_type": "TROUBLESHOOT_395",
+            "sms_body": data["sms_body"].strip(),
+            "category": data["category"],
+            "appointment_type": data["appointment_type"],
         }
+
+    except Exception as e:
+        print("Initial SMS FAILED:", repr(e))
+        return {
+            "sms_body": (
+                "Hi, this is Prevolt Electric — I received your message. "
+                "The next step is a $195 on-site consultation and quote visit. "
+                "What day works for you?"
+            ),
+            "category": "OTHER",
+            "appointment_type": "EVAL_195",
+        }
+
 
     # ----------------------------------------
     # NON-EMERGENCY → Use LLM classification
