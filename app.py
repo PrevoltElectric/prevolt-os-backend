@@ -771,42 +771,43 @@ def generate_reply_for_inbound(
         }
 
 
-   # ===============================================================
-# 5) LLM MODE
-# ===============================================================
-system_prompt = build_llm_prompt(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    scheduled_date,
-    scheduled_time,
-    address,
-    today_date_str,
-    today_weekday
-)
+    # ===============================================================
+    # 5) LLM MODE
+    # ===============================================================
+    system_prompt = build_llm_prompt(
+        cleaned_transcript,
+        category,
+        appointment_type,
+        initial_sms,
+        scheduled_date,
+        scheduled_time,
+        address,
+        today_date_str,
+        today_weekday
+    )
 
-completion = openai_client.chat.completions.create(
-    model="gpt-4.1-mini",
-    messages=[
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": inbound_text},
-    ],
-)
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": inbound_text},
+        ],
+    )
 
-raw = completion.choices[0].message.content.strip()
+    # ---- SAFE JSON PARSER ----
+    raw = completion.choices[0].message.content.strip()
 
-# SAFE JSON HANDLING — prevents crashes when LLM returns non-JSON
-try:
-    return json.loads(raw)
-except Exception:
-    print("LLM returned non-JSON:", raw)
-    return {
-        "sms_body": "Got it — we’ll take care of that.",
-        "scheduled_date": conversations[phone].get("scheduled_date"),
-        "scheduled_time": conversations[phone].get("scheduled_time"),
-        "address": conversations[phone].get("address"),
-    }
+    try:
+        return json.loads(raw)
+    except Exception:
+        # Fallback: if LLM output wasn't valid JSON
+        return {
+            "sms_body": raw,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": address,
+        }
+
 
 
 
