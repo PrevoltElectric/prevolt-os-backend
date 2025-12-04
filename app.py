@@ -184,6 +184,46 @@ def clean_transcript_text(raw_text: str) -> str:
         return raw_text
 
 
+# ===================================================
+# MASTER PRIORITIZATION LAYER RULES (GLOBAL VARIABLE)
+# ===================================================
+MPL_RULES = """
+### MPL-1 — Extract intent
+The OS must always detect whether the customer is giving date, time, address, confirmation, or new info.
+
+### MPL-2 — Move forward
+The OS must always move toward completing the booking, never backward.
+
+### MPL-3 — No repetition
+Never ask for anything that the OS already has stored.
+
+### MPL-4 — Only ask the missing piece
+If OS has date + address → ask time.
+If OS has time + address → ask date.
+If OS has date + time → ask address.
+If all three → finalize.
+
+### MPL-5 — Confirmations end the conversation
+If user says “yes”, “confirmed”, “sounds good”, “ok perfect” → OS sends **no further messages**.
+
+### MPL-6 — Extract date/time/address automatically
+The OS must read natural language and auto-fill:
+• scheduled_date
+• scheduled_time
+• address
+
+### MPL-7 — Keep messages short
+No fluff, no filler, no emojis.
+
+### MPL-8 — High-trust emergency handling
+If issue is urgent, OS must expedite the flow and skip any irrelevant steps.
+
+### MPL-9 — Resolve customer confusion
+If customer asks questions, answer once, then return to scheduling.
+
+### MPL-10 — Safety override
+If message implies danger, OS prioritizes dispatch workflow.
+"""
 
 # ---------------------------------------------------
 # Step 3 — Generate Initial SMS
