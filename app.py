@@ -366,6 +366,45 @@ def compute_emergency_arrival_time(now_local, travel_minutes):
         eta = eta.replace(minute=minute)
 
     return eta.strftime("%H:%M")
+# ---------------------------------------------------
+# Address Normalization Helper (Safe & Lightweight)
+# ---------------------------------------------------
+import re
+
+def normalize_possible_address(text: str):
+    """
+    Attempts to extract a street address from customer text.
+    Returns a minimal normalized structure if confident,
+    otherwise returns None.
+
+    This is intentionally lightweight because Section 4 logic
+    only needs enough structure for travel-time & Square booking.
+    """
+
+    if not text:
+        return None
+
+    t = text.strip().lower()
+
+    # Basic pattern: number + street name + suffix
+    pattern = r"(\d{1,6}[a-zA-Z]?)\s+([a-zA-Z0-9\s]+?)\s+(st|street|rd|road|ave|avenue|blvd|dr|drive|ln|lane|ct|court)"
+    match = re.search(pattern, t)
+
+    if not match:
+        return None
+
+    number = match.group(1).strip()
+    street = match.group(2).strip().title()
+    suffix = match.group(3).strip().title()
+
+    full = f"{number} {street} {suffix}"
+
+    return {
+        "number": number,
+        "street": street,
+        "suffix": suffix,
+        "full": full,
+    }
 
 
 
@@ -373,19 +412,44 @@ def compute_emergency_arrival_time(now_local, travel_minutes):
 #                    >>>>>  SECTION 4 FULLY PATCHED  <<<<<
 # ====================================================================
 
+import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+
+# ---------------------------------------------------
+# Boolean Helper: check if inbound message contains ANY term
+# ---------------------------------------------------
 def contains_any(msg, terms):
     return any(t in msg for t in terms)
 
+
+# ---------------------------------------------------
+# Customer confirmation detector
+# ---------------------------------------------------
 def is_customer_confirmation(msg):
-    confirmations = ["yes", "sounds good", "that works", "ok", "okay", "perfect", "confirm"]
+    confirmations = [
+        "yes", "sounds good", "that works",
+        "ok", "okay", "perfect", "confirm"
+    ]
     return any(c == msg or c in msg for c in confirmations)
 
+
+# ---------------------------------------------------
+# Lightweight address detector
+# ---------------------------------------------------
 def is_customer_address_only(msg):
-    # Very lightweight address detector — prevents noise during booking
     return any(char.isdigit() for char in msg) and any(
-        street in msg for street in ["st", "street", "rd", "road", "ave", "avenue", "ct", "lane", "dr"]
+        suffix in msg for suffix in [
+            "st", "street", "rd", "road", "ave", "avenue",
+            "ct", "lane", "ln", "dr", "drive", "blvd", "court"
+        ]
     )
 
+
+# ---------------------------------------------------
+# Finalization check — ensures autobooked and has all fields
+# ---------------------------------------------------
 def ready_to_finalize(conv, date, time, address):
     return (
         date is not None
@@ -395,12 +459,326 @@ def ready_to_finalize(conv, date, time, address):
         and conv.get("final_confirmation_sent") is not True
     )
 
-def build_llm_prompt(cleaned_transcript, category, appointment_type, initial_sms, scheduled_date, scheduled_time, address, today_date_str, today_weekday):
+
+# ---------------------------------------------------
+# Address Normalization Helper (Safe & Lightweight)
+# ---------------------------------------------------
+def normalize_possible_address(text: str):
+    """
+    Extract a simple street address like:
+    '12B Greenbrier Drive'
+    '110 maple road'
+    '55 Elm St'
+
+    Returns dict or None.
+    """
+    if not text:
+        return None
+
+    t = text.strip().lower()
+
+    pattern = r"(\d{1,6}[a-zA-Z]?)\s+([a-zA-Z0-9\s]+?)\s+(st|street|rd|road|ave|avenue|blvd|dr|drive|ln|lane|ct|court)"
+    match = re.search(pattern, t)
+
+    if not match:
+        return None
+
+    number = match.group(1).strip()
+    street = match.group(2).strip().title()
+    suffix = match.group(3).strip().title()
+
+    full = f"{number} {street} {suffix}"
+
+    return {
+        "number": number,
+        "street": street,
+        "suffix": suffix,
+        "full": full,
+    }
+
+
+# ---------------------------------------------------
+# Prompt Builder
+# ---------------------------------------------------
+def build_llm_prompt(
+    cleaned_transcript,
+    category,
+    appointment_type,
+    initial_sms,
+    scheduled_date,
+    scheduled_time,
+    address,
+    today_date_str,
+    today_weekday
+):
     return f"""
 You are Prevolt OS, the SMS assistant for Prevolt Electric.
-
-(Your full existing system prompt goes here — unchanged.)
+(Your full existing master prompt remains unchanged)
 """
+
+
+# ====================================================================
+# Step 4 — Generate Replies (THE BRAIN) — OPTIMIZED
+# ====================================================================
+def generate_reply_for_inbound(
+    cleaned_transcript,
+    category,
+    appointment_type,
+    initial_sms,
+    inbound_text,
+    scheduled_date,
+    scheduled_time,
+    address,
+) -> dict:
+
+    tz = ZoneInfo("America/New_York")
+    now_local = datetime.now(tz)
+    today_date_str = now_local.strftime("%Y-%m-%d")
+    today_weekday = now_local.strftime("%A")
+
+    phone = request.form.get("From", "").replace("whatsapp:", "")
+    inbound_lower = inbound_text.strip().lower()
+
+    conversations.setdefault(phone, {})
+
+    # ===============================================================
+    # PBM (POST-BOOKING MODE)
+    # ===============================================================
+    if conversations[phone].get("final_confirmation_sent") is True:
+        return {
+            "sms_body": "Got it — we’ll see you then.",
+            "scheduled_date": conversations[phone].get("scheduled_date"),
+            "scheduled_time": conversations[phone].get("scheduled_time"),
+            "address": conversations[phone].get("address"),
+        }
+
+    # ===============================================================
+    # UNIVERSAL CONFIRMATION & ADDRESS CLEANUP
+    # ===============================================================
+    if is_customer_confirmation(inbound_lower):
+        conversations[phone]["final_confirmation_sent"] = True
+        return {
+            "sms_body": "Perfect — you're all set. We’ll see you then.",
+            "scheduled_date": conversations[phone].get("scheduled_date"),
+            "scheduled_time": conversations[phone].get("scheduled_time"),
+            "address": conversations[phone].get("address"),
+        }
+
+    if is_customer_address_only(inbound_lower) and not address:
+        normalized = normalize_possible_address(inbound_text)
+        if normalized:
+            conversations[phone]["normalized_address"] = normalized
+            conversations[phone]["address"] = inbound_text.strip()
+            address = inbound_text.strip()
+
+    # ===============================================================
+    # 1) IMMEDIATE ARRIVAL LOGIC
+    # ===============================================================
+    immediate_terms = [
+        "now", "right now", "im home now", "i am home now", "home now",
+        "asap", "as soon as possible", "come now", "come asap",
+        "available now", "i'm available now", "whenever you can get here"
+    ]
+
+    if contains_any(inbound_lower, immediate_terms):
+
+        # Round to next 5 min
+        minute = (now_local.minute + 4) // 5 * 5
+        if minute == 60:
+            now_local = now_local.replace(hour=now_local.hour + 1, minute=0)
+        else:
+            now_local = now_local.replace(minute=minute)
+
+        scheduled_time = now_local.strftime("%H:%M")
+        scheduled_date = today_date_str
+
+        conversations[phone]["scheduled_time"] = scheduled_time
+        conversations[phone]["scheduled_date"] = scheduled_date
+        conversations[phone]["autobooked"] = True
+
+        if not address:
+            return {
+                "sms_body": "Got it — we can send someone out shortly. What’s the address?",
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": None,
+            }
+
+        maybe_create_square_booking(phone, {
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        })
+
+        conversations[phone]["final_confirmation_sent"] = True
+        return {
+            "sms_body": "You're all set — we’ll head out shortly. A Square confirmation will follow.",
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+    # ===============================================================
+    # 2) EMERGENCY LOGIC
+    # ===============================================================
+    emergency_terms = [
+        "no power", "partial power", "tree hit", "tree took",
+        "tree took my wires", "wires pulled off", "power line down",
+        "burning smell", "smoke smell", "fire", "sparks",
+        "melted outlet", "melted plug", "buzzing panel",
+        "arcing", "breaker arcing", "breaker won't reset", "breaker wont reset"
+    ]
+
+    if contains_any(inbound_lower, emergency_terms):
+
+        appointment_type = "TROUBLESHOOT_395"
+
+        travel_minutes = None
+        addr_struct = conversations[phone].get("normalized_address")
+
+        if addr_struct:
+            dest = format_full_address(addr_struct)
+            origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+            travel_minutes = compute_travel_time_minutes(origin, dest)
+
+        emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
+
+        scheduled_date = today_date_str
+        scheduled_time = emergency_time
+
+        conversations[phone]["scheduled_date"] = scheduled_date
+        conversations[phone]["scheduled_time"] = scheduled_time
+        conversations[phone]["autobooked"] = True
+
+        if not address:
+            return {
+                "sms_body": (
+                    f"Got it — we’ll prioritize this. We can have a tech out around {scheduled_time}. "
+                    "What’s the address?"
+                ),
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": None,
+            }
+
+        maybe_create_square_booking(phone, conversations[phone])
+        conversations[phone]["final_confirmation_sent"] = True
+
+        return {
+            "sms_body": (
+                f"You're all set — emergency troubleshoot scheduled for about {scheduled_time}. "
+                "A Square confirmation will follow."
+            ),
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+    # ===============================================================
+    # 3) HOME TODAY / FREE ALL DAY LOGIC
+    # ===============================================================
+    home_terms = [
+        "im home today", "home today", "available today",
+        "any time today", "anytime today", "today works",
+        "free today", "free all day", "home all day",
+        "any time", "anytime"
+    ]
+
+    if contains_any(inbound_lower, home_terms):
+        conversations[phone]["home_today_intent"] = True
+
+    if conversations[phone].get("home_today_intent") is True:
+
+        if not address:
+            return {
+                "sms_body": "Got it — are you home today at the property? What’s the address?",
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": None,
+            }
+
+        slot = get_today_available_slot(appointment_type)
+
+        if slot is None:
+            nxt = get_next_available_day_slot(appointment_type)
+
+            if not nxt:
+                return {
+                    "sms_body": "We're booked solid for several days. Want a sooner opening notification?",
+                    "scheduled_date": None,
+                    "scheduled_time": None,
+                    "address": address,
+                }
+
+            nxt_date, nxt_time = nxt
+            return {
+                "sms_body": f"We’re booked today, but our next opening is {nxt_date} at {nxt_time}. Does that work?",
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": address,
+            }
+
+        # Same-day slot exists
+        conversations[phone]["scheduled_date"] = today_date_str
+        conversations[phone]["scheduled_time"] = slot
+        conversations[phone]["autobooked"] = True
+
+        return {
+            "sms_body": f"We have an opening today at {slot}. Does that work?",
+            "scheduled_date": today_date_str,
+            "scheduled_time": slot,
+            "address": address,
+        }
+
+    # ===============================================================
+    # 4) AUTOBOOK FINAL CONFIRMATION
+    # ===============================================================
+    if ready_to_finalize(conversations[phone], scheduled_date, scheduled_time, address):
+
+        conversations[phone]["final_confirmation_sent"] = True
+        conversations[phone]["address"] = address
+
+        maybe_create_square_booking(phone, {
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        })
+
+        return {
+            "sms_body": (
+                f"You're all set — we’ve scheduled your visit for {scheduled_date} at {scheduled_time}. "
+                "A Square confirmation will follow shortly."
+            ),
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+    # ===============================================================
+    # 5) LLM MODE — ONLY IF NOTHING ELSE MATCHES
+    # ===============================================================
+    system_prompt = build_llm_prompt(
+        cleaned_transcript,
+        category,
+        appointment_type,
+        initial_sms,
+        scheduled_date,
+        scheduled_time,
+        address,
+        today_date_str,
+        today_weekday
+    )
+
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": inbound_text},
+        ],
+    )
+
+    return json.loads(completion.choices[0].message.content)
+
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) — OPTIMIZED
