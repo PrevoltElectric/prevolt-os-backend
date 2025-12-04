@@ -6309,7 +6309,7 @@ def voicemail_complete():
             "category": sms_info["category"],
             "appointment_type": sms_info["appointment_type"],
             "initial_sms": sms_info["sms_body"],
-            "first_sms_time": time.time(),
+            "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
             "replied": False,
             "followup_sent": False,
             "scheduled_date": None,
