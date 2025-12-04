@@ -110,28 +110,48 @@ def send_sms(to_number: str, body: str) -> None:
 # Step 1 — Transcription (Twilio → Whisper)
 # ---------------------------------------------------
 def transcribe_recording(recording_url: str) -> str:
-    audio_url = recording_url + ".wav"
+    """
+    Downloads the voicemail from Twilio (wav or mp3) and sends it to Whisper.
+    Auto-fallback: try .wav first, then .mp3.
+    """
 
-    resp = requests.get(
-        audio_url,
-        stream=True,
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-    )
-    resp.raise_for_status()
+    # --- 1) Try WAV first ---
+    wav_url = recording_url + ".wav"
+    mp3_url = recording_url + ".mp3"
 
+    def download(url):
+        resp = requests.get(
+            url,
+            stream=True,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp
+
+    resp = download(wav_url)
+    if resp is None:
+        resp = download(mp3_url)
+    if resp is None:
+        print("Voicemail download FAILED for:", recording_url)
+        return ""
+
+    # --- 2) Save temp file ---
     tmp_path = "/tmp/prevolt_voicemail.wav"
-
     with open(tmp_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
+    # --- 3) Send to Whisper ---
     with open(tmp_path, "rb") as audio_file:
         transcript = openai_client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
         )
 
-    return transcript.text
+    return transcript.text.strip()
+
 
 
 # ---------------------------------------------------
