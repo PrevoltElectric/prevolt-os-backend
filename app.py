@@ -551,36 +551,6 @@ def generate_reply_for_inbound(
             "address": conversations[phone].get("address"),
         }
 
-    # ===============================================================
-    # UNIVERSAL STATE CLEANUP
-    # ===============================================================
-    if is_customer_confirmation(inbound_lower):
-
-    # Only treat “yes/ok/perfect” as FINAL confirmation
-    # if a date, time, and address ALREADY exist.
-    if (
-        conversations[phone].get("scheduled_date")
-        and conversations[phone].get("scheduled_time")
-        and conversations[phone].get("address")
-    ):
-        # If Square booking NOT created yet, create it now
-        if not conversations[phone].get("final_confirmation_sent"):
-            maybe_create_square_booking(phone, {
-                "scheduled_date": conversations[phone]["scheduled_date"],
-                "scheduled_time": conversations[phone]["scheduled_time"],
-                "address": conversations[phone]["address"],
-            })
-
-        conversations[phone]["final_confirmation_sent"] = True
-
-        return {
-            "sms_body": "Perfect — you're all set. We’ll see you then.",
-            "scheduled_date": conversations[phone]["scheduled_date"],
-            "scheduled_time": conversations[phone]["scheduled_time"],
-            "address": conversations[phone]["address"],
-        }
-
-    # Otherwise, customer replied too early → ignore and continue normal logic.
 
 
     # ===============================================================
