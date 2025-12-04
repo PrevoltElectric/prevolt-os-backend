@@ -285,6 +285,8 @@ THESE PRIORITIES OVERRIDE ALL OTHER RULES:
 
 7. If two rules contradict, ALWAYS obey the higher-priority MPL directive.
 
+8. In emergency mode, ALL date-only and day-only rules (1.12–1.18) are disabled and must NOT trigger any additional time questions once a time has been collected.
+
 
 ===================================================
 SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
