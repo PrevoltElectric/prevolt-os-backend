@@ -429,6 +429,7 @@ def generate_reply_for_inbound(
     # ---------------------------------------------------
     # NON-EMERGENCY FLOW → full AI logic
     # ---------------------------------------------------
+
     system_prompt = f"""
 You are Prevolt OS, the SMS assistant for Prevolt Electric.
 Continue the conversation naturally.
@@ -490,11 +491,12 @@ OUTPUT FORMAT (STRICT JSON)
 
     return json.loads(completion.choices[0].message.content)
 
+
 # ===================================================
 # SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
 # ===================================================
 
-
+SCHEDULING_RULES = """
 ## SRB-1 — Scheduling, Time, Dispatch & Emergency Engine  
 (The primary logic block governing all scheduling behavior in Prevolt OS.)
 
