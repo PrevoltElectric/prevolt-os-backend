@@ -232,12 +232,12 @@ def generate_reply_for_inbound(
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday = now_local.strftime("%A")
 
-        system_prompt = f"""
+        system_prompt = """
 You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
 
 Today is {today_date_str}, a {today_weekday}, local time America/New_York.
 
-SYSTEM_PROMPT = """
+
 ===================================================
 STRICT CONVERSATION FLOW RULES
 ===================================================
@@ -5594,6 +5594,8 @@ OUTPUT FORMAT (STRICT JSON)
   "address": "string or null"
 }}
 """
+        system_prompt = system_prompt.replace("{today_date_str}", today_date_str)
+        system_prompt = system_prompt.replace("{today_weekday}", today_weekday)
 
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -5602,6 +5604,7 @@ OUTPUT FORMAT (STRICT JSON)
                 {"role": "user", "content": inbound_text},
             ],
         )
+
 
         return json.loads(completion.choices[0].message.content)
 
