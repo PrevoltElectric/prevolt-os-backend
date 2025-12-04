@@ -397,6 +397,17 @@ def generate_reply_for_inbound(
     phone = request.form.get("From", "").replace("whatsapp:", "")
     inbound_lower = inbound_text.strip().lower()
 
+    # ===============================================================
+    # PBM — POST-BOOKING MODE (AFTER FINAL CONFIRMATION)
+    # ===============================================================
+    if conversations.get(phone, {}).get("final_confirmation_sent") is True:
+        # Still respond to customers — just no scheduling logic.
+        return {
+            "sms_body": "Got it — we’ll see you then.",
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
 
     # ===============================================================
     # 1) IMMEDIATE-ARRIVAL LOGIC (NON-EMERGENCY)
@@ -442,6 +453,8 @@ def generate_reply_for_inbound(
             "address": address,
         })
 
+        conversations[phone]["final_confirmation_sent"] = True
+
         return {
             "sms_body": (
                 "You're all set — we’ll head out shortly. "
@@ -451,8 +464,6 @@ def generate_reply_for_inbound(
             "scheduled_time": scheduled_time,
             "address": address,
         }
-
-
 
     # ===============================================================
     # 2) EMERGENCY LOGIC
@@ -505,6 +516,7 @@ def generate_reply_for_inbound(
             }
 
         maybe_create_square_booking(phone, conversations[phone])
+        conversations[phone]["final_confirmation_sent"] = True
 
         return {
             "sms_body": (
@@ -516,7 +528,6 @@ def generate_reply_for_inbound(
             "scheduled_time": scheduled_time,
             "address": address,
         }
-
 
     # ===============================================================
     # 3) NON-EMERGENCY: “I’m home today” LOGIC
@@ -533,7 +544,6 @@ def generate_reply_for_inbound(
 
     if any(term in inbound_lower for term in home_today_terms):
 
-        # Must have address first (cannot search availability without location)
         if not address:
             return {
                 "sms_body": (
@@ -545,13 +555,9 @@ def generate_reply_for_inbound(
                 "address": None,
             }
 
-        # -------------------------------------------
-        # Check same-day availability from Square
-        # -------------------------------------------
         slot = get_today_available_slot(appointment_type)
 
         if slot is None:
-            # No openings today → find next available day
             nxt = get_next_available_day_slot(appointment_type)
 
             if nxt is None:
@@ -565,7 +571,6 @@ def generate_reply_for_inbound(
                     "address": address,
                 }
 
-            # A future opening exists
             return {
                 "sms_body": (
                     f"We’re booked up for today, but our next opening is "
@@ -576,9 +581,6 @@ def generate_reply_for_inbound(
                 "address": address,
             }
 
-        # -------------------------------------------
-        # Today DOES have an appointment slot
-        # -------------------------------------------
         conversations.setdefault(phone, {})
         conversations[phone]["scheduled_date"] = today_date_str
         conversations[phone]["scheduled_time"] = slot
@@ -586,8 +588,7 @@ def generate_reply_for_inbound(
 
         return {
             "sms_body": (
-                f"We have an opening today at {slot}. "
-                "Does that time work for you?"
+                f"We have an opening today at {slot}. Does that time work for you?"
             ),
             "scheduled_date": today_date_str,
             "scheduled_time": slot,
@@ -597,13 +598,13 @@ def generate_reply_for_inbound(
     # ===============================================================
     # 4) AUTOBOOK FINAL CONFIRMATION
     # ===============================================================
- 
     if (
         scheduled_date
         and scheduled_time
         and address
         and conversations.get(phone, {}).get("autobooked") is True
     ):
+        conversations[phone]["final_confirmation_sent"] = True
         return {
             "sms_body": (
                 f"You're all set — we’ve scheduled your visit for {scheduled_date} at {scheduled_time}. "
@@ -613,6 +614,7 @@ def generate_reply_for_inbound(
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
 
 
 
