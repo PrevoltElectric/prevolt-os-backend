@@ -401,7 +401,6 @@ def generate_reply_for_inbound(
     # PBM — POST-BOOKING MODE (AFTER FINAL CONFIRMATION)
     # ===============================================================
     if conversations.get(phone, {}).get("final_confirmation_sent") is True:
-        # Still respond to customers — just no scheduling logic.
         return {
             "sms_body": "Got it — we’ll see you then.",
             "scheduled_date": scheduled_date,
@@ -421,7 +420,21 @@ def generate_reply_for_inbound(
 
     if any(term in inbound_lower for term in immediate_terms):
 
-        # round to next 5 minutes
+        # Mark that we're waiting for an address (new fix)
+        if not address:
+            conversations.setdefault(phone, {})
+            conversations[phone]["awaiting_immediate_address"] = True
+            return {
+                "sms_body": (
+                    "Got it — we can send someone out shortly. "
+                    "What’s the address where we’re heading?"
+                ),
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": None,
+            }
+
+        # Address already known → proceed immediately
         minute = (now_local.minute + 4) // 5 * 5
         if minute == 60:
             now_local = now_local.replace(hour=now_local.hour + 1, minute=0)
@@ -436,17 +449,6 @@ def generate_reply_for_inbound(
         conversations[phone]["scheduled_date"] = scheduled_date
         conversations[phone]["autobooked"] = True
 
-        if not address:
-            return {
-                "sms_body": (
-                    "Got it — we can send someone out shortly. "
-                    "What’s the address where we’re heading?"
-                ),
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": None,
-            }
-
         maybe_create_square_booking(phone, {
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
@@ -458,6 +460,47 @@ def generate_reply_for_inbound(
         return {
             "sms_body": (
                 "You're all set — we’ll head out shortly. "
+                "A Square confirmation will follow."
+            ),
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+    # ===============================================================
+    # 1B) IMMEDIATE-ARRIVAL FOLLOW-UP (address arrives AFTER the fact)
+    # ===============================================================
+    if (
+        conversations.get(phone, {}).get("awaiting_immediate_address") is True
+        and address
+    ):
+        conversations[phone]["awaiting_immediate_address"] = False
+
+        # Round time
+        minute = (now_local.minute + 4) // 5 * 5
+        if minute == 60:
+            now_local = now_local.replace(hour=now_local.hour + 1, minute=0)
+        else:
+            now_local = now_local.replace(minute=minute)
+
+        scheduled_time = now_local.strftime("%H:%M")
+        scheduled_date = today_date_str
+
+        conversations[phone]["scheduled_date"] = scheduled_date
+        conversations[phone]["scheduled_time"] = scheduled_time
+        conversations[phone]["autobooked"] = True
+
+        maybe_create_square_booking(phone, {
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        })
+
+        conversations[phone]["final_confirmation_sent"] = True
+
+        return {
+            "sms_body": (
+                f"You're all set — we’ll head out shortly for your service call at {scheduled_time}. "
                 "A Square confirmation will follow."
             ),
             "scheduled_date": scheduled_date,
@@ -614,6 +657,7 @@ def generate_reply_for_inbound(
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
 
     # ===============================================================
     # 5) NON-EMERGENCY LLM FLOW  (PBM-AWARE)
