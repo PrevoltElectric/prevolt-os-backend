@@ -397,14 +397,13 @@ def generate_reply_for_inbound(
     phone = request.form.get("From", "").replace("whatsapp:", "")
     inbound_lower = inbound_text.strip().lower()
 
-    # Make sure we have a dict for this phone
+    # ensure dict exists
     conversations.setdefault(phone, {})
 
     # ===============================================================
-    # PBM — POST-BOOKING MODE (AFTER FINAL CONFIRMATION)
+    # PBM — POST-BOOKING MODE
     # ===============================================================
-    if conversations.get(phone, {}).get("final_confirmation_sent") is True:
-        # Still respond to customers — just no scheduling logic.
+    if conversations[phone].get("final_confirmation_sent") is True:
         return {
             "sms_body": "Got it — we’ll see you then.",
             "scheduled_date": scheduled_date,
@@ -413,7 +412,7 @@ def generate_reply_for_inbound(
         }
 
     # ===============================================================
-    # 1) IMMEDIATE-ARRIVAL LOGIC (NON-EMERGENCY)
+    # 1) IMMEDIATE-ARRIVAL LOGIC
     # ===============================================================
     immediate_terms = [
         "now", "right now", "im home now", "i am home now", "home now",
@@ -440,15 +439,13 @@ def generate_reply_for_inbound(
 
         if not address:
             return {
-                "sms_body": (
-                    "Got it — we can send someone out shortly. "
-                    "What’s the address where we’re heading?"
-                ),
+                "sms_body": "Got it — we can send someone out shortly. What’s the address?",
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
                 "address": None,
             }
 
+        # book once
         maybe_create_square_booking(phone, {
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
@@ -458,10 +455,7 @@ def generate_reply_for_inbound(
         conversations[phone]["final_confirmation_sent"] = True
 
         return {
-            "sms_body": (
-                "You're all set — we’ll head out shortly. "
-                "A Square confirmation will follow."
-            ),
+            "sms_body": "You're all set — we’ll head out shortly. A Square confirmation will follow.",
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
             "address": address,
@@ -470,22 +464,21 @@ def generate_reply_for_inbound(
     # ===============================================================
     # 2) EMERGENCY LOGIC
     # ===============================================================
-    emergency_indicators = [
-        "no power", "partial power", "tree hit", "tree took",
-        "tree took my wires", "wires pulled off", "power line down",
-        "burning smell", "smoke smell", "fire", "sparks",
-        "melted outlet", "melted plug", "buzzing panel",
-        "arcing", "breaker arcing", "breaker won't reset",
-        "breaker wont reset",
+    emergency_keywords = [
+        "no power", "partial power", "tree hit", "tree took", "tree took my wires",
+        "wires pulled off", "power line down", "burning smell", "smoke smell",
+        "fire", "sparks", "melted outlet", "melted plug", "buzzing panel",
+        "arcing", "breaker arcing", "breaker won't reset", "breaker wont reset"
     ]
 
-    is_emergency = (
-        appointment_type == "TROUBLESHOOT_395"
-        and any(term in inbound_lower for term in emergency_indicators)
-    )
+    is_emergency = any(term in inbound_lower for term in emergency_keywords)
 
     if is_emergency:
 
+        # override appointment_type → ALWAYS troubleshoot
+        appointment_type = "TROUBLESHOOT_395"
+
+        # compute travel time if possible
         travel_minutes = None
         addr_struct = conversations.get(phone, {}).get("normalized_address")
 
@@ -506,23 +499,19 @@ def generate_reply_for_inbound(
 
         if not address:
             return {
-                "sms_body": (
-                    "Got it — we’ll prioritize this right away. "
-                    f"We can have a tech out around {scheduled_time}. "
-                    "What’s the address where we’re heading?"
-                ),
+                "sms_body": f"Got it — we’ll prioritize this. We can have a tech out around {scheduled_time}. What’s the address?",
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
                 "address": None,
             }
 
+        # book once
         maybe_create_square_booking(phone, conversations[phone])
         conversations[phone]["final_confirmation_sent"] = True
 
         return {
             "sms_body": (
-                f"You're all set — we’ve scheduled your emergency troubleshoot visit "
-                f"for about {scheduled_time}. We’ll head out shortly. "
+                f"You're all set — emergency troubleshoot scheduled for about {scheduled_time}. "
                 "A Square confirmation will follow."
             ),
             "scheduled_date": scheduled_date,
@@ -534,82 +523,57 @@ def generate_reply_for_inbound(
     # 3) NON-EMERGENCY: “I’m home today / free all day” LOGIC
     # ===============================================================
     home_today_terms = [
-        "im home today", "i am home today", "home today",
-        "around today", "available today",
-        "any time today", "anytime today", "today works",
+        "im home today", "i am home today", "home today", "around today",
+        "available today", "any time today", "anytime today", "today works",
         "im flexible today", "i am flexible today", "flexible today",
-        "whenever today", "any time is fine", "any time is okay",
-        "any time works", "anytime works",
-        "i'm free today", "i am free today", "free today",
-        # extra real-world phrases you actually used
-        "im free all day", "i am free all day", "free all day",
-        "im home all day", "i am home all day", "home all day",
-        "any time", "anytime",
+        "whenever today", "any time is fine", "any time works",
+        "i'm free today", "free today",
+        "im home all day", "home all day", "free all day",
+        "any time", "anytime"
     ]
 
-    # Has this caller already expressed “home today / free all day” earlier?
-    home_today_intent = conversations.get(phone, {}).get("home_today_intent", False)
+    home_today_intent = conversations[phone].get("home_today_intent", False)
 
-    # If this message contains one of the phrases, lock in the intent.
     if any(term in inbound_lower for term in home_today_terms):
         home_today_intent = True
         conversations[phone]["home_today_intent"] = True
 
     if home_today_intent:
-        # Must have address first (cannot search availability without location)
+
         if not address:
             return {
-                "sms_body": (
-                    "Got it — are you home today at the property? "
-                    "What’s the address where we’d be heading?"
-                ),
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
+                "sms_body": "Got it — are you home today at the property? What’s the address?",
+                "scheduled_date": None,
+                "scheduled_time": None,
                 "address": None,
             }
 
-        # -------------------------------------------
-        # Check same-day availability from Square
-        # -------------------------------------------
         slot = get_today_available_slot(appointment_type)
 
         if slot is None:
-            # No openings today → find next available day
             nxt = get_next_available_day_slot(appointment_type)
-
             if nxt is None:
                 return {
-                    "sms_body": (
-                        "We’re booked solid for the next several days. "
-                        "Would you like us to notify you if something opens sooner?"
-                    ),
+                    "sms_body": "We’re booked solid for several days. Want us to notify you if something opens?",
                     "scheduled_date": None,
                     "scheduled_time": None,
                     "address": address,
                 }
 
-            # A future opening exists
             return {
-                "sms_body": (
-                    f"We’re booked up for today, but our next opening is "
-                    f"{nxt['date']} at {nxt['time']}. Does that work for you?"
-                ),
+                "sms_body": f"We’re booked today, but next opening is {nxt['date']} at {nxt['time']}. Does that work?",
                 "scheduled_date": None,
                 "scheduled_time": None,
                 "address": address,
             }
 
-        # -------------------------------------------
-        # Today DOES have an appointment slot
-        # -------------------------------------------
+        # slot exists today → propose it
         conversations[phone]["scheduled_date"] = today_date_str
         conversations[phone]["scheduled_time"] = slot
         conversations[phone]["autobooked"] = True
 
         return {
-            "sms_body": (
-                f"We have an opening today at {slot}. Does that time work for you?"
-            ),
+            "sms_body": f"We have an opening today at {slot}. Does that time work for you?",
             "scheduled_date": today_date_str,
             "scheduled_time": slot,
             "address": address,
@@ -622,9 +586,10 @@ def generate_reply_for_inbound(
         scheduled_date
         and scheduled_time
         and address
-        and conversations.get(phone, {}).get("autobooked") is True
+        and conversations[phone].get("autobooked") is True
     ):
         conversations[phone]["final_confirmation_sent"] = True
+
         return {
             "sms_body": (
                 f"You're all set — we’ve scheduled your visit for {scheduled_date} at {scheduled_time}. "
@@ -639,55 +604,32 @@ def generate_reply_for_inbound(
     # 5) NON-EMERGENCY LLM FLOW
     # ===============================================================
     system_prompt = f"""
-You are Prevolt OS, the SMS assistant for Prevolt Electric.
-Continue the conversation naturally.
+    You are Prevolt OS, the SMS assistant for Prevolt Electric.
+    Continue the conversation naturally.
 
-Today is {today_date_str}, a {today_weekday}, local time America/New_York.
+    Today is {today_date_str}, a {today_weekday}, local time America/New_York.
 
-===================================================
-STRICT CONVERSATION FLOW RULES
-===================================================
-1. NEVER repeat a question already asked.
-2. NEVER restart the conversation.
-3. NEVER ask again for date, time, or address if already collected.
-4. NEVER restate prices.
-5. ALWAYS move the conversation forward.
-6. If customer gives date AND time → accept once.
-7. If customer gives address → accept once.
-8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
-9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
-10. No AI mentions. No quoting their text.
-11. Keep messages short and human.
+    STRICT CONVERSATION RULES:
+    1. Never repeat a question already asked.
+    2. Never restart the conversation.
+    3. Never ask again for date/time/address if already collected.
+    4. Never restate prices.
+    5. Always move the conversation forward.
+    6. If customer gives date + time → accept once.
+    7. If customer gives address → accept once.
+    8. If date + time + address exist → send final confirmation with no question mark.
+    9. After “yes / sounds good / confirmed” → send nothing further.
+    10. No AI mentions. Keep messages short and human.
 
-===================================================
-MASTER PRIORITIZATION LAYER (MPL)
-===================================================
-{MPL_RULES}
+    CONTEXT:
+    Voicemail: {cleaned_transcript}
+    Category: {category}
+    Appointment type: {appointment_type}
+    Initial SMS: {initial_sms}
+    Stored: {scheduled_date}, {scheduled_time}, {address}
 
-===================================================
-SCHEDULING RULES — FINAL (SRB-1 → SRB-20)
-===================================================
-{SCHEDULING_RULES}
-
-===================================================
-CONTEXT
-===================================================
-Original voicemail: {cleaned_transcript}
-Category: {category}
-Appointment type: {appointment_type}
-Initial SMS: {initial_sms}
-Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
-
-===================================================
-OUTPUT FORMAT (STRICT JSON)
-===================================================
-{{
-  "sms_body": "...",
-  "scheduled_date": "YYYY-MM-DD or null",
-  "scheduled_time": "HH:MM or null",
-  "address": "string or null"
-}}
-"""
+    JSON FORMAT ONLY.
+    """
 
     completion = openai_client.chat.completions.create(
         model="gpt-4.1-mini",
@@ -699,139 +641,6 @@ OUTPUT FORMAT (STRICT JSON)
 
     return json.loads(completion.choices[0].message.content)
 
-
-    # ===============================================================
-    # 5B) NORMAL LLM MODE (PRE-BOOKING or PBM OFF)
-    # ===============================================================
-
-    system_prompt = f"""
-You are Prevolt OS, the SMS assistant for Prevolt Electric.
-Continue the conversation naturally.
-
-Today is {today_date_str}, a {today_weekday}, local time America/New_York.
-
-===================================================
-STRICT CONVERSATION FLOW RULES
-===================================================
-1. NEVER repeat a question already asked.
-2. NEVER restart the conversation.
-3. NEVER ask again for date, time, or address if already collected.
-4. NEVER restate prices.
-5. ALWAYS move the conversation forward.
-6. If customer gives date AND time → accept once.
-7. If customer gives address → accept once.
-8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
-9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
-10. No AI mentions. No quoting their text.
-11. Keep messages short and human.
-
-===================================================
-MASTER PRIORITIZATION LAYER (MPL)
-===================================================
-{MPL_RULES}
-
-===================================================
-SCHEDULING RULES — FINAL (SRB-1 → SRB-20)
-===================================================
-{SCHEDULING_RULES}
-
-===================================================
-CONTEXT
-===================================================
-Original voicemail: {cleaned_transcript}
-Category: {category}
-Appointment type: {appointment_type}
-Initial SMS: {initial_sms}
-Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
-
-===================================================
-OUTPUT FORMAT (STRICT JSON)
-===================================================
-{{
-  "sms_body": "...",
-  "scheduled_date": "YYYY-MM-DD or null",
-  "scheduled_time": "HH:MM or null",
-  "address": "string or null"
-}}
-"""
-
-    completion = openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": inbound_text},
-        ],
-    )
-
-    reply = json.loads(completion.choices[0].message.content)
-
-    return reply
-
-
-
-    # ===============================================================
-    # 5) NON-EMERGENCY LLM FLOW
-    # ===============================================================
-    system_prompt = f"""
-You are Prevolt OS, the SMS assistant for Prevolt Electric.
-Continue the conversation naturally.
-
-Today is {today_date_str}, a {today_weekday}, local time America/New_York.
-
-===================================================
-STRICT CONVERSATION FLOW RULES
-===================================================
-1. NEVER repeat a question already asked.
-2. NEVER restart the conversation.
-3. NEVER ask again for date, time, or address if already collected.
-4. NEVER restate prices.
-5. ALWAYS move the conversation forward.
-6. If customer gives date AND time → accept once.
-7. If customer gives address → accept once.
-8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
-9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
-10. No AI mentions. No quoting their text.
-11. Keep messages short and human.
-
-===================================================
-MASTER PRIORITIZATION LAYER (MPL)
-===================================================
-{MPL_RULES}
-
-===================================================
-SCHEDULING RULES — FINAL (SRB-1 → SRB-20)
-===================================================
-{SCHEDULING_RULES}
-
-===================================================
-CONTEXT
-===================================================
-Original voicemail: {cleaned_transcript}
-Category: {category}
-Appointment type: {appointment_type}
-Initial SMS: {initial_sms}
-Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
-
-===================================================
-OUTPUT FORMAT (STRICT JSON)
-===================================================
-{{
-  "sms_body": "...",
-  "scheduled_date": "YYYY-MM-DD or null",
-  "scheduled_time": "HH:MM or null",
-  "address": "string or null"
-}}
-"""
-
-    completion = openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": inbound_text},
-        ],
-    )
-
-    return json.loads(completion.choices[0].message.content)
 
 
 # ===================================================
