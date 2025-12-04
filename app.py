@@ -469,8 +469,6 @@ def normalize_possible_address(text: str):
     '12B Greenbrier Drive'
     '110 maple road'
     '55 Elm St'
-
-    Returns dict or None.
     """
     if not text:
         return None
@@ -516,6 +514,7 @@ You are Prevolt OS, the SMS assistant for Prevolt Electric.
 (Your full existing master prompt remains unchanged)
 """
 
+
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) — OPTIMIZED
 # ---------------------------------------------------
@@ -551,6 +550,38 @@ def generate_reply_for_inbound(
             "address": conversations[phone].get("address"),
         }
 
+
+    # ===============================================================
+    # UNIVERSAL STATE CLEANUP  (THIS IS THE NEW BLOCK)
+    # ===============================================================
+    if is_customer_confirmation(inbound_lower):
+
+        # Only treat “yes/ok/perfect” as FINAL confirmation
+        # if a date, time, and address ALREADY exist.
+        if (
+            conversations[phone].get("scheduled_date")
+            and conversations[phone].get("scheduled_time")
+            and conversations[phone].get("address")
+        ):
+            # If Square booking NOT created yet, create it now
+            if not conversations[phone].get("final_confirmation_sent"):
+                maybe_create_square_booking(phone, {
+                    "scheduled_date": conversations[phone]["scheduled_date"],
+                    "scheduled_time": conversations[phone]["scheduled_time"],
+                    "address": conversations[phone]["address"],
+                })
+
+            conversations[phone]["final_confirmation_sent"] = True
+
+            return {
+                "sms_body": "Perfect — you're all set. We’ll see you then.",
+                "scheduled_date": conversations[phone]["scheduled_date"],
+                "scheduled_time": conversations[phone]["scheduled_time"],
+                "address": conversations[phone]["address"],
+            }
+
+        # Otherwise, customer replied too early → ignore and continue.
+        # DO NOT return — let logic flow into Step 1, 2, 3, etc.
 
 
     # ===============================================================
@@ -599,6 +630,7 @@ def generate_reply_for_inbound(
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
 
     # ===============================================================
     # 2) EMERGENCY LOGIC
@@ -655,6 +687,7 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
+
     # ===============================================================
     # 3) HOME TODAY / FREE ALL DAY LOGIC
     # ===============================================================
@@ -691,7 +724,6 @@ def generate_reply_for_inbound(
                     "address": address,
                 }
 
-            # IMPORTANT — tuple unpacking FIX
             nxt_date, nxt_time = nxt
 
             return {
@@ -712,6 +744,7 @@ def generate_reply_for_inbound(
             "scheduled_time": slot,
             "address": address,
         }
+
 
     # ===============================================================
     # 4) AUTOBOOK FINAL CONFIRMATION
@@ -737,8 +770,9 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
+
     # ===============================================================
-    # 5) LLM MODE (SAFE)
+    # 5) LLM MODE
     # ===============================================================
     system_prompt = build_llm_prompt(
         cleaned_transcript,
@@ -761,6 +795,8 @@ def generate_reply_for_inbound(
     )
 
     return json.loads(completion.choices[0].message.content)
+
+
 
 
 
