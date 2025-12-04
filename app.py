@@ -308,6 +308,7 @@ def generate_reply_for_inbound(
 
     if any(term in inbound_lower for term in immediate_terms):
 
+        # round to next 5 minutes
         minute = (now_local.minute + 4) // 5 * 5
         if minute == 60:
             now_local = now_local.replace(hour=now_local.hour + 1, minute=0)
@@ -320,6 +321,7 @@ def generate_reply_for_inbound(
         conversations.setdefault(phone, {})
         conversations[phone]["scheduled_time"] = scheduled_time
         conversations[phone]["scheduled_date"] = scheduled_date
+        conversations[phone]["autobooked"] = True   # <<< ADD
 
         if not address:
             return {
@@ -387,6 +389,7 @@ def generate_reply_for_inbound(
         conversations.setdefault(phone, {})
         conversations[phone]["scheduled_date"] = scheduled_date
         conversations[phone]["scheduled_time"] = scheduled_time
+        conversations[phone]["autobooked"] = True   # <<< ADD
 
         if not address:
             return {
@@ -407,6 +410,25 @@ def generate_reply_for_inbound(
                 f"You're all set — we’ve scheduled your emergency troubleshoot visit "
                 f"for about {scheduled_time}. We’ll head out shortly. "
                 "A Square confirmation will follow."
+            ),
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+    # ---------------------------------------------------
+    # AUTOBOOK FINAL CONFIRMATION (prevents loops)
+    # ---------------------------------------------------
+    if (
+        scheduled_date
+        and scheduled_time
+        and address
+        and conversations.get(phone, {}).get("autobooked") is True
+    ):
+        return {
+            "sms_body": (
+                f"You're all set — we’ve scheduled your visit for {scheduled_date} at {scheduled_time}. "
+                "A Square confirmation will follow shortly."
             ),
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
