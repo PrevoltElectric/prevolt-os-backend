@@ -275,6 +275,107 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 
 # ---------------------------------------------------
+# NON-EMERGENCY SAME-DAY AVAILABILITY HELPERS
+# ---------------------------------------------------
+
+def get_today_available_slot(appointment_type: str) -> str | None:
+    """
+    Returns the earliest available HH:MM time slot TODAY from Square calendar.
+    Returns None if there is no remaining availability today.
+    """
+
+    try:
+        # This function calls your existing Square query helper:
+        # get_square_availability(date_str, appointment_type)
+        # which MUST already exist in your project.
+
+        tz = ZoneInfo("America/New_York")
+        now_local = datetime.now(tz)
+        today = now_local.strftime("%Y-%m-%d")
+
+        slots = get_square_availability(today, appointment_type)
+
+        if not slots:
+            return None
+
+        # Filter out times that have already passed today
+        valid = []
+        for t in slots:
+            slot_dt = datetime.strptime(f"{today} {t}", "%Y-%m-%d %H:%M")
+            if slot_dt > now_local:
+                valid.append(t)
+
+        if not valid:
+            return None
+
+        # Earliest valid slot
+        return sorted(valid)[0]
+
+    except Exception as e:
+        print("get_today_available_slot FAILED:", repr(e))
+        return None
+
+
+
+def get_next_available_day_slot(appointment_type: str) -> tuple[str, str] | None:
+    """
+    Finds the next day with ANY availability.
+    Returns tuple: (YYYY-MM-DD, HH:MM)
+    Returns None if totally unavailable (rare).
+    """
+
+    try:
+        tz = ZoneInfo("America/New_York")
+        now_local = datetime.now(tz)
+
+        for offset in range(1, 10):  # search next 10 days max
+            day = (now_local + timedelta(days=offset)).strftime("%Y-%m-%d")
+            slots = get_square_availability(day, appointment_type)
+
+            if slots:
+                early = sorted(slots)[0]
+                return (day, early)
+
+        return None
+
+    except Exception as e:
+        print("get_next_available_day_slot FAILED:", repr(e))
+        return None
+
+
+
+
+# ---------------------------------------------------
+# EMERGENCY TRAVEL-TIME ARRIVAL (ALREADY IN YOUR CODE)
+# ---------------------------------------------------
+
+def compute_emergency_arrival_time(now_local, travel_minutes):
+    """
+    Maintains your existing emergency logic.
+    Always rounds to next 5-minute mark.
+    """
+    if travel_minutes is None:
+        travel_minutes = 20
+
+    eta = now_local + timedelta(minutes=travel_minutes)
+
+    minute = (eta.minute + 4) // 5 * 5
+    if minute == 60:
+        eta = eta.replace(hour=eta.hour+1, minute=0)
+    else:
+        eta = eta.replace(minute=minute)
+
+    return eta.strftime("%H:%M")
+
+
+
+# ====================================================================
+# ====================================================================
+#                    >>>>>  SECTION 4 FULLY PATCHED  <<<<<
+# ====================================================================
+# ====================================================================
+
+# ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN)
 # ---------------------------------------------------
 def generate_reply_for_inbound(
@@ -296,9 +397,10 @@ def generate_reply_for_inbound(
     phone = request.form.get("From", "").replace("whatsapp:", "")
     inbound_lower = inbound_text.strip().lower()
 
-    # ---------------------------------------------------
-    # IMMEDIATE-ARRIVAL LOGIC ("NOW", "ASAP", "I'M HOME NOW")
-    # ---------------------------------------------------
+
+    # ===============================================================
+    # 1) IMMEDIATE-ARRIVAL LOGIC (NON-EMERGENCY)
+    # ===============================================================
     immediate_terms = [
         "now", "right now", "im home now", "i am home now", "home now",
         "asap", "as soon as possible", "come now", "come asap",
@@ -321,7 +423,7 @@ def generate_reply_for_inbound(
         conversations.setdefault(phone, {})
         conversations[phone]["scheduled_time"] = scheduled_time
         conversations[phone]["scheduled_date"] = scheduled_date
-        conversations[phone]["autobooked"] = True   # <<< ADD
+        conversations[phone]["autobooked"] = True
 
         if not address:
             return {
@@ -350,9 +452,11 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
-    # ---------------------------------------------------
-    # Emergency indicators (MEDIUM sensitivity)
-    # ---------------------------------------------------
+
+
+    # ===============================================================
+    # 2) EMERGENCY LOGIC
+    # ===============================================================
     emergency_indicators = [
         "no power", "partial power", "tree hit", "tree took",
         "tree took my wires", "wires pulled off", "power line down",
@@ -367,9 +471,6 @@ def generate_reply_for_inbound(
         and any(term in inbound_lower for term in emergency_indicators)
     )
 
-    # ---------------------------------------------------
-    # EMERGENCY LOGIC
-    # ---------------------------------------------------
     if is_emergency:
 
         travel_minutes = None
@@ -389,7 +490,7 @@ def generate_reply_for_inbound(
         conversations.setdefault(phone, {})
         conversations[phone]["scheduled_date"] = scheduled_date
         conversations[phone]["scheduled_time"] = scheduled_time
-        conversations[phone]["autobooked"] = True   # <<< ADD
+        conversations[phone]["autobooked"] = True
 
         if not address:
             return {
@@ -416,9 +517,74 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
-    # ---------------------------------------------------
-    # AUTOBOOK FINAL CONFIRMATION (prevents loops)
-    # ---------------------------------------------------
+
+
+    # ===============================================================
+    # 3) NON-EMERGENCY: “I’m home today” LOGIC
+    # ===============================================================
+    home_today_terms = [
+        "im home today", "i am home today", "home today", 
+        "around today", "available today"
+    ]
+
+    if any(term in inbound_lower for term in home_today_terms):
+
+        # Must have address first (cannot search availability without location)
+        if not address:
+            return {
+                "sms_body": (
+                    "Got it — are you home today at the property? "
+                    "What’s the address where we’d be heading?"
+                ),
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": None,
+            }
+
+        # Get today's availability from Square
+        slot = get_today_available_slot(appointment_type)
+
+        if slot is None:
+            # No openings today → find next available day
+            nxt = get_next_available_day_slot(appointment_type)
+
+            if nxt is None:
+                return {
+                    "sms_body": (
+                        "We’re booked solid for the next several days. "
+                        "Would you like us to notify you if something opens sooner?"
+                    ),
+                    "scheduled_date": None,
+                    "scheduled_time": None,
+                    "address": address,
+                }
+
+            next_day, next_time = nxt
+            return {
+                "sms_body": (
+                    f"We’re booked for today, but our next opening is {next_day} at {next_time}. "
+                    "Does that work for you?"
+                ),
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": address,
+            }
+
+        # Slot exists → propose it
+        return {
+            "sms_body": (
+                f"We can fit you in today at {slot}. Does that work for you?"
+            ),
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": address,
+        }
+
+
+
+    # ===============================================================
+    # 4) AUTOBOOK FINAL CONFIRMATION
+    # ===============================================================
     if (
         scheduled_date
         and scheduled_time
@@ -435,9 +601,11 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
-    # ---------------------------------------------------
-    # NON-EMERGENCY FLOW (LLM)
-    # ---------------------------------------------------
+
+
+    # ===============================================================
+    # 5) NON-EMERGENCY LLM FLOW
+    # ===============================================================
     system_prompt = f"""
 You are Prevolt OS, the SMS assistant for Prevolt Electric.
 Continue the conversation naturally.
