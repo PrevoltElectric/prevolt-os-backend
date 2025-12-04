@@ -152,6 +152,39 @@ def transcribe_recording(recording_url: str) -> str:
 
     return transcript.text.strip()
 
+# ---------------------------------------------------
+# Step 2 — Cleanup (improve clarity)
+# ---------------------------------------------------
+def clean_transcript_text(raw_text: str) -> str:
+    """
+    Cleans up a voicemail transcript:
+    - Fix obvious Whisper mistakes
+    - Keep electrical terminology intact
+    - Keep all facts (name, location, issue)
+    - NEVER add or invent details
+    - Make it easier for the AI to extract the emergency information
+    """
+    try:
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You clean up voicemail transcriptions for an electrical contractor. "
+                        "Fix obvious transcription mistakes, preserve electrical terminology, "
+                        "improve grammar slightly, but DO NOT add or infer information. "
+                        "Preserve all names, addresses, symptoms, and urgency keywords exactly."
+                    ),
+                },
+                {"role": "user", "content": raw_text},
+            ],
+        )
+        return completion.choices[0].message.content.strip()
+
+    except Exception as e:
+        print("Cleanup FAILED:", repr(e))
+        return raw_text
 
 
 # ---------------------------------------------------
