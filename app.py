@@ -615,6 +615,150 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
+    # ===============================================================
+    # 5) NON-EMERGENCY LLM FLOW  (PBM-AWARE)
+    # ===============================================================
+
+    # ---- Detect if Post-Booking Mode should be active ----
+    pbm = conversations.get(phone, {}).get("post_booking_mode", False)
+
+    # ---- Expire PBM automatically after 24 hours ----
+    last_booking = conversations.get(phone, {}).get("last_booking_timestamp")
+    if last_booking:
+        elapsed = (now_local - last_booking).total_seconds()
+        if elapsed > 86400:  # 24 hours
+            conversations[phone]["post_booking_mode"] = False
+            pbm = False
+
+    # ---- If PBM is active, route messages differently ----
+    if pbm is True:
+
+        # Customer may ask normal questions after booking.
+        # We answer normally but do NOT re-enter scheduling logic.
+        safe_questions = [
+            "thank you", "thanks", "appreciate it",
+            "do i need to", "should i", "will the tech",
+            "can i", "is it ok if", "do you take",
+            "payment", "weather", "driveway", "dog",
+            "gate", "instructions", "prep"
+        ]
+
+        if any(q in inbound_lower for q in safe_questions):
+            return {
+                "sms_body": (
+                    "You're all set — and we’ll take care of everything when we arrive. "
+                    "If you need anything before then, just text me here."
+                ),
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": address,
+            }
+
+        # If customer tries to change or reschedule:
+        if "reschedule" in inbound_lower or "different time" in inbound_lower:
+            conversations[phone]["post_booking_mode"] = False  # exit PBM
+            return {
+                "sms_body": (
+                    "No problem — what time works better?"
+                ),
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": address,
+            }
+
+        # If customer indicates “new issue”
+        new_issue_terms = [
+            "another issue", "new issue", "separate issue",
+            "different problem", "something else"
+        ]
+        if any(t in inbound_lower for t in new_issue_terms):
+            conversations[phone]["post_booking_mode"] = False
+            return {
+                "sms_body": (
+                    "Got it — what’s going on with the new issue?"
+                ),
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": None,
+            }
+
+        # Default PBM fallback
+        return {
+            "sms_body": (
+                "All set — we’ll see you at your scheduled time. "
+                "If anything changes, just text me here."
+            ),
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+    # ===============================================================
+    # 5B) NORMAL LLM MODE (PRE-BOOKING or PBM OFF)
+    # ===============================================================
+
+    system_prompt = f"""
+You are Prevolt OS, the SMS assistant for Prevolt Electric.
+Continue the conversation naturally.
+
+Today is {today_date_str}, a {today_weekday}, local time America/New_York.
+
+===================================================
+STRICT CONVERSATION FLOW RULES
+===================================================
+1. NEVER repeat a question already asked.
+2. NEVER restart the conversation.
+3. NEVER ask again for date, time, or address if already collected.
+4. NEVER restate prices.
+5. ALWAYS move the conversation forward.
+6. If customer gives date AND time → accept once.
+7. If customer gives address → accept once.
+8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
+9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
+10. No AI mentions. No quoting their text.
+11. Keep messages short and human.
+
+===================================================
+MASTER PRIORITIZATION LAYER (MPL)
+===================================================
+{MPL_RULES}
+
+===================================================
+SCHEDULING RULES — FINAL (SRB-1 → SRB-20)
+===================================================
+{SCHEDULING_RULES}
+
+===================================================
+CONTEXT
+===================================================
+Original voicemail: {cleaned_transcript}
+Category: {category}
+Appointment type: {appointment_type}
+Initial SMS: {initial_sms}
+Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
+
+===================================================
+OUTPUT FORMAT (STRICT JSON)
+===================================================
+{{
+  "sms_body": "...",
+  "scheduled_date": "YYYY-MM-DD or null",
+  "scheduled_time": "HH:MM or null",
+  "address": "string or null"
+}}
+"""
+
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": inbound_text},
+        ],
+    )
+
+    reply = json.loads(completion.choices[0].message.content)
+
+    return reply
 
 
 
