@@ -5749,29 +5749,6 @@ OUTPUT FORMAT (STRICT JSON)
   "address": "string or null"
 }}
 """
-        
-
-        completion = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": inbound_text},
-            ],
-        )
-
-
-        return json.loads(completion.choices[0].message.content)
-
-    except Exception as e:
-        print("Inbound reply FAILED:", repr(e))
-        return {
-            "sms_body": "Got it.",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-        }
-
-
 # ---------------------------------------------------
 # Google Maps helper (travel time)
 # ---------------------------------------------------
