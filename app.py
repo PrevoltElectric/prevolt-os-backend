@@ -5856,8 +5856,7 @@ OUTPUT FORMAT (STRICT JSON)
   "address": "string or null"
 }}
 """
-        system_prompt = system_prompt.replace("{today_date_str}", today_date_str)
-        system_prompt = system_prompt.replace("{today_weekday}", today_weekday)
+        
 
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
