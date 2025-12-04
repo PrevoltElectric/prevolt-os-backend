@@ -540,6 +540,22 @@ def generate_reply_for_inbound(
     conversations.setdefault(phone, {})
 
     # ===============================================================
+    # ADDRESS CAPTURE & NORMALIZATION  (NEW BLOCK — REQUIRED)
+    # ===============================================================
+    if is_customer_address_only(inbound_lower):
+        # Store raw address
+        conversations[phone]["address"] = inbound_text.strip()
+
+        # Attempt normalized version
+        norm = normalize_possible_address(inbound_text)
+        if norm:
+            conversations[phone]["normalized_address"] = norm
+
+        # Update local var so downstream logic sees it
+        address = inbound_text.strip()
+
+
+    # ===============================================================
     # PBM (POST-BOOKING MODE)
     # ===============================================================
     if conversations[phone].get("final_confirmation_sent") is True:
@@ -807,6 +823,7 @@ def generate_reply_for_inbound(
             "scheduled_time": None,
             "address": address,
         }
+
 
 
 
