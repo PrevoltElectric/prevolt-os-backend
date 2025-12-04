@@ -223,14 +223,18 @@ def generate_reply_for_inbound(
 ) -> dict:
 
     try:
+        # ---------------------------------------------------
         # Local date/time for Option A date conversion
+        # ---------------------------------------------------
         if ZoneInfo:
             tz = ZoneInfo("America/New_York")
         else:
             tz = timezone(timedelta(hours=-5))
+
         now_local = datetime.now(tz)
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday = now_local.strftime("%A")
+
         # ---------------------------------------------------
         # Session Reset Logic (prevents ghost-state)
         # ---------------------------------------------------
@@ -240,8 +244,13 @@ def generate_reply_for_inbound(
 
         # Reset if conversation is older than 60 minutes
         if last_time:
-            elapsed_minutes = (now_local - last_time).total_seconds() / 60
-            if elapsed_minutes > 60:
+            try:
+                # Ensure last_time is a datetime
+                elapsed_minutes = (now_local - last_time).total_seconds() / 60
+                if elapsed_minutes > 60:
+                    should_reset = True
+            except Exception:
+                # If corrupted/old format → force reset
                 should_reset = True
 
         # Reset if user signals a brand-new issue
@@ -253,6 +262,7 @@ def generate_reply_for_inbound(
         ]:
             should_reset = True
 
+        # Perform reset if needed
         if should_reset:
             conversations[phone] = {
                 "cleaned_transcript": cleaned_transcript,
