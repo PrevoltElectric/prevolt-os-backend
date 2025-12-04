@@ -517,14 +517,19 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
-
+       }
 
     # ===============================================================
     # 3) NON-EMERGENCY: “I’m home today” LOGIC
     # ===============================================================
     home_today_terms = [
-        "im home today", "i am home today", "home today", 
-        "around today", "available today"
+        "im home today", "i am home today", "home today",
+        "around today", "available today",
+        "any time today", "anytime today", "today works",
+        "im flexible today", "i am flexible today", "flexible today",
+        "whenever today", "any time is fine", "any time is okay",
+        "any time works", "anytime works",
+        "i'm free today", "i am free today", "free today"
     ]
 
     if any(term in inbound_lower for term in home_today_terms):
@@ -541,7 +546,9 @@ def generate_reply_for_inbound(
                 "address": None,
             }
 
-        # Get today's availability from Square
+        # -------------------------------------------
+        # Check same-day availability from Square
+        # -------------------------------------------
         slot = get_today_available_slot(appointment_type)
 
         if slot is None:
@@ -559,32 +566,39 @@ def generate_reply_for_inbound(
                     "address": address,
                 }
 
-            next_day, next_time = nxt
+            # A future opening exists
             return {
                 "sms_body": (
-                    f"We’re booked for today, but our next opening is {next_day} at {next_time}. "
-                    "Does that work for you?"
+                    f"We’re booked up for today, but our next opening is "
+                    f"{nxt['date']} at {nxt['time']}. Does that work for you?"
                 ),
                 "scheduled_date": None,
                 "scheduled_time": None,
                 "address": address,
             }
 
-        # Slot exists → propose it
+        # -------------------------------------------
+        # Today DOES have an appointment slot
+        # -------------------------------------------
+        conversations.setdefault(phone, {})
+        conversations[phone]["scheduled_date"] = today_date_str
+        conversations[phone]["scheduled_time"] = slot
+        conversations[phone]["autobooked"] = True
+
         return {
             "sms_body": (
-                f"We can fit you in today at {slot}. Does that work for you?"
+                f"We have an opening today at {slot}. "
+                "Does that time work for you?"
             ),
-            "scheduled_date": None,
-            "scheduled_time": None,
+            "scheduled_date": today_date_str,
+            "scheduled_time": slot,
             "address": address,
         }
-
-
 
     # ===============================================================
     # 4) AUTOBOOK FINAL CONFIRMATION
     # ===============================================================
+ 
     if (
         scheduled_date
         and scheduled_time
