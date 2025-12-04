@@ -77,6 +77,12 @@ conversations = {}
 #   "state_prompt_sent": bool,
 # }
 
+# ---------------------------------------------------
+# Dispatch origin (fallback starting point for tech)
+# ---------------------------------------------------
+DISPATCH_ORIGIN_ADDRESS = "45 Dickerman Ave, Windsor Locks, CT 06096"
+TECH_CURRENT_ADDRESS = None  # Override dynamically if needed
+
 
 # ---------------------------------------------------
 # Utility: Send outbound message via WhatsApp (testing)
@@ -285,7 +291,6 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         }
 
 
-
 # ---------------------------------------------------
 # Step 3 — Generate Initial SMS
 # ---------------------------------------------------
@@ -349,141 +354,263 @@ def generate_reply_for_inbound(
     address,
 ) -> dict:
 
-    try:
-        # ---------------------------------------------------
-        # Local date/time for Option A date conversion
-        # ---------------------------------------------------
-        if ZoneInfo:
-            tz = ZoneInfo("America/New_York")
-        else:
-            tz = timezone(timedelta(hours=-5))
+    tz = ZoneInfo("America/New_York")
+    now_local = datetime.now(tz)
+    today_date_str = now_local.strftime("%Y-%m-%d")
+    today_weekday = now_local.strftime("%A")
 
-        now_local = datetime.now(tz)
-        today_date_str = now_local.strftime("%Y-%m-%d")
-        today_weekday = now_local.strftime("%A")
+    phone = request.form.get("From", "").replace("whatsapp:", "")
+    inbound_lower = inbound_text.strip().lower()
 
-        # ---------------------------------------------------
-        # Session Reset Logic (prevents ghost-state)
-        # ---------------------------------------------------
-        phone = request.form.get("From", "").replace("whatsapp:", "")
-        last_time = conversations.get(phone, {}).get("first_sms_time")
-        should_reset = False
+    # ---------------------------------------------------
+    # Emergency indicators (MEDIUM sensitivity)
+    # ---------------------------------------------------
+    emergency_indicators = [
+        "no power", "partial power", "tree hit", "tree took",
+        "tree took my wires", "wires pulled off",
+        "power line down", "burning smell", "smoke smell",
+        "fire", "sparks", "melted outlet", "melted plug",
+        "buzzing panel", "arcing", "breaker arcing",
+        "breaker won't reset", "breaker wont reset",
+    ]
 
-        # Reset if the prior conversation is older than 60 minutes
-        if last_time:
-            try:
-                # Safety: ensure last_time is a datetime, not a float
-                elapsed_minutes = (now_local - last_time).total_seconds() / 60
-                if elapsed_minutes > 60:
-                    should_reset = True
-            except Exception:
-                # Corrupted/old format → reset for safety
-                should_reset = True
+    # Does this message describe a REAL emergency?
+    is_emergency = (
+        appointment_type == "TROUBLESHOOT_395"
+        and any(term in inbound_lower for term in emergency_indicators)
+    )
 
-        # Reset if user signals a brand-new issue
-        if inbound_text.strip().lower() in [
-            "hi", "hello", "hey",
-            "new issue", "another issue",
-            "new problem", "i need help",
-            "i have a new problem",
-        ]:
-            should_reset = True
+    # ---------------------------------------------------
+    # EMERGENCY LOGIC
+    # ---------------------------------------------------
+    if is_emergency:
+        travel_minutes = None
+        addr_struct = conversations.get(phone, {}).get("normalized_address")
 
-        # Perform reset if needed
-        if should_reset:
-            conversations[phone] = {
-                "cleaned_transcript": cleaned_transcript,
-                "category": category,
-                "appointment_type": appointment_type,
-                "initial_sms": initial_sms,
-                "first_sms_time": now_local,
-                "replied": False,
-                "followup_sent": False,
-                "scheduled_date": None,
-                "scheduled_time": None,
+        if addr_struct:
+            dest = format_full_address(addr_struct)
+            origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+            if origin:
+                travel_minutes = compute_travel_time_minutes(origin, dest)
+
+        emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
+
+        scheduled_date = today_date_str
+        scheduled_time = emergency_time
+
+        conversations[phone]["scheduled_date"] = scheduled_date
+        conversations[phone]["scheduled_time"] = scheduled_time
+
+        if not address:
+            return {
+                "sms_body": (
+                    "Got it — we’ll prioritize this right away. "
+                    f"We can have a tech out around {scheduled_time}. "
+                    "What’s the address where we’re heading?"
+                ),
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
                 "address": None,
-                "normalized_address": None,
-                "booking_created": False,
-                "square_booking_id": None,
-                "state_prompt_sent": False,
-            }
-                # Perform reset if needed
-        if should_reset:
-            conversations[phone] = {
-                "cleaned_transcript": cleaned_transcript,
-                "category": category,
-                "appointment_type": appointment_type,
-                "initial_sms": initial_sms,
-                "first_sms_time": now_local,
-                "replied": False,
-                "followup_sent": False,
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": None,
-                "normalized_address": None,
-                "booking_created": False,
-                "square_booking_id": None,
-                "state_prompt_sent": False,
             }
 
+        maybe_create_square_booking(phone, conversations[phone])
+
+        return {
+            "sms_body": (
+                f"You're all set — we’ve scheduled your emergency troubleshoot visit "
+                f"for about {scheduled_time}. We’ll head out shortly. "
+                "A Square confirmation will follow."
+            ),
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+    # ---------------------------------------------------
+    # NON-EMERGENCY FLOW
+    # ---------------------------------------------------
+    system_prompt = f"""
+You are Prevolt OS, the SMS assistant for Prevolt Electric.
+Continue the conversation naturally.
+
+Today is {today_date_str}, a {today_weekday}, America/New_York.
+"""
+
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": inbound_text},
+        ],
+    )
+
+    reply = completion.choices[0].message.content.strip()
+
+    return {
+        "sms_body": reply,
+        "scheduled_date": scheduled_date,
+        "scheduled_time": scheduled_time,
+        "address": address,
+    }
+
+
+
+        # Build the system prompt for the model
+        system_prompt = f"""
+You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
+
+Today is {today_date_str}, a {today_weekday}, local time America/New_York.
+
+===================================================
+STRICT CONVERSATION FLOW RULES
+===================================================
+1. NEVER repeat a question already asked.
+2. NEVER restart the conversation.
+3. NEVER ask again for date, time, or address if already collected.
+4. NEVER restate prices.
+5. ALWAYS move the conversation forward.
+6. If customer gives date AND time → accept once.
+7. If customer gives address → accept once.
+8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
+9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
+10. No AI mentions. No quoting their text.
+11. Keep messages short and human.
+
+===================================================
+MASTER PRIORITIZATION LAYER (MPL)
+===================================================
+{ (your existing MPL rules stay exactly as-is) }
+
+===================================================
+SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
+===================================================
+{ (your existing SRB-1 → SRB-20 rules stay exactly as-is) }
+
+===================================================
+CONTEXT
+===================================================
+Original voicemail: {cleaned_transcript}
+Category: {category}
+Appointment type: {appointment_type}
+Initial SMS: {initial_sms}
+Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
+
+===================================================
+OUTPUT FORMAT (STRICT JSON)
+===================================================
+{{
+  "sms_body": "...",
+  "scheduled_date": "YYYY-MM-DD or null",
+  "scheduled_time": "HH:MM or null",
+  "address": "string or null"
+}}
+"""
+
+        # Inject dynamic values
+        system_prompt = system_prompt.replace("{today_date_str}", today_date_str)
+        system_prompt = system_prompt.replace("{today_weekday}", today_weekday)
+
         # ---------------------------------------------------
-        # Emergency "I'm home right now" override
-        # (Prevents the model from asking for extra day/time
-        #  and forces same-day, ASAP scheduling.)
+        # Call the model for normal (non-emergency) replies
+        # ---------------------------------------------------
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": inbound_text},
+            ],
+        )
+
+        # Parse the model’s STRICT JSON response
+        return json.loads(completion.choices[0].message.content)
+
+
+
+        # ---------------------------------------------------
+        # Emergency Mode: Realistic ETA + Same-Day Scheduling
         # ---------------------------------------------------
         inbound_lower = inbound_text.strip().lower()
 
-        immediate_phrases = [
-            "im home right now",
-            "i'm home right now",
-            "im home now",
-            "i'm home now",
+        # Detect true emergency based on voicemail/category
+        is_emergency_case = (
+            appointment_type == "TROUBLESHOOT_395"
+            and any(word in (cleaned_transcript.lower() if cleaned_transcript else "") for word in [
+                "no power",
+                "sparks",
+                "smoke",
+                "burning",
+                "outage",
+                "tree",
+                "fire",
+                "main line",
+                "main wires",
+                "danger",
+            ])
+        )
+
+        # Detect "I am home" context (but does NOT imply emergency by itself)
+        home_phrases = [
             "im home",
             "i'm home",
             "im here",
             "i'm here",
-            "right now",
-            "asap",
-            "as soon as possible",
-            "as soon as you can",
-            "asap as possible",
-            "you come now",
-            "can you come now",
-            "can you come tonight",
-            "come tonight",
-            "whenever you can get here",
-            "whenever you can",
+            "i am home",
+            "i’m home",
+            "i am here",
         ]
+        customer_is_home_now = any(p in inbound_lower for p in home_phrases)
 
-        if appointment_type == "TROUBLESHOOT_395" and any(
-            p in inbound_lower for p in immediate_phrases
-        ):
-            # Force same-day date
-            if not scheduled_date:
-                scheduled_date = today_date_str
+        # Emergency is only triggered by the emergency conditions (not just “I’m home”)
+        if is_emergency_case and customer_is_home_now:
 
-            # Force time = current local time rounded to next 5 minutes
-            if not scheduled_time:
-                minute = ((now_local.minute + 4) // 5) * 5
-                hour = now_local.hour
-                if minute >= 60:
-                    minute -= 60
-                    hour += 1
-                scheduled_time = f"{hour:02d}:{minute:02d}"
-
-            # Choose message based on whether we already have an address
+            # If no address yet → ask for address FIRST
             if not address:
-                sms_body = (
-                    "Got it — we’ll prioritize this and head over as soon as possible. "
-                    "What’s the address where we’ll be coming out?"
-                )
-            else:
-                sms_body = (
-                    f"Got it — we’ll prioritize this and head over as soon as possible. "
-                    f"We have you at {address}."
-                )
+                return {
+                    "sms_body": (
+                        "Got it — we’ll prioritize this for you. "
+                        "What’s the full address where the issue is happening?"
+                    ),
+                    "scheduled_date": scheduled_date,
+                    "scheduled_time": scheduled_time,
+                    "address": address,
+                }
 
-            # Short-circuit: do NOT call the model for this turn
+            # ---------------------------------------------------
+            # We HAVE the address → calculate realistic ETA window
+            # ---------------------------------------------------
+            origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+
+            # Travel time estimation
+            destination_for_travel = address
+            travel_minutes = compute_travel_time_minutes(origin, destination_for_travel)
+
+            if not travel_minutes:
+                travel_minutes = 30  # fallback safety
+
+            # Add prep buffer (tech preparing, grabbing truck, etc.)
+            PREP_BUFFER = 20  # minutes
+            total_minutes = travel_minutes + PREP_BUFFER
+
+            # Compute arrival time (rounded to next hour)
+            arrival_time = now_local + timedelta(minutes=total_minutes)
+            arrival_hour = arrival_time.hour + (1 if arrival_time.minute > 30 else 0)
+            if arrival_hour >= 24:
+                arrival_hour = 23  # clamp to 11pm latest
+
+            final_time_str = f"{arrival_hour:02d}:00"
+            final_date_str = today_date_str  # same-day emergency
+
+            # Persist into conversation
+            scheduled_date = final_date_str
+            scheduled_time = final_time_str
+
+            # >>> VERY IMPORTANT: This keeps conversation flowing <<<
+            sms_body = (
+                "Understood — we’ll prioritize this. "
+                f"We can have someone there around {arrival_hour}:00. "
+                "Does that work?"
+            )
+
             return {
                 "sms_body": sms_body,
                 "scheduled_date": scheduled_date,
@@ -5943,6 +6070,17 @@ OUTPUT FORMAT (STRICT JSON)
 # ---------------------------------------------------
 # Google Maps helper (travel time)
 # ---------------------------------------------------
+# ---------------------------------------------------
+# Format full address from normalized structure
+# ---------------------------------------------------
+def format_full_address(addr_struct: dict) -> str:
+    return (
+        f"{addr_struct['address_line_1']}, "
+        f"{addr_struct['locality']}, "
+        f"{addr_struct['administrative_district_level_1']} "
+        f"{addr_struct['postal_code']}"
+    )
+
 def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
     """
     Uses Google Maps Distance Matrix API to estimate travel time in minutes.
@@ -5984,6 +6122,37 @@ def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
 # ---------------------------------------------------
 # Google Maps — Address Normalization (CT/MA-aware)
 # ---------------------------------------------------
+# ---------------------------------------------------
+# Compute emergency arrival window (rounded to next hour)
+# ---------------------------------------------------
+def compute_emergency_arrival_time(now_local, travel_minutes: float | None) -> str:
+    """
+    Computes an emergency arrival time:
+    • Round current time UP to next whole hour
+    • Add travel duration if available
+    • Return an HH:MM 24h string
+
+    Example:
+      now_local = 1:37pm (13:37)
+      next whole hour = 14:00
+      travel = 22 minutes
+      final = 14:22 → round again to 15:00 for whole-hour SLA
+    """
+
+    # Start with next whole hour
+    next_hour = (now_local + timedelta(hours=1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+
+    # If we have a travel estimate, add it
+    if travel_minutes:
+        next_hour = next_hour + timedelta(minutes=travel_minutes)
+
+    # Now re-round to whole hour again (SLA rule)
+    final_hour = next_hour.replace(minute=0, second=0, microsecond=0)
+
+    return final_hour.strftime("%H:%M")
+
 def normalize_address(raw_address: str, forced_state: str | None = None) -> tuple[str, dict | None]:
     """
     Normalize a freeform address like:
@@ -6211,11 +6380,12 @@ def is_within_normal_hours(time_str: str) -> bool:
 
 
 # ---------------------------------------------------
-# Create Square Booking (with address normalization)
+# Create Square Booking (with emergency-aware scheduling)
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict) -> None:
     """
     Create a Square booking once we have date, time, and address.
+    Emergency jobs enforce realistic 1-hour arrival windows including travel time.
     Square bookings CANNOT include the 'country' field inside booking.address.
     Customer profiles CAN include country, but bookings cannot.
     """
@@ -6235,12 +6405,12 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Unknown appointment_type; cannot map:", appointment_type)
         return
 
-    # Weekend rule
+    # Weekend rule (non-emergency only)
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
         print("Weekend non-emergency booking blocked:", phone, scheduled_date)
         return
 
-    # Time window rule (non-emergency)
+    # Business-hours rule (non-emergency only)
     if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(scheduled_time):
         print("Non-emergency time outside 9–4; booking not auto-created:", phone, scheduled_time)
         return
@@ -6249,7 +6419,9 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Square configuration incomplete; skipping booking creation.")
         return
 
-    # Normalize or reuse
+    # ---------------------------------------------------
+    # Address Normalization
+    # ---------------------------------------------------
     addr_struct = convo.get("normalized_address")
     if not addr_struct:
         status, addr_struct = normalize_address(raw_address)
@@ -6268,8 +6440,12 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             print("Address normalization failed; cannot create booking for:", raw_address)
             return
 
-    # Travel time check
+    # ---------------------------------------------------
+    # Travel Time (origin → customer)
+    # ---------------------------------------------------
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+    travel_minutes = None
+
     if origin:
         destination_for_travel = (
             f"{addr_struct['address_line_1']}, "
@@ -6277,7 +6453,9 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             f"{addr_struct['administrative_district_level_1']} "
             f"{addr_struct['postal_code']}"
         )
+
         travel_minutes = compute_travel_time_minutes(origin, destination_for_travel)
+
         if travel_minutes is not None:
             print(
                 f"Estimated travel from origin to job: ~{travel_minutes:.1f} minutes "
@@ -6287,13 +6465,31 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
                 print("Travel exceeds max; skipping auto-book.")
                 return
 
-    # Create or find customer (customers CAN include country)
+    # ---------------------------------------------------
+    # EMERGENCY — compute realistic arrival time
+    # ---------------------------------------------------
+    if appointment_type == "TROUBLESHOOT_395":
+        now_local = datetime.now(ZoneInfo("America/New_York"))
+
+        emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
+
+        print(
+            f"Emergency mode active — overriding schedule time "
+            f"{scheduled_date} {scheduled_time} → {scheduled_date} {emergency_time}"
+        )
+
+        scheduled_time = emergency_time
+        convo["scheduled_time"] = emergency_time
+
+    # ---------------------------------------------------
+    # Create/Search Square Customer
+    # ---------------------------------------------------
     customer_id = square_create_or_get_customer(phone, addr_struct)
     if not customer_id:
         print("No customer_id; cannot create booking.")
         return
 
-    # Convert local → UTC
+    # Convert to UTC for Square
     start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
     if not start_at_utc:
         print("Could not parse scheduled date/time; skipping booking.")
@@ -6301,7 +6497,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
     idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
 
-    # Square booking.address MUST NOT include "country"
+    # Square MUST NOT receive 'country' in booking.address
     booking_address = {
         "address_line_1": addr_struct["address_line_1"],
         "locality": addr_struct["locality"],
@@ -6311,6 +6507,9 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     if "address_line_2" in addr_struct and addr_struct["address_line_2"]:
         booking_address["address_line_2"] = addr_struct["address_line_2"]
 
+    # ---------------------------------------------------
+    # Build the Booking Payload
+    # ---------------------------------------------------
     booking_payload = {
         "idempotency_key": idempotency_key,
         "booking": {
@@ -6333,6 +6532,9 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         },
     }
 
+        # ---------------------------------------------------
+    # Send to Square
+    # ---------------------------------------------------
     try:
         resp = requests.post(
             "https://connect.squareup.com/v2/bookings",
@@ -6340,6 +6542,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             json=booking_payload,
             timeout=10,
         )
+
         if resp.status_code not in (200, 201):
             print("Square booking create failed:", resp.status_code, resp.text)
             return
@@ -6356,28 +6559,10 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             f"{scheduled_date} {scheduled_time} ({appointment_type})"
         )
 
-        # ---------------------------------------------------
-        # Reset conversation AFTER successful booking
-        # ---------------------------------------------------
-        conversations[phone] = {
-            "cleaned_transcript": None,
-            "category": None,
-            "appointment_type": None,
-            "initial_sms": None,
-            "first_sms_time": None,
-            "replied": False,
-            "followup_sent": False,
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": None,
-            "normalized_address": None,
-            "booking_created": True,
-            "square_booking_id": booking_id,
-            "state_prompt_sent": False,
-        }
-
     except Exception as e:
         print("Square booking exception:", repr(e))
+        return
+
 
 
 # ---------------------------------------------------
