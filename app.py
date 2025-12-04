@@ -397,10 +397,14 @@ def generate_reply_for_inbound(
     phone = request.form.get("From", "").replace("whatsapp:", "")
     inbound_lower = inbound_text.strip().lower()
 
+    # Make sure we have a dict for this phone
+    conversations.setdefault(phone, {})
+
     # ===============================================================
     # PBM — POST-BOOKING MODE (AFTER FINAL CONFIRMATION)
     # ===============================================================
     if conversations.get(phone, {}).get("final_confirmation_sent") is True:
+        # Still respond to customers — just no scheduling logic.
         return {
             "sms_body": "Got it — we’ll see you then.",
             "scheduled_date": scheduled_date,
@@ -420,21 +424,7 @@ def generate_reply_for_inbound(
 
     if any(term in inbound_lower for term in immediate_terms):
 
-        # Mark that we're waiting for an address (new fix)
-        if not address:
-            conversations.setdefault(phone, {})
-            conversations[phone]["awaiting_immediate_address"] = True
-            return {
-                "sms_body": (
-                    "Got it — we can send someone out shortly. "
-                    "What’s the address where we’re heading?"
-                ),
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": None,
-            }
-
-        # Address already known → proceed immediately
+        # round to next 5 minutes
         minute = (now_local.minute + 4) // 5 * 5
         if minute == 60:
             now_local = now_local.replace(hour=now_local.hour + 1, minute=0)
@@ -444,10 +434,20 @@ def generate_reply_for_inbound(
         scheduled_time = now_local.strftime("%H:%M")
         scheduled_date = today_date_str
 
-        conversations.setdefault(phone, {})
         conversations[phone]["scheduled_time"] = scheduled_time
         conversations[phone]["scheduled_date"] = scheduled_date
         conversations[phone]["autobooked"] = True
+
+        if not address:
+            return {
+                "sms_body": (
+                    "Got it — we can send someone out shortly. "
+                    "What’s the address where we’re heading?"
+                ),
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": None,
+            }
 
         maybe_create_square_booking(phone, {
             "scheduled_date": scheduled_date,
@@ -460,47 +460,6 @@ def generate_reply_for_inbound(
         return {
             "sms_body": (
                 "You're all set — we’ll head out shortly. "
-                "A Square confirmation will follow."
-            ),
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-        }
-
-    # ===============================================================
-    # 1B) IMMEDIATE-ARRIVAL FOLLOW-UP (address arrives AFTER the fact)
-    # ===============================================================
-    if (
-        conversations.get(phone, {}).get("awaiting_immediate_address") is True
-        and address
-    ):
-        conversations[phone]["awaiting_immediate_address"] = False
-
-        # Round time
-        minute = (now_local.minute + 4) // 5 * 5
-        if minute == 60:
-            now_local = now_local.replace(hour=now_local.hour + 1, minute=0)
-        else:
-            now_local = now_local.replace(minute=minute)
-
-        scheduled_time = now_local.strftime("%H:%M")
-        scheduled_date = today_date_str
-
-        conversations[phone]["scheduled_date"] = scheduled_date
-        conversations[phone]["scheduled_time"] = scheduled_time
-        conversations[phone]["autobooked"] = True
-
-        maybe_create_square_booking(phone, {
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-        })
-
-        conversations[phone]["final_confirmation_sent"] = True
-
-        return {
-            "sms_body": (
-                f"You're all set — we’ll head out shortly for your service call at {scheduled_time}. "
                 "A Square confirmation will follow."
             ),
             "scheduled_date": scheduled_date,
@@ -541,7 +500,6 @@ def generate_reply_for_inbound(
         scheduled_date = today_date_str
         scheduled_time = emergency_time
 
-        conversations.setdefault(phone, {})
         conversations[phone]["scheduled_date"] = scheduled_date
         conversations[phone]["scheduled_time"] = scheduled_time
         conversations[phone]["autobooked"] = True
@@ -573,7 +531,7 @@ def generate_reply_for_inbound(
         }
 
     # ===============================================================
-    # 3) NON-EMERGENCY: “I’m home today” LOGIC
+    # 3) NON-EMERGENCY: “I’m home today / free all day” LOGIC
     # ===============================================================
     home_today_terms = [
         "im home today", "i am home today", "home today",
@@ -582,11 +540,23 @@ def generate_reply_for_inbound(
         "im flexible today", "i am flexible today", "flexible today",
         "whenever today", "any time is fine", "any time is okay",
         "any time works", "anytime works",
-        "i'm free today", "i am free today", "free today"
+        "i'm free today", "i am free today", "free today",
+        # extra real-world phrases you actually used
+        "im free all day", "i am free all day", "free all day",
+        "im home all day", "i am home all day", "home all day",
+        "any time", "anytime",
     ]
 
-    if any(term in inbound_lower for term in home_today_terms):
+    # Has this caller already expressed “home today / free all day” earlier?
+    home_today_intent = conversations.get(phone, {}).get("home_today_intent", False)
 
+    # If this message contains one of the phrases, lock in the intent.
+    if any(term in inbound_lower for term in home_today_terms):
+        home_today_intent = True
+        conversations[phone]["home_today_intent"] = True
+
+    if home_today_intent:
+        # Must have address first (cannot search availability without location)
         if not address:
             return {
                 "sms_body": (
@@ -598,9 +568,13 @@ def generate_reply_for_inbound(
                 "address": None,
             }
 
+        # -------------------------------------------
+        # Check same-day availability from Square
+        # -------------------------------------------
         slot = get_today_available_slot(appointment_type)
 
         if slot is None:
+            # No openings today → find next available day
             nxt = get_next_available_day_slot(appointment_type)
 
             if nxt is None:
@@ -614,6 +588,7 @@ def generate_reply_for_inbound(
                     "address": address,
                 }
 
+            # A future opening exists
             return {
                 "sms_body": (
                     f"We’re booked up for today, but our next opening is "
@@ -624,7 +599,9 @@ def generate_reply_for_inbound(
                 "address": address,
             }
 
-        conversations.setdefault(phone, {})
+        # -------------------------------------------
+        # Today DOES have an appointment slot
+        # -------------------------------------------
         conversations[phone]["scheduled_date"] = today_date_str
         conversations[phone]["scheduled_time"] = slot
         conversations[phone]["autobooked"] = True
@@ -658,84 +635,70 @@ def generate_reply_for_inbound(
             "address": address,
         }
 
-
     # ===============================================================
-    # 5) NON-EMERGENCY LLM FLOW  (PBM-AWARE)
+    # 5) NON-EMERGENCY LLM FLOW
     # ===============================================================
+    system_prompt = f"""
+You are Prevolt OS, the SMS assistant for Prevolt Electric.
+Continue the conversation naturally.
 
-    # ---- Detect if Post-Booking Mode should be active ----
-    pbm = conversations.get(phone, {}).get("post_booking_mode", False)
+Today is {today_date_str}, a {today_weekday}, local time America/New_York.
 
-    # ---- Expire PBM automatically after 24 hours ----
-    last_booking = conversations.get(phone, {}).get("last_booking_timestamp")
-    if last_booking:
-        elapsed = (now_local - last_booking).total_seconds()
-        if elapsed > 86400:  # 24 hours
-            conversations[phone]["post_booking_mode"] = False
-            pbm = False
+===================================================
+STRICT CONVERSATION FLOW RULES
+===================================================
+1. NEVER repeat a question already asked.
+2. NEVER restart the conversation.
+3. NEVER ask again for date, time, or address if already collected.
+4. NEVER restate prices.
+5. ALWAYS move the conversation forward.
+6. If customer gives date AND time → accept once.
+7. If customer gives address → accept once.
+8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
+9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
+10. No AI mentions. No quoting their text.
+11. Keep messages short and human.
 
-    # ---- If PBM is active, route messages differently ----
-    if pbm is True:
+===================================================
+MASTER PRIORITIZATION LAYER (MPL)
+===================================================
+{MPL_RULES}
 
-        # Customer may ask normal questions after booking.
-        # We answer normally but do NOT re-enter scheduling logic.
-        safe_questions = [
-            "thank you", "thanks", "appreciate it",
-            "do i need to", "should i", "will the tech",
-            "can i", "is it ok if", "do you take",
-            "payment", "weather", "driveway", "dog",
-            "gate", "instructions", "prep"
-        ]
+===================================================
+SCHEDULING RULES — FINAL (SRB-1 → SRB-20)
+===================================================
+{SCHEDULING_RULES}
 
-        if any(q in inbound_lower for q in safe_questions):
-            return {
-                "sms_body": (
-                    "You're all set — and we’ll take care of everything when we arrive. "
-                    "If you need anything before then, just text me here."
-                ),
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": address,
-            }
+===================================================
+CONTEXT
+===================================================
+Original voicemail: {cleaned_transcript}
+Category: {category}
+Appointment type: {appointment_type}
+Initial SMS: {initial_sms}
+Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
 
-        # If customer tries to change or reschedule:
-        if "reschedule" in inbound_lower or "different time" in inbound_lower:
-            conversations[phone]["post_booking_mode"] = False  # exit PBM
-            return {
-                "sms_body": (
-                    "No problem — what time works better?"
-                ),
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": address,
-            }
+===================================================
+OUTPUT FORMAT (STRICT JSON)
+===================================================
+{{
+  "sms_body": "...",
+  "scheduled_date": "YYYY-MM-DD or null",
+  "scheduled_time": "HH:MM or null",
+  "address": "string or null"
+}}
+"""
 
-        # If customer indicates “new issue”
-        new_issue_terms = [
-            "another issue", "new issue", "separate issue",
-            "different problem", "something else"
-        ]
-        if any(t in inbound_lower for t in new_issue_terms):
-            conversations[phone]["post_booking_mode"] = False
-            return {
-                "sms_body": (
-                    "Got it — what’s going on with the new issue?"
-                ),
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": None,
-            }
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": inbound_text},
+        ],
+    )
 
-        # Default PBM fallback
-        return {
-            "sms_body": (
-                "All set — we’ll see you at your scheduled time. "
-                "If anything changes, just text me here."
-            ),
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-        }
+    return json.loads(completion.choices[0].message.content)
+
 
     # ===============================================================
     # 5B) NORMAL LLM MODE (PRE-BOOKING or PBM OFF)
