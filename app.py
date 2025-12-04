@@ -367,14 +367,13 @@ def generate_reply_for_inbound(
     # ---------------------------------------------------
     emergency_indicators = [
         "no power", "partial power", "tree hit", "tree took",
-        "tree took my wires", "wires pulled off",
-        "power line down", "burning smell", "smoke smell",
-        "fire", "sparks", "melted outlet", "melted plug",
-        "buzzing panel", "arcing", "breaker arcing",
-        "breaker won't reset", "breaker wont reset",
+        "tree took my wires", "wires pulled off", "power line down",
+        "burning smell", "smoke smell", "fire", "sparks",
+        "melted outlet", "melted plug", "buzzing panel",
+        "arcing", "breaker arcing", "breaker won't reset",
+        "breaker wont reset",
     ]
 
-    # Does this message describe a REAL emergency?
     is_emergency = (
         appointment_type == "TROUBLESHOOT_395"
         and any(term in inbound_lower for term in emergency_indicators)
@@ -384,6 +383,7 @@ def generate_reply_for_inbound(
     # EMERGENCY LOGIC
     # ---------------------------------------------------
     if is_emergency:
+
         travel_minutes = None
         addr_struct = conversations.get(phone, {}).get("normalized_address")
 
@@ -427,37 +427,11 @@ def generate_reply_for_inbound(
         }
 
     # ---------------------------------------------------
-    # NON-EMERGENCY FLOW
+    # NON-EMERGENCY FLOW → full AI logic
     # ---------------------------------------------------
     system_prompt = f"""
 You are Prevolt OS, the SMS assistant for Prevolt Electric.
 Continue the conversation naturally.
-
-Today is {today_date_str}, a {today_weekday}, America/New_York.
-"""
-
-    completion = openai_client.chat.completions.create(
-        model="gpt-4.1",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": inbound_text},
-        ],
-    )
-
-    reply = completion.choices[0].message.content.strip()
-
-    return {
-        "sms_body": reply,
-        "scheduled_date": scheduled_date,
-        "scheduled_time": scheduled_time,
-        "address": address,
-    }
-
-
-
-        # Build the system prompt for the model
-        system_prompt = f"""
-You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
 
 Today is {today_date_str}, a {today_weekday}, local time America/New_York.
 
@@ -479,12 +453,12 @@ STRICT CONVERSATION FLOW RULES
 ===================================================
 MASTER PRIORITIZATION LAYER (MPL)
 ===================================================
-{ (your existing MPL rules stay exactly as-is) }
+{MPL_RULES}
 
 ===================================================
-SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
+SCHEDULING RULES — FINAL (SRB-1 → SRB-20)
 ===================================================
-{ (your existing SRB-1 → SRB-20 rules stay exactly as-is) }
+{SCHEDULING_RULES}
 
 ===================================================
 CONTEXT
@@ -506,178 +480,16 @@ OUTPUT FORMAT (STRICT JSON)
 }}
 """
 
-        # Inject dynamic values
-        system_prompt = system_prompt.replace("{today_date_str}", today_date_str)
-        system_prompt = system_prompt.replace("{today_weekday}", today_weekday)
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": inbound_text},
+        ],
+    )
 
-        # ---------------------------------------------------
-        # Call the model for normal (non-emergency) replies
-        # ---------------------------------------------------
-        completion = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": inbound_text},
-            ],
-        )
+    return json.loads(completion.choices[0].message.content)
 
-        # Parse the model’s STRICT JSON response
-        return json.loads(completion.choices[0].message.content)
-
-
-
-        # ---------------------------------------------------
-        # Emergency Mode: Realistic ETA + Same-Day Scheduling
-        # ---------------------------------------------------
-        inbound_lower = inbound_text.strip().lower()
-
-        # Detect true emergency based on voicemail/category
-        is_emergency_case = (
-            appointment_type == "TROUBLESHOOT_395"
-            and any(word in (cleaned_transcript.lower() if cleaned_transcript else "") for word in [
-                "no power",
-                "sparks",
-                "smoke",
-                "burning",
-                "outage",
-                "tree",
-                "fire",
-                "main line",
-                "main wires",
-                "danger",
-            ])
-        )
-
-        # Detect "I am home" context (but does NOT imply emergency by itself)
-        home_phrases = [
-            "im home",
-            "i'm home",
-            "im here",
-            "i'm here",
-            "i am home",
-            "i’m home",
-            "i am here",
-        ]
-        customer_is_home_now = any(p in inbound_lower for p in home_phrases)
-
-        # Emergency is only triggered by the emergency conditions (not just “I’m home”)
-        if is_emergency_case and customer_is_home_now:
-
-            # If no address yet → ask for address FIRST
-            if not address:
-                return {
-                    "sms_body": (
-                        "Got it — we’ll prioritize this for you. "
-                        "What’s the full address where the issue is happening?"
-                    ),
-                    "scheduled_date": scheduled_date,
-                    "scheduled_time": scheduled_time,
-                    "address": address,
-                }
-
-            # ---------------------------------------------------
-            # We HAVE the address → calculate realistic ETA window
-            # ---------------------------------------------------
-            origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
-
-            # Travel time estimation
-            destination_for_travel = address
-            travel_minutes = compute_travel_time_minutes(origin, destination_for_travel)
-
-            if not travel_minutes:
-                travel_minutes = 30  # fallback safety
-
-            # Add prep buffer (tech preparing, grabbing truck, etc.)
-            PREP_BUFFER = 20  # minutes
-            total_minutes = travel_minutes + PREP_BUFFER
-
-            # Compute arrival time (rounded to next hour)
-            arrival_time = now_local + timedelta(minutes=total_minutes)
-            arrival_hour = arrival_time.hour + (1 if arrival_time.minute > 30 else 0)
-            if arrival_hour >= 24:
-                arrival_hour = 23  # clamp to 11pm latest
-
-            final_time_str = f"{arrival_hour:02d}:00"
-            final_date_str = today_date_str  # same-day emergency
-
-            # Persist into conversation
-            scheduled_date = final_date_str
-            scheduled_time = final_time_str
-
-            # >>> VERY IMPORTANT: This keeps conversation flowing <<<
-            sms_body = (
-                "Understood — we’ll prioritize this. "
-                f"We can have someone there around {arrival_hour}:00. "
-                "Does that work?"
-            )
-
-            return {
-                "sms_body": sms_body,
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": address,
-            }
-
-
-
-        system_prompt = """
-You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
-
-Today is {today_date_str}, a {today_weekday}, local time America/New_York.
-
-
-===================================================
-STRICT CONVERSATION FLOW RULES
-===================================================
-1. NEVER repeat a question already asked.
-2. NEVER restart the conversation.
-3. NEVER ask again for date, time, or address if already collected.
-4. NEVER restate prices.
-5. ALWAYS move the conversation forward.
-6. If customer gives date AND time → accept once.
-7. If customer gives address → accept once.
-8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
-9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
-10. No AI mentions. No quoting their text.
-11. Keep messages short and human.
-
-===================================================
-MASTER PRIORITIZATION LAYER (MPL)
-===================================================
-THESE PRIORITIES OVERRIDE ALL OTHER RULES:
-
-1. Emergency mode rules override ALL other scheduling rules.
-   - If appointment_type = TROUBLESHOOT_395 → ignore ALL non-emergency windows.
-   - Never use “morning/afternoon” logic.
-   - Never ask fallback twice.
-   - Any time given (including “now”) must be immediately accepted once per Rule 1.11.
-
-2. Once time is collected, it cannot be re-asked unless customer explicitly changes it.
-
-3. Once emergency fallback is used once (Rule 1.8), it must NEVER be used again.
-
-4. When conflicts exist between SRBs, the higher-numbered module loses to the lower-numbered one.
-   Priority: SRB-1 > SRB-2 > SRB-3 > SRB-4 > … > SRB-20.
-
-5. Rules must be checked in this order:
-   a. Emergency overrides
-   b. Previously collected fields (date/time/address)
-   c. Fallback constraints
-   d. Non-emergency time windows (ONLY if not in emergency mode)
-   e. Clarification rules
-   f. Tone rules
-   g. Safety rules
-   h. Everything else
-
-6. The OS must NEVER revert to non-emergency logic once emergency mode is active.
-
-7. If two rules contradict, ALWAYS obey the higher-priority MPL directive.
-
-8. In emergency mode, ALL date-only and day-only rules (1.12–1.18) are disabled and must NOT trigger any additional time questions once a time has been collected.
-9. If the customer says “now”, “as soon as possible”, “I’m home now”, or any equivalent:
-   - Immediately set scheduled_time to the current local time (rounded to the next 5 minutes).
-   - OS must NOT ask for another time or day.
-   - OS must move directly to address (if not collected), or confirmation (if address already collected).
 
 
 ===================================================
