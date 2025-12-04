@@ -158,7 +158,19 @@ def transcribe_recording(recording_url: str) -> str:
 # Step 2 — Cleanup (improve clarity)
 # ---------------------------------------------------
 def clean_transcript_text(raw_text: str) -> str:
+    """
+    Cleans up Whisper voicemail text:
+    • Fix obvious transcription errors
+    • Improve grammar slightly
+    • Correct electrical terms (breaker, panel, service drop, meter, etc.)
+    • Preserve ALL meaning (never add information)
+    • Tag emergency phrases so later stages cannot misclassify the call
+    """
+
     try:
+        # --------------------------------------------
+        # AI Cleanup
+        # --------------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
@@ -166,14 +178,49 @@ def clean_transcript_text(raw_text: str) -> str:
                     "role": "system",
                     "content": (
                         "You clean up voicemail transcriptions for an electrical contractor. "
-                        "Fix obvious transcription mistakes and electrical terminology, "
-                        "improve grammar slightly, but preserve meaning. Do NOT add info."
+                        "Fix obvious transcription mistakes, stabilize grammar, and correct common "
+                        "electrical terminology errors (breaker, panel, service line, service drop, "
+                        "meter, main wires, feeder, outage). "
+                        "Do NOT invent details, change facts, or soften emergency statements. "
+                        "Preserve all original intent exactly."
                     ),
                 },
                 {"role": "user", "content": raw_text},
             ],
         )
-        return completion.choices[0].message.content.strip()
+
+        cleaned = completion.choices[0].message.content.strip()
+
+        # --------------------------------------------
+        # Emergency phrase safeguard (critical)
+        # Ensures later steps always classify emergencies correctly,
+        # even if Whisper hallucinated “reminder / tomorrow”.
+        # --------------------------------------------
+        emergency_keywords = [
+            "no power",
+            "power is out",
+            "tree took",
+            "tree ripped",
+            "tree fell on",
+            "sparks",
+            "smoke",
+            "burning smell",
+            "smell burning",
+            "fire",
+            "arcing",
+            "breaker keeps tripping",
+            "electrical emergency",
+            "danger",
+            "hazard",
+        ]
+
+        lower = cleaned.lower()
+        if any(k in lower for k in emergency_keywords):
+            # Inject a tag ONLY to influence logic — does not alter text.
+            cleaned = cleaned + " [EMERGENCY_TRIGGER]"
+
+        return cleaned
+
     except Exception as e:
         print("Cleanup FAILED:", repr(e))
         return raw_text
