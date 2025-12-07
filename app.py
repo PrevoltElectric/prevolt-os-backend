@@ -89,7 +89,7 @@ TECH_CURRENT_ADDRESS = None  # Override dynamically if needed
 # ---------------------------------------------------
 def send_sms(to_number: str, body: str) -> None:
     """
-    Sends outbound messages to WhatsApp sandbox for testing.
+    Sends outbound messages to WhatsApp Sandbox for testing.
     The caller MUST join the sandbox before receiving messages.
     """
 
@@ -99,17 +99,19 @@ def send_sms(to_number: str, body: str) -> None:
         return
 
     try:
-        # Normalize: ensure number has whatsapp: prefix
-        if not to_number.startswith("whatsapp:"):
-            to_number = "whatsapp:" + to_number.replace("whatsapp:", "")
+        # Normalize "to" field → must be whatsapp:+1XXXXXXXXXX
+        to_number = to_number.replace("whatsapp:", "")
+        to_number = f"whatsapp:{to_number}"
 
-        whatsapp_from = "whatsapp:+14155238886"  # Twilio Sandbox
+        # Your WhatsApp Sandbox From Number
+        whatsapp_from = "whatsapp:+14155238886"
 
         msg = twilio_client.messages.create(
             body=body,
             from_=whatsapp_from,
             to=to_number,
         )
+
         print("WhatsApp sent. SID:", msg.sid)
 
     except Exception as e:
