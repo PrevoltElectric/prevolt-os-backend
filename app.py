@@ -7051,16 +7051,39 @@ def incoming_call():
 # ---------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
-    recording_url = request.form.get("RecordingUrl")
     caller = request.form.get("From")
+    recording_sid = request.form.get("RecordingSid")
+
+    print("Voicemail webhook hit. SID:", recording_sid, "Caller:", caller)
+
+    # ---- FIX: Twilio does NOT send RecordingUrl to the action callback ----
+    if not recording_sid:
+        print("ERROR: Missing RecordingSid in voicemail webhook.")
+        vr = VoiceResponse()
+        vr.hangup()
+        return Response(str(vr), mimetype="text/xml")
+
+    # Construct correct Twilio recording URL
+    recording_url = (
+        f"https://api.twilio.com/2010-04-01/Accounts/"
+        f"{TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}"
+    )
 
     try:
+        print("Downloading and transcribing voicemail from:", recording_url)
+
         raw = transcribe_recording(recording_url)
+        print("Raw transcript:", raw)
+
         cleaned = clean_transcript_text(raw)
+        print("Cleaned transcript:", cleaned)
+
         sms_info = generate_initial_sms(cleaned)
+        print("Initial SMS info:", sms_info)
 
         send_sms(caller, sms_info["sms_body"])
 
+        # Initialize their conversation state
         conversations[caller] = {
             "cleaned_transcript": cleaned,
             "category": sms_info["category"],
@@ -7081,9 +7104,10 @@ def voicemail_complete():
     except Exception as e:
         print("Voicemail fail:", repr(e))
 
-    response = VoiceResponse()
-    response.hangup()
-    return Response(str(response), mimetype="text/xml")
+    vr = VoiceResponse()
+    vr.hangup()
+    return Response(str(vr), mimetype="text/xml")
+
 
 
 # ---------------------------------------------------
