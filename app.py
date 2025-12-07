@@ -85,35 +85,35 @@ TECH_CURRENT_ADDRESS = None  # Override dynamically if needed
 
 
 # ---------------------------------------------------
-# Utility: Send outbound SMS (production version)
+# Utility: Send outbound message via WhatsApp Sandbox
 # ---------------------------------------------------
 def send_sms(to_number: str, body: str) -> None:
     """
-    Sends SMS to the customer using your real Twilio SMS phone number.
-    Automatically strips WhatsApp prefixes if present.
+    Sends outbound messages to WhatsApp sandbox for testing.
+    The caller MUST join the sandbox before receiving messages.
     """
 
     if not twilio_client:
-        print("Twilio not configured; SMS not sent.")
-        print("Intended SMS to", to_number, ":", body)
+        print("Twilio not configured; WhatsApp message not sent.")
+        print("Intended WhatsApp message:", body)
         return
 
     try:
-        # Normalize: remove WhatsApp prefix if Twilio sent one
-        to_number = to_number.replace("whatsapp:", "")
+        # Normalize: ensure number has whatsapp: prefix
+        if not to_number.startswith("whatsapp:"):
+            to_number = "whatsapp:" + to_number.replace("whatsapp:", "")
 
-        twilio_from = TWILIO_SMS_NUMBER  # <-- Your REAL SMS phone number
+        whatsapp_from = "whatsapp:+14155238886"  # Twilio Sandbox
 
         msg = twilio_client.messages.create(
             body=body,
-            from_=twilio_from,
+            from_=whatsapp_from,
             to=to_number,
         )
-
-        print(f"SMS sent to {to_number}. SID:", msg.sid)
+        print("WhatsApp sent. SID:", msg.sid)
 
     except Exception as e:
-        print("Failed to send SMS to", to_number, ":", repr(e))
+        print("Failed to send WhatsApp message:", repr(e))
 
 
 # ---------------------------------------------------
