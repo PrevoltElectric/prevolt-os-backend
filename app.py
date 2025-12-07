@@ -632,15 +632,52 @@ def is_customer_confirmation(msg):
 
 
 # ---------------------------------------------------
-# Lightweight address detector
+# Robust Address Detector (Fix)
 # ---------------------------------------------------
-def is_customer_address_only(msg):
-    return any(char.isdigit() for char in msg) and any(
-        suffix in msg for suffix in [
-            "st", "street", "rd", "road", "ave", "avenue",
-            "ct", "lane", "ln", "dr", "drive", "blvd", "court"
-        ]
-    )
+import re
+
+def is_customer_address_only(text: str) -> bool:
+    """
+    Extremely tolerant address detector.
+    Returns True if the message contains:
+
+      • a street number (1–5 digits)
+      • at least one word following it
+      • optional filler words (in, at, on, my, is, the, live, etc.)
+      • optional town/city names
+
+    Accepts:
+        '54 bloomfield ave windsor'
+        '54 bloomfield ave in windsor'
+        'my address is 12 main st'
+        'we live at 88 oak street'
+        'come to 120 broadway hartford'
+        'the address is 77 river st'
+        'its 40 maple rd'
+        'come to 92 park ave please'
+
+    Rejects:
+        'hi'
+        'ok'
+        'thanks'
+        'what time?'
+    """
+
+    text = text.lower().strip()
+
+    # Must contain a street number
+    if not re.search(r"\b\d{1,5}\b", text):
+        return False
+
+    # Remove irrelevant filler to detect "number + street name"
+    cleaned = re.sub(
+        r"\b(in|at|on|by|my|is|the|we|live|lives|are|i|am|address|addr|pls|please|come|to|it's|its)\b",
+        "",
+        text,
+    ).strip()
+
+    # Look for "number + word"
+    return bool(re.search(r"\b\d{1,5}\s+[a-z]+", cleaned))
 
 
 # ---------------------------------------------------
