@@ -602,6 +602,43 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
     # If none of the above → continue normal processing
     return None
 
+# ===============================================================
+# SRB-14 Address Intake (Safe, Deferred, State-Aware)
+# ===============================================================
+if is_customer_address_only(inbound_lower):
+
+    # Store raw address
+    clean_addr = inbound_text.strip()
+    conv["address"] = clean_addr
+    address = clean_addr
+
+    # Attempt normalization using SRB-14 safe wrapper
+    status, parsed = normalize_address(clean_addr)
+
+    # Full success → store immediately
+    if status == "ok" and parsed:
+        conv["normalized_address"] = parsed
+
+    # Needs CT/MA confirmation
+    elif status == "needs_state":
+        if not conv.get("state_prompt_sent"):
+            return {
+                "sms_body": "Just confirming — is that address in Connecticut or Massachusetts?",
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": clean_addr,
+            }
+        # If prompt already sent, just wait for reply
+        return {
+            "sms_body": "Connecticut or Massachusetts?",
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": clean_addr,
+        }
+
+    # Error occurred → hold raw address but do NOT block conversation flow
+    else:
+        conv["normalized_address"] = None
 
 
 # ====================================================================
@@ -838,13 +875,6 @@ def generate_reply_for_inbound(
         appointment_type = "TROUBLESHOOT_395"
         conv["appointment_type"] = "TROUBLESHOOT_395"
 
-        # Capture address if message IS the address
-        if is_customer_address_only(inbound_lower):
-            conv["address"] = inbound_text.strip()
-            address = conv["address"]
-            norm = normalize_possible_address(inbound_text)
-            if norm:
-                conv["normalized_address"] = norm
 
         final_addr = conv.get("address") or address
 
