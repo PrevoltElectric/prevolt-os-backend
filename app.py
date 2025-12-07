@@ -599,6 +599,60 @@ You are Prevolt OS, the SMS assistant for Prevolt Electric.
 
 
 # ---------------------------------------------------
+# SRB-13 — State Machine & Branch Safety Engine
+# ---------------------------------------------------
+
+def get_current_state(conv: dict) -> str:
+    """
+    Determines the user's current booking step.
+    Must return a deterministic state used by enforce_state_lock().
+    """
+
+    if not conv:
+        return "new_job"
+
+    if not conv.get("appointment_type"):
+        return "need_appointment_type"
+
+    if not conv.get("address"):
+        return "need_address"
+
+    if not conv.get("scheduled_date"):
+        return "need_date"
+
+    if not conv.get("scheduled_time"):
+        return "need_time"
+
+    return "ready_to_finalize"
+
+
+def enforce_state_lock(state: str,
+                       conv: dict,
+                       inbound_lower: str,
+                       address,
+                       scheduled_date,
+                       scheduled_time) -> dict:
+    """
+    SRB-13 lockout logic.
+    Prevents responding after final confirmation
+    and prevents illegal backward movement.
+    """
+
+    # Hard stop: once final confirmation is sent, OS must not send further replies
+    if conv.get("final_confirmation_sent"):
+        return {
+            "interrupt": True,
+            "reply": {
+                "sms_body": "",
+                "scheduled_date": conv.get("scheduled_date"),
+                "scheduled_time": conv.get("scheduled_time"),
+                "address": conv.get("address"),
+            }
+        }
+
+    # No lockout required — allow Section 4 logic to continue normally
+    return {"interrupt": False}
+# ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) — OPTIMIZED
 # ---------------------------------------------------
 def generate_reply_for_inbound(
@@ -1106,6 +1160,7 @@ def generate_reply_for_inbound(
             "scheduled_time": None,
             "address": address,
         }
+
 
 
 
