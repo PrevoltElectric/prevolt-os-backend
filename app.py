@@ -413,7 +413,123 @@ def normalize_possible_address(text: str):
         "full": full,
     }
 
+# ---------------------------------------------------
+# SRB-12 — Natural Language Date/Time Parser
+# ---------------------------------------------------
 
+def parse_natural_datetime(text: str, now_local) -> dict:
+    """
+    Lightweight datetime interpreter for phrases like:
+    'tomorrow', 'later today', 'this afternoon', 'after 1', 'around 3', etc.
+
+    Returns:
+        {
+            "has_datetime": bool,
+            "date": "YYYY-MM-DD" or None,
+            "time": "HH:MM" or None
+        }
+    """
+
+    t = text.lower().strip()
+    today = now_local.date()
+    tomorrow = today + timedelta(days=1)
+
+    # DEFAULT RETURN
+    result = {
+        "has_datetime": False,
+        "date": None,
+        "time": None
+    }
+
+    # ---------------------------
+    # DATE DETECTION
+    # ---------------------------
+    if "tomorrow" in t:
+        result["date"] = tomorrow.strftime("%Y-%m-%d")
+        result["has_datetime"] = True
+
+    elif "today" in t:
+        result["date"] = today.strftime("%Y-%m-%d")
+        result["has_datetime"] = True
+
+    # ---------------------------
+    # TIME DETECTION — simple patterns
+    # ---------------------------
+    # Match things like: "after 1", "around 3", "3pm", "2 pm"
+    time_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2) or "00")
+        ampm = time_match.group(3)
+
+        if ampm:
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            if ampm == "am" and hour == 12:
+                hour = 0
+
+        # Reject impossible non-emergency hours
+        if 0 <= hour <= 23:
+            result["time"] = f"{hour:02d}:{minute:02d}"
+            result["has_datetime"] = True
+
+    return result
+
+
+# ---------------------------------------------------
+# SRB-13 — State Machine & Branch Safety Engine
+# ---------------------------------------------------
+
+def get_current_state(conv: dict) -> str:
+    """
+    Determines the user's current booking step.
+    Must return a deterministic state used by enforce_state_lock().
+    """
+
+    if not conv:
+        return "new_job"
+
+    if not conv.get("appointment_type"):
+        return "need_appointment_type"
+
+    if not conv.get("address"):
+        return "need_address"
+
+    if not conv.get("scheduled_date"):
+        return "need_date"
+
+    if not conv.get("scheduled_time"):
+        return "need_time"
+
+    return "ready_to_finalize"
+
+
+def enforce_state_lock(state: str,
+                       conv: dict,
+                       inbound_lower: str,
+                       address,
+                       scheduled_date,
+                       scheduled_time) -> dict:
+    """
+    SRB-13 lockout logic.
+    Prevents responding after final confirmation
+    and prevents illegal backward movement.
+    """
+
+    # Hard stop: once final confirmation is sent, OS must not send further replies
+    if conv.get("final_confirmation_sent"):
+        return {
+            "interrupt": True,
+            "reply": {
+                "sms_body": "",
+                "scheduled_date": conv.get("scheduled_date"),
+                "scheduled_time": conv.get("scheduled_time"),
+                "address": conv.get("address"),
+            }
+        }
+
+    # No lockout required — allow Section 4 logic to continue normally
+    return {"interrupt": False}
 
 # ====================================================================
 #                    >>>>>  SECTION 4 FULLY PATCHED  <<<<<
@@ -597,123 +713,7 @@ def build_llm_prompt(
 You are Prevolt OS, the SMS assistant for Prevolt Electric.
 (Your full existing master prompt remains unchanged)
 """
-# ---------------------------------------------------
-# SRB-12 — Natural Language Date/Time Parser
-# ---------------------------------------------------
 
-def parse_natural_datetime(text: str, now_local) -> dict:
-    """
-    Lightweight datetime interpreter for phrases like:
-    'tomorrow', 'later today', 'this afternoon', 'after 1', 'around 3', etc.
-
-    Returns:
-        {
-            "has_datetime": bool,
-            "date": "YYYY-MM-DD" or None,
-            "time": "HH:MM" or None
-        }
-    """
-
-    t = text.lower().strip()
-    today = now_local.date()
-    tomorrow = today + timedelta(days=1)
-
-    # DEFAULT RETURN
-    result = {
-        "has_datetime": False,
-        "date": None,
-        "time": None
-    }
-
-    # ---------------------------
-    # DATE DETECTION
-    # ---------------------------
-    if "tomorrow" in t:
-        result["date"] = tomorrow.strftime("%Y-%m-%d")
-        result["has_datetime"] = True
-
-    elif "today" in t:
-        result["date"] = today.strftime("%Y-%m-%d")
-        result["has_datetime"] = True
-
-    # ---------------------------
-    # TIME DETECTION — simple patterns
-    # ---------------------------
-    # Match things like: "after 1", "around 3", "3pm", "2 pm"
-    time_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t)
-    if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2) or "00")
-        ampm = time_match.group(3)
-
-        if ampm:
-            if ampm == "pm" and hour != 12:
-                hour += 12
-            if ampm == "am" and hour == 12:
-                hour = 0
-
-        # Reject impossible non-emergency hours
-        if 0 <= hour <= 23:
-            result["time"] = f"{hour:02d}:{minute:02d}"
-            result["has_datetime"] = True
-
-    return result
-
-
-# ---------------------------------------------------
-# SRB-13 — State Machine & Branch Safety Engine
-# ---------------------------------------------------
-
-def get_current_state(conv: dict) -> str:
-    """
-    Determines the user's current booking step.
-    Must return a deterministic state used by enforce_state_lock().
-    """
-
-    if not conv:
-        return "new_job"
-
-    if not conv.get("appointment_type"):
-        return "need_appointment_type"
-
-    if not conv.get("address"):
-        return "need_address"
-
-    if not conv.get("scheduled_date"):
-        return "need_date"
-
-    if not conv.get("scheduled_time"):
-        return "need_time"
-
-    return "ready_to_finalize"
-
-
-def enforce_state_lock(state: str,
-                       conv: dict,
-                       inbound_lower: str,
-                       address,
-                       scheduled_date,
-                       scheduled_time) -> dict:
-    """
-    SRB-13 lockout logic.
-    Prevents responding after final confirmation
-    and prevents illegal backward movement.
-    """
-
-    # Hard stop: once final confirmation is sent, OS must not send further replies
-    if conv.get("final_confirmation_sent"):
-        return {
-            "interrupt": True,
-            "reply": {
-                "sms_body": "",
-                "scheduled_date": conv.get("scheduled_date"),
-                "scheduled_time": conv.get("scheduled_time"),
-                "address": conv.get("address"),
-            }
-        }
-
-    # No lockout required — allow Section 4 logic to continue normally
-    return {"interrupt": False}
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) — OPTIMIZED
 # ---------------------------------------------------
