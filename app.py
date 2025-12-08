@@ -1516,15 +1516,17 @@ def run_llm_fallback(
 # MAIN ENTRYPOINT — generate_reply_for_inbound()
 # ====================================================================
 def generate_reply_for_inbound(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    inbound_text,
-    scheduled_date,
-    scheduled_time,
-    address,
+    conv: dict,
+    cleaned_transcript: str | None,
+    category: str | None,
+    appointment_type: str | None,
+    initial_sms: str | None,
+    inbound_text: str,
+    scheduled_date: str | None,
+    scheduled_time: str | None,
+    address: str | None,
 ) -> dict:
+
 
     tz = ZoneInfo("America/New_York")
     now_local = datetime.now(tz)
@@ -7747,9 +7749,12 @@ def incoming_sms():
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
-    # Normalize Twilio WhatsApp format ("whatsapp:+1860…")
+    # ---------------------------------------------------
+    # Normalize Twilio WhatsApp format
+    # ---------------------------------------------------
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
+    from_number = from_number.strip()  # ensure key match
 
     convo = conversations.get(from_number)
 
@@ -7762,6 +7767,23 @@ def incoming_sms():
             "Hi, this is Prevolt Electric — thanks for reaching out. "
             "What electrical work are you looking to have done?"
         )
+        # Start minimal convo for cold inbound
+        conversations[from_number] = {
+            "cleaned_transcript": None,
+            "category": None,
+            "appointment_type": None,
+            "initial_sms": None,
+            "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
+            "replied": True,
+            "followup_sent": False,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
+            "normalized_address": None,
+            "booking_created": False,
+            "square_booking_id": None,
+            "state_prompt_sent": False,
+        }
         return Response(str(resp), mimetype="text/xml")
 
     # ---------------------------------------------------
@@ -7770,6 +7792,7 @@ def incoming_sms():
     if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
         up = body.upper()
 
+        # Parse state
         if "CT" in up or "CONNECTICUT" in up:
             chosen_state = "CT"
         elif "MA" in up or "MASS" in up or "MASSACHUSETTS" in up:
@@ -7779,10 +7802,11 @@ def incoming_sms():
             resp.message("Please reply with CT or MA so we can verify the address.")
             return Response(str(resp), mimetype="text/xml")
 
+        # Normalize with forced state
         raw_address = convo.get("address")
         status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
 
-        if status != "ok" or not addr_struct:
+        if status != "ok":
             resp = MessagingResponse()
             resp.message(
                 "I still couldn't verify the address. "
@@ -7791,11 +7815,11 @@ def incoming_sms():
             convo["state_prompt_sent"] = False
             return Response(str(resp), mimetype="text/xml")
 
-        # SAVE success
+        # Save and continue
         convo["normalized_address"] = addr_struct
         convo["state_prompt_sent"] = False
 
-        # Optional: allow Square booking ONLY here (safe)
+        # Allow booking after address verification
         try:
             maybe_create_square_booking(from_number, convo)
         except Exception as e:
@@ -7806,11 +7830,12 @@ def incoming_sms():
         return Response(str(resp), mimetype="text/xml")
 
     # ---------------------------------------------------
-    # 3) NORMAL CONVERSATION BRANCH
+    # 3) NORMAL CONVERSATION BRANCH — SRB STATE ENGINE
     # ---------------------------------------------------
     convo["replied"] = True
 
     ai_reply = generate_reply_for_inbound(
+        conv=convo,  # <<<<<<<<<<<<<< THE FIX — SRB-13 MUST MUTATE STATE
         cleaned_transcript=convo.get("cleaned_transcript"),
         category=convo.get("category"),
         appointment_type=convo.get("appointment_type"),
@@ -7835,21 +7860,21 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # IMPORTANT — NEVER allow appointment_type to be overwritten with None
+    # IMPORTANT — DO NOT OVERWRITE appointment_type WITH None
     incoming_apt = ai_reply.get("appointment_type")
-
-    if incoming_apt:  # only update if valid
+    if incoming_apt is not None:   # Only update if explicitly set
         convo["appointment_type"] = incoming_apt
-    # else: keep existing appointment_type → this prevents emergency break
+    # Else: preserve original appointment_type ALWAYS
 
     # ---------------------------------------------------
-    # 5) NO AUTO-BOOKING HERE (only via emergency engine or CT/MA block)
+    # 5) NO AUTO-BOOKING HERE unless emergency rules trigger it
     # ---------------------------------------------------
 
-    # If no outgoing message needed
+    # If no message needed → send empty TwiML
     if sms_body == "":
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
+    # Normal reply
     resp = MessagingResponse()
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
