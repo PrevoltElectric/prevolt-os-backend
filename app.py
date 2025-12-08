@@ -7192,7 +7192,7 @@ def normalize_address(raw_address: str, forced_state: str | None = None) -> tupl
 
 
 # ---------------------------------------------------
-# Square helpers
+# Square helpers (FULL FIXED VERSION)
 # ---------------------------------------------------
 def square_headers() -> dict:
     if not SQUARE_ACCESS_TOKEN:
@@ -7276,35 +7276,48 @@ def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
     if not date_str or not time_str:
         return None
     try:
-        local_naive = datetime.strptime(
-            f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
-        )
+        local_naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+
         if ZoneInfo:
             local = local_naive.replace(tzinfo=ZoneInfo("America/New_York"))
         else:
-            # Fallback: assume -05:00 (no DST handling)
             local = local_naive.replace(tzinfo=timezone(timedelta(hours=-5)))
-        # Convert to UTC and drop tzinfo for Square's expected format
+
         return local.astimezone(timezone.utc).replace(tzinfo=None)
     except Exception as e:
         print("Failed to parse local datetime:", repr(e))
         return None
 
 
+# ---------------------------------------------------
+# FIXED — ROBUST APPOINTMENT TYPE MAPPING
+# ---------------------------------------------------
 def map_appointment_type_to_variation(appointment_type: str):
-    if appointment_type == "EVAL_195":
+
+    # Normalize hard — eliminate all edge cases
+    if not appointment_type:
+        return None, None
+
+    atype = appointment_type.strip().upper()
+
+    # Canonical Prevolt types
+    if atype == "EVAL_195":
         return SERVICE_VARIATION_EVAL_ID, SERVICE_VARIATION_EVAL_VERSION
-    if appointment_type == "WHOLE_HOME_INSPECTION":
+
+    if atype in ("WHOLE_HOME_INSPECTION", "INSPECTION", "HOME_INSPECTION"):
         return SERVICE_VARIATION_INSPECTION_ID, SERVICE_VARIATION_INSPECTION_VERSION
-    if appointment_type == "TROUBLESHOOT_395":
+
+    if atype in ("TROUBLESHOOT_395", "TROUBLESHOOT", "REPAIR", "EMERGENCY"):
         return SERVICE_VARIATION_TROUBLESHOOT_ID, SERVICE_VARIATION_TROUBLESHOOT_VERSION
+
+    # Fallback — still return None, but log cleanly
+    print(f"APPOINTMENT_TYPE MISMATCH → '{appointment_type}' normalized to '{atype}' has no mapping.")
     return None, None
 
 
 def is_weekend(date_str: str) -> bool:
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        # Monday=0 ... Sunday=6
         return d.weekday() >= 5
     except Exception:
         return False
