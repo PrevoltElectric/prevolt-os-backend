@@ -1098,14 +1098,25 @@ def handle_emergency(
 
     conv["appointment_type"] = "TROUBLESHOOT_395"
 
+    # Always prefer normalized Google/PAI address if available
+norm = conv.get("normalized_address")
+
+if norm:
+    final_addr = format_full_address(norm)
+else:
+    # fallback to raw address
     final_addr = conv.get("address") or address
-    if not final_addr:
-        return {
-            "sms_body": "Got it — we can prioritize this. What’s the full service address?",
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": None,
-        }
+
+# If raw address exists but no normalized components yet,
+# DO NOT block emergency booking.
+if not final_addr:
+    return {
+        "sms_body": "Got it — we can prioritize this. What’s the full service address?",
+        "scheduled_date": None,
+        "scheduled_time": None,
+        "address": None,
+    }
+
 
     travel_minutes = None
     norm = conv.get("normalized_address")
