@@ -732,17 +732,26 @@ def handle_address_intake(conv, inbound_text, inbound_lower, scheduled_date, sch
 
 
 # ====================================================================
-# EMERGENCY ENGINE — RUNS AFTER ADDRESS INTAKE
+# EMERGENCY FAST-TRACK ENGINE (FINAL CLEAN VERSION)
 # ====================================================================
-def handle_emergency(conv, category, inbound_lower, address, now_local,
-                     today_date_str, scheduled_date, scheduled_time, phone):
-
+def handle_emergency(
+    conv,
+    category,
+    inbound_lower,
+    address,
+    now_local,
+    today_date_str,
+    scheduled_date,
+    scheduled_time,
+    phone
+):
     emergency_terms = [
         "no power", "partial power", "tree hit", "tree took",
         "tree took my wires", "wires pulled off", "power line down",
         "burning smell", "smoke smell", "fire", "sparks",
         "melted outlet", "melted plug", "buzzing panel",
-        "arcing", "breaker arcing", "breaker won't reset", "breaker wont reset",
+        "arcing", "breaker arcing", "breaker won't reset",
+        "breaker wont reset",
     ]
 
     is_emergency = contains_any(inbound_lower, emergency_terms)
@@ -767,9 +776,12 @@ def handle_emergency(conv, category, inbound_lower, address, now_local,
     travel_minutes = None
     norm = conv.get("normalized_address")
     if norm:
-        dest = format_full_address(norm)
-        origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
-        travel_minutes = compute_travel_time_minutes(origin, dest)
+        try:
+            dest = format_full_address(norm)
+            origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+            travel_minutes = compute_travel_time_minutes(origin, dest)
+        except:
+            travel_minutes = None
 
     emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
 
@@ -786,30 +798,43 @@ def handle_emergency(conv, category, inbound_lower, address, now_local,
         "address": final_addr,
     })
 
-    if not sq.get("success"):
+    if sq.get("success"):
+        if not conv.get("normalized_address"):
+            conv["normalized_address"] = {
+                "address_line_1": final_addr,
+                "locality": "",
+                "administrative_district_level_1": "",
+                "postal_code": "",
+            }
+
+        conv["final_confirmation_sent"] = True
+
+        try:
+            t_nice = datetime.strptime(scheduled_time, "%H:%M")\
+                .strftime("%I:%M %p").lstrip("0")
+        except:
+            t_nice = scheduled_time
+
         return {
-            "sms_body": "Before I finalize this emergency visit, I still need the complete service address.",
+            "sms_body": (
+                f"You're all set — emergency troubleshoot scheduled for about {t_nice}. "
+                "A Square confirmation will follow."
+            ),
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
             "address": final_addr,
         }
 
-    conv["final_confirmation_sent"] = True
-
-    try:
-        t_nice = datetime.strptime(scheduled_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
-    except:
-        t_nice = scheduled_time
-
     return {
         "sms_body": (
-            f"You're all set — emergency troubleshoot scheduled for about {t_nice}. "
-            "A Square confirmation will follow."
+            "Before I finalize this emergency visit, I still need the complete service address."
         ),
         "scheduled_date": scheduled_date,
         "scheduled_time": scheduled_time,
         "address": final_addr,
     }
+
+
 
 
 # ====================================================================
