@@ -919,38 +919,102 @@ Follow internal SRB rules only. Output MUST be strict JSON.
 
 
 # ====================================================================
-# SRB-12 — Natural Language Date/Time Parsing
+# SRB-12 — Natural Language Date/Time Parsing (UPGRADED VERSION)
 # ====================================================================
-def parse_natural_datetime(text: str, now_local) -> dict:
-    t = text.lower().strip()
-    today = now_local.date()
-    tomorrow = today + timedelta(days=1)
+import re
+from datetime import timedelta
 
-    out = {"has_datetime": False, "date": None, "time": None}
+def parse_natural_datetime(inbound_text: str, now_local):
+    text = inbound_text.lower().strip()
 
-    if "tomorrow" in t:
-        out["date"] = tomorrow.strftime("%Y-%m-%d")
-        out["has_datetime"] = True
-    elif "today" in t:
-        out["date"] = today.strftime("%Y-%m-%d")
-        out["has_datetime"] = True
+    result = {
+        "has_datetime": False,
+        "date": None,
+        "time": None
+    }
 
-    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t)
-    if m:
-        h = int(m.group(1))
-        minute = int(m.group(2) or 0)
-        ampm = m.group(3)
+    # ---------------------------------------------------------------
+    # SAME-DAY / IMMEDIATE PHRASES
+    # ---------------------------------------------------------------
+    same_day_terms = [
+        "today", "right now", "im home", "i am home",
+        "here now", "home now", "asap", "available now"
+    ]
 
-        if ampm == "pm" and h != 12:
-            h += 12
-        if ampm == "am" and h == 12:
-            h = 0
+    if any(x in text for x in same_day_terms):
+        result["has_datetime"] = True
+        result["date"] = now_local.strftime("%Y-%m-%d")
+        result["time"] = (now_local + timedelta(hours=2)).strftime("%H:%M")
+        return result
 
-        if 0 <= h <= 23:
-            out["time"] = f"{h:02d}:{minute:02d}"
-            out["has_datetime"] = True
+    # ---------------------------------------------------------------
+    # TOMORROW
+    # ---------------------------------------------------------------
+    if "tomorrow" in text:
+        t = now_local + timedelta(days=1)
+        result["has_datetime"] = True
+        result["date"] = t.strftime("%Y-%m-%d")
+        result["time"] = "09:00"
+        return result
 
-    return out
+    # ---------------------------------------------------------------
+    # WEEKDAY NAMES
+    # ---------------------------------------------------------------
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+
+    for word, target_idx in weekdays.items():
+        if word in text:
+            today_idx = now_local.weekday()
+            delta = (target_idx - today_idx) % 7
+            if delta == 0:
+                delta = 7  # Next week same day
+
+            visit_day = now_local + timedelta(days=delta)
+            result["has_datetime"] = True
+            result["date"] = visit_day.strftime("%Y-%m-%d")
+            result["time"] = "09:00"
+            return result
+
+    # ---------------------------------------------------------------
+    # OPEN / FLEXIBLE PHRASES
+    # ---------------------------------------------------------------
+    if any(x in text for x in ["any day", "whenever", "you pick", "flexible"]):
+        t = now_local + timedelta(days=1)
+        result["has_datetime"] = True
+        result["date"] = t.strftime("%Y-%m-%d")
+        result["time"] = "09:00"
+        return result
+
+    # ---------------------------------------------------------------
+    # SPECIFIC TIMES (3 pm, 4:30, 10am, etc.)
+    # ---------------------------------------------------------------
+    time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2)) if time_match.group(2) else 0
+        meridiem = time_match.group(3)
+
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+
+        # Validate hour
+        if 0 <= hour <= 23:
+            result["has_datetime"] = True
+            result["date"] = now_local.strftime("%Y-%m-%d")
+            result["time"] = f"{hour:02d}:{minute:02d}"
+            return result
+
+    return result
 
 
 # ====================================================================
