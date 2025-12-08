@@ -7744,7 +7744,7 @@ def voicemail_complete():
 
 
 # ---------------------------------------------------
-# Incoming SMS / WhatsApp  (FULLY PATCHED – FINAL VERSION)
+# Incoming SMS / WhatsApp (FINAL PATCHED VERSION)
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
@@ -7760,9 +7760,9 @@ def incoming_sms():
 
     convo = conversations.get(from_number)
 
-    # ---------------------------------------------------
+    # ===================================================
     # 1) COLD INBOUND (no voicemail history)
-    # ---------------------------------------------------
+    # ===================================================
     if not convo:
         resp = MessagingResponse()
         resp.message(
@@ -7773,7 +7773,7 @@ def incoming_sms():
         conversations[from_number] = {
             "cleaned_transcript": None,
             "category": None,
-            "appointment_type": "TROUBLESHOOT_395",  # <-- SAFE DEFAULT
+            "appointment_type": "TROUBLESHOOT_395",   # SAFE DEFAULT
             "initial_sms": None,
             "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
             "replied": True,
@@ -7785,21 +7785,24 @@ def incoming_sms():
             "booking_created": False,
             "square_booking_id": None,
             "state_prompt_sent": False,
+            "phone": from_number,                      # REQUIRED
         }
         return Response(str(resp), mimetype="text/xml")
 
     # ===================================================
     # 2) APPOINTMENT TYPE FIREWALL (CRITICAL FIX)
     # ===================================================
-    if convo.get("appointment_type") is None:
-        restored = convo.get("category")
-        if restored:
-            restored = restored.strip().upper()
-        else:
-            restored = "TROUBLESHOOT_395"
-        convo["appointment_type"] = restored
+    appt = convo.get("appointment_type")
 
-    forced_type = convo["appointment_type"]
+    if appt is None:
+        appt = convo.get("category")
+
+    if appt is None:
+        appt = "TROUBLESHOOT_395"
+
+    appt = appt.strip().upper()
+    convo["appointment_type"] = appt
+    forced_type = appt
 
     # ---------------------------------------------------
     # 3) ADDRESS STATE CONFIRMATION (CT / MA)
@@ -7809,17 +7812,17 @@ def incoming_sms():
 
         if "CT" in up or "CONNECTICUT" in up:
             chosen_state = "CT"
-        elif "MA" in up or "MASS" in up:
+        elif "MA" in up or "MASS" in up or "MASSACHUSETTS" in up:
             chosen_state = "MA"
         else:
             resp = MessagingResponse()
             resp.message("Please reply with CT or MA so we can verify the address.")
             return Response(str(resp), mimetype="text/xml")
 
-        raw_address = convo.get("address")
-        status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
+        raw = convo.get("address")
+        status, parsed = normalize_address(raw, forced_state=chosen_state)
 
-        if status != "ok" or not addr_struct:
+        if status != "ok" or not parsed:
             resp = MessagingResponse()
             resp.message(
                 "I still couldn't verify the address. "
@@ -7828,7 +7831,7 @@ def incoming_sms():
             convo["state_prompt_sent"] = False
             return Response(str(resp), mimetype="text/xml")
 
-        convo["normalized_address"] = addr_struct
+        convo["normalized_address"] = parsed
         convo["state_prompt_sent"] = False
 
         try:
@@ -7844,12 +7847,13 @@ def incoming_sms():
     # 4) NORMAL FLOW
     # ---------------------------------------------------
     convo["replied"] = True
+    convo["phone"] = from_number   # ensure always present
 
     ai_reply = generate_reply_for_inbound(
         conv=convo,
         cleaned_transcript=convo.get("cleaned_transcript"),
         category=convo.get("category"),
-        appointment_type=forced_type,   # << HARD ENFORCEMENT
+        appointment_type=forced_type,  # NEVER NONE
         initial_sms=convo.get("initial_sms"),
         inbound_text=body,
         scheduled_date=convo.get("scheduled_date"),
@@ -7875,12 +7879,13 @@ def incoming_sms():
     # 6) APPOINTMENT TYPE PROTECTION
     # ---------------------------------------------------
     incoming_apt = ai_reply.get("appointment_type")
-    if incoming_apt is not None:
-        convo["appointment_type"] = incoming_apt
-    # else: KEEP existing convo["appointment_type"]
+
+    if incoming_apt is not None and incoming_apt != "":
+        convo["appointment_type"] = incoming_apt.strip().upper()
+    # else → KEEP existing appointment_type ALWAYS
 
     # ---------------------------------------------------
-    # 7) No outgoing message
+    # 7) No outgoing message needed
     # ---------------------------------------------------
     if sms_body == "":
         return Response(str(MessagingResponse()), mimetype="text/xml")
@@ -7891,6 +7896,7 @@ def incoming_sms():
     resp = MessagingResponse()
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
+
 
 
 
