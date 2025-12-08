@@ -7638,6 +7638,86 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
         "booking_id": booking_id,
     }
 
+# ---------------------------------------------------
+# Voice: Incoming Call
+# ---------------------------------------------------
+@app.route("/incoming-call", methods=["POST"])
+def incoming_call():
+    response = VoiceResponse()
+    response.say(
+        "Thanks for calling Prevolt Electric. "
+        "Please leave your name, address, and a brief description of your project. "
+        "We will text you shortly."
+    )
+    response.record(
+        max_length=60,
+        play_beep=True,
+        trim="do-not-trim",
+        action="/voicemail-complete",
+    )
+    response.hangup()
+    return Response(str(response), mimetype="text/xml")
+
+
+# ---------------------------------------------------
+# Voicemail Complete → Transcribe → Initial SMS
+# ---------------------------------------------------
+@app.route("/voicemail-complete", methods=["POST"])
+def voicemail_complete():
+    caller = request.form.get("From")
+    recording_sid = request.form.get("RecordingSid")
+
+    print("Voicemail webhook hit. SID:", recording_sid, "Caller:", caller)
+
+    if not recording_sid:
+        print("ERROR: Missing RecordingSid in voicemail webhook.")
+        vr = VoiceResponse()
+        vr.hangup()
+        return Response(str(vr), mimetype="text/xml")
+
+    recording_url = (
+        f"https://api.twilio.com/2010-04-01/Accounts/"
+        f"{TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}"
+    )
+
+    try:
+        print("Downloading and transcribing voicemail from:", recording_url)
+
+        raw = transcribe_recording(recording_url)
+        print("Raw transcript:", raw)
+
+        cleaned = clean_transcript_text(raw)
+        print("Cleaned transcript:", cleaned)
+
+        sms_info = generate_initial_sms(cleaned)
+        print("Initial SMS info:", sms_info)
+
+        send_sms(caller, sms_info["sms_body"])
+
+        # Initialize conversation state
+        conversations[caller] = {
+            "cleaned_transcript": cleaned,
+            "category": sms_info["category"],
+            "appointment_type": sms_info["appointment_type"],
+            "initial_sms": sms_info["sms_body"],
+            "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
+            "replied": False,
+            "followup_sent": False,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
+            "normalized_address": None,
+            "booking_created": False,
+            "square_booking_id": None,
+            "state_prompt_sent": False,
+        }
+
+    except Exception as e:
+        print("Voicemail fail:", repr(e))
+
+    vr = VoiceResponse()
+    vr.hangup()
+    return Response(str(vr), mimetype="text/xml")
 
 
 # ---------------------------------------------------
