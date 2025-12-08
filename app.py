@@ -233,12 +233,58 @@ If message implies danger, OS prioritizes dispatch workflow.
 """
 
 # ---------------------------------------------------
-# Step 3 — Generate Initial SMS
+# Step 3 — Generate Initial SMS (with hard-wired emergency override)
 # ---------------------------------------------------
 def generate_initial_sms(cleaned_text: str) -> dict:
+    t = cleaned_text.lower()
+
+    # ------------------------------------------------
+    # 3A — Deterministic emergency detector (pre-LLM)
+    # ------------------------------------------------
+    emergency_terms = [
+        "no power",
+        "power outage",
+        "lost power",
+        "tree hit",
+        "tree took",
+        "tree took my wires",
+        "tree fell on the lines",
+        "tree fell on my lines",
+        "tree pulled",
+        "wires pulled off",
+        "power line down",
+        "lines down",
+        "burning smell",
+        "smoke smell",
+        "smell of smoke",
+        "smell burning",
+        "sparks",
+        "arcing",
+        "panel is buzzing",
+        "buzzing panel",
+    ]
+
+    if any(term in t for term in emergency_terms):
+        # Hard-coded emergency script so pricing + type are ALWAYS correct
+        return {
+            "sms_body": (
+                "Hi, this is Prevolt Electric — we understand you have an urgent "
+                "electrical issue, likely related to a tree or power loss. "
+                "We can schedule a same-day troubleshooting visit to restore service. "
+                "Our emergency troubleshoot and repair visit is $395. "
+                "Please reply with your full service address and a good time today."
+            ),
+            "category": "Active problems",
+            "appointment_type": "TROUBLESHOOT_395",
+        }
+
+    # ------------------------------------------------
+    # 3B — Normal LLM path (non-emergency)
+    # ------------------------------------------------
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
+            temperature=0,  # reduce randomness for classification
             messages=[
                 {
                     "role": "system",
@@ -274,11 +320,13 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         return {
             "sms_body": (
                 "Hi, this is Prevolt Electric — I received your message. "
-                "The next step is a $195 on-site consultation and quote visit. What day works for you?"
+                "The next step is a $195 on-site consultation and quote visit. "
+                "What day works for you?"
             ),
             "category": "OTHER",
             "appointment_type": "EVAL_195",
         }
+
 
 
 # ---------------------------------------------------
