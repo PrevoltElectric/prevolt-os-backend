@@ -1518,10 +1518,13 @@ def generate_reply_for_inbound(
     conv = conversations[phone]
 
     # -----------------------------------------------------------
-    # 🔥 NEW PATCH — PROTECT EMERGENCY APPOINTMENT TYPE
+    # APPOINTMENT TYPE PROTECTION (cannot be None anymore)
     # -----------------------------------------------------------
     if conv.get("is_emergency") and conv.get("appointment_type") is None:
         conv["appointment_type"] = "TROUBLESHOOT_395"
+
+    if appointment_type is None:
+        appointment_type = conv.get("appointment_type")
 
     # 1) State Machine Lock
     state = get_current_state(conv)
@@ -1538,7 +1541,7 @@ def generate_reply_for_inbound(
             intent_reply["appointment_type"] = conv.get("appointment_type")
         return intent_reply
 
-    # 3) Address Intake — must run BEFORE emergency logic
+    # 3) Address Intake
     addr_reply = handle_address_intake(
         conv, inbound_text, inbound_lower,
         scheduled_date, scheduled_time, address
@@ -7754,12 +7757,15 @@ def incoming_sms():
         convo["address"] = ai_reply["address"]
 
     # ---------------------------------------------------
-    # DO NOT ALLOW APPOINTMENT TYPE TO BE WIPED
+    # DO NOT ALLOW APPOINTMENT TYPE TO BE WIPED  (**FIXED**)
     # ---------------------------------------------------
     incoming_apt = ai_reply.get("appointment_type")
-    if incoming_apt is not None:
+
+    # Only update if incoming_apt is non-empty AND valid
+    if incoming_apt:
         convo["appointment_type"] = incoming_apt
-    # (If None: preserve existing appointment_type — critical for emergency flows)
+    # If incoming_apt is None or "", preserve the existing appointment_type
+    # This prevents loops and ensures emergency flows remain intact.
 
     # ---------------------------------------------------
     # IMPORTANT:
