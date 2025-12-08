@@ -805,66 +805,75 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
                            scheduled_date, scheduled_time, address):
     """
     Prevolt Address Intelligence (PAI) + Google fallback:
-    • Accepts partial addresses (e.g., “54 Bloomfield”)
-    • Extracts town if present
+    • Accepts partial addresses (“54 Bloomfield”)
+    • Extracts town when present
     • Determines CT or MA using PAI rules
     • Only asks CT/MA when truly ambiguous
-    • NEVER loops the state question
+    • NEVER asks CT/MA twice
+    • NEVER loops
     • Produces clean address for Square
     """
 
-    # Not an address → skip
+    # Not an address → skip intake entirely
     if not is_customer_address_only(inbound_lower):
         return None
 
     raw = inbound_text.strip()
     conv["address"] = raw
 
-    # --- STEP 1: Run PAI resolver (cheap + instant)
+    # -----------------------------
+    # STEP 1 — Run PAI
+    # -----------------------------
     pai = resolve_address_pai(raw)
-    status = pai["status"]
+    status = pai.get("status")
+    forced_state = pai.get("state")  # may be "CT", "MA", or None
 
-    # If PAI detects ambiguity → ask CT or MA ONCE
+    # Need CT/MA? Ask ONLY once
     if status == "needs_state":
-        # Do not ask twice
-        if conv.get("town_prompt_sent"):
-            return None
+        if not conv.get("town_prompt_sent"):
+            conv["town_prompt_sent"] = True
+            return {
+                "sms_body": "Is that address in Connecticut or Massachusetts?",
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": raw,
+            }
+        # Already asked → never ask again → continue booking
+        return None
 
-        conv["town_prompt_sent"] = True
-        return {
-            "sms_body": "Is that address in Connecticut or Massachusetts?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": raw,
-        }
+    # -----------------------------
+    # STEP 2 — Try Google Normalization
+    # -----------------------------
+    norm_status, parsed = normalize_address(raw, forced_state)
 
-    # --- STEP 2: PAI says “OK” → attempt Google normalization
-    forced_state = pai.get("state")  # may be CT, MA, or None
-    final_try = normalize_address(raw, forced_state)
-
-    norm_status, parsed = final_try
-
-    # SUCCESS: store structured address
+    # Successful Google normalization
     if norm_status == "ok":
         conv["normalized_address"] = parsed
         return None
 
-    # Google couldn't infer state but PAI already determined it → retry with forced state
+    # Google says "needs_state" BUT PAI already determined state → retry once
     if norm_status == "needs_state" and forced_state:
-        retry = normalize_address(raw, forced_state)
-        r_status, r_parsed = retry
-        if r_status == "ok":
-            conv["normalized_address"] = r_parsed
+        retry_status, retry_parsed = normalize_address(raw, forced_state)
+        if retry_status == "ok":
+            conv["normalized_address"] = retry_parsed
             return None
-
-    # Google wants CT/MA but PAI already knows → DO NOT ASK AGAIN
-    if norm_status == "needs_state" and forced_state:
+        # If retry still fails → proceed with raw (but do not block)
         conv["normalized_address"] = None
         return None
 
-    # Google fully failed → keep raw but allow booking to continue
+    # Google says "needs_state" BUT PAI gave no state → PAI already handled ambiguity earlier
+    if norm_status == "needs_state" and not forced_state:
+        # DO NOT ask again. DO NOT loop. Use raw.
+        conv["normalized_address"] = None
+        return None
+
+    # -----------------------------
+    # STEP 3 — Google Failure
+    # -----------------------------
+    # Allow booking with raw address
     conv["normalized_address"] = None
     return None
+
 
 
 
