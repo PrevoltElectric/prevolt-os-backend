@@ -467,20 +467,29 @@ def normalize_possible_address(text: str):
 
 
 # ---------------------------------------------------
-# Format address for travel-time logic
+# Format address for travel-time logic (FINAL VERSION)
 # ---------------------------------------------------
 def format_full_address(norm: dict) -> str:
     """
     Returns a safe human-readable address string.
+    Ensures that earlier-captured `full` field is NEVER lost.
     """
     if not norm:
         return ""
-    line = norm.get("address_line_1") or norm.get("full") or ""
-    loc = norm.get("locality") or ""
-    st  = norm.get("administrative_district_level_1") or ""
+
+    line = (
+        norm.get("address_line_1")
+        or norm.get("full")
+        or ""
+    )
+
+    loc  = norm.get("locality") or ""
+    st   = norm.get("administrative_district_level_1") or ""
     zipc = norm.get("postal_code") or ""
 
-    return f"{line}, {loc} {st} {zipc}".strip(", ").strip()
+    # Clean formatting to avoid leading/trailing commas
+    formatted = f"{line}, {loc} {st} {zipc}".strip().strip(", ")
+    return formatted
 
 
 
@@ -1262,65 +1271,104 @@ def handle_emergency(
 
 
 # ====================================================================
-# FOLLOW-UP QUESTION ENGINE
+# FOLLOW-UP QUESTION ENGINE (SAFE, NON-DROPPING VERSION)
 # ====================================================================
 def handle_followup_questions(conv, appointment_type, inbound_lower,
                               scheduled_date, scheduled_time, address):
 
-    if conv.get("appointment_type") is None and appointment_type is None:
+    # Helper: always return a safe dict with appointment_type preserved
+    def reply(body, date, time, addr, appt_type=None):
         return {
-            "sms_body": (
+            "sms_body": body,
+            "scheduled_date": date,
+            "scheduled_time": time,
+            "address": addr,
+            # ALWAYS include appointment_type — never allow it to drop
+            "appointment_type": (
+                appt_type
+                if appt_type is not None
+                else conv.get("appointment_type")
+                if conv.get("appointment_type") is not None
+                else appointment_type
+            ),
+        }
+
+    # ---------------------------------------------------------
+    # 1) APPOINTMENT TYPE MISSING
+    # ---------------------------------------------------------
+    if conv.get("appointment_type") is None and appointment_type is None:
+        return reply(
+            (
                 "Before I schedule anything, which type of visit is this?\n"
                 "1) $195 on-site evaluation\n"
                 "2) Full-home inspection\n"
                 "3) Troubleshoot and repair\n\nReply 1, 2, or 3."
             ),
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-        }
+            scheduled_date,
+            scheduled_time,
+            address,
+            appt_type=None
+        )
 
+    # ---------------------------------------------------------
+    # 2) ADDRESS MISSING
+    # ---------------------------------------------------------
     if not conv.get("address") and not is_customer_address_only(inbound_lower):
-        return {
-            "sms_body": "What’s the full service address for this visit?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": None,
-        }
+        return reply(
+            "What’s the full service address for this visit?",
+            scheduled_date,
+            scheduled_time,
+            None
+        )
 
+    # ---------------------------------------------------------
+    # 3) STATE CONFIRMATION NEEDED (CT/MA)
+    # ---------------------------------------------------------
     if conv.get("state_prompt_sent") and not conv.get("normalized_address"):
-        return {
-            "sms_body": "Just confirming — is the address in Connecticut or Massachusetts?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": conv.get("address"),
-        }
+        return reply(
+            "Just confirming — is the address in Connecticut or Massachusetts?",
+            scheduled_date,
+            scheduled_time,
+            conv.get("address")
+        )
 
+    # ---------------------------------------------------------
+    # 4) DATE MISSING
+    # ---------------------------------------------------------
     if not conv.get("scheduled_date") and scheduled_date is None:
-        return {
-            "sms_body": "What day works best for your visit?",
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": conv.get("address"),
-        }
+        return reply(
+            "What day works best for your visit?",
+            None,
+            None,
+            conv.get("address")
+        )
 
+    # ---------------------------------------------------------
+    # 5) TIME MISSING
+    # ---------------------------------------------------------
     if not conv.get("scheduled_time") and scheduled_time is None:
-        return {
-            "sms_body": f"What time works for your visit on {scheduled_date or 'that day'}?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": None,
-            "address": conv.get("address"),
-        }
+        return reply(
+            f"What time works for your visit on {scheduled_date or 'that day'}?",
+            scheduled_date,
+            None,
+            conv.get("address")
+        )
 
+    # ---------------------------------------------------------
+    # 6) HOME INSPECTION REQUIRES SQUARE FOOTAGE
+    # ---------------------------------------------------------
     if conv.get("appointment_type") == "INSPECTION" and not conv.get("square_footage"):
         if "sq" not in inbound_lower:
-            return {
-                "sms_body": "For the home inspection, what’s the approximate square footage?",
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": conv.get("address"),
-            }
+            return reply(
+                "For the home inspection, what’s the approximate square footage?",
+                scheduled_date,
+                scheduled_time,
+                conv.get("address")
+            )
 
+    # ---------------------------------------------------------
+    # 7) NO FOLLOW-UP NEEDED
+    # ---------------------------------------------------------
     return None
 
 
@@ -1535,18 +1583,40 @@ def generate_reply_for_inbound(
     if conv is None:
         conv = {}
 
-    # STEP 1 — Collect possible sources of appointment_type
-    if appointment_type is None:
-        appointment_type = conv.get("appointment_type")
+    # ============================================================
+    # STEP 1 — COLLECT appointment_type ONLY FROM VALID SOURCES
+    # DO NOT EVER DERIVE TYPE FROM category (breaks everything)
+    # ============================================================
 
-    if appointment_type is None:
-        appointment_type = conv.get("category")
+    # Provided directly by caller?
+    if appointment_type is not None:
+        pass
 
+    # Stored in conversation memory?
+    elif conv.get("appointment_type"):
+        appointment_type = conv["appointment_type"]
+
+    # Validate type
+    VALID_TYPES = {
+        "EVAL_195",
+        "TROUBLESHOOT_395",
+        "INSPECTION",
+        "WHOLE_HOME_INSPECTION",
+    }
+
+    # If the type is invalid, discard it
+    if appointment_type and appointment_type.strip().upper() not in VALID_TYPES:
+        appointment_type = None
+
+    # ============================================================
     # STEP 2 — FINAL FAILSAFE DEFAULT
+    # ============================================================
     if appointment_type is None:
         appointment_type = "TROUBLESHOOT_395"
 
-    # STEP 3 — Normalize + store permanently
+    # ============================================================
+    # STEP 3 — NORMALIZE + STORE PERMANENTLY
+    # ============================================================
     appointment_type = appointment_type.strip().upper()
     conv["appointment_type"] = appointment_type
 
@@ -1576,7 +1646,7 @@ def generate_reply_for_inbound(
         return intent_reply
 
     # -----------------------------------------------------------
-    # 4) ADDRESS INTAKE (MUST HAPPEN BEFORE EMERGENCY ENGINE)
+    # 4) ADDRESS INTAKE
     # -----------------------------------------------------------
     addr_reply = handle_address_intake(
         conv,
@@ -1591,11 +1661,11 @@ def generate_reply_for_inbound(
             addr_reply["appointment_type"] = conv.get("appointment_type")
         return addr_reply
 
-    # Ensure address synced before emergency pass
+    # Sync latest address before emergency engine
     address = conv.get("address")
 
     # -----------------------------------------------------------
-    # 5) EMERGENCY ENGINE (SRB-15)
+    # 5) EMERGENCY ENGINE
     # -----------------------------------------------------------
     emergency_reply = handle_emergency(
         conv,
@@ -7742,36 +7812,51 @@ def voicemail_complete():
 
 
 # ---------------------------------------------------
-# Incoming SMS / WhatsApp (FINAL PATCHED VERSION)
+# Incoming SMS / WhatsApp — FULLY HARDENED VERSION
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
-    # ---------------------------------------------------
-    # Normalize Twilio WhatsApp format
-    # ---------------------------------------------------
+    # Normalize WhatsApp format
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
     from_number = from_number.strip()
 
     convo = conversations.get(from_number)
 
+    # ---------------------------------------------------
+    # INTERNAL FUNCTION — ALWAYS RETURNS VALID TYPE
+    # ---------------------------------------------------
+    def sanitize_appt_type(value):
+        """
+        Ensures appointment_type can NEVER be None/empty.
+        """
+        if not value:
+            return "TROUBLESHOOT_395"
+
+        if isinstance(value, str):
+            v = value.strip().upper()
+            if v in ("", "NONE", "NULL"):
+                return "TROUBLESHOOT_395"
+            return v
+
+        return "TROUBLESHOOT_395"
+
     # ===================================================
-    # 1) COLD INBOUND (no voicemail history)
+    # 1) COLD INBOUND — NO PRIOR CONVO
     # ===================================================
-    if not convo:
+    if convo is None:
         resp = MessagingResponse()
         resp.message(
-            "Hi, this is Prevolt Electric — thanks for reaching out. "
-            "What electrical work are you looking to have done?"
+            "Hi, this is Prevolt Electric — what electrical work are you looking to have done?"
         )
 
         conversations[from_number] = {
             "cleaned_transcript": None,
             "category": None,
-            "appointment_type": "TROUBLESHOOT_395",   # SAFE DEFAULT
+            "appointment_type": "TROUBLESHOOT_395",
             "initial_sms": None,
             "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
             "replied": True,
@@ -7783,28 +7868,24 @@ def incoming_sms():
             "booking_created": False,
             "square_booking_id": None,
             "state_prompt_sent": False,
-            "phone": from_number,                      # REQUIRED
+            "phone": from_number,
         }
         return Response(str(resp), mimetype="text/xml")
 
     # ===================================================
-    # 2) APPOINTMENT TYPE FIREWALL (CRITICAL FIX)
+    # 2) APPOINTMENT TYPE FIREWALL (IMMUTABLE PROTECTION)
     # ===================================================
-    appt = convo.get("appointment_type")
+    raw_appt = convo.get("appointment_type")
+    raw_cat = convo.get("category")
 
-    if appt is None:
-        appt = convo.get("category")
-
-    if appt is None:
-        appt = "TROUBLESHOOT_395"
-
-    appt = appt.strip().upper()
+    # The ONLY valid initial value must be sanitized
+    appt = sanitize_appt_type(raw_appt or raw_cat or "TROUBLESHOOT_395")
     convo["appointment_type"] = appt
     forced_type = appt
 
-    # ---------------------------------------------------
-    # 3) ADDRESS STATE CONFIRMATION (CT / MA)
-    # ---------------------------------------------------
+    # ===================================================
+    # 3) ADDRESS STATE CONFIRMATION (CT/MA)
+    # ===================================================
     if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
         up = body.upper()
 
@@ -7817,14 +7898,14 @@ def incoming_sms():
             resp.message("Please reply with CT or MA so we can verify the address.")
             return Response(str(resp), mimetype="text/xml")
 
-        raw = convo.get("address")
-        status, parsed = normalize_address(raw, forced_state=chosen_state)
+        raw_addr = convo.get("address")
+
+        status, parsed = normalize_address(raw_addr, forced_state=chosen_state)
 
         if status != "ok" or not parsed:
             resp = MessagingResponse()
             resp.message(
-                "I still couldn't verify the address. "
-                "Please reply with the full street, town, state, and ZIP."
+                "I still couldn't verify the address — please send the full street, town, state, and ZIP."
             )
             convo["state_prompt_sent"] = False
             return Response(str(resp), mimetype="text/xml")
@@ -7835,23 +7916,24 @@ def incoming_sms():
         try:
             maybe_create_square_booking(from_number, convo)
         except Exception as e:
-            print("maybe_create_square_booking after CT/MA reply failed:", repr(e))
+            print("Square booking after CT/MA confirm failed:", repr(e))
 
         resp = MessagingResponse()
-        resp.message("Thanks — that helps. We have everything we need for your visit.")
+        resp.message("Thanks — we have everything we need for your visit.")
         return Response(str(resp), mimetype="text/xml")
 
-    # ---------------------------------------------------
-    # 4) NORMAL FLOW
-    # ---------------------------------------------------
+    # ===================================================
+    # 4) NORMAL FLOW — ALWAYS PRESERVE STATE
+    # ===================================================
     convo["replied"] = True
-    convo["phone"] = from_number   # ensure always present
+    convo["phone"] = from_number
 
+    # -- ALWAYS use forced_type, never trust inbound or convo state
     ai_reply = generate_reply_for_inbound(
         conv=convo,
         cleaned_transcript=convo.get("cleaned_transcript"),
         category=convo.get("category"),
-        appointment_type=forced_type,  # NEVER NONE
+        appointment_type=forced_type,
         initial_sms=convo.get("initial_sms"),
         inbound_text=body,
         scheduled_date=convo.get("scheduled_date"),
@@ -7859,11 +7941,9 @@ def incoming_sms():
         address=convo.get("address"),
     )
 
-    sms_body = (ai_reply.get("sms_body") or "").strip()
-
-    # ---------------------------------------------------
-    # 5) UPDATE STATE SAFELY
-    # ---------------------------------------------------
+    # ===================================================
+    # 5) UPDATE STATE SAFELY (NEVER OVERWRITE WITH NONE)
+    # ===================================================
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
 
@@ -7873,27 +7953,25 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # ---------------------------------------------------
-    # 6) APPOINTMENT TYPE PROTECTION
-    # ---------------------------------------------------
-    incoming_apt = ai_reply.get("appointment_type")
+    # ===================================================
+    # 6) HARD APPT-TYPE PROTECTION
+    # ===================================================
+    incoming_apt = sanitize_appt_type(ai_reply.get("appointment_type"))
+    convo["appointment_type"] = incoming_apt  # ALWAYS overwrite with sanitized value
 
-    if incoming_apt is not None and incoming_apt != "":
-        convo["appointment_type"] = incoming_apt.strip().upper()
-    # else → KEEP existing appointment_type ALWAYS
+    # ===================================================
+    # 7) SEND SMS OR NOT
+    # ===================================================
+    sms_body = (ai_reply.get("sms_body") or "").strip()
 
-    # ---------------------------------------------------
-    # 7) No outgoing message needed
-    # ---------------------------------------------------
     if sms_body == "":
+        # No message required — return empty TwiML
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
-    # ---------------------------------------------------
-    # 8) SEND RESPONSE
-    # ---------------------------------------------------
     resp = MessagingResponse()
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
+
 
 
 
