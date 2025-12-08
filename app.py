@@ -538,6 +538,146 @@ def is_troubleshoot_case(text: str) -> bool:
     t = text.lower().strip()
     return any(trigger in t for trigger in TROUBLESHOOT_TRIGGERS)
 
+# ====================================================================
+# PREVOLT ADDRESS INTELLIGENCE (PAI) — GLOBAL NORMALIZATION ENGINE
+# ====================================================================
+import re
+
+# --------------------------------------------------------------------
+# 1) Hard-coded CT/MA town lists (covers all common customer inputs)
+# --------------------------------------------------------------------
+CT_TOWNS = {
+    "windsor", "bloomfield", "granby", "hartford", "enfield", "suffield",
+    "simbsury", "simbsbury", "simsbury", "newington", "wethersfield",
+    "bristol", "east hartford", "west hartford", "rocky hill",
+    "manchester", "south windsor", "ellington", "tolland",
+    "vernon", "east granby", "farmington", "avon", "canton",
+}
+MA_TOWNS = {
+    "springfield", "chicopee", "holyoke", "longmeadow", "east longmeadow",
+    "agawam", "northampton", "west springfield", "southampton",
+    "amherst", "ludlow", "wilbraham",
+}
+
+# --------------------------------------------------------------------
+# 2) Address detector — detects ANY street + number (even partial)
+# --------------------------------------------------------------------
+def is_customer_address_only(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.lower().strip()
+
+    # MUST include a house number
+    if not re.search(r"\b\d{1,6}[a-z]?\b", t):
+        return False
+
+    # Remove noise language
+    noise = r"\b(in|at|on|by|my|is|the|we|live|are|i|am|its|it's|address|please|come|to|can|you|now)\b"
+    cleaned = re.sub(noise, "", t).strip()
+
+    # Accept "54 bloomfield ave", "54 bloomfield", "54 bloomfield windsor"
+    loose = r"\b\d{1,6}[a-z]?\s+[a-z0-9\s]{3,}\b"
+    return bool(re.search(loose, cleaned))
+
+# --------------------------------------------------------------------
+# 3) Extract town if present
+# --------------------------------------------------------------------
+def extract_town(text: str) -> str | None:
+    t = text.lower()
+    for town in CT_TOWNS | MA_TOWNS:
+        if town.lower() in t:
+            return town.lower()
+    return None
+
+# --------------------------------------------------------------------
+# 4) Decide CT or MA (your chosen rule: ASK if ambiguous)
+# --------------------------------------------------------------------
+def decide_state_for_town(town: str):
+    if not town:
+        return None  # let geocoder decide
+
+    in_ct = town in CT_TOWNS
+    in_ma = town in MA_TOWNS
+
+    if in_ct and not in_ma:
+        return "CT"
+    if in_ma and not in_ct:
+        return "MA"
+
+    # AMBIGUOUS — must ask CT or MA
+    return "ASK"
+
+# --------------------------------------------------------------------
+# 5) Soft parse street number + name (suffix optional)
+# --------------------------------------------------------------------
+def extract_street_line(text: str) -> str | None:
+    t = text.lower()
+
+    # Matches:
+    #   54 bloomfield ave
+    #   54 bloomfield
+    #   12 e main st
+    m = re.search(r"(\d{1,6}[a-z]?)\s+([a-z0-9\s]+)", t)
+    if not m:
+        return None
+
+    num = m.group(1).strip().title()
+    street = m.group(2).strip().title()
+
+    # Trim trailing town names inside street chunk
+    for town in CT_TOWNS | MA_TOWNS:
+        if street.lower().endswith(town):
+            street = street[: -len(town)].strip()
+
+    return f"{num} {street}".strip()
+
+# --------------------------------------------------------------------
+# 6) PAI master resolver (runs BEFORE emergency or final booking)
+# --------------------------------------------------------------------
+def resolve_address_pai(raw: str) -> dict:
+    """
+    ALWAYS returns:
+      {
+         "status": "ok" | "needs_state" | "error",
+         "line1": "...",
+         "town": "...",
+         "state": "CT" | "MA" | None,
+         "zip": None,
+      }
+    """
+
+    if not raw:
+        return {"status": "error"}
+
+    raw = raw.strip()
+    line1 = extract_street_line(raw)
+    town = extract_town(raw)
+    state = decide_state_for_town(town)
+
+    # Missing street? Reject
+    if not line1:
+        return {"status": "error"}
+
+    # If ambiguous — ask CT or MA
+    if state == "ASK":
+        return {
+            "status": "needs_state",
+            "line1": line1,
+            "town": town,
+            "state": None,
+            "zip": None,
+        }
+
+    # Otherwise — state determined or unknown (geocoder will fill)
+    return {
+        "status": "ok",
+        "line1": line1,
+        "town": town,
+        "state": state,  # may be None, geocode fills later
+        "zip": None,
+    }
+
 
 # ====================================================================
 #                    >>>>>  SECTION 4 FULLY PATCHED  <<<<<
@@ -659,16 +799,18 @@ def normalize_address(raw: str):
 
 
 # ---------------------------------------------------
-# Address Intake — NO LOOP GUARANTEE
+# Address Intake — PAI + Google Normalization + No Loops
 # ---------------------------------------------------
 def handle_address_intake(conv, inbound_text, inbound_lower,
                            scheduled_date, scheduled_time, address):
     """
-    One-pass address capture:
-    - Accepts partial addresses
-    - Asks CT/MA only once
-    - NEVER loops
-    - Never blocks emergency booking
+    Prevolt Address Intelligence (PAI) + Google fallback:
+    • Accepts partial addresses (e.g., “54 Bloomfield”)
+    • Extracts town if present
+    • Determines CT or MA using PAI rules
+    • Only asks CT/MA when truly ambiguous
+    • NEVER loops the state question
+    • Produces clean address for Square
     """
 
     # Not an address → skip
@@ -678,24 +820,16 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
     raw = inbound_text.strip()
     conv["address"] = raw
 
-    # If we already asked the CT/MA question once:
-    # Do NOT ask again — just continue the booking.
-    if conv.get("town_prompt_sent"):
-        status, parsed = normalize_address(raw)
-        if status == "ok":
-            conv["normalized_address"] = parsed
-        return None
+    # --- STEP 1: Run PAI resolver (cheap + instant)
+    pai = resolve_address_pai(raw)
+    status = pai["status"]
 
-    # First attempt
-    status, parsed = normalize_address(raw)
-
-    # Full success → store normalized version
-    if status == "ok":
-        conv["normalized_address"] = parsed
-        return None
-
-    # Ambiguous → ask CT/MA *once only*
+    # If PAI detects ambiguity → ask CT or MA ONCE
     if status == "needs_state":
+        # Do not ask twice
+        if conv.get("town_prompt_sent"):
+            return None
+
         conv["town_prompt_sent"] = True
         return {
             "sms_body": "Is that address in Connecticut or Massachusetts?",
@@ -704,9 +838,34 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
             "address": raw,
         }
 
-    # Parsing error → accept raw and continue
+    # --- STEP 2: PAI says “OK” → attempt Google normalization
+    forced_state = pai.get("state")  # may be CT, MA, or None
+    final_try = normalize_address(raw, forced_state)
+
+    norm_status, parsed = final_try
+
+    # SUCCESS: store structured address
+    if norm_status == "ok":
+        conv["normalized_address"] = parsed
+        return None
+
+    # Google couldn't infer state but PAI already determined it → retry with forced state
+    if norm_status == "needs_state" and forced_state:
+        retry = normalize_address(raw, forced_state)
+        r_status, r_parsed = retry
+        if r_status == "ok":
+            conv["normalized_address"] = r_parsed
+            return None
+
+    # Google wants CT/MA but PAI already knows → DO NOT ASK AGAIN
+    if norm_status == "needs_state" and forced_state:
+        conv["normalized_address"] = None
+        return None
+
+    # Google fully failed → keep raw but allow booking to continue
     conv["normalized_address"] = None
     return None
+
 
 
 # ---------------------------------------------------
