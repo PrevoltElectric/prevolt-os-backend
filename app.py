@@ -7858,11 +7858,17 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # IMPORTANT — DO NOT OVERWRITE appointment_type WITH None
+    # ---------------------------------------------------
+    # APPOINTMENT TYPE PROTECTION (CRITICAL)
+    # ---------------------------------------------------
     incoming_apt = ai_reply.get("appointment_type")
-    if incoming_apt is not None:   # Only update if explicitly set
+
+    # Only update if the engine explicitly SET a value
+    # Never allow None to overwrite the valid appointment_type
+    if incoming_apt is not None:
         convo["appointment_type"] = incoming_apt
-    # Else: preserve original appointment_type ALWAYS
+    # If None → preserve existing convo["appointment_type"] ALWAYS
+    
 
     # ---------------------------------------------------
     # 5) NO AUTO-BOOKING HERE unless emergency rules trigger it
