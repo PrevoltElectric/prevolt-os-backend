@@ -1078,29 +1078,22 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
         return None  # emergency engine must take over
 
     # -----------------------------------------------------------
-    # 5) TODAY / TOMORROW OVERRIDE (CRITICAL FIX)
-    # -----------------------------------------------------------
-    # If user already expressed a date ("today" / "tomorrow"),
-    # DO NOT ask "what day" — allow SRB-12 to fill date.
+    # 5) TODAY / TOMORROW OVERRIDE
     # -----------------------------------------------------------
     if "today" in inbound_lower or "tomorrow" in inbound_lower:
-        # Skip asking for date; continue flow so SRB-12 sets scheduled_date
-        pass
+        pass  # let SRB-12 handle date parsing
     else:
-        # -----------------------------------------------------------
-        # 6) DATE MISSING → ASK FOR DATE NORMALLY
-        # -----------------------------------------------------------
         if conv.get("intent_affirm") and conv.get("intent_available") and not conv.get("scheduled_date"):
             return {"sms_body": "Got it — what day would you like us to come out?"}
 
     # -----------------------------------------------------------
-    # 7) MISSING ADDRESS
+    # 6) MISSING ADDRESS
     # -----------------------------------------------------------
     if conv.get("intent_affirm") and not conv.get("address"):
         return {"sms_body": "Perfect — what’s the full service address?"}
 
     # -----------------------------------------------------------
-    # 8) MISSING TIME
+    # 7) MISSING TIME
     # -----------------------------------------------------------
     if conv.get("intent_affirm") and conv.get("scheduled_date") and not conv.get("scheduled_time"):
         return {"sms_body": f"What time works for your visit on {conv['scheduled_date']}?"}
@@ -1109,40 +1102,7 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
 
 
 # ====================================================================
-# Google Address Normalization (stub wrapper)
-# ====================================================================
-def try_normalize_with_google(raw: str):
-    if not raw:
-        return None
-
-    base = normalize_possible_address(raw)
-    if not base:
-        return None
-
-    return {
-        "address_line_1": base["address_line_1"],
-        "locality": None,
-        "administrative_district_level_1": None,
-        "postal_code": None,
-    }
-
-
-def normalize_address(raw: str):
-    try:
-        parsed = try_normalize_with_google(raw)
-        if parsed is None:
-            return ("error", None)
-
-        if not parsed.get("administrative_district_level_1"):
-            return ("needs_state", parsed)
-
-        return ("ok", parsed)
-    except:
-        return ("error", None)
-
-
-# ====================================================================
-# EMERGENCY FAST-TRACK ENGINE — LOOP-PROOF, STATEFUL VERSION (FIXED)
+# EMERGENCY FAST-TRACK ENGINE — CLEAN, LOOP-PROOF VERSION
 # ====================================================================
 def handle_emergency(
     conv,
@@ -1155,7 +1115,8 @@ def handle_emergency(
     scheduled_time,
     phone
 ):
-    # If already completed, never run again
+
+    # If already completed → do nothing
     if conv.get("emergency_completed"):
         return None
 
@@ -1164,13 +1125,12 @@ def handle_emergency(
     # ================================================================
     if conv.get("is_emergency"):
 
-        # Always keep stored address fresh
+        # Keep address fresh
         if address and not conv.get("address"):
             conv["address"] = address
 
         final_addr = conv.get("address")
 
-        # If STILL no address → ask ONCE but persist appointment_type
         if not final_addr:
             conv["appointment_type"] = "TROUBLESHOOT_395"
             return {
@@ -1178,9 +1138,9 @@ def handle_emergency(
                 "appointment_type": "TROUBLESHOOT_395",
             }
 
-        # Normalize state if missing
-        norm = conv.get("normalized_address")
+        # Compute travel time if normalized
         travel_minutes = None
+        norm = conv.get("normalized_address")
 
         try:
             if norm:
@@ -1216,8 +1176,6 @@ def handle_emergency(
                 "address": final_addr,
             }
 
-        # Booking failed → DO NOT LOOP
-        conv["appointment_type"] = "TROUBLESHOOT_395"
         return {
             "sms_body": "Before I finalize this emergency visit, I still need the complete service address.",
             "appointment_type": "TROUBLESHOOT_395",
@@ -1237,42 +1195,29 @@ def handle_emergency(
 
     is_emergency = contains_any(inbound_lower, emergency_terms)
 
-    # Category override
     if category == "Active problems":
         is_emergency = True
 
     if not is_emergency:
         return None
 
-    # Flag emergency mode
     conv["is_emergency"] = True
     conv["appointment_type"] = "TROUBLESHOOT_395"
 
-    # Persist address immediately if provided
     if address and not conv.get("address"):
         conv["address"] = address
 
-    norm = conv.get("normalized_address")
-    final_addr = None
+    final_addr = conv.get("address")
 
-    if norm:
-        try:
-            final_addr = format_full_address(norm)
-        except:
-            final_addr = None
-
-    if not final_addr:
-        final_addr = conv.get("address")
-
-    # STILL no address → ask ONCE but persist appointment_type
     if not final_addr:
         return {
             "sms_body": "Got it — we can prioritize this. What’s the full service address?",
             "appointment_type": "TROUBLESHOOT_395",
         }
 
-    # Compute arrival time
     travel_minutes = None
+    norm = conv.get("normalized_address")
+
     try:
         if norm:
             dest = format_full_address(norm)
@@ -1306,43 +1251,12 @@ def handle_emergency(
             "address": final_addr,
         }
 
-    # Booking failed → do NOT loop
-    conv["appointment_type"] = "TROUBLESHOOT_395"
     return {
         "sms_body": "Before I finalize this emergency visit, I still need the complete service address.",
         "appointment_type": "TROUBLESHOOT_395",
     }
 
-
-    # -----------------------------------------------------------------
-    # 3. GOOGLE NORMALIZATION
-    # -----------------------------------------------------------------
-    norm_status, parsed = normalize_address(raw, forced_state)
-
-    if norm_status == "ok":
-        conv["normalized_address"] = parsed
-        return None
-
-    if norm_status == "needs_state":
-
-        if forced_state:
-            conv["normalized_address"] = parsed
-            return None
-
-        if not conv.get("town_prompt_sent"):
-            conv["town_prompt_sent"] = True
-            return {
-                "sms_body": "Is that address in Connecticut or Massachusetts?",
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": raw
-            }
-
-        conv["normalized_address"] = None
-        return None
-
-    conv["normalized_address"] = None
-    return None
+        
 
 
 
