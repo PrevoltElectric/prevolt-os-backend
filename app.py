@@ -1107,13 +1107,14 @@ def handle_emergency(
     if not is_emergency:
         return None
 
-    # Always enforce emergency visit type
+    # Always enforce emergency visit type (sticky!)
     conv["appointment_type"] = "TROUBLESHOOT_395"
 
     # -------------------------------------------------------
     # ADDRESS SELECTION (Normalized preferred)
     # -------------------------------------------------------
     norm = conv.get("normalized_address")
+
     if norm:
         final_addr = format_full_address(norm)
     else:
@@ -1158,10 +1159,10 @@ def handle_emergency(
         "address": final_addr,
     })
 
-    # TRUE BOOKING SUCCESS (no fall-through allowed)
+    # === SUCCESS — DO NOT EVER FALL THROUGH THIS BLOCK ===
     if sq.get("success") is True:
 
-        # If no normalized address existed, store minimal structure
+        # Store minimal normalized address if needed
         if not conv.get("normalized_address"):
             conv["normalized_address"] = {
                 "address_line_1": final_addr,
@@ -1172,7 +1173,6 @@ def handle_emergency(
 
         conv["final_confirmation_sent"] = True
 
-        # Clean time format
         try:
             t_nice = datetime.strptime(scheduled_time, "%H:%M") \
                 .strftime("%I:%M %p").lstrip("0")
@@ -1188,6 +1188,18 @@ def handle_emergency(
             "scheduled_time": scheduled_time,
             "address": final_addr,
         }
+
+    # -------------------------------------------------------
+    # BOOKING FAILED — ASK FOR ADDRESS ONLY ONCE
+    # -------------------------------------------------------
+    return {
+        "sms_body": (
+            "Before I finalize this emergency visit, I still need the complete service address."
+        ),
+        "scheduled_date": scheduled_date,
+        "scheduled_time": scheduled_time,
+        "address": final_addr,
+    }
 
 
 
