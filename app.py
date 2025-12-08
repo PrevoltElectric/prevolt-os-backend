@@ -7846,17 +7846,44 @@ def incoming_sms():
 
     sms_body = (ai_reply.get("sms_body") or "").strip()
 
-    # ---------------------------------------------------
+       # ---------------------------------------------------
     # 4) UPDATE CONVERSATION STATE SAFELY
     # ---------------------------------------------------
+
+    #   CRITICAL PATCH — NEVER allow appointment_type to fall to None
+    # If generate_reply_for_inbound forgot to return a type,
+    # restore the PREVIOUS known good appointment_type.
+    if ("appointment_type" not in ai_reply) or (ai_reply["appointment_type"] is None):
+        ai_reply["appointment_type"] = convo.get("appointment_type")
+
+    # ------------------------
+    # DATE
+    # ------------------------
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
 
+    # ------------------------
+    # TIME
+    # ------------------------
     if ai_reply.get("scheduled_time"):
         convo["scheduled_time"] = ai_reply["scheduled_time"]
 
+    # ------------------------
+    # ADDRESS
+    # ------------------------
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
+
+    # ------------------------
+    # APPOINTMENT TYPE (PROTECTED)
+    # ------------------------
+    incoming_apt = ai_reply.get("appointment_type")
+
+    # Only update appointment_type if it is VALID (not None, not empty)
+    if incoming_apt:
+        convo["appointment_type"] = incoming_apt
+    # If incoming_apt == None, we simply ignore it and preserve convo["appointment_type"]
+
 
     # ---------------------------------------------------
     # APPOINTMENT TYPE PROTECTION (CRITICAL)
