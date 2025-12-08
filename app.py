@@ -472,14 +472,14 @@ from zoneinfo import ZoneInfo
 
 
 # ---------------------------------------------------
-# Boolean Helper: check if inbound message contains ANY term
+# Boolean Helper
 # ---------------------------------------------------
 def contains_any(msg, terms):
     return any(t in msg for t in terms)
 
 
 # ---------------------------------------------------
-# Customer confirmation detector
+# Confirmation Helper
 # ---------------------------------------------------
 def is_customer_confirmation(msg):
     confirmations = [
@@ -491,7 +491,7 @@ def is_customer_confirmation(msg):
 
 
 # ---------------------------------------------------
-# Robust Address Detector (v3 — Fully Hardened)
+# Address Detector
 # ---------------------------------------------------
 def is_customer_address_only(text: str) -> bool:
     text = text.lower().strip()
@@ -509,7 +509,7 @@ def is_customer_address_only(text: str) -> bool:
 
 
 # ---------------------------------------------------
-# Basic Address Normalizer (Non-Google)
+# Basic Lightweight Address Parse
 # ---------------------------------------------------
 def normalize_possible_address(text: str):
     if not text:
@@ -555,7 +555,7 @@ Follow internal SRB rules only. Output MUST be strict JSON.
 
 
 # ====================================================================
-# SRB-12 — NATURAL LANGUAGE DATE/TIME PARSER
+# SRB-12 — Natural Language Date/Time Parsing
 # ====================================================================
 def parse_natural_datetime(text: str, now_local) -> dict:
     t = text.lower().strip()
@@ -590,7 +590,7 @@ def parse_natural_datetime(text: str, now_local) -> dict:
 
 
 # ====================================================================
-# SRB-13 — STATE MACHINE & SAFETY ENGINE
+# SRB-13 — State Machine
 # ====================================================================
 def get_current_state(conv: dict) -> str:
     if not conv:
@@ -621,9 +621,10 @@ def enforce_state_lock(state: str, conv: dict):
 
 
 # ====================================================================
-# SRB-14 — HUMAN INTENT INTERPRETER
+# SRB-14 — Human Intent Interpreter
 # ====================================================================
 def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
+
     aff = [
         "yes", "yeah", "yep", "sure", "sounds good", "that works",
         "ok", "okay", "perfect", "please come", "come today"
@@ -660,8 +661,24 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
 
 
 # ====================================================================
-# SRB-14 — ADDRESS NORMALIZATION WRAPPER
+# Google Address Normalization (stub wrapper)
 # ====================================================================
+def try_normalize_with_google(raw: str):
+    if not raw:
+        return None
+
+    base = normalize_possible_address(raw)
+    if not base:
+        return None
+
+    return {
+        "address_line_1": base["address_line_1"],
+        "locality": None,
+        "administrative_district_level_1": None,
+        "postal_code": None,
+    }
+
+
 def normalize_address(raw: str):
     try:
         parsed = try_normalize_with_google(raw)
@@ -674,10 +691,13 @@ def normalize_address(raw: str):
         return ("ok", parsed)
     except:
         return ("error", None)
+
+
 # ====================================================================
-# SRB-14 — ADDRESS INTAKE (SAFE, DEFERRED, STATE-AWARE)
+# ADDRESS INTAKE ENGINE — MUST RUN BEFORE EMERGENCY
 # ====================================================================
 def handle_address_intake(conv, inbound_text, inbound_lower, scheduled_date, scheduled_time, address):
+
     if not is_customer_address_only(inbound_lower):
         return None
 
@@ -712,7 +732,7 @@ def handle_address_intake(conv, inbound_text, inbound_lower, scheduled_date, sch
 
 
 # ====================================================================
-# EMERGENCY FAST-TRACK ENGINE
+# EMERGENCY ENGINE — RUNS AFTER ADDRESS INTAKE
 # ====================================================================
 def handle_emergency(conv, category, inbound_lower, address, now_local,
                      today_date_str, scheduled_date, scheduled_time, phone):
@@ -793,7 +813,7 @@ def handle_emergency(conv, category, inbound_lower, address, now_local,
 
 
 # ====================================================================
-# FOLLOW-UP QUESTION ENGINE (SRB-12.5)
+# FOLLOW-UP QUESTION ENGINE
 # ====================================================================
 def handle_followup_questions(conv, appointment_type, inbound_lower,
                               scheduled_date, scheduled_time, address):
@@ -856,7 +876,7 @@ def handle_followup_questions(conv, appointment_type, inbound_lower,
 
 
 # ====================================================================
-# HOME-TODAY INTENT ENGINE
+# HOME-TODAY ENGINE
 # ====================================================================
 def handle_home_today(conv, inbound_lower, appointment_type, address, today_date_str):
 
@@ -911,7 +931,7 @@ def handle_home_today(conv, inbound_lower, appointment_type, address, today_date
 
 
 # ====================================================================
-# CUSTOMER CONFIRMATION ENGINE
+# CONFIRMATION ENGINE
 # ====================================================================
 def handle_confirmation(conv, inbound_lower, phone):
     if not is_customer_confirmation(inbound_lower):
@@ -1076,7 +1096,17 @@ def generate_reply_for_inbound(
     if intent_reply:
         return intent_reply
 
-    # 3) Emergency Engine
+    # 3) ADDRESS INTAKE — must run BEFORE emergency logic
+    addr_reply = handle_address_intake(
+        conv, inbound_text, inbound_lower,
+        scheduled_date, scheduled_time, address
+    )
+    if addr_reply:
+        return addr_reply
+
+    address = conv.get("address") or address
+
+    # 4) EMERGENCY ENGINE (now safe)
     emergency_reply = handle_emergency(
         conv, category, inbound_lower, address,
         now_local, today_date_str, scheduled_date,
@@ -1085,7 +1115,7 @@ def generate_reply_for_inbound(
     if emergency_reply:
         return emergency_reply
 
-    # 4) Natural-Language Date/Time Parsing
+    # 5) Natural Date/Time Parse
     dt = parse_natural_datetime(inbound_text, now_local)
     if dt["has_datetime"]:
         conv["scheduled_date"] = dt["date"]
@@ -1093,7 +1123,7 @@ def generate_reply_for_inbound(
         scheduled_date = dt["date"]
         scheduled_time = dt["time"]
 
-    # 5) Follow-Up Questions
+    # 6) Follow-Up Question Engine
     follow_reply = handle_followup_questions(
         conv, appointment_type, inbound_lower,
         scheduled_date, scheduled_time, address
@@ -1101,27 +1131,17 @@ def generate_reply_for_inbound(
     if follow_reply:
         return follow_reply
 
-    # 6) Persist appointment type
+    # 7) Persist type
     if appointment_type is None:
         appointment_type = conv.get("appointment_type")
     conv["appointment_type"] = appointment_type
-
-    # 7) Address Intake
-    addr_reply = handle_address_intake(
-        conv, inbound_text, inbound_lower,
-        scheduled_date, scheduled_time, address
-    )
-    if addr_reply:
-        return addr_reply
-
-    address = conv.get("address")
 
     # 8) Confirmation Engine
     confirm_reply = handle_confirmation(conv, inbound_lower, phone)
     if confirm_reply:
         return confirm_reply
 
-    # 9) Home-Today Logic
+    # 9) Home Today Logic
     home_reply = handle_home_today(
         conv, inbound_lower, appointment_type,
         address, today_date_str
