@@ -1049,10 +1049,13 @@ def enforce_state_lock(state: str, conv: dict):
 
 
 # ====================================================================
-# SRB-14 — Human Intent Interpreter
+# SRB-14 — Human Intent Interpreter (FULLY PATCHED)
 # ====================================================================
 def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
 
+    # -----------------------------------------------------------
+    # 1) AFFIRMATIVE INTENT
+    # -----------------------------------------------------------
     aff = [
         "yes", "yeah", "yep", "sure", "sounds good", "that works",
         "ok", "okay", "perfect", "please come", "come today"
@@ -1060,6 +1063,9 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
     if any(a in inbound_lower for a in aff):
         conv["intent_affirm"] = True
 
+    # -----------------------------------------------------------
+    # 2) AVAILABILITY INTENT
+    # -----------------------------------------------------------
     avail = [
         "i'm home", "im home", "home now", "at the house",
         "here now", "someone is here", "i'm available",
@@ -1068,20 +1074,45 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
     if any(a in inbound_lower for a in avail):
         conv["intent_available"] = True
 
-    today_terms = ["today", "later today", "this afternoon", "this morning"]
+    # -----------------------------------------------------------
+    # 3) SAME-DAY INTENT
+    # -----------------------------------------------------------
+    today_terms = ["today", "later today", "this afternoon", "this morning", "tonight"]
     if any(t in inbound_lower for t in today_terms):
         conv["intent_today"] = True
 
+    # -----------------------------------------------------------
+    # 4) IGNORE INTENT ENGINE FOR EMERGENCIES
+    # -----------------------------------------------------------
     emergencies = ["no power", "partial power", "fire", "sparks", "smoke", "burning", "tree", "arcing"]
     if any(e in inbound_lower for e in emergencies):
-        return None
+        return None  # emergency engine must take over
 
-    if conv.get("intent_affirm") and conv.get("intent_available") and not conv.get("scheduled_date"):
-        return {"sms_body": "Got it — what day would you like us to come out?"}
+    # -----------------------------------------------------------
+    # 5) TODAY / TOMORROW OVERRIDE (CRITICAL FIX)
+    # -----------------------------------------------------------
+    # If user already expressed a date ("today" / "tomorrow"),
+    # DO NOT ask "what day" — allow SRB-12 to fill date.
+    # -----------------------------------------------------------
+    if "today" in inbound_lower or "tomorrow" in inbound_lower:
+        # Skip asking for date; continue flow so SRB-12 sets scheduled_date
+        pass
+    else:
+        # -----------------------------------------------------------
+        # 6) DATE MISSING → ASK FOR DATE NORMALLY
+        # -----------------------------------------------------------
+        if conv.get("intent_affirm") and conv.get("intent_available") and not conv.get("scheduled_date"):
+            return {"sms_body": "Got it — what day would you like us to come out?"}
 
+    # -----------------------------------------------------------
+    # 7) MISSING ADDRESS
+    # -----------------------------------------------------------
     if conv.get("intent_affirm") and not conv.get("address"):
         return {"sms_body": "Perfect — what’s the full service address?"}
 
+    # -----------------------------------------------------------
+    # 8) MISSING TIME
+    # -----------------------------------------------------------
     if conv.get("intent_affirm") and conv.get("scheduled_date") and not conv.get("scheduled_time"):
         return {"sms_body": f"What time works for your visit on {conv['scheduled_date']}?"}
 
