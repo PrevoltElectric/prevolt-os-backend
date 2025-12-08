@@ -1088,38 +1088,43 @@ def handle_emergency(
         "breaker wont reset",
     ]
 
+    # Detect emergency
     is_emergency = contains_any(inbound_lower, emergency_terms)
 
+    # Category override
     if category == "Active problems":
         is_emergency = True
 
+    # Not emergency → skip
     if not is_emergency:
         return None
 
+    # Set visit type
     conv["appointment_type"] = "TROUBLESHOOT_395"
 
-    # Always prefer normalized Google/PAI address if available
-norm = conv.get("normalized_address")
-
-if norm:
-    final_addr = format_full_address(norm)
-else:
-    # fallback to raw address
-    final_addr = conv.get("address") or address
-
-# If raw address exists but no normalized components yet,
-# DO NOT block emergency booking.
-if not final_addr:
-    return {
-        "sms_body": "Got it — we can prioritize this. What’s the full service address?",
-        "scheduled_date": None,
-        "scheduled_time": None,
-        "address": None,
-    }
-
-
-    travel_minutes = None
+    # -------------------------------------------------------
+    # ADDRESS SELECTION (Normalized preferred)
+    # -------------------------------------------------------
     norm = conv.get("normalized_address")
+
+    if norm:
+        final_addr = format_full_address(norm)
+    else:
+        final_addr = conv.get("address") or address
+
+    # If still missing any usable address → ask once
+    if not final_addr:
+        return {
+            "sms_body": "Got it — we can prioritize this. What’s the full service address?",
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
+        }
+
+    # -------------------------------------------------------
+    # TRAVEL TIME COMPUTATION
+    # -------------------------------------------------------
+    travel_minutes = None
     if norm:
         try:
             dest = format_full_address(norm)
@@ -1128,8 +1133,10 @@ if not final_addr:
         except:
             travel_minutes = None
 
+    # Compute arrival window
     emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
 
+    # Lock in date/time
     scheduled_date = today_date_str
     scheduled_time = emergency_time
 
@@ -1137,13 +1144,18 @@ if not final_addr:
     conv["scheduled_time"] = scheduled_time
     conv["autobooked"] = True
 
+    # -------------------------------------------------------
+    # SQUARE BOOKING
+    # -------------------------------------------------------
     sq = maybe_create_square_booking(phone, {
         "scheduled_date": scheduled_date,
         "scheduled_time": scheduled_time,
         "address": final_addr,
     })
 
+    # Booking SUCCESS
     if sq.get("success"):
+        # If address never normalized, store minimal version
         if not conv.get("normalized_address"):
             conv["normalized_address"] = {
                 "address_line_1": final_addr,
@@ -1155,7 +1167,7 @@ if not final_addr:
         conv["final_confirmation_sent"] = True
 
         try:
-            t_nice = datetime.strptime(scheduled_time, "%H:%M")\
+            t_nice = datetime.strptime(scheduled_time, "%H:%M") \
                 .strftime("%I:%M %p").lstrip("0")
         except:
             t_nice = scheduled_time
@@ -1170,6 +1182,9 @@ if not final_addr:
             "address": final_addr,
         }
 
+    # -------------------------------------------------------
+    # BOOKING FAILED → REQUEST ADDRESS JUST ONCE
+    # -------------------------------------------------------
     return {
         "sms_body": (
             "Before I finalize this emergency visit, I still need the complete service address."
@@ -1178,6 +1193,7 @@ if not final_addr:
         "scheduled_time": scheduled_time,
         "address": final_addr,
     }
+
 
 
 
