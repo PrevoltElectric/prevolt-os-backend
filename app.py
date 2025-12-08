@@ -790,21 +790,50 @@ def normalize_address(raw: str, forced_state=None):
         return ("error", None)
 
 
-# ---------------------------------------------------
-# Address Intake — PAI + Google Normalization — No Loops
-# ---------------------------------------------------
+# ====================================================================
+# ADDRESS INTAKE ENGINE — FINAL FIXED VERSION
+# ====================================================================
 def handle_address_intake(conv, inbound_text, inbound_lower,
                           scheduled_date, scheduled_time, address):
 
-    # ACCEPT ALL INBOUND TEXT AS POSSIBLE ADDRESS
+    # ---------------------------------------------------------------
+    # 0. DO NOT treat casual sentences as addresses
+    # ---------------------------------------------------------------
+    words = inbound_lower.replace(",", "").split()
+
+    # Must be at least 3 words AND contain a street number
+    if len(words) < 3:
+        return None
+
+    if not any(tok.isdigit() for tok in words):
+        return None
+
+    # Must contain a REAL street keyword as a whole word
+    street_keywords = {
+        "st", "street",
+        "rd", "road",
+        "ave", "avenue",
+        "blvd",
+        "lane", "ln",
+        "drive", "dr",
+        "way",
+        "ct"
+    }
+
+    if not any(w in street_keywords for w in words):
+        return None
+
+    # ---------------------------------------------------------------
+    # 1. This IS an address → store it
+    # ---------------------------------------------------------------
     raw = inbound_text.strip()
     conv["address"] = raw
 
-    # -------------------------------
-    # STEP 1 — PAI gives street/town/state
-    # -------------------------------
+    # ---------------------------------------------------------------
+    # 2. PAI
+    # ---------------------------------------------------------------
     pai = resolve_address_pai(raw)
-    forced_state = pai.get("state")  # CT / MA / None
+    forced_state = pai.get("state")
     status = pai["status"]
 
     if status == "needs_state":
@@ -814,45 +843,38 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
                 "sms_body": "Is that address in Connecticut or Massachusetts?",
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
-                "address": raw
+                "address": raw,
             }
         return None
 
-    # -------------------------------
-    # STEP 2 — Google Normalization
-    # -------------------------------
+    # ---------------------------------------------------------------
+    # 3. Google Normalization
+    # ---------------------------------------------------------------
     norm_status, parsed = normalize_address(raw, forced_state)
 
-    # COMPLETE SUCCESS
     if norm_status == "ok":
         conv["normalized_address"] = parsed
         return None
 
-    # GOOGLE NEEDS STATE
     if norm_status == "needs_state":
-
-        # If PAI already knew state → should NEVER happen now
         if forced_state:
             conv["normalized_address"] = parsed
             return None
 
-        # Otherwise ask user ONCE
         if not conv.get("town_prompt_sent"):
             conv["town_prompt_sent"] = True
             return {
                 "sms_body": "Is that address in Connecticut or Massachusetts?",
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
-                "address": raw
+                "address": raw,
             }
 
         conv["normalized_address"] = None
         return None
 
-    # TOTAL FAILURE
     conv["normalized_address"] = None
     return None
-
 
 
 
@@ -1495,11 +1517,16 @@ def generate_reply_for_inbound(
     conversations.setdefault(phone, {})
     conv = conversations[phone]
 
+    # -----------------------------------------------------------
+    # 🔥 NEW PATCH — PROTECT EMERGENCY APPOINTMENT TYPE
+    # -----------------------------------------------------------
+    if conv.get("is_emergency") and conv.get("appointment_type") is None:
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+
     # 1) State Machine Lock
     state = get_current_state(conv)
     lock = enforce_state_lock(state, conv)
     if lock.get("interrupt"):
-        # Preserve appointment type if reply did not set it
         if lock["reply"].get("appointment_type") is None:
             lock["reply"]["appointment_type"] = conv.get("appointment_type")
         return lock["reply"]
@@ -1511,7 +1538,7 @@ def generate_reply_for_inbound(
             intent_reply["appointment_type"] = conv.get("appointment_type")
         return intent_reply
 
-    # 3) ADDRESS INTAKE — must run BEFORE emergency logic
+    # 3) Address Intake — must run BEFORE emergency logic
     addr_reply = handle_address_intake(
         conv, inbound_text, inbound_lower,
         scheduled_date, scheduled_time, address
@@ -1523,7 +1550,7 @@ def generate_reply_for_inbound(
 
     address = conv.get("address") or address
 
-    # 4) EMERGENCY ENGINE (now safe)
+    # 4) Emergency Engine
     emergency_reply = handle_emergency(
         conv, category, inbound_lower, address,
         now_local, today_date_str, scheduled_date,
@@ -1534,8 +1561,7 @@ def generate_reply_for_inbound(
             emergency_reply["appointment_type"] = conv.get("appointment_type")
         return emergency_reply
 
-    # 4.5) TROUBLESHOOT CASE DETECTION (Non-emergency failure)
-    # ---------------------------------------------------------
+    # 4.5) Troubleshoot Case Detection (non-emergency)
     if is_troubleshoot_case(inbound_lower):
         conv["appointment_type"] = "TROUBLESHOOT_395"
         appointment_type = "TROUBLESHOOT_395"
@@ -1562,7 +1588,6 @@ def generate_reply_for_inbound(
     if appointment_type is None:
         appointment_type = conv.get("appointment_type")
 
-    # Normalize and protect state
     if appointment_type:
         appointment_type = appointment_type.strip().upper()
 
@@ -1594,7 +1619,7 @@ def generate_reply_for_inbound(
             final_reply["appointment_type"] = conv.get("appointment_type")
         return final_reply
 
-    # 11) LLM Fallback — now also protected by SRB-13
+    # 11) LLM Fallback
     fallback = run_llm_fallback(
         cleaned_transcript,
         category,
