@@ -791,107 +791,96 @@ def normalize_address(raw: str, forced_state=None):
 
 
 # ====================================================================
-# ADDRESS INTAKE ENGINE — FINAL FIXED VERSION (WITH EXTRACTION PATCH)
+# ADDRESS INTAKE ENGINE — CLEAN + RELIABLE VERSION (NO LOOPS)
 # ====================================================================
 def handle_address_intake(conv, inbound_text, inbound_lower,
                           scheduled_date, scheduled_time, address):
 
     # ---------------------------------------------------------------
-    # 0. DO NOT treat casual sentences as addresses
+    # 0. QUICK EXIT — message is not an address
     # ---------------------------------------------------------------
-    words = inbound_lower.replace(",", "").split()
+    # Basic detection: must have a number + street keyword
+    tokens = inbound_lower.replace(",", "").split()
 
-    # Must be at least 3 words AND contain a street number
-    if len(words) < 3:
+    if len(tokens) < 3:
         return None
 
-    if not any(tok.isdigit() for tok in words):
+    if not any(tok.isdigit() for tok in tokens):
         return None
 
-    # Must contain a REAL street keyword as a whole word
     street_keywords = {
         "st", "street",
         "rd", "road",
         "ave", "avenue",
         "blvd",
-        "lane", "ln",
-        "drive", "dr",
+        "ln", "lane",
+        "dr", "drive",
         "way",
-        "ct"
+        "ct", "court"
     }
 
-    if not any(w in street_keywords for w in words):
+    if not any(tok in street_keywords for tok in tokens):
         return None
 
     # ---------------------------------------------------------------
-    # EXTRACTION PATCH — reliably pull street + city if typed inline
+    # 1. Extract the usable address substring
     # ---------------------------------------------------------------
     import re
-    def try_extract_address(text: str):
-        # grabs: "47 dickerman ave windsor locks"
-        pattern = r"\d{1,6}\s+[A-Za-z0-9\s\.\-]+"
-        m = re.search(pattern, text)
-        return m.group(0).strip() if m else None
-
-    extracted = try_extract_address(inbound_text)
-
-    # If we found a more precise substring, prefer it
-    raw = extracted if extracted else inbound_text.strip()
+    m = re.search(r"\d{1,6}\s+[A-Za-z0-9\s\.\-]+", inbound_text)
+    raw_addr = m.group(0).strip() if m else inbound_text.strip()
 
     # ---------------------------------------------------------------
-    # 1. This IS an address → store it
+    # 2. STORE ADDRESS IMMEDIATELY (CRITICAL FIX)
     # ---------------------------------------------------------------
-    conv["address"] = raw   # <<< CRITICAL FIX — this was missing
+    conv["address"] = raw_addr
 
     # ---------------------------------------------------------------
-    # 2. PAI — determine if CT/MA needed
+    # 3. Normalize address (attempt CT/MA detection)
     # ---------------------------------------------------------------
-    pai = resolve_address_pai(raw)
-    forced_state = pai.get("state")
-    status = pai["status"]
+    norm_status, parsed = normalize_address(raw_addr)
 
-    if status == "needs_state":
-        if not conv.get("town_prompt_sent"):
-            conv["town_prompt_sent"] = True
-            return {
-                "sms_body": "Is that address in Connecticut or Massachusetts?",
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": raw,
-            }
-        return None
-
-    # ---------------------------------------------------------------
-    # 3. Google Normalization
-    # ---------------------------------------------------------------
-    norm_status, parsed = normalize_address(raw, forced_state)
-
-    if norm_status == "ok":
+    # -------- CASE A: FULLY NORMALIZED ADDRESS --------
+    if norm_status == "ok" and parsed:
         conv["normalized_address"] = parsed
-        return None
 
-    if norm_status == "needs_state":
-        if forced_state:
-            # PAI forced state → success
-            conv["normalized_address"] = parsed
-            return None
-
-        # Must prompt for CT/MA
-        if not conv.get("town_prompt_sent"):
-            conv["town_prompt_sent"] = True
+        # If no date yet → ask for date next
+        if not conv.get("scheduled_date"):
             return {
-                "sms_body": "Is that address in Connecticut or Massachusetts?",
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": raw,
+                "sms_body": "Got it — what day would you like us to come out?",
+                "address": raw_addr,
+                "scheduled_date": None,
+                "scheduled_time": None,
             }
 
-        conv["normalized_address"] = None
+        # If date but no time → ask time next
+        if conv.get("scheduled_date") and not conv.get("scheduled_time"):
+            return {
+                "sms_body": (
+                    f"What time works for your visit on {conv['scheduled_date']}?"
+                ),
+                "address": raw_addr,
+                "scheduled_date": conv["scheduled_date"],
+                "scheduled_time": None,
+            }
+
+        # Otherwise return None so downstream continues normally
         return None
 
-    # ---------------------------------------------------------------
-    # 4. Final fallback — address invalid or not understood
-    # ---------------------------------------------------------------
+    # -------- CASE B: NORMALIZER NEEDS STATE (CT/MA) --------
+    if norm_status == "needs_state":
+        if not conv.get("state_prompt_sent"):
+            conv["state_prompt_sent"] = True
+            return {
+                "sms_body": "Just confirming — is that address in CT or MA?",
+                "address": raw_addr,
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+            }
+
+        # Already asked — wait for user reply
+        return None
+
+    # -------- CASE C: INVALID / UNRECOGNIZED ADDRESS --------
     conv["normalized_address"] = None
     return None
 
