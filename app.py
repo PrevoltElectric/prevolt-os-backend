@@ -491,74 +491,144 @@ def is_customer_confirmation(msg):
 
 
 # ---------------------------------------------------
-# Address Detector (v4 — Hardened, Accepts CT/MA Style Inputs)
+# Address Detector — hardened for real-world input
 # ---------------------------------------------------
 def is_customer_address_only(text: str) -> bool:
     """
-    Detects whether the inbound text *looks like a standalone street address*,
-    even if missing city/state/zip. Accepts things like:
-        '54 bloomfield ave'
-        '54 bloomfield ave windsor'
-        '12 main st'
-        '12 main street'
-    Rejects messages with verbs or extra intent language.
+    Accepts anything that *looks like* an address:
+    - Has a street number
+    - Has at least one word after it
+    - Does NOT require state/zip/town to proceed
     """
+    text = text.lower().strip()
 
-    if not text:
+    # Must contain a number
+    if not re.search(r"\b\d{1,6}\b", text):
         return False
 
-    t = text.lower().strip()
+    # Remove filler words that are not part of an address
+    cleaned = re.sub(
+        r"\b(in|at|on|by|my|is|the|we|live|lives|are|i|am|it's|its|address|addr|please|pls|come|to)\b",
+        "",
+        text,
+    ).strip()
 
-    # MUST contain a street number
-    if not re.search(r"\b\d{1,6}[a-z]?\b", t):
-        return False
-
-    # Remove common noise words
-    noise = r"\b(in|at|on|by|my|is|the|we|live|lives|are|i|am|it's|its|address|addr|please|pls|come|to|can|you|now)\b"
-    cleaned = re.sub(noise, "", t).strip()
-
-    # Pattern: number + street name + suffix (VERY permissive)
-    pattern = (
-        r"\b\d{1,6}[a-z]?"          # 54
-        r"\s+"                      # space
-        r"[a-z0-9\s]+"              # bloomfield
-        r"\s+"                      # space
-        r"(st|street|rd|road|ave|avenue|blvd|ln|lane|dr|drive|ct|court)\b"
-    )
-
-    if re.search(pattern, cleaned):
-        return True
-
-    # Also accept: number + street + city (no suffix typed)
-    # Example: "54 bloomfield ave windsor" → missing suffix match previously
-    loose = r"\b\d{1,6}[a-z]?\s+[a-z0-9\s]{3,}\b"
-    return bool(re.search(loose, cleaned))
+    # Must have a number + at least one word
+    return bool(re.search(r"\b\d{1,6}\s+[a-z0-9]+", cleaned))
 
 
 # ---------------------------------------------------
-# Basic Lightweight Address Parse
+# Google normalization wrapper (safe)
 # ---------------------------------------------------
-def normalize_possible_address(text: str):
-    if not text:
+def try_normalize_with_google(raw: str):
+    """
+    Minimal safe wrapper.
+    Uses normalize_possible_address() for structure.
+    Returns a dict shaped like the real Google result.
+    NEVER raises.
+    """
+    if not raw:
         return None
 
-    t = text.lower()
-    pattern = r"(\d{1,6}[a-z]?)\s+([a-z0-9\s]+?)\s+(st|street|rd|road|ave|avenue|blvd|ln|lane|dr|drive|ct|court)"
-    m = re.search(pattern, t)
-    if not m:
+    base = normalize_possible_address(raw)
+    if not base:
         return None
-
-    num = m.group(1).title()
-    street = m.group(2).title()
-    suf = m.group(3).title()
-    full = f"{num} {street} {suf}"
 
     return {
-        "address_line_1": full,
+        "address_line_1": base["full"],
         "locality": None,
-        "administrative_district_level_1": None,
+        "administrative_district_level_1": None,  # lacking town → triggers CT/MA question
         "postal_code": None,
     }
+
+
+# ---------------------------------------------------
+# Format for travel-time engine
+# ---------------------------------------------------
+def format_full_address(norm: dict) -> str:
+    if not norm:
+        return ""
+    line = norm.get("address_line_1") or norm.get("full") or ""
+    loc = norm.get("locality") or ""
+    st  = norm.get("administrative_district_level_1") or ""
+    zipc = norm.get("postal_code") or ""
+    return f"{line}, {loc} {st} {zipc}".strip(", ").strip()
+
+
+# ---------------------------------------------------
+# Address Normalization (CT/MA aware)
+# ---------------------------------------------------
+def normalize_address(raw: str):
+    """
+    Returns:
+      ("ok", parsed_dict)
+      ("needs_state", parsed_dict)  → requires CT/MA question
+      ("error", None)
+    """
+    try:
+        parsed = try_normalize_with_google(raw)
+        if not parsed:
+            return ("error", None)
+
+        # Lacking a state → must ask CT/MA once.
+        if not parsed.get("administrative_district_level_1"):
+            return ("needs_state", parsed)
+
+        return ("ok", parsed)
+
+    except:
+        return ("error", None)
+
+
+# ---------------------------------------------------
+# Address Intake — NO LOOP GUARANTEE
+# ---------------------------------------------------
+def handle_address_intake(conv, inbound_text, inbound_lower,
+                           scheduled_date, scheduled_time, address):
+    """
+    One-pass address capture:
+    - Accepts partial addresses
+    - Asks CT/MA only once
+    - NEVER loops
+    - Never blocks emergency booking
+    """
+
+    # Not an address → skip
+    if not is_customer_address_only(inbound_lower):
+        return None
+
+    raw = inbound_text.strip()
+    conv["address"] = raw
+
+    # If we already asked the CT/MA question once:
+    # Do NOT ask again — just continue the booking.
+    if conv.get("town_prompt_sent"):
+        status, parsed = normalize_address(raw)
+        if status == "ok":
+            conv["normalized_address"] = parsed
+        return None
+
+    # First attempt
+    status, parsed = normalize_address(raw)
+
+    # Full success → store normalized version
+    if status == "ok":
+        conv["normalized_address"] = parsed
+        return None
+
+    # Ambiguous → ask CT/MA *once only*
+    if status == "needs_state":
+        conv["town_prompt_sent"] = True
+        return {
+            "sms_body": "Is that address in Connecticut or Massachusetts?",
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": raw,
+        }
+
+    # Parsing error → accept raw and continue
+    conv["normalized_address"] = None
+    return None
 
 
 # ---------------------------------------------------
