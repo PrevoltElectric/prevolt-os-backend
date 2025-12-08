@@ -1484,11 +1484,16 @@ def generate_reply_for_inbound(
     state = get_current_state(conv)
     lock = enforce_state_lock(state, conv)
     if lock.get("interrupt"):
+        # Preserve appointment type if reply did not set it
+        if lock["reply"].get("appointment_type") is None:
+            lock["reply"]["appointment_type"] = conv.get("appointment_type")
         return lock["reply"]
 
     # 2) Human Intent Interpreter
     intent_reply = srb14_interpret_human_intent(conv, inbound_lower)
     if intent_reply:
+        if intent_reply.get("appointment_type") is None:
+            intent_reply["appointment_type"] = conv.get("appointment_type")
         return intent_reply
 
     # 3) ADDRESS INTAKE — must run BEFORE emergency logic
@@ -1497,6 +1502,8 @@ def generate_reply_for_inbound(
         scheduled_date, scheduled_time, address
     )
     if addr_reply:
+        if addr_reply.get("appointment_type") is None:
+            addr_reply["appointment_type"] = conv.get("appointment_type")
         return addr_reply
 
     address = conv.get("address") or address
@@ -1508,11 +1515,12 @@ def generate_reply_for_inbound(
         scheduled_time, phone
     )
     if emergency_reply:
+        if emergency_reply.get("appointment_type") is None:
+            emergency_reply["appointment_type"] = conv.get("appointment_type")
         return emergency_reply
 
     # 4.5) TROUBLESHOOT CASE DETECTION (Non-emergency failure)
     # ---------------------------------------------------------
-    # This forces $395 logic when tools/troubleshooting are required.
     if is_troubleshoot_case(inbound_lower):
         conv["appointment_type"] = "TROUBLESHOOT_395"
         appointment_type = "TROUBLESHOOT_395"
@@ -1531,16 +1539,25 @@ def generate_reply_for_inbound(
         scheduled_date, scheduled_time, address
     )
     if follow_reply:
+        if follow_reply.get("appointment_type") is None:
+            follow_reply["appointment_type"] = conv.get("appointment_type")
         return follow_reply
 
-    # 7) Persist appointment type
+    # 7) Persist appointment type (SRB-13 safe)
     if appointment_type is None:
         appointment_type = conv.get("appointment_type")
+
+    # Normalize and protect state
+    if appointment_type:
+        appointment_type = appointment_type.strip().upper()
+
     conv["appointment_type"] = appointment_type
 
     # 8) Confirmation Engine
     confirm_reply = handle_confirmation(conv, inbound_lower, phone)
     if confirm_reply:
+        if confirm_reply.get("appointment_type") is None:
+            confirm_reply["appointment_type"] = conv.get("appointment_type")
         return confirm_reply
 
     # 9) Home Today Logic
@@ -1549,6 +1566,8 @@ def generate_reply_for_inbound(
         address, today_date_str
     )
     if home_reply:
+        if home_reply.get("appointment_type") is None:
+            home_reply["appointment_type"] = conv.get("appointment_type")
         return home_reply
 
     # 10) Final Autobook
@@ -1556,10 +1575,12 @@ def generate_reply_for_inbound(
         conv, phone, scheduled_date, scheduled_time, address
     )
     if final_reply:
+        if final_reply.get("appointment_type") is None:
+            final_reply["appointment_type"] = conv.get("appointment_type")
         return final_reply
 
-    # 11) LLM Fallback
-    return run_llm_fallback(
+    # 11) LLM Fallback — now also protected by SRB-13
+    fallback = run_llm_fallback(
         cleaned_transcript,
         category,
         appointment_type,
@@ -1571,6 +1592,12 @@ def generate_reply_for_inbound(
         today_weekday,
         inbound_text
     )
+
+    if fallback.get("appointment_type") is None:
+        fallback["appointment_type"] = conv.get("appointment_type")
+
+    return fallback
+
 
 
 
@@ -7671,6 +7698,14 @@ def incoming_sms():
         convo["scheduled_time"] = ai_reply["scheduled_time"]
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
+
+    # ---------------------------------------------------
+    # DO NOT ALLOW APPOINTMENT TYPE TO BE WIPED
+    # ---------------------------------------------------
+    incoming_apt = ai_reply.get("appointment_type")
+    if incoming_apt is not None:
+        convo["appointment_type"] = incoming_apt
+    # (If None: preserve existing appointment_type — critical for emergency flows)
 
     # ---------------------------------------------------
     # IMPORTANT:
