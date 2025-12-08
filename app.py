@@ -1059,7 +1059,7 @@ def handle_address_intake(conv, inbound_text, inbound_lower, scheduled_date, sch
 
 
 # ====================================================================
-# EMERGENCY FAST-TRACK ENGINE — PAI-COMPATIBLE / LOOP-PROOF
+# EMERGENCY FAST-TRACK ENGINE — FINAL LOOP-PROOF VERSION (v5)
 # ====================================================================
 def handle_emergency(
     conv,
@@ -1072,6 +1072,13 @@ def handle_emergency(
     scheduled_time,
     phone
 ):
+
+    # ---------------------------------------------------------------
+    # 0. SAFETY STOP — Prevent RE-TRIGGERING after first booking
+    # ---------------------------------------------------------------
+    if conv.get("emergency_completed"):
+        return None   # absolutely no second booking
+
     emergency_terms = [
         "no power", "partial power", "tree hit", "tree took",
         "tree took my wires", "wires pulled off", "power line down",
@@ -1081,33 +1088,31 @@ def handle_emergency(
         "breaker wont reset",
     ]
 
-    # -------------------------------
-    # 1. EMERGENCY TRIGGER
-    # -------------------------------
+    # ---------------------------------------------------------------
+    # 1. PRIMARY EMERGENCY DETECTION
+    # ---------------------------------------------------------------
     is_emergency = contains_any(inbound_lower, emergency_terms)
 
+    # category override is fine — but only on FIRST RUN
     if category == "Active problems":
         is_emergency = True
 
     if not is_emergency:
         return None
 
-    # Set emergency appointment type
+    # enforce appointment type
     conv["appointment_type"] = "TROUBLESHOOT_395"
 
-    # -------------------------------
+    # ---------------------------------------------------------------
     # 2. ADDRESS SELECTION
-    # -------------------------------
-    # Prefer normalized address from intake → guaranteed correct state
+    # ---------------------------------------------------------------
     norm = conv.get("normalized_address")
 
     if norm:
         final_addr = format_full_address(norm)
     else:
-        # Raw fallback (allowed in emergency)
         final_addr = conv.get("address") or address
 
-    # If STILL no usable address → ask ONCE but DO NOT BLOCK
     if not final_addr:
         return {
             "sms_body": "Got it — we can prioritize this. What’s the full service address?",
@@ -1116,9 +1121,9 @@ def handle_emergency(
             "address": None,
         }
 
-    # -------------------------------
-    # 3. TRAVEL TIME CALCULATION
-    # -------------------------------
+    # ---------------------------------------------------------------
+    # 3. TRAVEL TIME
+    # ---------------------------------------------------------------
     travel_minutes = None
     try:
         if norm:
@@ -1128,33 +1133,34 @@ def handle_emergency(
     except:
         travel_minutes = None
 
-    # Compute the final emergency arrival time
     emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
 
-    # -------------------------------
-    # 4. LOCK IN SCHEDULE
-    # -------------------------------
+    # ---------------------------------------------------------------
+    # 4. LOCK SCHEDULE
+    # ---------------------------------------------------------------
     scheduled_date = today_date_str
     scheduled_time = emergency_time
 
     conv["scheduled_date"] = scheduled_date
     conv["scheduled_time"] = scheduled_time
 
-    # -------------------------------
-    # 5. AUTOBOOK WITH SQUARE
-    # -------------------------------
+    # ---------------------------------------------------------------
+    # 5. SQUARE BOOKING
+    # ---------------------------------------------------------------
     sq = maybe_create_square_booking(phone, {
         "scheduled_date": scheduled_date,
         "scheduled_time": scheduled_time,
         "address": final_addr,
     })
 
-    # -------------------------------
-    # 6. BOOKING SUCCESS
-    # -------------------------------
+    # ---------------------------------------------------------------
+    # 6. SUCCESS — SEND CONFIRMATION + FREEZE ENGINE
+    # ---------------------------------------------------------------
     if sq.get("success"):
 
-        # Normalize missing-address case (Square requires structure)
+        # Freeze so emergency does NOT run again
+        conv["emergency_completed"] = True
+
         if not conv.get("normalized_address"):
             conv["normalized_address"] = {
                 "address_line_1": final_addr,
@@ -1165,7 +1171,6 @@ def handle_emergency(
 
         conv["final_confirmation_sent"] = True
 
-        # Format time
         try:
             t_nice = datetime.strptime(scheduled_time, "%H:%M") \
                 .strftime("%I:%M %p").lstrip("0")
@@ -1182,9 +1187,9 @@ def handle_emergency(
             "address": final_addr,
         }
 
-    # -------------------------------
-    # 7. BOOKING FAILURE → ASK FOR ADDRESS ONLY ONCE
-    # -------------------------------
+    # ---------------------------------------------------------------
+    # 7. BOOKING FAILURE
+    # ---------------------------------------------------------------
     return {
         "sms_body": (
             "Before I finalize this emergency visit, I still need the complete service address."
@@ -1193,6 +1198,7 @@ def handle_emergency(
         "scheduled_time": scheduled_time,
         "address": final_addr,
     }
+
 
 
 
@@ -7573,7 +7579,7 @@ def voicemail_complete():
 
 
 # ---------------------------------------------------
-# Incoming SMS / WhatsApp
+# Incoming SMS / WhatsApp  (FULLY PATCHED – NO DOUBLE BOOKING)
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
@@ -7586,7 +7592,9 @@ def incoming_sms():
 
     convo = conversations.get(from_number)
 
-    # Cold inbound with no voicemail history
+    # ---------------------------------------------------
+    # COLD INBOUND
+    # ---------------------------------------------------
     if not convo:
         resp = MessagingResponse()
         resp.message(
@@ -7595,23 +7603,27 @@ def incoming_sms():
         )
         return Response(str(resp), mimetype="text/xml")
 
-    # Handle CT/MA reply after we asked specifically
+    # ---------------------------------------------------
+    # CT/MA REPLY HANDLER (ONLY place dispatcher books)
+    # ---------------------------------------------------
     if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
         upper = body.upper()
+
+        # Interpret user CT/MA reply
         if "CT" in upper or "CONNECTICUT" in upper:
             chosen_state = "CT"
         elif "MA" in upper or "MASS" in upper or "MASSACHUSETTS" in upper:
             chosen_state = "MA"
         else:
-            # Not clearly CT or MA; ask again
             resp = MessagingResponse()
             resp.message("Please reply with either CT or MA so we can confirm the address.")
             return Response(str(resp), mimetype="text/xml")
 
         raw_address = convo.get("address")
         status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
+
+        # Still failure?
         if status != "ok" or not addr_struct:
-            # Still no good; ask for full address details
             resp = MessagingResponse()
             resp.message(
                 "I still couldn't verify the address. "
@@ -7620,10 +7632,11 @@ def incoming_sms():
             convo["state_prompt_sent"] = False
             return Response(str(resp), mimetype="text/xml")
 
+        # SUCCESS → Save normalized address
         convo["normalized_address"] = addr_struct
         convo["state_prompt_sent"] = False
 
-        # Attempt booking now that we have a fully normalized address
+        # Booking is allowed *ONLY here* outside emergency engine
         try:
             maybe_create_square_booking(from_number, convo)
         except Exception as e:
@@ -7633,7 +7646,9 @@ def incoming_sms():
         resp.message("Thanks — that helps. We have everything we need for your visit.")
         return Response(str(resp), mimetype="text/xml")
 
-    # Normal conversational flow
+    # ---------------------------------------------------
+    # NORMAL CONVERSATIONAL FLOW
+    # ---------------------------------------------------
     convo["replied"] = True
 
     ai_reply = generate_reply_for_inbound(
@@ -7649,6 +7664,7 @@ def incoming_sms():
 
     sms_body = ai_reply.get("sms_body", "").strip()
 
+    # Update convo state
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
     if ai_reply.get("scheduled_time"):
@@ -7656,13 +7672,17 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # Attempt booking once we have a complete date + time + address
-    try:
-        maybe_create_square_booking(from_number, convo)
-    except Exception as e:
-        print("maybe_create_square_booking failed:", repr(e))
+    # ---------------------------------------------------
+    # IMPORTANT:
+    # REMOVE automatic booking here to prevent loops
+    # Booking now ONLY occurs:
+    #   • Inside emergency engine
+    #   • Inside CT/MA clarification block above
+    # ---------------------------------------------------
+    # (NO BOOKING CALL HERE)
+    # ---------------------------------------------------
 
-    # If final confirmation matched → stop responding
+    # If the engine returned empty string → no reply needed
     if sms_body == "":
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
