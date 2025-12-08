@@ -791,7 +791,7 @@ def normalize_address(raw: str, forced_state=None):
 
 
 # ====================================================================
-# ADDRESS INTAKE ENGINE — FINAL FIXED VERSION
+# ADDRESS INTAKE ENGINE — FINAL FIXED VERSION (WITH EXTRACTION PATCH)
 # ====================================================================
 def handle_address_intake(conv, inbound_text, inbound_lower,
                           scheduled_date, scheduled_time, address):
@@ -824,13 +824,27 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
         return None
 
     # ---------------------------------------------------------------
-    # 1. This IS an address → store it
+    # EXTRACTION PATCH — reliably pull street + city if typed inline
     # ---------------------------------------------------------------
-    raw = inbound_text.strip()
-    conv["address"] = raw
+    import re
+    def try_extract_address(text: str):
+        # grabs: "47 dickerman ave windsor locks"
+        pattern = r"\d{1,6}\s+[A-Za-z0-9\s\.\-]+"
+        m = re.search(pattern, text)
+        return m.group(0).strip() if m else None
+
+    extracted = try_extract_address(inbound_text)
+
+    # If we found a more precise substring, prefer it
+    raw = extracted if extracted else inbound_text.strip()
 
     # ---------------------------------------------------------------
-    # 2. PAI
+    # 1. This IS an address → store it
+    # ---------------------------------------------------------------
+    conv["address"] = raw   # <<< CRITICAL FIX — this was missing
+
+    # ---------------------------------------------------------------
+    # 2. PAI — determine if CT/MA needed
     # ---------------------------------------------------------------
     pai = resolve_address_pai(raw)
     forced_state = pai.get("state")
@@ -858,9 +872,11 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
 
     if norm_status == "needs_state":
         if forced_state:
+            # PAI forced state → success
             conv["normalized_address"] = parsed
             return None
 
+        # Must prompt for CT/MA
         if not conv.get("town_prompt_sent"):
             conv["town_prompt_sent"] = True
             return {
@@ -873,6 +889,9 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
         conv["normalized_address"] = None
         return None
 
+    # ---------------------------------------------------------------
+    # 4. Final fallback — address invalid or not understood
+    # ---------------------------------------------------------------
     conv["normalized_address"] = None
     return None
 
