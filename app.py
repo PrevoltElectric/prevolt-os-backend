@@ -1059,7 +1059,7 @@ def handle_address_intake(conv, inbound_text, inbound_lower, scheduled_date, sch
 
 
 # ====================================================================
-# EMERGENCY FAST-TRACK ENGINE — FINAL LOOP-PROOF VERSION (v5)
+# EMERGENCY FAST-TRACK ENGINE — LOOP-PROOF, STATEFUL VERSION (v7)
 # ====================================================================
 def handle_emergency(
     conv,
@@ -1074,11 +1074,78 @@ def handle_emergency(
 ):
 
     # ---------------------------------------------------------------
-    # 0. SAFETY STOP — Prevent RE-TRIGGERING after first booking
+    # 0. HARD STOP — If emergency completed, never run again.
     # ---------------------------------------------------------------
     if conv.get("emergency_completed"):
-        return None   # absolutely no second booking
+        return None
 
+    # ---------------------------------------------------------------
+    # 1. EMERGENCY PERSISTENCE — If flagged earlier, re-enter emergency.
+    # ---------------------------------------------------------------
+    if conv.get("is_emergency") is True:
+
+        final_addr = conv.get("address") or address
+
+        # Still no address → ask again
+        if not final_addr:
+            return {
+                "sms_body": "Understood — we can prioritize this. What’s the full service address?",
+                "appointment_type": "TROUBLESHOOT_395",
+            }
+
+        # If we DO have address but no date/time → schedule emergency time
+        norm = conv.get("normalized_address")
+        travel_minutes = None
+
+        try:
+            if norm:
+                dest = format_full_address(norm)
+                origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+                travel_minutes = compute_travel_time_minutes(origin, dest)
+        except:
+            travel_minutes = None
+
+        emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
+        scheduled_date = today_date_str
+        scheduled_time = emergency_time
+
+        conv["scheduled_date"] = scheduled_date
+        conv["scheduled_time"] = scheduled_time
+
+        # Attempt booking
+        sq = maybe_create_square_booking(phone, {
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": final_addr,
+        })
+
+        if sq.get("success"):
+            conv["emergency_completed"] = True
+            conv["appointment_type"] = "TROUBLESHOOT_395"
+
+            try:
+                t_nice = datetime.strptime(scheduled_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
+            except:
+                t_nice = scheduled_time
+
+            return {
+                "sms_body": (
+                    f"You're all set — emergency troubleshoot scheduled for about {t_nice}. "
+                    "A Square confirmation will follow."
+                ),
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": final_addr,
+            }
+
+        return {
+            "sms_body": "Before I finalize this emergency visit, I still need the complete service address.",
+            "appointment_type": "TROUBLESHOOT_395",
+        }
+
+    # ---------------------------------------------------------------
+    # 2. FIRST-TIME EMERGENCY DETECTION
+    # ---------------------------------------------------------------
     emergency_terms = [
         "no power", "partial power", "tree hit", "tree took",
         "tree took my wires", "wires pulled off", "power line down",
@@ -1088,41 +1155,35 @@ def handle_emergency(
         "breaker wont reset",
     ]
 
-    # ---------------------------------------------------------------
-    # 1. PRIMARY EMERGENCY DETECTION
-    # ---------------------------------------------------------------
     is_emergency = contains_any(inbound_lower, emergency_terms)
 
-    # category override is fine — but only on FIRST RUN
+    # category override is fine — but only on first run
     if category == "Active problems":
         is_emergency = True
 
     if not is_emergency:
         return None
 
-    # enforce appointment type
+    # ---------------------------------------------------------------
+    # 3. EMERGENCY CONFIRMED — Persist state!
+    # ---------------------------------------------------------------
+    conv["is_emergency"] = True
     conv["appointment_type"] = "TROUBLESHOOT_395"
 
     # ---------------------------------------------------------------
-    # 2. ADDRESS SELECTION
+    # 4. ADDRESS COLLECTION (first-time emergency)
     # ---------------------------------------------------------------
     norm = conv.get("normalized_address")
-
-    if norm:
-        final_addr = format_full_address(norm)
-    else:
-        final_addr = conv.get("address") or address
+    final_addr = format_full_address(norm) if norm else (conv.get("address") or address)
 
     if not final_addr:
         return {
             "sms_body": "Got it — we can prioritize this. What’s the full service address?",
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": None,
+            "appointment_type": "TROUBLESHOOT_395",
         }
 
     # ---------------------------------------------------------------
-    # 3. TRAVEL TIME
+    # 5. COMPUTE ARRIVAL TIME
     # ---------------------------------------------------------------
     travel_minutes = None
     try:
@@ -1135,9 +1196,6 @@ def handle_emergency(
 
     emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
 
-    # ---------------------------------------------------------------
-    # 4. LOCK SCHEDULE
-    # ---------------------------------------------------------------
     scheduled_date = today_date_str
     scheduled_time = emergency_time
 
@@ -1145,7 +1203,7 @@ def handle_emergency(
     conv["scheduled_time"] = scheduled_time
 
     # ---------------------------------------------------------------
-    # 5. SQUARE BOOKING
+    # 6. BOOK WITH SQUARE
     # ---------------------------------------------------------------
     sq = maybe_create_square_booking(phone, {
         "scheduled_date": scheduled_date,
@@ -1153,27 +1211,11 @@ def handle_emergency(
         "address": final_addr,
     })
 
-    # ---------------------------------------------------------------
-    # 6. SUCCESS — SEND CONFIRMATION + FREEZE ENGINE
-    # ---------------------------------------------------------------
     if sq.get("success"):
-
-        # Freeze so emergency does NOT run again
         conv["emergency_completed"] = True
 
-        if not conv.get("normalized_address"):
-            conv["normalized_address"] = {
-                "address_line_1": final_addr,
-                "locality": "",
-                "administrative_district_level_1": "",
-                "postal_code": "",
-            }
-
-        conv["final_confirmation_sent"] = True
-
         try:
-            t_nice = datetime.strptime(scheduled_time, "%H:%M") \
-                .strftime("%I:%M %p").lstrip("0")
+            t_nice = datetime.strptime(scheduled_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
         except:
             t_nice = scheduled_time
 
@@ -1187,17 +1229,11 @@ def handle_emergency(
             "address": final_addr,
         }
 
-    # ---------------------------------------------------------------
-    # 7. BOOKING FAILURE
-    # ---------------------------------------------------------------
     return {
-        "sms_body": (
-            "Before I finalize this emergency visit, I still need the complete service address."
-        ),
-        "scheduled_date": scheduled_date,
-        "scheduled_time": scheduled_time,
-        "address": final_addr,
+        "sms_body": "Before I finalize this emergency visit, I still need the complete service address.",
+        "appointment_type": "TROUBLESHOOT_395",
     }
+
 
 
 
