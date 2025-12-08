@@ -431,9 +431,6 @@ def normalize_possible_address(text: str):
     Attempts to extract a street address from customer text.
     Returns a minimal normalized structure if confident,
     otherwise returns None.
-
-    This is intentionally lightweight because Section 4 logic
-    only needs enough structure for travel-time & Square booking.
     """
 
     if not text:
@@ -461,139 +458,29 @@ def normalize_possible_address(text: str):
         "full": full,
     }
 
-# ====================================================================
-# MISSING HELPERS REQUIRED BY SECTION 4 (SAFE MINIMAL VERSIONS)
-# ====================================================================
-
-
-# ---------------------------------------------------
-# Format address for travel-time logic (FINAL VERSION)
-# ---------------------------------------------------
-def format_full_address(norm: dict) -> str:
-    """
-    Returns a safe human-readable address string.
-    Ensures that earlier-captured `full` field is NEVER lost.
-    """
-    if not norm:
-        return ""
-
-    line = (
-        norm.get("address_line_1")
-        or norm.get("full")
-        or ""
-    )
-
-    loc  = norm.get("locality") or ""
-    st   = norm.get("administrative_district_level_1") or ""
-    zipc = norm.get("postal_code") or ""
-
-    # Clean formatting to avoid leading/trailing commas
-    formatted = f"{line}, {loc} {st} {zipc}".strip().strip(", ")
-    return formatted
-
-
-
-# ---------------------------------------------------
-# Finalization readiness checker
-# ---------------------------------------------------
-def ready_to_finalize(conv, scheduled_date, scheduled_time, address):
-    """
-    Returns True if all fields required for booking are present.
-    """
-    if not conv:
-        return False
-
-    if not (scheduled_date and scheduled_time and address):
-        return False
-
-    if not conv.get("appointment_type"):
-        return False
-
-    return True
-
-
-# ---------------------------------------------------
-# Dispatch constants (safe defaults)
-# ---------------------------------------------------
-TECH_CURRENT_ADDRESS = "1 Granby CT"          # can be replaced with live GPS later
-DISPATCH_ORIGIN_ADDRESS = "1 Granby CT"       # fallback dispatch origin
-
-# ---------------------------------------------------
-# TROUBLESHOOT TRIGGERS — Non-Emergency, Requires Tools ($395)
-# ---------------------------------------------------
-TROUBLESHOOT_TRIGGERS = [
-    "not working", "stopped working", "stop working",
-    "doesn't work", "doesnt work",
-    "won't turn on", "wont turn on",
-    "no power to", "gfci not resetting", "gfi not resetting",
-    "outlet dead", "outlet not working",
-    "switch not working",
-    "light not working", "light stopped working",
-    "no lights",
-    "breaker keeps tripping",
-    "breaker won't reset", "breaker wont reset",
-    "constant tripping",
-    "shorted", "short circuit",
-    "i don't know why", "dont know why",
-    "not sure why", "mystery issue",
-    "something is wrong", "issue with", "problem with",
-]
-
-def is_troubleshoot_case(text: str) -> bool:
-    """
-    Detects non-emergency failure conditions requiring tools.
-    ALWAYS maps to TROUBLESHOOT_395, never EVAL_195.
-    """
-    t = text.lower().strip()
-    return any(trigger in t for trigger in TROUBLESHOOT_TRIGGERS)
 
 # ====================================================================
-# PREVOLT ADDRESS INTELLIGENCE (PAI) — ZERO-ASSUMPTION VERSION (PATCHED)
+# PREVOLT ADDRESS INTELLIGENCE (PAI)
 # ====================================================================
-import re
 
-# --------------------------------------------------------------------
-# 1) Ultra-flexible address detector (NO town lists, NO assumptions)
-# --------------------------------------------------------------------
 def is_customer_address_only(text: str) -> bool:
-    """
-    Detects ANY message that is *likely* a street address.
-    Requirements:
-    • Must contain a number (house number)
-    • Must contain ≥1 word after the number
-    • Accepts partial streets with missing suffix or missing town
-    Examples accepted:
-       "54 bloomfield"
-       "54 bloomfield ave windsor"
-       "12 east main"
-       "120 maple"
-    """
     if not text:
         return False
 
     t = text.lower().strip()
 
-    # Must contain a house number
+    # must contain a number
     if not re.search(r"\b\d{1,6}[a-z]?\b", t):
         return False
 
-    # Number followed by at least one word
+    # number followed by one or more words
     if re.search(r"\b\d{1,6}[a-z]?\s+[a-z0-9]+(?:\s+[a-z0-9]+)*\b", t):
         return True
 
     return False
 
 
-# --------------------------------------------------------------------
-# 2) Extract street line (NO assumptions about suffix or town)
-# --------------------------------------------------------------------
 def extract_street_line(text: str) -> str | None:
-    """
-    Extracts street address portion BEFORE any state/ZIP.
-    Example:
-      "54 bloomfield windsor ct" → "54 Bloomfield"
-      "12 east main st springfield ma" → "12 East Main St"
-    """
     t = text.lower().strip()
 
     m = re.search(r"\b(\d{1,6}[a-z]?)\s+([a-z0-9\s]+)", t)
@@ -603,35 +490,20 @@ def extract_street_line(text: str) -> str | None:
     num = m.group(1).strip().title()
     rest = m.group(2).strip()
 
-    # Remove explicit state abbreviations
     rest = re.sub(r"\b(ct|ma|us|usa)\b", "", rest, flags=re.I).strip()
-
-    # Remove ZIPs
     rest = re.sub(r"\b\d{5}(?:-\d{4})?\b", "", rest).strip()
 
     street = f"{num} {rest}".strip().title()
     return street if street else None
 
 
-# --------------------------------------------------------------------
-# 3) Extract *possible* town token (NO static lists)
-# --------------------------------------------------------------------
 def extract_town(text: str) -> str | None:
-    """
-    Attempts to detect a town word AFTER the street name.
-    Rules:
-    • Skip house number + street words
-    • Skip obvious non-town tokens (state codes, zip codes)
-    • Return FIRST remaining human-like token
-    """
     tokens = text.lower().strip().split()
 
     if len(tokens) < 3:
         return None
 
-    # Skip: number + one street word at minimum
     skip = 2
-
     for tok in tokens[skip:]:
         if tok in ("ct", "ma", "usa", "us"):
             continue
@@ -640,38 +512,25 @@ def extract_town(text: str) -> str | None:
         if tok.isdigit():
             continue
         if len(tok) <= 2:
-            continue  # too short to be a town
+            continue
 
         return tok.title()
 
     return None
 
 
-# --------------------------------------------------------------------
-# 4) Detect explicit state only if user actually typed CT/MA
-# --------------------------------------------------------------------
 def detect_state_from_text(text: str):
     t = text.lower().strip()
 
-    # ending with "ct" or containing " ct "
     if re.search(r"\bct\b", t):
         return "CT"
-
     if re.search(r"\bma\b", t):
         return "MA"
 
-    return None  # otherwise unknown → let Google decide
+    return None
 
 
-# --------------------------------------------------------------------
-# 5) PAI master resolver — cleanest possible preprocessing
-# --------------------------------------------------------------------
 def resolve_address_pai(raw: str) -> dict:
-    """
-    Produces the cleanest possible structure BEFORE Google normalization.
-    NEVER asks CT/MA unless absolutely required (Google cannot infer state).
-    """
-
     if not raw:
         return {"status": "error"}
 
@@ -684,24 +543,140 @@ def resolve_address_pai(raw: str) -> dict:
     town = extract_town(raw)
     state = detect_state_from_text(raw)
 
-    # If user said CT or MA explicitly → lock it in
-    if state:
-        return {
-            "status": "ok",
-            "line1": street,
-            "town": town,
-            "state": state,   # CT or MA explicitly from user
-            "zip": None,
-        }
-
-    # Otherwise → let Google infer state
     return {
         "status": "ok",
         "line1": street,
         "town": town,
-        "state": None,       # Google must fill it
+        "state": state,
         "zip": None,
     }
+
+
+# ====================================================================
+# GOOGLE WRAPPER + FORMATTER
+# ====================================================================
+
+def try_normalize_with_google(raw: str):
+    """
+    Minimal safe wrapper.
+    Returns dict where PAI can fill in missing pieces.
+    """
+    if not raw:
+        return None
+
+    base = normalize_possible_address(raw)
+    if not base:
+        return None
+
+    return {
+        "address_line_1": base["full"],
+        "locality": None,
+        "administrative_district_level_1": None,
+        "postal_code": None,
+    }
+
+
+def format_full_address(norm: dict) -> str:
+    if not norm:
+        return ""
+    line = norm.get("address_line_1") or ""
+    loc = norm.get("locality") or ""
+    st = norm.get("administrative_district_level_1") or ""
+    zipc = norm.get("postal_code") or ""
+    return f"{line}, {loc} {st} {zipc}".strip(", ").strip()
+
+
+# ====================================================================
+# NORMALIZE ADDRESS (FINAL — WITH SAFETY FIX)
+# ====================================================================
+
+def normalize_address(raw: str, forced_state=None):
+    """
+    FINAL VERSION:
+    • No loops
+    • No CT/MA prompt
+    • Preserves PAI logic
+    • Ensures we NEVER mark a street-only address as fully normalized
+    • Travel-time compatibility preserved
+    """
+    try:
+        parsed = try_normalize_with_google(raw)
+        if not parsed:
+            return ("error", None)
+
+        pai = resolve_address_pai(raw)
+
+        if pai["status"] == "ok":
+            if pai.get("town"):
+                parsed["locality"] = pai["town"]
+
+            if pai.get("state"):
+                parsed["administrative_district_level_1"] = pai["state"]
+
+        # ----------------------------------------------------
+        # SAFETY FIX:
+        # If BOTH town AND state are missing → NOT normalized.
+        # This prevents premature progression and downstream stalls.
+        # ----------------------------------------------------
+        if parsed.get("locality") is None and parsed.get("administrative_district_level_1") is None:
+            return ("error", None)
+
+        return ("ok", parsed)
+
+    except:
+        return ("error", None)
+
+
+# ====================================================================
+# ADDRESS INTAKE ENGINE — LOOP PROOF
+# ====================================================================
+
+def handle_address_intake(conv, inbound_text, inbound_lower,
+                          scheduled_date, scheduled_time, address):
+
+    tokens = inbound_lower.replace(",", "").split()
+    if len(tokens) < 3:
+        return None
+    if not any(tok.isdigit() for tok in tokens):
+        return None
+
+    street_keywords = {
+        "st", "street", "rd", "road", "ave", "avenue", "blvd",
+        "ln", "lane", "dr", "drive", "way", "ct", "court"
+    }
+    if not any(tok in street_keywords for tok in tokens):
+        return None
+
+    m = re.search(r"\d{1,6}\s+[A-Za-z0-9\s\.\-]+", inbound_text)
+    raw_addr = m.group(0).strip() if m else inbound_text.strip()
+
+    conv["address"] = raw_addr
+
+    norm_status, parsed = normalize_address(raw_addr)
+
+    if norm_status == "ok" and parsed:
+        conv["normalized_address"] = parsed
+
+        if not conv.get("scheduled_date"):
+            return {
+                "sms_body": "Got it — what day would you like us to come out?",
+                "address": raw_addr,
+                "scheduled_date": None,
+                "scheduled_time": None,
+            }
+
+        if conv.get("scheduled_date") and not conv.get("scheduled_time"):
+            return {
+                "sms_body": f"What time works for your visit on {conv['scheduled_date']}?",
+                "address": raw_addr,
+                "scheduled_date": conv["scheduled_date"],
+                "scheduled_time": None,
+            }
+
+        return None
+
+    conv["normalized_address"] = None
+    return None
 
 
 # ====================================================================
@@ -737,11 +712,6 @@ def is_customer_confirmation(msg):
 # Google normalization wrapper (safe)
 # ---------------------------------------------------
 def try_normalize_with_google(raw: str):
-    """
-    Minimal safe wrapper.
-    NEVER raises.
-    Always returns a dict with state missing, letting PAI decide.
-    """
     if not raw:
         return None
 
@@ -774,24 +744,26 @@ def format_full_address(norm: dict) -> str:
 # Address Normalization (PAI → Google)
 # ---------------------------------------------------
 def normalize_address(raw: str, forced_state=None):
-    """
-    FORCE FIX:
-    • If PAI gives CT/MA → treat as FINAL
-    • never return "needs_state" once state is known
-    """
     try:
         parsed = try_normalize_with_google(raw)
         if not parsed:
             return ("error", None)
 
-        # If PAI already knows the state → enforce and EXIT SUCCESS
-        if forced_state:
-            parsed["administrative_district_level_1"] = forced_state
-            return ("ok", parsed)
+        pai = resolve_address_pai(raw)
 
-        # No forced state → still missing → needs CT/MA once
-        if not parsed.get("administrative_district_level_1"):
-            return ("needs_state", parsed)
+        if pai["status"] == "ok":
+
+            if pai.get("town"):
+                parsed["locality"] = pai["town"]
+
+            if pai.get("state"):
+                parsed["administrative_district_level_1"] = pai["state"]
+
+        # ----------------------------------------------------
+        # REAL FIX: do NOT accept street-only addresses
+        # ----------------------------------------------------
+        if parsed.get("locality") is None and parsed.get("administrative_district_level_1") is None:
+            return ("error", None)
 
         return ("ok", parsed)
 
@@ -800,15 +772,11 @@ def normalize_address(raw: str, forced_state=None):
 
 
 # ====================================================================
-# ADDRESS INTAKE ENGINE — CLEAN + RELIABLE VERSION (NO LOOPS)
+# ADDRESS INTAKE ENGINE — CLEAN + RELIABLE (NO LOOPS)
 # ====================================================================
 def handle_address_intake(conv, inbound_text, inbound_lower,
                           scheduled_date, scheduled_time, address):
 
-    # ---------------------------------------------------------------
-    # 0. QUICK EXIT — message is not an address
-    # ---------------------------------------------------------------
-    # Basic detection: must have a number + street keyword
     tokens = inbound_lower.replace(",", "").split()
 
     if len(tokens) < 3:
@@ -831,28 +799,16 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
     if not any(tok in street_keywords for tok in tokens):
         return None
 
-    # ---------------------------------------------------------------
-    # 1. Extract the usable address substring
-    # ---------------------------------------------------------------
-    import re
     m = re.search(r"\d{1,6}\s+[A-Za-z0-9\s\.\-]+", inbound_text)
     raw_addr = m.group(0).strip() if m else inbound_text.strip()
 
-    # ---------------------------------------------------------------
-    # 2. STORE ADDRESS IMMEDIATELY (CRITICAL FIX)
-    # ---------------------------------------------------------------
     conv["address"] = raw_addr
 
-    # ---------------------------------------------------------------
-    # 3. Normalize address (attempt CT/MA detection)
-    # ---------------------------------------------------------------
     norm_status, parsed = normalize_address(raw_addr)
 
-    # -------- CASE A: FULLY NORMALIZED ADDRESS --------
     if norm_status == "ok" and parsed:
         conv["normalized_address"] = parsed
 
-        # If no date yet → ask for date next
         if not conv.get("scheduled_date"):
             return {
                 "sms_body": "Got it — what day would you like us to come out?",
@@ -861,7 +817,6 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
                 "scheduled_time": None,
             }
 
-        # If date but no time → ask time next
         if conv.get("scheduled_date") and not conv.get("scheduled_time"):
             return {
                 "sms_body": (
@@ -872,28 +827,10 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
                 "scheduled_time": None,
             }
 
-        # Otherwise return None so downstream continues normally
         return None
 
-    # -------- CASE B: NORMALIZER NEEDS STATE (CT/MA) --------
-    if norm_status == "needs_state":
-        if not conv.get("state_prompt_sent"):
-            conv["state_prompt_sent"] = True
-            return {
-                "sms_body": "Just confirming — is that address in CT or MA?",
-                "address": raw_addr,
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-            }
-
-        # Already asked — wait for user reply
-        return None
-
-    # -------- CASE C: INVALID / UNRECOGNIZED ADDRESS --------
     conv["normalized_address"] = None
     return None
-
-
 
 
 # ---------------------------------------------------
@@ -917,7 +854,7 @@ Follow internal SRB rules only. Output MUST be strict JSON.
 
 
 # ====================================================================
-# SRB-12 — Natural Language Date/Time Parsing (UPGRADED VERSION)
+# SRB-12 — Natural Language Date/Time Parsing
 # ====================================================================
 import re
 from datetime import timedelta
@@ -931,9 +868,6 @@ def parse_natural_datetime(inbound_text: str, now_local):
         "time": None
     }
 
-    # ---------------------------------------------------------------
-    # SAME-DAY / IMMEDIATE PHRASES
-    # ---------------------------------------------------------------
     same_day_terms = [
         "today", "right now", "im home", "i am home",
         "here now", "home now", "asap", "available now"
@@ -945,9 +879,6 @@ def parse_natural_datetime(inbound_text: str, now_local):
         result["time"] = (now_local + timedelta(hours=2)).strftime("%H:%M")
         return result
 
-    # ---------------------------------------------------------------
-    # TOMORROW
-    # ---------------------------------------------------------------
     if "tomorrow" in text:
         t = now_local + timedelta(days=1)
         result["has_datetime"] = True
@@ -955,9 +886,6 @@ def parse_natural_datetime(inbound_text: str, now_local):
         result["time"] = "09:00"
         return result
 
-    # ---------------------------------------------------------------
-    # WEEKDAY NAMES
-    # ---------------------------------------------------------------
     weekdays = {
         "monday": 0,
         "tuesday": 1,
@@ -973,7 +901,7 @@ def parse_natural_datetime(inbound_text: str, now_local):
             today_idx = now_local.weekday()
             delta = (target_idx - today_idx) % 7
             if delta == 0:
-                delta = 7  # Next week same day
+                delta = 7
 
             visit_day = now_local + timedelta(days=delta)
             result["has_datetime"] = True
@@ -981,9 +909,6 @@ def parse_natural_datetime(inbound_text: str, now_local):
             result["time"] = "09:00"
             return result
 
-    # ---------------------------------------------------------------
-    # OPEN / FLEXIBLE PHRASES
-    # ---------------------------------------------------------------
     if any(x in text for x in ["any day", "whenever", "you pick", "flexible"]):
         t = now_local + timedelta(days=1)
         result["has_datetime"] = True
@@ -991,9 +916,6 @@ def parse_natural_datetime(inbound_text: str, now_local):
         result["time"] = "09:00"
         return result
 
-    # ---------------------------------------------------------------
-    # SPECIFIC TIMES (3 pm, 4:30, 10am, etc.)
-    # ---------------------------------------------------------------
     time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text)
     if time_match:
         hour = int(time_match.group(1))
@@ -1005,7 +927,6 @@ def parse_natural_datetime(inbound_text: str, now_local):
         if meridiem == "am" and hour == 12:
             hour = 0
 
-        # Validate hour
         if 0 <= hour <= 23:
             result["has_datetime"] = True
             result["date"] = now_local.strftime("%Y-%m-%d")
@@ -1047,13 +968,10 @@ def enforce_state_lock(state: str, conv: dict):
 
 
 # ====================================================================
-# SRB-14 — Human Intent Interpreter (FULLY PATCHED)
+# SRB-14 — Human Intent Interpreter
 # ====================================================================
 def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
 
-    # -----------------------------------------------------------
-    # 1) AFFIRMATIVE INTENT
-    # -----------------------------------------------------------
     aff = [
         "yes", "yeah", "yep", "sure", "sounds good", "that works",
         "ok", "okay", "perfect", "please come", "come today"
@@ -1061,9 +979,6 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
     if any(a in inbound_lower for a in aff):
         conv["intent_affirm"] = True
 
-    # -----------------------------------------------------------
-    # 2) AVAILABILITY INTENT
-    # -----------------------------------------------------------
     avail = [
         "i'm home", "im home", "home now", "at the house",
         "here now", "someone is here", "i'm available",
@@ -1072,38 +987,23 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
     if any(a in inbound_lower for a in avail):
         conv["intent_available"] = True
 
-    # -----------------------------------------------------------
-    # 3) SAME-DAY INTENT
-    # -----------------------------------------------------------
     today_terms = ["today", "later today", "this afternoon", "this morning", "tonight"]
     if any(t in inbound_lower for t in today_terms):
         conv["intent_today"] = True
 
-    # -----------------------------------------------------------
-    # 4) IGNORE INTENT ENGINE FOR EMERGENCIES
-    # -----------------------------------------------------------
     emergencies = ["no power", "partial power", "fire", "sparks", "smoke", "burning", "tree", "arcing"]
     if any(e in inbound_lower for e in emergencies):
-        return None  # emergency engine must take over
+        return None
 
-    # -----------------------------------------------------------
-    # 5) TODAY / TOMORROW OVERRIDE
-    # -----------------------------------------------------------
     if "today" in inbound_lower or "tomorrow" in inbound_lower:
-        pass  # let SRB-12 handle date parsing
+        pass
     else:
         if conv.get("intent_affirm") and conv.get("intent_available") and not conv.get("scheduled_date"):
             return {"sms_body": "Got it — what day would you like us to come out?"}
 
-    # -----------------------------------------------------------
-    # 6) MISSING ADDRESS
-    # -----------------------------------------------------------
     if conv.get("intent_affirm") and not conv.get("address"):
         return {"sms_body": "Perfect — what’s the full service address?"}
 
-    # -----------------------------------------------------------
-    # 7) MISSING TIME
-    # -----------------------------------------------------------
     if conv.get("intent_affirm") and conv.get("scheduled_date") and not conv.get("scheduled_time"):
         return {"sms_body": f"What time works for your visit on {conv['scheduled_date']}?"}
 
@@ -1111,7 +1011,7 @@ def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
 
 
 # ====================================================================
-# EMERGENCY FAST-TRACK ENGINE — CLEAN, LOOP-PROOF VERSION
+# EMERGENCY FAST-TRACK ENGINE (unchanged, stable)
 # ====================================================================
 def handle_emergency(
     conv,
@@ -1125,16 +1025,11 @@ def handle_emergency(
     phone
 ):
 
-    # If already completed → do nothing
     if conv.get("emergency_completed"):
         return None
 
-    # ================================================================
-    # CONTINUED EMERGENCY FLOW
-    # ================================================================
     if conv.get("is_emergency"):
 
-        # Keep address fresh
         if address and not conv.get("address"):
             conv["address"] = address
 
@@ -1147,7 +1042,6 @@ def handle_emergency(
                 "appointment_type": "TROUBLESHOOT_395",
             }
 
-        # Compute travel time if normalized
         travel_minutes = None
         norm = conv.get("normalized_address")
 
@@ -1190,9 +1084,6 @@ def handle_emergency(
             "appointment_type": "TROUBLESHOOT_395",
         }
 
-    # ================================================================
-    # FIRST-TIME EMERGENCY DETECTION
-    # ================================================================
     emergency_terms = [
         "no power", "partial power", "tree hit", "tree took",
         "tree took my wires", "wires pulled off", "power line down",
