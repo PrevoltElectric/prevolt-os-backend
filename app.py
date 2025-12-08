@@ -1528,23 +1528,29 @@ def generate_reply_for_inbound(
 ) -> dict:
 
     # -----------------------------------------------------------
-    # 0) ENV + NORMALIZATION
+    # 0) ENV + HARD APPOINTMENT TYPE FIREWALL (CRITICAL)
     # -----------------------------------------------------------
     tz = ZoneInfo("America/New_York")
     now_local = datetime.now(tz)
     inbound_lower = inbound_text.strip().lower()
 
-    # If generate_reply_for_inbound was called without passing conv,
-    # something upstream is wrong — force-guard it.
     if conv is None:
         conv = {}
 
-    # Ensure appointment_type always exists in memory
+    # STEP 1 — Collect possible sources of appointment_type
     if appointment_type is None:
         appointment_type = conv.get("appointment_type")
 
-    if conv.get("appointment_type") is None and appointment_type:
-        conv["appointment_type"] = appointment_type
+    if appointment_type is None:
+        appointment_type = conv.get("category")
+
+    # STEP 2 — FINAL FAILSAFE DEFAULT
+    if appointment_type is None:
+        appointment_type = "TROUBLESHOOT_395"
+
+    # STEP 3 — Normalize + store permanently
+    appointment_type = appointment_type.strip().upper()
+    conv["appointment_type"] = appointment_type
 
     # -----------------------------------------------------------
     # 1) STATE MACHINE LOCK (SRB-13)
@@ -1561,9 +1567,6 @@ def generate_reply_for_inbound(
     # -----------------------------------------------------------
     if conv.get("is_emergency") and conv.get("appointment_type") is None:
         conv["appointment_type"] = "TROUBLESHOOT_395"
-
-    if appointment_type is None:
-        appointment_type = conv.get("appointment_type")
 
     # -----------------------------------------------------------
     # 3) INTENT ENGINE (SRB-14)
@@ -1590,7 +1593,7 @@ def generate_reply_for_inbound(
             addr_reply["appointment_type"] = conv.get("appointment_type")
         return addr_reply
 
-    # CRITICAL FIX — Sync address BEFORE emergency engine
+    # Ensure address synced before emergency pass
     address = conv.get("address")
 
     # -----------------------------------------------------------
@@ -1600,7 +1603,7 @@ def generate_reply_for_inbound(
         conv,
         category,
         inbound_lower,
-        address,            # now ALWAYS correct
+        address,
         now_local,
         now_local.strftime("%Y-%m-%d"),
         scheduled_date,
@@ -1646,7 +1649,7 @@ def generate_reply_for_inbound(
         return follow_reply
 
     # -----------------------------------------------------------
-    # 9) APPOINTMENT TYPE LOCK
+    # 9) APPOINTMENT TYPE LOCK (SECONDARY SAFETY)
     # -----------------------------------------------------------
     if appointment_type is None:
         appointment_type = conv.get("appointment_type")
@@ -1715,6 +1718,7 @@ def generate_reply_for_inbound(
         fallback["appointment_type"] = conv.get("appointment_type")
 
     return fallback
+
 
 
 
@@ -7752,7 +7756,7 @@ def incoming_sms():
     # ---------------------------------------------------
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
-    from_number = from_number.strip()  # ensure key match
+    from_number = from_number.strip()
 
     convo = conversations.get(from_number)
 
@@ -7765,11 +7769,11 @@ def incoming_sms():
             "Hi, this is Prevolt Electric — thanks for reaching out. "
             "What electrical work are you looking to have done?"
         )
-        # Start minimal convo for cold inbound
+
         conversations[from_number] = {
             "cleaned_transcript": None,
             "category": None,
-            "appointment_type": None,
+            "appointment_type": "TROUBLESHOOT_395",  # <-- SAFE DEFAULT
             "initial_sms": None,
             "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
             "replied": True,
@@ -7784,27 +7788,38 @@ def incoming_sms():
         }
         return Response(str(resp), mimetype="text/xml")
 
+    # ===================================================
+    # 2) APPOINTMENT TYPE FIREWALL (CRITICAL FIX)
+    # ===================================================
+    if convo.get("appointment_type") is None:
+        restored = convo.get("category")
+        if restored:
+            restored = restored.strip().upper()
+        else:
+            restored = "TROUBLESHOOT_395"
+        convo["appointment_type"] = restored
+
+    forced_type = convo["appointment_type"]
+
     # ---------------------------------------------------
-    # 2) ADDRESS STATE CONFIRMATION (CT / MA)
+    # 3) ADDRESS STATE CONFIRMATION (CT / MA)
     # ---------------------------------------------------
     if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
         up = body.upper()
 
-        # Parse state
         if "CT" in up or "CONNECTICUT" in up:
             chosen_state = "CT"
-        elif "MA" in up or "MASS" in up or "MASSACHUSETTS" in up:
+        elif "MA" in up or "MASS" in up:
             chosen_state = "MA"
         else:
             resp = MessagingResponse()
             resp.message("Please reply with CT or MA so we can verify the address.")
             return Response(str(resp), mimetype="text/xml")
 
-        # Normalize with forced state
         raw_address = convo.get("address")
         status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
 
-        if status != "ok":
+        if status != "ok" or not addr_struct:
             resp = MessagingResponse()
             resp.message(
                 "I still couldn't verify the address. "
@@ -7813,11 +7828,9 @@ def incoming_sms():
             convo["state_prompt_sent"] = False
             return Response(str(resp), mimetype="text/xml")
 
-        # Save and continue
         convo["normalized_address"] = addr_struct
         convo["state_prompt_sent"] = False
 
-        # Allow booking after address verification
         try:
             maybe_create_square_booking(from_number, convo)
         except Exception as e:
@@ -7828,15 +7841,15 @@ def incoming_sms():
         return Response(str(resp), mimetype="text/xml")
 
     # ---------------------------------------------------
-    # 3) NORMAL CONVERSATION BRANCH — SRB STATE ENGINE
+    # 4) NORMAL FLOW
     # ---------------------------------------------------
     convo["replied"] = True
 
     ai_reply = generate_reply_for_inbound(
-        conv=convo,  # <<<<<<<<<<<<<< THE FIX — SRB-13 MUST MUTATE STATE
+        conv=convo,
         cleaned_transcript=convo.get("cleaned_transcript"),
         category=convo.get("category"),
-        appointment_type=convo.get("appointment_type"),
+        appointment_type=forced_type,   # << HARD ENFORCEMENT
         initial_sms=convo.get("initial_sms"),
         inbound_text=body,
         scheduled_date=convo.get("scheduled_date"),
@@ -7846,66 +7859,35 @@ def incoming_sms():
 
     sms_body = (ai_reply.get("sms_body") or "").strip()
 
-       # ---------------------------------------------------
-    # 4) UPDATE CONVERSATION STATE SAFELY
     # ---------------------------------------------------
-
-    #   CRITICAL PATCH — NEVER allow appointment_type to fall to None
-    # If generate_reply_for_inbound forgot to return a type,
-    # restore the PREVIOUS known good appointment_type.
-    if ("appointment_type" not in ai_reply) or (ai_reply["appointment_type"] is None):
-        ai_reply["appointment_type"] = convo.get("appointment_type")
-
-    # ------------------------
-    # DATE
-    # ------------------------
+    # 5) UPDATE STATE SAFELY
+    # ---------------------------------------------------
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
 
-    # ------------------------
-    # TIME
-    # ------------------------
     if ai_reply.get("scheduled_time"):
         convo["scheduled_time"] = ai_reply["scheduled_time"]
 
-    # ------------------------
-    # ADDRESS
-    # ------------------------
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # ------------------------
-    # APPOINTMENT TYPE (PROTECTED)
-    # ------------------------
-    incoming_apt = ai_reply.get("appointment_type")
-
-    # Only update appointment_type if it is VALID (not None, not empty)
-    if incoming_apt:
-        convo["appointment_type"] = incoming_apt
-    # If incoming_apt == None, we simply ignore it and preserve convo["appointment_type"]
-
-
     # ---------------------------------------------------
-    # APPOINTMENT TYPE PROTECTION (CRITICAL)
+    # 6) APPOINTMENT TYPE PROTECTION
     # ---------------------------------------------------
     incoming_apt = ai_reply.get("appointment_type")
-
-    # Only update if the engine explicitly SET a value
-    # Never allow None to overwrite the valid appointment_type
     if incoming_apt is not None:
         convo["appointment_type"] = incoming_apt
-    # If None → preserve existing convo["appointment_type"] ALWAYS
-    
+    # else: KEEP existing convo["appointment_type"]
 
     # ---------------------------------------------------
-    # 5) NO AUTO-BOOKING HERE unless emergency rules trigger it
+    # 7) No outgoing message
     # ---------------------------------------------------
-
-    # If no message needed → send empty TwiML
     if sms_body == "":
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
-    # Normal reply
+    # ---------------------------------------------------
+    # 8) SEND RESPONSE
+    # ---------------------------------------------------
     resp = MessagingResponse()
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
