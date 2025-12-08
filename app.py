@@ -1518,6 +1518,17 @@ def generate_reply_for_inbound(
     conv = conversations[phone]
 
     # -----------------------------------------------------------
+    # 0) HARD APPOINTMENT-TYPE RESTORE FIX  (critical)
+    # -----------------------------------------------------------
+    # If appointment_type is None from the inbound SMS route, restore it from conv
+    if appointment_type is None:
+        appointment_type = conv.get("appointment_type")
+
+    # If conv has nothing but appointment_type exists now, store it
+    if conv.get("appointment_type") is None and appointment_type:
+        conv["appointment_type"] = appointment_type
+
+    # -----------------------------------------------------------
     # 1) State Machine Lock (SRB-13)
     # -----------------------------------------------------------
     state = get_current_state(conv)
@@ -1528,7 +1539,7 @@ def generate_reply_for_inbound(
         return lock["reply"]
 
     # -----------------------------------------------------------
-    # 2) FIXED — APPOINTMENT TYPE PRE-PROTECTION
+    # 2) Appointment Type Protection (AFTER SRB-13)
     # -----------------------------------------------------------
     if conv.get("is_emergency") and conv.get("appointment_type") is None:
         conv["appointment_type"] = "TROUBLESHOOT_395"
@@ -1549,8 +1560,12 @@ def generate_reply_for_inbound(
     # 4) Address Intake
     # -----------------------------------------------------------
     addr_reply = handle_address_intake(
-        conv, inbound_text, inbound_lower,
-        scheduled_date, scheduled_time, address
+        conv,
+        inbound_text,
+        inbound_lower,
+        scheduled_date,
+        scheduled_time,
+        address
     )
     if addr_reply:
         if addr_reply.get("appointment_type") is None:
@@ -1563,9 +1578,15 @@ def generate_reply_for_inbound(
     # 5) Emergency Engine
     # -----------------------------------------------------------
     emergency_reply = handle_emergency(
-        conv, category, inbound_lower, address,
-        now_local, today_date_str, scheduled_date,
-        scheduled_time, phone
+        conv,
+        category,
+        inbound_lower,
+        address,
+        now_local,
+        today_date_str,
+        scheduled_date,
+        scheduled_time,
+        phone
     )
     if emergency_reply:
         if emergency_reply.get("appointment_type") is None:
@@ -1573,14 +1594,14 @@ def generate_reply_for_inbound(
         return emergency_reply
 
     # -----------------------------------------------------------
-    # 6) Troubleshoot Case Detection (non-emergency)
+    # 6) Troubleshoot Detection (Non-Emergency)
     # -----------------------------------------------------------
     if is_troubleshoot_case(inbound_lower):
         conv["appointment_type"] = "TROUBLESHOOT_395"
         appointment_type = "TROUBLESHOOT_395"
 
     # -----------------------------------------------------------
-    # 7) Natural Date/Time Parse
+    # 7) Natural Language Date/Time Parse
     # -----------------------------------------------------------
     dt = parse_natural_datetime(inbound_text, now_local)
     if dt["has_datetime"]:
@@ -1593,8 +1614,12 @@ def generate_reply_for_inbound(
     # 8) Follow-Up Question Engine
     # -----------------------------------------------------------
     follow_reply = handle_followup_questions(
-        conv, appointment_type, inbound_lower,
-        scheduled_date, scheduled_time, address
+        conv,
+        appointment_type,
+        inbound_lower,
+        scheduled_date,
+        scheduled_time,
+        address
     )
     if follow_reply:
         if follow_reply.get("appointment_type") is None:
@@ -1602,19 +1627,14 @@ def generate_reply_for_inbound(
         return follow_reply
 
     # -----------------------------------------------------------
-    # 9) HARD APPOINTMENT TYPE ENFORCEMENT (FINAL PATCHED STEP)
+    # 9) Persist Appointment Type
     # -----------------------------------------------------------
-    # Emergency → always troubleshoot
-    if conv.get("is_emergency"):
-        conv["appointment_type"] = "TROUBLESHOOT_395"
-        appointment_type = "TROUBLESHOOT_395"
+    if appointment_type is None:
+        appointment_type = conv.get("appointment_type")
 
-    # If STILL None → system default
-    if not appointment_type:
-        appointment_type = conv.get("appointment_type") or "TROUBLESHOOT_395"
+    if appointment_type:
+        appointment_type = appointment_type.strip().upper()
 
-    # Normalize
-    appointment_type = appointment_type.strip().upper()
     conv["appointment_type"] = appointment_type
 
     # -----------------------------------------------------------
@@ -1627,11 +1647,14 @@ def generate_reply_for_inbound(
         return confirm_reply
 
     # -----------------------------------------------------------
-    # 11) Home Today Logic
+    # 11) Home-Today Engine
     # -----------------------------------------------------------
     home_reply = handle_home_today(
-        conv, inbound_lower, appointment_type,
-        address, today_date_str
+        conv,
+        inbound_lower,
+        appointment_type,
+        address,
+        today_date_str
     )
     if home_reply:
         if home_reply.get("appointment_type") is None:
@@ -1642,7 +1665,11 @@ def generate_reply_for_inbound(
     # 12) Final Autobook
     # -----------------------------------------------------------
     final_reply = attempt_final_autobook(
-        conv, phone, scheduled_date, scheduled_time, address
+        conv,
+        phone,
+        scheduled_date,
+        scheduled_time,
+        address
     )
     if final_reply:
         if final_reply.get("appointment_type") is None:
@@ -1669,7 +1696,6 @@ def generate_reply_for_inbound(
         fallback["appointment_type"] = conv.get("appointment_type")
 
     return fallback
-
 
 
 
