@@ -7201,6 +7201,7 @@ def square_headers() -> dict:
         "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "Square-Version": "2023-10-18"   # <<< REQUIRED or bookings FAIL
     }
 
 
