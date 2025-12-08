@@ -509,6 +509,36 @@ def ready_to_finalize(conv, scheduled_date, scheduled_time, address):
 TECH_CURRENT_ADDRESS = "1 Granby CT"          # can be replaced with live GPS later
 DISPATCH_ORIGIN_ADDRESS = "1 Granby CT"       # fallback dispatch origin
 
+# ---------------------------------------------------
+# TROUBLESHOOT TRIGGERS — Non-Emergency, Requires Tools ($395)
+# ---------------------------------------------------
+TROUBLESHOOT_TRIGGERS = [
+    "not working", "stopped working", "stop working",
+    "doesn't work", "doesnt work",
+    "won't turn on", "wont turn on",
+    "no power to", "gfci not resetting", "gfi not resetting",
+    "outlet dead", "outlet not working",
+    "switch not working",
+    "light not working", "light stopped working",
+    "no lights",
+    "breaker keeps tripping",
+    "breaker won't reset", "breaker wont reset",
+    "constant tripping",
+    "shorted", "short circuit",
+    "i don't know why", "dont know why",
+    "not sure why", "mystery issue",
+    "something is wrong", "issue with", "problem with",
+]
+
+def is_troubleshoot_case(text: str) -> bool:
+    """
+    Detects non-emergency failure conditions requiring tools.
+    ALWAYS maps to TROUBLESHOOT_395, never EVAL_195.
+    """
+    t = text.lower().strip()
+    return any(trigger in t for trigger in TROUBLESHOOT_TRIGGERS)
+
+
 # ====================================================================
 #                    >>>>>  SECTION 4 FULLY PATCHED  <<<<<
 # ====================================================================
@@ -1285,6 +1315,13 @@ def generate_reply_for_inbound(
     if emergency_reply:
         return emergency_reply
 
+    # 4.5) TROUBLESHOOT CASE DETECTION (Non-emergency failure)
+    # ---------------------------------------------------------
+    # This forces $395 logic when tools/troubleshooting are required.
+    if is_troubleshoot_case(inbound_lower):
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        appointment_type = "TROUBLESHOOT_395"
+
     # 5) Natural Date/Time Parse
     dt = parse_natural_datetime(inbound_text, now_local)
     if dt["has_datetime"]:
@@ -1301,7 +1338,7 @@ def generate_reply_for_inbound(
     if follow_reply:
         return follow_reply
 
-    # 7) Persist type
+    # 7) Persist appointment type
     if appointment_type is None:
         appointment_type = conv.get("appointment_type")
     conv["appointment_type"] = appointment_type
@@ -1339,6 +1376,7 @@ def generate_reply_for_inbound(
         today_weekday,
         inbound_text
     )
+
 
 
 
