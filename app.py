@@ -730,9 +730,8 @@ def is_customer_confirmation(msg):
 def try_normalize_with_google(raw: str):
     """
     Minimal safe wrapper.
-    Uses normalize_possible_address() for structure.
-    Returns a dict shaped like the real Google result.
     NEVER raises.
+    Always returns a dict with state missing, letting PAI decide.
     """
     if not raw:
         return None
@@ -744,7 +743,7 @@ def try_normalize_with_google(raw: str):
     return {
         "address_line_1": base["full"],
         "locality": None,
-        "administrative_district_level_1": None,   # Missing state triggers CT/MA question
+        "administrative_district_level_1": None,
         "postal_code": None,
     }
 
@@ -755,7 +754,7 @@ def try_normalize_with_google(raw: str):
 def format_full_address(norm: dict) -> str:
     if not norm:
         return ""
-    line = norm.get("address_line_1") or norm.get("full") or ""
+    line = norm.get("address_line_1") or ""
     loc  = norm.get("locality") or ""
     st   = norm.get("administrative_district_level_1") or ""
     zipc = norm.get("postal_code") or ""
@@ -763,27 +762,25 @@ def format_full_address(norm: dict) -> str:
 
 
 # ---------------------------------------------------
-# Address Normalization (now supports forced_state)
+# Address Normalization (PAI → Google)
 # ---------------------------------------------------
 def normalize_address(raw: str, forced_state=None):
     """
-    Returns:
-      ("ok", parsed_dict)
-      ("needs_state", parsed_dict)
-      ("error", None)
-
-    Supports optional forced CT/MA state injection.
+    FORCE FIX:
+    • If PAI gives CT/MA → treat as FINAL
+    • never return "needs_state" once state is known
     """
     try:
         parsed = try_normalize_with_google(raw)
         if not parsed:
             return ("error", None)
 
-        # If PAI said what the state MUST be → enforce it
+        # If PAI already knows the state → enforce and EXIT SUCCESS
         if forced_state:
             parsed["administrative_district_level_1"] = forced_state
+            return ("ok", parsed)
 
-        # Missing a state → needs CT/MA question
+        # No forced state → still missing → needs CT/MA once
         if not parsed.get("administrative_district_level_1"):
             return ("needs_state", parsed)
 
@@ -797,19 +794,9 @@ def normalize_address(raw: str, forced_state=None):
 # Address Intake — PAI + Google Normalization — No Loops
 # ---------------------------------------------------
 def handle_address_intake(conv, inbound_text, inbound_lower,
-                           scheduled_date, scheduled_time, address):
-    """
-    Unified address intake logic:
-    • Detects ANY street address input
-    • Runs PAI first (cheap, fast, zero-assumption)
-    • Google normalization resolves final components
-    • Only asks CT/MA when Google truly has no state
-    • Never asks CT/MA twice
-    • Never loops
-    • Never blocks emergency fast-track
-    """
+                          scheduled_date, scheduled_time, address):
 
-    # If inbound does not look like an address → skip
+    # Not an address → ignore
     if not is_customer_address_only(inbound_lower):
         return None
 
@@ -817,13 +804,12 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
     conv["address"] = raw
 
     # -------------------------------
-    # STEP 1 — Run PAI preprocessing
+    # STEP 1 — PAI gives street/town/state
     # -------------------------------
     pai = resolve_address_pai(raw)
-    status = pai["status"]
     forced_state = pai.get("state")  # CT / MA / None
+    status = pai["status"]
 
-    # PAI says ambiguous (extremely rare with the patched engine)
     if status == "needs_state":
         if not conv.get("town_prompt_sent"):
             conv["town_prompt_sent"] = True
@@ -831,52 +817,46 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
                 "sms_body": "Is that address in Connecticut or Massachusetts?",
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
-                "address": raw,
+                "address": raw
             }
-        return None  # never ask again
+        return None
+
 
     # -------------------------------
-    # STEP 2 — Google normalization
+    # STEP 2 — Google Normalization
     # -------------------------------
     norm_status, parsed = normalize_address(raw, forced_state)
 
-    # Full success
+    # COMPLETE SUCCESS
     if norm_status == "ok":
         conv["normalized_address"] = parsed
         return None
 
-    # Google wants CT or MA
+    # GOOGLE NEEDS STATE
     if norm_status == "needs_state":
 
-        # PAI already knows state? → retry with it
+        # If PAI already knew state → should NEVER happen now
         if forced_state:
-            r_status, r_parsed = normalize_address(raw, forced_state)
-            if r_status == "ok":
-                conv["normalized_address"] = r_parsed
-                return None
-
-            conv["normalized_address"] = None
+            conv["normalized_address"] = parsed
             return None
 
-        # User has NOT been asked CT/MA yet → ask ONCE
+        # Otherwise ask user ONCE
         if not conv.get("town_prompt_sent"):
             conv["town_prompt_sent"] = True
             return {
                 "sms_body": "Is that address in Connecticut or Massachusetts?",
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
-                "address": raw,
+                "address": raw
             }
 
-        # Already asked → accept raw, do not ask again
         conv["normalized_address"] = None
         return None
 
-    # -------------------------------
-    # STEP 3 — TOTAL Google failure
-    # -------------------------------
+    # TOTAL FAILURE
     conv["normalized_address"] = None
     return None
+
 
 
 
