@@ -1128,72 +1128,67 @@ def handle_emergency(
             "address": None,
         }
 
-# -------------------------------------------------------
-# TRAVEL TIME COMPUTATION
-# -------------------------------------------------------
-travel_minutes = None
-if norm:
-    try:
-        dest = format_full_address(norm)
-        origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
-        travel_minutes = compute_travel_time_minutes(origin, dest)
-    except:
-        travel_minutes = None
-
-# Compute arrival window
-emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
-
-# Lock in schedule
-scheduled_date = today_date_str
-scheduled_time = emergency_time
-conv["scheduled_date"] = scheduled_date
-conv["scheduled_time"] = scheduled_time
-
-# -------------------------------------------------------
-# SQUARE BOOKING (TRUE/FALSE BASED ONLY ON SQUARE)
-# -------------------------------------------------------
-sq = maybe_create_square_booking(phone, {
-    "scheduled_date": scheduled_date,
-    "scheduled_time": scheduled_time,
-    "address": final_addr,
-})
-
-# -------------------------------------------------------
-# TRUE BOOKING SUCCESS (NO FALL-THROUGH ALLOWED)
-# -------------------------------------------------------
-if sq.get("success") is True:
-
-    # ALWAYS save normalized address after booking — this kills the loop.
+    # -------------------------------------------------------
+    # TRAVEL TIME COMPUTATION
+    # -------------------------------------------------------
+    travel_minutes = None
     if norm:
-        # Google normalized address
-        conv["normalized_address"] = norm
-    else:
-        # Minimal fallback structure
-        conv["normalized_address"] = {
-            "address_line_1": final_addr,
-            "locality": "",
-            "administrative_district_level_1": "",
-            "postal_code": "",
-        }
+        try:
+            dest = format_full_address(norm)
+            origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+            travel_minutes = compute_travel_time_minutes(origin, dest)
+        except:
+            travel_minutes = None
 
-    conv["final_confirmation_sent"] = True
+    # Compute arrival window
+    emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
 
-    # Clean time format
-    try:
-        t_nice = datetime.strptime(scheduled_time, "%H:%M") \
-            .strftime("%I:%M %p").lstrip("0")
-    except:
-        t_nice = scheduled_time
+    # Lock in schedule
+    scheduled_date = today_date_str
+    scheduled_time = emergency_time
+    conv["scheduled_date"] = scheduled_date
+    conv["scheduled_time"] = scheduled_time
 
-    return {
-        "sms_body": (
-            f"You're all set — emergency troubleshoot scheduled for about {t_nice}. "
-            "A Square confirmation will follow."
-        ),
+    # -------------------------------------------------------
+    # SQUARE BOOKING (TRUE/FALSE BASED ONLY ON SQUARE)
+    # -------------------------------------------------------
+    sq = maybe_create_square_booking(phone, {
         "scheduled_date": scheduled_date,
         "scheduled_time": scheduled_time,
         "address": final_addr,
-    }
+    })
+
+    # TRUE BOOKING SUCCESS (no fall-through allowed)
+    if sq.get("success") is True:
+
+        # If no normalized address existed, store minimal structure
+        if not conv.get("normalized_address"):
+            conv["normalized_address"] = {
+                "address_line_1": final_addr,
+                "locality": "",
+                "administrative_district_level_1": "",
+                "postal_code": "",
+            }
+
+        conv["final_confirmation_sent"] = True
+
+        # Clean time format
+        try:
+            t_nice = datetime.strptime(scheduled_time, "%H:%M") \
+                .strftime("%I:%M %p").lstrip("0")
+        except:
+            t_nice = scheduled_time
+
+        return {
+            "sms_body": (
+                f"You're all set — emergency troubleshoot scheduled for about {t_nice}. "
+                "A Square confirmation will follow."
+            ),
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": final_addr,
+        }
+
 
 
 
