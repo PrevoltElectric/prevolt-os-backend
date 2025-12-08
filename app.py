@@ -1017,45 +1017,158 @@ def normalize_address(raw: str):
 
 
 # ====================================================================
-# ADDRESS INTAKE ENGINE — FIXED VERSION (PATCHED)
+# EMERGENCY FAST-TRACK ENGINE — LOOP-PROOF, STATEFUL VERSION
 # ====================================================================
-def handle_address_intake(conv, inbound_text, inbound_lower,
-                          scheduled_date, scheduled_time, address):
-
-    # -----------------------------------------------------------------
-    # 1. LIGHTWEIGHT ADDRESS DETECTION
-    # -----------------------------------------------------------------
-    street_keywords = ["st", "street", "rd", "road", "ave", "avenue",
-                       "blvd", "lane", "ln", "drive", "dr", "way", "ct"]
-
-    tokens = inbound_lower.split()
-
-    if not any(tok.isdigit() for tok in tokens):
+def handle_emergency(
+    conv,
+    category,
+    inbound_lower,
+    address,
+    now_local,
+    today_date_str,
+    scheduled_date,
+    scheduled_time,
+    phone
+):
+    # If already completed, never run again
+    if conv.get("emergency_completed"):
         return None
 
-    if not any(sk in inbound_lower for sk in street_keywords):
-        return None
+    # If already flagged earlier, continue emergency flow
+    if conv.get("is_emergency"):
 
-    raw = inbound_text.strip()
-    conv["address"] = raw
+        final_addr = conv.get("address") or address
 
-    # -----------------------------------------------------------------
-    # 2. PAI
-    # -----------------------------------------------------------------
-    pai = resolve_address_pai(raw)
-    forced_state = pai.get("state")
-    status = pai["status"]
-
-    if status == "needs_state":
-        if not conv.get("town_prompt_sent"):
-            conv["town_prompt_sent"] = True
+        if not final_addr:
             return {
-                "sms_body": "Is that address in Connecticut or Massachusetts?",
+                "sms_body": "Understood — we can prioritize this. What’s the full service address?",
+                "appointment_type": "TROUBLESHOOT_395",
+            }
+
+        norm = conv.get("normalized_address")
+        travel_minutes = None
+
+        try:
+            if norm:
+                dest = format_full_address(norm)
+                origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+                travel_minutes = compute_travel_time_minutes(origin, dest)
+        except:
+            travel_minutes = None
+
+        emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
+
+        scheduled_date = today_date_str
+        scheduled_time = emergency_time
+
+        conv["scheduled_date"] = scheduled_date
+        conv["scheduled_time"] = scheduled_time
+
+        sq = maybe_create_square_booking(phone, {
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": final_addr,
+        })
+
+        if sq.get("success"):
+            conv["emergency_completed"] = True
+            conv["appointment_type"] = "TROUBLESHOOT_395"
+
+            try:
+                t_nice = datetime.strptime(scheduled_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
+            except:
+                t_nice = scheduled_time
+
+            return {
+                "sms_body": f"You're all set — emergency troubleshoot scheduled for about {t_nice}. A Square confirmation will follow.",
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
-                "address": raw
+                "address": final_addr,
             }
+
+        return {
+            "sms_body": "Before I finalize this emergency visit, I still need the complete service address.",
+            "appointment_type": "TROUBLESHOOT_395",
+        }
+
+    # First-time emergency detection
+    emergency_terms = [
+        "no power", "partial power", "tree hit", "tree took",
+        "tree took my wires", "wires pulled off", "power line down",
+        "burning smell", "smoke smell", "fire", "sparks",
+        "melted outlet", "melted plug", "buzzing panel",
+        "arcing", "breaker arcing", "breaker won't reset",
+        "breaker wont reset",
+    ]
+
+    is_emergency = contains_any(inbound_lower, emergency_terms)
+
+    # Category override
+    if category == "Active problems":
+        is_emergency = True
+
+    if not is_emergency:
         return None
+
+    # Confirm emergency state
+    conv["is_emergency"] = True
+    conv["appointment_type"] = "TROUBLESHOOT_395"
+
+    # Address collection
+    norm = conv.get("normalized_address")
+    final_addr = format_full_address(norm) if norm else (conv.get("address") or address)
+
+    if not final_addr:
+        return {
+            "sms_body": "Got it — we can prioritize this. What’s the full service address?",
+            "appointment_type": "TROUBLESHOOT_395",
+        }
+
+    # Compute arrival time
+    travel_minutes = None
+
+    try:
+        if norm:
+            dest = format_full_address(norm)
+            origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+            travel_minutes = compute_travel_time_minutes(origin, dest)
+    except:
+        travel_minutes = None
+
+    emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
+
+    scheduled_date = today_date_str
+    scheduled_time = emergency_time
+
+    conv["scheduled_date"] = scheduled_date
+    conv["scheduled_time"] = scheduled_time
+
+    # Book
+    sq = maybe_create_square_booking(phone, {
+        "scheduled_date": scheduled_date,
+        "scheduled_time": scheduled_time,
+        "address": final_addr,
+    })
+
+    if sq.get("success"):
+        conv["emergency_completed"] = True
+
+        try:
+            t_nice = datetime.strptime(scheduled_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
+        except:
+            t_nice = scheduled_time
+
+        return {
+            "sms_body": f"You're all set — emergency troubleshoot scheduled for about {t_nice}. A Square confirmation will follow.",
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": final_addr,
+        }
+
+    return {
+        "sms_body": "Before I finalize this emergency visit, I still need the complete service address.",
+        "appointment_type": "TROUBLESHOOT_395",
+    }
 
     # -----------------------------------------------------------------
     # 3. GOOGLE NORMALIZATION
