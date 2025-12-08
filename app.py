@@ -1517,22 +1517,22 @@ def generate_reply_for_inbound(
     conversations.setdefault(phone, {})
     conv = conversations[phone]
 
-    # -----------------------------------------------------------
-    # APPOINTMENT TYPE PROTECTION (cannot be None anymore)
-    # -----------------------------------------------------------
-    if conv.get("is_emergency") and conv.get("appointment_type") is None:
-        conv["appointment_type"] = "TROUBLESHOOT_395"
-
-    if appointment_type is None:
-        appointment_type = conv.get("appointment_type")
-
-    # 1) State Machine Lock
+        # 1) State Machine Lock
     state = get_current_state(conv)
     lock = enforce_state_lock(state, conv)
     if lock.get("interrupt"):
         if lock["reply"].get("appointment_type") is None:
             lock["reply"]["appointment_type"] = conv.get("appointment_type")
         return lock["reply"]
+
+    # -----------------------------------------------------------
+    # FIXED — APPOINTMENT TYPE PROTECTION (must run AFTER SRB-13)
+    # -----------------------------------------------------------
+    if conv.get("is_emergency") and conv.get("appointment_type") is None:
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+
+    if appointment_type is None:
+        appointment_type = conv.get("appointment_type")
 
     # 2) Human Intent Interpreter
     intent_reply = srb14_interpret_human_intent(conv, inbound_lower)
@@ -1640,6 +1640,7 @@ def generate_reply_for_inbound(
         fallback["appointment_type"] = conv.get("appointment_type")
 
     return fallback
+
 
 
 
