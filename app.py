@@ -491,21 +491,48 @@ def is_customer_confirmation(msg):
 
 
 # ---------------------------------------------------
-# Address Detector
+# Address Detector (v4 — Hardened, Accepts CT/MA Style Inputs)
 # ---------------------------------------------------
 def is_customer_address_only(text: str) -> bool:
-    text = text.lower().strip()
+    """
+    Detects whether the inbound text *looks like a standalone street address*,
+    even if missing city/state/zip. Accepts things like:
+        '54 bloomfield ave'
+        '54 bloomfield ave windsor'
+        '12 main st'
+        '12 main street'
+    Rejects messages with verbs or extra intent language.
+    """
 
-    if not re.search(r"\b\d{1,5}\b", text):
+    if not text:
         return False
 
-    cleaned = re.sub(
-        r"\b(in|at|on|by|my|is|the|we|live|lives|are|i|am|it's|its|address|addr|please|pls|come|to)\b",
-        "",
-        text,
-    ).strip()
+    t = text.lower().strip()
 
-    return bool(re.search(r"\b\d{1,5}\s+[a-z]+", cleaned))
+    # MUST contain a street number
+    if not re.search(r"\b\d{1,6}[a-z]?\b", t):
+        return False
+
+    # Remove common noise words
+    noise = r"\b(in|at|on|by|my|is|the|we|live|lives|are|i|am|it's|its|address|addr|please|pls|come|to|can|you|now)\b"
+    cleaned = re.sub(noise, "", t).strip()
+
+    # Pattern: number + street name + suffix (VERY permissive)
+    pattern = (
+        r"\b\d{1,6}[a-z]?"          # 54
+        r"\s+"                      # space
+        r"[a-z0-9\s]+"              # bloomfield
+        r"\s+"                      # space
+        r"(st|street|rd|road|ave|avenue|blvd|ln|lane|dr|drive|ct|court)\b"
+    )
+
+    if re.search(pattern, cleaned):
+        return True
+
+    # Also accept: number + street + city (no suffix typed)
+    # Example: "54 bloomfield ave windsor" → missing suffix match previously
+    loose = r"\b\d{1,6}[a-z]?\s+[a-z0-9\s]{3,}\b"
+    return bool(re.search(loose, cleaned))
 
 
 # ---------------------------------------------------
