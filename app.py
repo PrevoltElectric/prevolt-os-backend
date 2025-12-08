@@ -7333,7 +7333,7 @@ def is_within_normal_hours(time_str: str) -> bool:
 
 
 # ---------------------------------------------------
-# Create Square Booking (SAFE WRAPPED VERSION — FULLY PATCHED)
+# Create Square Booking (SAFE WRAPPED VERSION)
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict) -> dict:
     """
@@ -7359,34 +7359,16 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
             "booking_id": convo.get("square_booking_id"),
         }
 
-    # ---------------------------------------------------
-    # HARDEN APPOINTMENT TYPE (GLOBAL FIX)
-    # ---------------------------------------------------
-    # If missing, restore from history
-    appointment_type = convo.get("appointment_type")
-
-    if appointment_type is None:
-        print("APPOINTMENT_TYPE MISSING → Restoring default TROUBLESHOOT_395")
-        appointment_type = "TROUBLESHOOT_395"
-        convo["appointment_type"] = appointment_type
-
-    # Normalize hard (removes trailing lowercase, spaces, etc.)
-    appointment_type = appointment_type.strip().upper()
-    convo["appointment_type"] = appointment_type
-
-    # ---------------------------------------------------
-    # REQUIRED FIELDS
-    # ---------------------------------------------------
     scheduled_date = convo.get("scheduled_date")
     scheduled_time = convo.get("scheduled_time")
     raw_address = convo.get("address")
+    appointment_type = convo.get("appointment_type")
 
+    # Required
     if not (scheduled_date and scheduled_time and raw_address):
         return fail("Missing scheduled_date/time/address — cannot create booking.")
 
-    # ---------------------------------------------------
-    # Map service variation — with hardened appointment_type
-    # ---------------------------------------------------
+    # Map service variation
     try:
         variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
     except Exception as e:
@@ -7395,21 +7377,15 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
     if not variation_id:
         return fail(f"Unknown appointment_type; cannot map: {appointment_type}")
 
-    # ---------------------------------------------------
     # Weekend rule
-    # ---------------------------------------------------
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
         return fail(f"Weekend non-emergency booking blocked for {phone}")
 
-    # ---------------------------------------------------
     # Business hours rule
-    # ---------------------------------------------------
     if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(scheduled_time):
         return fail(f"Non-emergency time outside 9–4: {scheduled_time}")
 
-    # ---------------------------------------------------
-    # Square configuration check
-    # ---------------------------------------------------
+    # Config check
     if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
         return fail("Square configuration incomplete; skipping booking creation.")
 
@@ -7442,34 +7418,118 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
             return fail(f"Address normalization failed for: {raw_address}")
 
     # ---------------------------------------------------
-    # READY TO BUILD BOOKING PAYLOAD
+    # Travel Time (origin → customer)
     # ---------------------------------------------------
-    customer_id = square_create_or_get_customer(phone, addr_struct)
+    origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+    travel_minutes = None
+
+    if origin:
+        try:
+            destination_for_travel = (
+                f"{addr_struct.get('address_line_1', '')}, "
+                f"{addr_struct.get('locality', '')}, "
+                f"{addr_struct.get('administrative_district_level_1', '')} "
+                f"{addr_struct.get('postal_code', '')}"
+            )
+        except Exception:
+            return fail("Invalid address structure for travel computation.")
+
+        travel_minutes = compute_travel_time_minutes(origin, destination_for_travel)
+
+        if travel_minutes is not None:
+            print(
+                f"Estimated travel from origin to job: ~{travel_minutes:.1f} minutes "
+                f"for {phone} at {destination_for_travel}"
+            )
+            if travel_minutes > MAX_TRAVEL_MINUTES:
+                return fail("Travel exceeds maximum allowed minutes — auto-book canceled.")
+
+    # ---------------------------------------------------
+    # EMERGENCY MODE TIME OVERRIDE
+    # ---------------------------------------------------
+    if appointment_type == "TROUBLESHOOT_395":
+        now_local = datetime.now(ZoneInfo("America/New_York"))
+
+        try:
+            emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
+        except Exception as e:
+            return fail(f"Emergency arrival computation failed: {repr(e)}")
+
+        print(
+            f"Emergency mode active — overriding schedule time "
+            f"{scheduled_date} {scheduled_time} → {scheduled_date} {emergency_time}"
+        )
+
+        scheduled_time = emergency_time
+        convo["scheduled_time"] = emergency_time
+
+    # ---------------------------------------------------
+    # Create/Search Square Customer
+    # ---------------------------------------------------
+    try:
+        customer_id = square_create_or_get_customer(phone, addr_struct)
+    except Exception as e:
+        return fail(f"Square customer lookup failed: {repr(e)}")
 
     if not customer_id:
-        return fail("Unable to create or fetch customer.")
+        return fail("Square customer_id lookup returned None.")
 
-    start_dt = parse_local_datetime(scheduled_date, scheduled_time)
-    if not start_dt:
-        return fail("Unable to parse scheduling datetime.")
+    # ---------------------------------------------------
+    # Convert Local Time → UTC
+    # ---------------------------------------------------
+    try:
+        start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
+    except Exception as e:
+        return fail(f"Local datetime parsing failed: {repr(e)}")
 
+    if not start_at_utc:
+        return fail("parse_local_datetime returned None — invalid date/time.")
+
+    idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
+
+    # ---------------------------------------------------
+    # Booking Address (Square CANNOT accept the 'country' field)
+    # ---------------------------------------------------
+    try:
+        booking_address = {
+            "address_line_1": addr_struct.get("address_line_1", ""),
+            "locality": addr_struct.get("locality", ""),
+            "administrative_district_level_1": addr_struct.get("administrative_district_level_1", ""),
+            "postal_code": addr_struct.get("postal_code", ""),
+        }
+
+        if addr_struct.get("address_line_2"):
+            booking_address["address_line_2"] = addr_struct["address_line_2"]
+    except Exception as e:
+        return fail(f"Booking address construction failed: {repr(e)}")
+
+    # ---------------------------------------------------
+    # Build Final Payload
+    # ---------------------------------------------------
     booking_payload = {
-        "idempotency_key": str(uuid.uuid4()),
-        "location_id": SQUARE_LOCATION_ID,
-        "customer_id": customer_id,
-        "start_at": start_dt.isoformat() + "Z",
-        "appointment_segments": [
-            {
-                "duration_minutes": 60,
-                "service_variation_id": variation_id,
-                "team_member_id": SQUARE_TEAM_MEMBER_ID,
-                "service_variation_version": variation_version,
-            }
-        ]
+        "idempotency_key": idempotency_key,
+        "booking": {
+            "location_id": SQUARE_LOCATION_ID,
+            "customer_id": customer_id,
+            "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "location_type": "CUSTOMER_LOCATION",
+            "address": booking_address,
+            "customer_note": (
+                f"Auto-booked by Prevolt OS. Raw address from customer: {raw_address}"
+            ),
+            "appointment_segments": [
+                {
+                    "duration_minutes": 60,
+                    "service_variation_id": variation_id,
+                    "service_variation_version": variation_version,
+                    "team_member_id": SQUARE_TEAM_MEMBER_ID,
+                }
+            ],
+        },
     }
 
     # ---------------------------------------------------
-    # SEND TO SQUARE
+    # Send to Square
     # ---------------------------------------------------
     try:
         resp = requests.post(
@@ -7478,23 +7538,39 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
             json=booking_payload,
             timeout=10,
         )
+    except Exception as e:
+        return fail(f"Square API exception: {repr(e)}")
+
+    if resp.status_code not in (200, 201):
+        return fail(f"Square booking failed [{resp.status_code}]: {resp.text}")
+
+    # Parse response JSON safely
+    try:
         data = resp.json()
     except Exception as e:
-        return fail(f"Square booking request exception: {repr(e)}")
+        return fail(f"Invalid JSON in Square response: {repr(e)}")
 
-    # ---------------------------------------------------
-    # FINAL RESULT
-    # ---------------------------------------------------
-    if "booking" in data:
-        booking_id = data["booking"]["id"]
-        convo["booking_created"] = True
-        convo["square_booking_id"] = booking_id
+    booking = data.get("booking")
+    if not booking:
+        return fail(f"Square response missing 'booking': {data}")
 
-        print(f"Square booking successful for {phone} → {booking_id}")
+    booking_id = booking.get("id")
 
-        return {"success": True, "error": None, "booking_id": booking_id}
+    # Mark booking in conversation state
+    convo["booking_created"] = True
+    convo["square_booking_id"] = booking_id
 
-    return fail(f"Square booking API error: {data}")
+    print(
+        f"Square booking created for {phone}: {booking_id} "
+        f"{scheduled_date} {scheduled_time} ({appointment_type})"
+    )
+
+    # SUCCESS RETURN
+    return {
+        "success": True,
+        "error": None,
+        "booking_id": booking_id,
+    }
 
 
 
