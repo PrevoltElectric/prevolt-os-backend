@@ -539,142 +539,137 @@ def is_troubleshoot_case(text: str) -> bool:
     return any(trigger in t for trigger in TROUBLESHOOT_TRIGGERS)
 
 # ====================================================================
-# PREVOLT ADDRESS INTELLIGENCE (PAI) — GLOBAL NORMALIZATION ENGINE
+# PREVOLT ADDRESS INTELLIGENCE (PAI) — ZERO-ASSUMPTION VERSION
 # ====================================================================
 import re
 
 # --------------------------------------------------------------------
-# 1) Hard-coded CT/MA town lists (covers all common customer inputs)
-# --------------------------------------------------------------------
-CT_TOWNS = {
-    "windsor", "bloomfield", "granby", "hartford", "enfield", "suffield",
-    "simbsury", "simbsbury", "simsbury", "newington", "wethersfield",
-    "bristol", "east hartford", "west hartford", "rocky hill",
-    "manchester", "south windsor", "ellington", "tolland",
-    "vernon", "east granby", "farmington", "avon", "canton",
-}
-MA_TOWNS = {
-    "springfield", "chicopee", "holyoke", "longmeadow", "east longmeadow",
-    "agawam", "northampton", "west springfield", "southampton",
-    "amherst", "ludlow", "wilbraham",
-}
-
-# --------------------------------------------------------------------
-# 2) Address detector — detects ANY street + number (even partial)
+# 1) Ultra-flexible address detector
 # --------------------------------------------------------------------
 def is_customer_address_only(text: str) -> bool:
+    """
+    Detects ANY inbound message that is *likely* a street address.
+    Rules:
+    • Must contain a number (house number)
+    • Must contain ≥ 1 word after the number
+    • Accepts partial streets, missing suffixes, missing towns
+    • Accepts “54 bloomfield ave windsor ct”
+    • Accepts “12 east main”
+    """
     if not text:
         return False
 
     t = text.lower().strip()
 
-    # MUST include a house number
+    # must contain at least one number
     if not re.search(r"\b\d{1,6}[a-z]?\b", t):
         return False
 
-    # Remove noise language
-    noise = r"\b(in|at|on|by|my|is|the|we|live|are|i|am|its|it's|address|please|come|to|can|you|now)\b"
-    cleaned = re.sub(noise, "", t).strip()
+    # match: number + words after it
+    if re.search(r"\b\d{1,6}[a-z]?\s+[a-z0-9]+(?:\s+[a-z0-9]+)*\b", t):
+        return True
 
-    # Accept "54 bloomfield ave", "54 bloomfield", "54 bloomfield windsor"
-    loose = r"\b\d{1,6}[a-z]?\s+[a-z0-9\s]{3,}\b"
-    return bool(re.search(loose, cleaned))
+    return False
 
-# --------------------------------------------------------------------
-# 3) Extract town if present
-# --------------------------------------------------------------------
-def extract_town(text: str) -> str | None:
-    t = text.lower()
-    for town in CT_TOWNS | MA_TOWNS:
-        if town.lower() in t:
-            return town.lower()
-    return None
 
 # --------------------------------------------------------------------
-# 4) Decide CT or MA (your chosen rule: ASK if ambiguous)
-# --------------------------------------------------------------------
-def decide_state_for_town(town: str):
-    if not town:
-        return None  # let geocoder decide
-
-    in_ct = town in CT_TOWNS
-    in_ma = town in MA_TOWNS
-
-    if in_ct and not in_ma:
-        return "CT"
-    if in_ma and not in_ct:
-        return "MA"
-
-    # AMBIGUOUS — must ask CT or MA
-    return "ASK"
-
-# --------------------------------------------------------------------
-# 5) Soft parse street number + name (suffix optional)
+# 2) Extract street line (NO trimming by town lists)
 # --------------------------------------------------------------------
 def extract_street_line(text: str) -> str | None:
-    t = text.lower()
+    """
+    Extracts the leading part of an address — number + street words.
+    Stop parsing once we detect state or ZIP.
+    """
+    t = text.lower().strip()
 
-    # Matches:
-    #   54 bloomfield ave
-    #   54 bloomfield
-    #   12 e main st
-    m = re.search(r"(\d{1,6}[a-z]?)\s+([a-z0-9\s]+)", t)
+    # Primary pattern: number + street words
+    m = re.search(r"\b(\d{1,6}[a-z]?)\s+([a-z0-9\s]+)", t)
     if not m:
         return None
 
     num = m.group(1).strip().title()
-    street = m.group(2).strip().title()
+    rest = m.group(2).strip()
 
-    # Trim trailing town names inside street chunk
-    for town in CT_TOWNS | MA_TOWNS:
-        if street.lower().endswith(town):
-            street = street[: -len(town)].strip()
+    # remove trailing state or zip
+    rest = re.sub(r"\b(ct|ma|us|usa)\b", "", rest, flags=re.I).strip()
+    rest = re.sub(r"\b\d{5}(?:-\d{4})?\b", "", rest).strip()
 
-    return f"{num} {street}".strip()
+    street = f"{num} {rest}".strip().title()
+    return street if street else None
+
 
 # --------------------------------------------------------------------
-# 6) PAI master resolver (runs BEFORE emergency or final booking)
+# 3) Extract ANY town-like token (no lists required)
+# --------------------------------------------------------------------
+def extract_town(text: str) -> str | None:
+    """
+    Detects the first non-street token after the street portion.
+    Not dependent on CT_TOWNS or MA_TOWNS.
+    """
+    tokens = text.lower().split()
+    if len(tokens) < 3:
+        return None
+
+    # skip house number + street word
+    # attempt identifying a possible town by position (heuristic)
+    for tok in tokens[2:]:
+        if tok not in ("ct", "ma", "usa", "us") and not tok.isdigit():
+            return tok.title()
+
+    return None
+
+
+# --------------------------------------------------------------------
+# 4) Decide CT or MA ONLY if user said it explicitly
+# --------------------------------------------------------------------
+def detect_state_from_text(text: str):
+    t = text.lower()
+    if " ct" in t or t.endswith("ct"):
+        return "CT"
+    if " ma" in t or t.endswith("ma"):
+        return "MA"
+    return None  # ask user only if Google also can't infer it
+
+
+# --------------------------------------------------------------------
+# 5) PAI master resolver — ultra-clean
 # --------------------------------------------------------------------
 def resolve_address_pai(raw: str) -> dict:
     """
-    ALWAYS returns:
-      {
-         "status": "ok" | "needs_state" | "error",
-         "line1": "...",
-         "town": "...",
-         "state": "CT" | "MA" | None,
-         "zip": None,
-      }
+    PRIMARY GOAL:
+    • Provide Google with the cleanest possible street line
+    • Determine state ONLY if explicitly stated
+    • DO NOT block if town/state missing — Google can figure it out
     """
 
     if not raw:
         return {"status": "error"}
 
     raw = raw.strip()
-    line1 = extract_street_line(raw)
-    town = extract_town(raw)
-    state = decide_state_for_town(town)
 
-    # Missing street? Reject
-    if not line1:
+    street = extract_street_line(raw)
+    if not street:
         return {"status": "error"}
 
-    # If ambiguous — ask CT or MA
-    if state == "ASK":
+    town = extract_town(raw)
+    state = detect_state_from_text(raw)
+
+    # If user explicitly gives CT or MA, no need to ask
+    if state:
         return {
-            "status": "needs_state",
-            "line1": line1,
+            "status": "ok",
+            "line1": street,
             "town": town,
-            "state": None,
+            "state": state,
             "zip": None,
         }
 
-    # Otherwise — state determined or unknown (geocoder will fill)
+    # Otherwise → Google decides
     return {
         "status": "ok",
-        "line1": line1,
+        "line1": street,
         "town": town,
-        "state": state,  # may be None, geocode fills later
+        "state": None,  # let normalize_address fill this
         "zip": None,
     }
 
@@ -799,36 +794,35 @@ def normalize_address(raw: str):
 
 
 # ---------------------------------------------------
-# Address Intake — PAI + Google Normalization + No Loops
+# Address Intake — PAI + Google Normalization — No Loops
 # ---------------------------------------------------
 def handle_address_intake(conv, inbound_text, inbound_lower,
                            scheduled_date, scheduled_time, address):
     """
-    Prevolt Address Intelligence (PAI) + Google fallback:
-    • Accepts partial addresses (“54 Bloomfield”)
-    • Extracts town when present
-    • Determines CT or MA using PAI rules
-    • Only asks CT/MA when truly ambiguous
-    • NEVER asks CT/MA twice
-    • NEVER loops
-    • Produces clean address for Square
+    Unified address intake logic:
+    • Detects ANY street address input
+    • Runs PAI first (cheap, fast, zero-town-list)
+    • Google normalization resolves final components
+    • Only asks CT/MA when Google truly cannot determine the state
+    • Never asks more than once
+    • Never blocks emergency fast-track
     """
 
-    # Not an address → skip intake entirely
+    # If inbound does not look like an address → skip
     if not is_customer_address_only(inbound_lower):
         return None
 
     raw = inbound_text.strip()
     conv["address"] = raw
 
-    # -----------------------------
-    # STEP 1 — Run PAI
-    # -----------------------------
+    # -------------------------------
+    # Run PAI (lightweight preprocessing)
+    # -------------------------------
     pai = resolve_address_pai(raw)
-    status = pai.get("status")
-    forced_state = pai.get("state")  # may be "CT", "MA", or None
+    status = pai["status"]
 
-    # Need CT/MA? Ask ONLY once
+    # PAI should only return needs_state if ambiguous AND explicitly matched ambiguous form.
+    # But with the new PAI, this is extremely rare. Keep logic anyway.
     if status == "needs_state":
         if not conv.get("town_prompt_sent"):
             conv["town_prompt_sent"] = True
@@ -838,39 +832,52 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
                 "scheduled_time": scheduled_time,
                 "address": raw,
             }
-        # Already asked → never ask again → continue booking
+        # Already asked once → do not ask again
         return None
 
-    # -----------------------------
-    # STEP 2 — Try Google Normalization
-    # -----------------------------
+    # -------------------------------
+    # Attempt Google Normalization
+    # -------------------------------
+    forced_state = pai.get("state")  # CT / MA / None
+
     norm_status, parsed = normalize_address(raw, forced_state)
 
-    # Successful Google normalization
+    # --- FULL SUCCESS ---
     if norm_status == "ok":
         conv["normalized_address"] = parsed
         return None
 
-    # Google says "needs_state" BUT PAI already determined state → retry once
-    if norm_status == "needs_state" and forced_state:
-        retry_status, retry_parsed = normalize_address(raw, forced_state)
-        if retry_status == "ok":
-            conv["normalized_address"] = retry_parsed
+    # --- GOOGLE REQUESTS STATE ---
+    if norm_status == "needs_state":
+
+        # If Google needs CT or MA and PAI explicitly knew,
+        # retry with PAI's forced state.
+        if forced_state:
+            r_status, r_parsed = normalize_address(raw, forced_state)
+            if r_status == "ok":
+                conv["normalized_address"] = r_parsed
+                return None
+            # Even if retry fails → continue without blocking
+            conv["normalized_address"] = None
             return None
-        # If retry still fails → proceed with raw (but do not block)
+
+        # If Google truly cannot infer state → ask user ONCE
+        if not conv.get("town_prompt_sent"):
+            conv["town_prompt_sent"] = True
+            return {
+                "sms_body": "Is that address in Connecticut or Massachusetts?",
+                "scheduled_date": scheduled_date,
+                "scheduled_time": scheduled_time,
+                "address": raw,
+            }
+
+        # Already asked once → accept raw / partial and do NOT ask again
         conv["normalized_address"] = None
         return None
 
-    # Google says "needs_state" BUT PAI gave no state → PAI already handled ambiguity earlier
-    if norm_status == "needs_state" and not forced_state:
-        # DO NOT ask again. DO NOT loop. Use raw.
-        conv["normalized_address"] = None
-        return None
-
-    # -----------------------------
-    # STEP 3 — Google Failure
-    # -----------------------------
-    # Allow booking with raw address
+    # -------------------------------
+    # TOTAL FAILURE — Google could not parse
+    # -------------------------------
     conv["normalized_address"] = None
     return None
 
