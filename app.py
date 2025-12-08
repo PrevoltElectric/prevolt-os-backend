@@ -1128,7 +1128,7 @@ def handle_emergency(
             "address": None,
         }
 
-   # -------------------------------------------------------
+# -------------------------------------------------------
 # TRAVEL TIME COMPUTATION
 # -------------------------------------------------------
 travel_minutes = None
@@ -1195,17 +1195,6 @@ if sq.get("success") is True:
         "address": final_addr,
     }
 
-    # -------------------------------------------------------
-    # TRUE BOOKING FAILURE → Ask ONE time only
-    # -------------------------------------------------------
-    return {
-        "sms_body": (
-            "Before I finalize this emergency visit, I still need the complete service address."
-        ),
-        "scheduled_date": scheduled_date,
-        "scheduled_time": scheduled_time,
-        "address": final_addr,
-    }
 
 
 
