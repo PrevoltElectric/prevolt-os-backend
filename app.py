@@ -7641,106 +7641,21 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
 
 
 # ---------------------------------------------------
-# Voice: Incoming Call
-# ---------------------------------------------------
-@app.route("/incoming-call", methods=["POST"])
-def incoming_call():
-    response = VoiceResponse()
-    response.say(
-        "Thanks for calling Prevolt Electric. "
-        "Please leave your name, address, and a brief description of your project. "
-        "We will text you shortly."
-    )
-    response.record(
-        max_length=60,
-        play_beep=True,
-        trim="do-not-trim",
-        action="/voicemail-complete",
-    )
-    response.hangup()
-    return Response(str(response), mimetype="text/xml")
-
-
-# ---------------------------------------------------
-# Voicemail Complete → Transcribe → Initial SMS
-# ---------------------------------------------------
-@app.route("/voicemail-complete", methods=["POST"])
-def voicemail_complete():
-    caller = request.form.get("From")
-    recording_sid = request.form.get("RecordingSid")
-
-    print("Voicemail webhook hit. SID:", recording_sid, "Caller:", caller)
-
-    # ---- FIX: Twilio does NOT send RecordingUrl to the action callback ----
-    if not recording_sid:
-        print("ERROR: Missing RecordingSid in voicemail webhook.")
-        vr = VoiceResponse()
-        vr.hangup()
-        return Response(str(vr), mimetype="text/xml")
-
-    # Construct correct Twilio recording URL
-    recording_url = (
-        f"https://api.twilio.com/2010-04-01/Accounts/"
-        f"{TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}"
-    )
-
-    try:
-        print("Downloading and transcribing voicemail from:", recording_url)
-
-        raw = transcribe_recording(recording_url)
-        print("Raw transcript:", raw)
-
-        cleaned = clean_transcript_text(raw)
-        print("Cleaned transcript:", cleaned)
-
-        sms_info = generate_initial_sms(cleaned)
-        print("Initial SMS info:", sms_info)
-
-        send_sms(caller, sms_info["sms_body"])
-
-        # Initialize their conversation state
-        conversations[caller] = {
-            "cleaned_transcript": cleaned,
-            "category": sms_info["category"],
-            "appointment_type": sms_info["appointment_type"],
-            "initial_sms": sms_info["sms_body"],
-            "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
-            "replied": False,
-            "followup_sent": False,
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": None,
-            "normalized_address": None,
-            "booking_created": False,
-            "square_booking_id": None,
-            "state_prompt_sent": False,
-        }
-
-    except Exception as e:
-        print("Voicemail fail:", repr(e))
-
-    vr = VoiceResponse()
-    vr.hangup()
-    return Response(str(vr), mimetype="text/xml")
-
-
-
-# ---------------------------------------------------
-# Incoming SMS / WhatsApp  (FULLY PATCHED – NO DOUBLE BOOKING)
+# Incoming SMS / WhatsApp  (FULLY PATCHED – FINAL VERSION)
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
-    # Normalize Twilio's WhatsApp prefix
+    # Normalize Twilio WhatsApp format ("whatsapp:+1860…")
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
 
     convo = conversations.get(from_number)
 
     # ---------------------------------------------------
-    # COLD INBOUND
+    # 1) COLD INBOUND (no voicemail history)
     # ---------------------------------------------------
     if not convo:
         resp = MessagingResponse()
@@ -7751,39 +7666,37 @@ def incoming_sms():
         return Response(str(resp), mimetype="text/xml")
 
     # ---------------------------------------------------
-    # CT/MA REPLY HANDLER (ONLY place dispatcher books)
+    # 2) ADDRESS STATE CONFIRMATION (CT / MA)
     # ---------------------------------------------------
     if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
-        upper = body.upper()
+        up = body.upper()
 
-        # Interpret user CT/MA reply
-        if "CT" in upper or "CONNECTICUT" in upper:
+        if "CT" in up or "CONNECTICUT" in up:
             chosen_state = "CT"
-        elif "MA" in upper or "MASS" in upper or "MASSACHUSETTS" in upper:
+        elif "MA" in up or "MASS" in up or "MASSACHUSETTS" in up:
             chosen_state = "MA"
         else:
             resp = MessagingResponse()
-            resp.message("Please reply with either CT or MA so we can confirm the address.")
+            resp.message("Please reply with CT or MA so we can verify the address.")
             return Response(str(resp), mimetype="text/xml")
 
         raw_address = convo.get("address")
         status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
 
-        # Still failure?
         if status != "ok" or not addr_struct:
             resp = MessagingResponse()
             resp.message(
                 "I still couldn't verify the address. "
-                "Please reply with the full street, town, state, and ZIP code."
+                "Please reply with the full street, town, state, and ZIP."
             )
             convo["state_prompt_sent"] = False
             return Response(str(resp), mimetype="text/xml")
 
-        # SUCCESS → Save normalized address
+        # SAVE success
         convo["normalized_address"] = addr_struct
         convo["state_prompt_sent"] = False
 
-        # Booking is allowed *ONLY here* outside emergency engine
+        # Optional: allow Square booking ONLY here (safe)
         try:
             maybe_create_square_booking(from_number, convo)
         except Exception as e:
@@ -7794,53 +7707,47 @@ def incoming_sms():
         return Response(str(resp), mimetype="text/xml")
 
     # ---------------------------------------------------
-    # NORMAL CONVERSATIONAL FLOW
+    # 3) NORMAL CONVERSATION BRANCH
     # ---------------------------------------------------
     convo["replied"] = True
 
     ai_reply = generate_reply_for_inbound(
-        cleaned_transcript=convo["cleaned_transcript"],
-        category=convo["category"],
-        appointment_type=convo["appointment_type"],
-        initial_sms=convo["initial_sms"],
+        cleaned_transcript=convo.get("cleaned_transcript"),
+        category=convo.get("category"),
+        appointment_type=convo.get("appointment_type"),
+        initial_sms=convo.get("initial_sms"),
         inbound_text=body,
         scheduled_date=convo.get("scheduled_date"),
         scheduled_time=convo.get("scheduled_time"),
         address=convo.get("address"),
     )
 
-    sms_body = ai_reply.get("sms_body", "").strip()
+    sms_body = (ai_reply.get("sms_body") or "").strip()
 
-    # Update convo state
+    # ---------------------------------------------------
+    # 4) UPDATE CONVERSATION STATE SAFELY
+    # ---------------------------------------------------
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
+
     if ai_reply.get("scheduled_time"):
         convo["scheduled_time"] = ai_reply["scheduled_time"]
+
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # ---------------------------------------------------
-    # DO NOT ALLOW APPOINTMENT TYPE TO BE WIPED  (**FIXED**)
-    # ---------------------------------------------------
+    # IMPORTANT — NEVER allow appointment_type to be overwritten with None
     incoming_apt = ai_reply.get("appointment_type")
 
-    # Only update if incoming_apt is non-empty AND valid
-    if incoming_apt:
+    if incoming_apt:  # only update if valid
         convo["appointment_type"] = incoming_apt
-    # If incoming_apt is None or "", preserve the existing appointment_type
-    # This prevents loops and ensures emergency flows remain intact.
+    # else: keep existing appointment_type → this prevents emergency break
 
     # ---------------------------------------------------
-    # IMPORTANT:
-    # REMOVE automatic booking here to prevent loops
-    # Booking now ONLY occurs:
-    #   • Inside emergency engine
-    #   • Inside CT/MA clarification block above
-    # ---------------------------------------------------
-    # (NO BOOKING CALL HERE)
+    # 5) NO AUTO-BOOKING HERE (only via emergency engine or CT/MA block)
     # ---------------------------------------------------
 
-    # If the engine returned empty string → no reply needed
+    # If no outgoing message needed
     if sms_body == "":
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
@@ -7848,27 +7755,6 @@ def incoming_sms():
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
 
-
-# ---------------------------------------------------
-# Follow-up Cron (10 minutes)
-# ---------------------------------------------------
-@app.route("/cron-followups", methods=["GET"])
-def cron_followups():
-    now = time.time()
-    sent_count = 0
-
-    for phone, convo in conversations.items():
-        if convo.get("replied"):
-            continue
-        if convo.get("followup_sent"):
-            continue
-
-        if now - convo.get("first_sms_time", 0) >= 600:
-            send_sms(phone, "Just checking in — still interested?")
-            convo["followup_sent"] = True
-            sent_count += 1
-
-    return f"Sent {sent_count} follow-up(s)."
 
 
 # ---------------------------------------------------
