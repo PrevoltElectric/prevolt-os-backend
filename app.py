@@ -7664,6 +7664,12 @@ def incoming_sms():
         raw_reply = {}
 
     # ---------------------------------------------------
+    # 🟦 DIAGNOSTIC PROBE — EXACTLY WHAT WE NEED
+    # ---------------------------------------------------
+    print("🔍 RAW REPLY FROM GRFI:", raw_reply)
+    print("🔍 TYPE OF RAW REPLY:", type(raw_reply))
+
+    # ---------------------------------------------------
     # 4B) REPLY SANITIZER — CRITICAL FIX
     # ---------------------------------------------------
     ai_reply = raw_reply if isinstance(raw_reply, dict) else {}
@@ -7711,7 +7717,6 @@ def incoming_sms():
         resp.message(sms_body)
 
     return Response(str(resp), mimetype="text/xml")
-
 
 
 
