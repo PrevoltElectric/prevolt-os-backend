@@ -6813,20 +6813,24 @@ def incoming_call():
         method="POST"
     )
 
-    # 100% Matthew Neural for greeting + menu
+    # FULL SSML — Slowed down + pauses + Matthew voice
     gather.say(
-        "Thanks for calling Preavolt electric "
-        "To help us direct your call, please choose an option. "
-        "If you are a residential customer, press 1. "
-        "If you are a commercial, government, or facility customer, press 2.",
+        '<speak>'
+            '<prosody rate="90%">'
+                'Thanks for calling Preavolt Electric.<break time="0.7s"/>'
+                'To help us direct your call, please choose an option.<break time="0.6s"/>'
+                'If you are a residential customer, press 1.<break time="0.6s"/>'
+                'If you are a commercial, government, or facility customer, press 2.'
+            '</prosody>'
+        '</speak>',
         voice="Polly.Matthew-Neural"
     )
 
     response.append(gather)
 
-    # If caller does nothing → replay message in Matthew
+    # No input → replay menu
     response.say(
-        "Sorry, I didn't get that.",
+        '<speak><prosody rate="90%">Sorry, I did not get that. Let me repeat the options.</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
     response.redirect("/incoming-call")
@@ -6845,15 +6849,19 @@ def handle_call_selection():
     response = VoiceResponse()
 
     # -----------------------------
-    # OPTION 1 → RESIDENTIAL
+    # OPTION 1 → RESIDENTIAL FLOW
     # -----------------------------
     if digit == "1":
         response.say(
-            "Welcome to Preavolt Electric’s premier residential service desk."
-            "You’ll leave a quick message, and our team will text you right away to assist."
-            "Please leave your name, your address, "
-            "and a brief description of what you need help with. "
-            "We will text you shortly.",
+            '<speak>'
+                '<prosody rate="90%">'
+                    'Welcome to Preavolt Electric’s premium residential service desk.<break time="0.7s"/>'
+                    'You’ll leave a quick message, and our team will text you right away to assist.<break time="0.8s"/>'
+                    'Please leave your name,<break time="0.4s"/> your address,<break time="0.4s"/> '
+                    'and a brief description of what you need help with.<break time="0.6s"/>'
+                    'We will text you shortly.'
+                '</prosody>'
+            '</speak>',
             voice="Polly.Matthew-Neural"
         )
 
@@ -6868,24 +6876,22 @@ def handle_call_selection():
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
-    # OPTION 2 → COMMERCIAL / GOVERNMENT
+    # OPTION 2 → COMMERCIAL / GOVERNMENT ROUTING
     # -----------------------------
     elif digit == "2":
         response.say(
-            "Connecting you now.",
+            '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
             voice="Polly.Matthew-Neural"
         )
-
-        # Replace with your real direct number when ready
-        response.dial("+15555555555")
+        response.dial("+15555555555")  # Replace with your real number
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
-    # INVALID INPUT → RESTART
+    # INVALID INPUT → Replay Menu
     # -----------------------------
     else:
         response.say(
-            "Sorry, I didn't understand that.",
+            '<speak><prosody rate="90%">Sorry, I didn’t understand that.</prosody></speak>',
             voice="Polly.Matthew-Neural"
         )
         response.redirect("/incoming-call")
@@ -6902,7 +6908,7 @@ def voicemail_complete():
     recording_url = request.form.get("RecordingUrl", "")
     from_number = request.form.get("From", "")
 
-    # Store voicemail URL + create conversation bucket
+    # Store voicemail data + init conversation
     conversations[from_number] = {
         "voicemail_url": recording_url,
         "initial_sms": "",
@@ -6921,7 +6927,7 @@ def voicemail_complete():
         "state_prompt_sent": False,
     }
 
-    # Send SMS kickoff message after voicemail
+    # Kick off SMS workflow
     try:
         send_sms(
             from_number,
@@ -6932,12 +6938,10 @@ def voicemail_complete():
 
     response = VoiceResponse()
     response.say(
-        "Thanks, we received your message.",
+        '<speak><prosody rate="90%">Thanks, we received your message.</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
     response.hangup()
-
-    return Response(str(response), mimetype="text/xml")
 
 
 
