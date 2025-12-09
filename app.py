@@ -1069,6 +1069,72 @@ Upon detection:
 
 Emergency-intent voicemail classification must trigger **before** any other scheduling logic, and it must never be undone unless the customer later clarifies it is not an emergency.
 
+---
+
+### Rule 1.43.10 — Voicemail-Derived Intent Extraction (Non-Emergency)
+If voicemail transcription contains recognizable work-intent keywords, the OS must infer the job category BEFORE the first outbound SMS.
+
+Examples include:
+• “EV charger” → category = EV_CHARGER  
+• “outlet not working”, “dead outlet” → OUTLET_ISSUE  
+• “panel upgrade”, “breaker keeps tripping” → PANEL  
+• “generator”, “interlock” → GENERATOR  
+• “light fixture”, “recessed lights”, “ceiling fan” → LIGHTING  
+• “inspection”, “home inspection”, “knob and tube” → INSPECTION  
+
+Rules:
+1. OS must pre-populate category from voicemail.  
+2. OS must pre-populate appointment_type when clear (e.g., INSPECTION → WHOLE_HOME_INSPECTION).  
+3. OS must never classify as EMERGENCY unless Rule 1.43.9 applies.  
+4. If multiple intents are mentioned, use the most safety-critical one.  
+5. First outbound SMS must reference the inferred intent:
+   “This is Prevolt Electric — I saw you called about an EV charger installation.”
+
+If the AI cannot determine intent confidently, fallback is:
+   “your electrical issue.”
+
+---
+
+### Rule 1.43.11 — Voicemail-Derived Address Extraction
+If voicemail includes a clear, complete address (or nearly complete):
+• Number + Street  
+• Town  
+• Optional ZIP  
+• Optional state  
+
+Then OS must:
+1. Save it immediately to convo["address"].  
+2. Attempt normalization BEFORE sending the first outbound SMS.  
+3. If state is missing → invoke SRB-CT/MA state-confirmation rules on the FIRST outbound message.  
+4. OS must NOT re-ask for address unless normalization fails.
+
+If voicemail gives partial address:
+• If town + street → OS must save partial and politely confirm missing pieces later.  
+
+---
+
+### Rule 1.43.12 — Voicemail → First SMS Personalization Rule
+The OS must ALWAYS personalize the very first SMS after voicemail using extracted voicemail intent and (if detected) address.
+
+Template:
+“This is Prevolt Electric — I saw you called about {{intent}}. What’s the address and best time for the visit?”
+
+Examples:
+• “I saw you called about an EV charger installation…”  
+• “I saw you called about an outlet issue…”  
+• “I saw you called about your electrical panel…”  
+• If address already known:
+   “I saw you called about an outlet issue at 12 River Street in Windsor Locks.”
+
+Fallback when intent unknown:
+• “I saw you called about your electrical issue.”
+
+Fallback when nothing can be extracted:
+• “Thanks for calling Prevolt Electric — how can I help?”
+
+This rule governs ONLY the *first* SMS after voicemail.
+
+
 
 ## SRB-2 — Emergency, Hazard, Outage & High-Urgency Engine  
 (The rule block governing all active electrical problems, outages, hazards, priority logic, triage, and emergency-specific NLP behavior.)
@@ -6989,13 +7055,36 @@ def voicemail_complete():
     # ---------------------------------------------------
     # Pull transcription if Twilio provides it
     # ---------------------------------------------------
-    transcript = request.form.get("TranscriptionText", "")
-    transcript_lower = (transcript or "").lower()
+    transcript = request.form.get("TranscriptionText", "") or ""
+    transcript_lower = transcript.lower()
 
     # ---------------------------------------------------
-    # Very lightweight intent extraction
+    # Rule 1.43.9 — Emergency-intent auto-classification
     # ---------------------------------------------------
-    intent = "your electrical issue"  # default fallback
+    emergency_keywords = [
+        "no power", "partial power", "power out",
+        "burning", "burning smell", "smoke", "smoke smell",
+        "sparks", "spark", "boom", "pop", "bang",
+        "hot outlet", "hot plug", "hot panel",
+        "tree ripped", "line down", "wire down",
+        "service cable", "arc", "arcing",
+        "water near", "leak", "flood", "flooding"
+    ]
+
+    detected_emergency = any(k in transcript_lower for k in emergency_keywords)
+
+    # ---------------------------------------------------
+    # Lightweight address extraction attempt
+    # ---------------------------------------------------
+    import re
+    address_match = re.search(r"\d{1,5} .+?(ct|street|st|road|rd|lane|ln|ave|avenue|blvd|drive|dr|circle|cir)\b",
+                              transcript_lower)
+    extracted_address = address_match.group(0) if address_match else None
+
+    # ---------------------------------------------------
+    # Lightweight intent extraction
+    # ---------------------------------------------------
+    intent = "your electrical issue"  # fallback
 
     keywords = {
         "outlet": "an outlet issue",
@@ -7006,19 +7095,23 @@ def voicemail_complete():
         "breaker": "a breaker issue",
         "no power": "a power-loss issue",
         "power": "a power issue",
-        "ev": "an EV charger issue",
-        "charger": "an EV charger issue",
+        "ev": "an EV charger installation",
+        "charger": "an EV charger installation",
         "generator": "a generator issue",
         "inspection": "a home electrical inspection",
         "smoke": "a burning or smoke smell",
         "burning": "a burning smell",
-        "sparks": "a sparking hazard",
+        "sparks": "a sparking hazard"
     }
 
     for key, value in keywords.items():
         if key in transcript_lower:
             intent = value
             break
+
+    # If emergency, override intent wording
+    if detected_emergency:
+        intent = "a possible electrical hazard"
 
     # ---------------------------------------------------
     # Store voicemail data + init conversation
@@ -7028,13 +7121,15 @@ def voicemail_complete():
         "initial_sms": transcript,
         "cleaned_transcript": transcript,
         "category": None,
-        "appointment_type": None,
+        "appointment_type": (
+            "TROUBLESHOOT_395" if detected_emergency else None
+        ),
         "first_sms_time": time.time(),
         "replied": False,
         "followup_sent": False,
         "scheduled_date": None,
         "scheduled_time": None,
-        "address": None,
+        "address": extracted_address,
         "normalized_address": None,
         "booking_created": False,
         "square_booking_id": None,
@@ -7042,20 +7137,36 @@ def voicemail_complete():
     }
 
     # ---------------------------------------------------
-    # Send premium kickoff SMS using extracted intent
+    # Build premium kickoff SMS (emergency-aware)
     # ---------------------------------------------------
     try:
-        sms_message = (
-            f"This is Prevolt Electric — I saw you called about {intent}. "
-            f"What’s the address and best time for the visit?"
-        )
+        if detected_emergency:
+            # Emergency SMS tone (Rule 1.43.9)
+            sms_message = (
+                "This is Prevolt Electric — I saw your message about a possible electrical hazard. "
+                "Let’s get you taken care of. "
+            )
+        else:
+            sms_message = (
+                f"This is Prevolt Electric — I saw you called about {intent}. "
+            )
+
+        # If address was extracted → include it
+        if extracted_address:
+            sms_message += f"I have your address as {extracted_address}. "
+
+        # Always close with request for missing fields
+        sms_message += "What’s the address and best time for the visit?" \
+            if not extracted_address else \
+            "What’s the best time for the visit?"
+
         send_sms(from_number, sms_message)
 
     except Exception as e:
         print("Error sending SMS after voicemail:", repr(e))
 
     # ---------------------------------------------------
-    # Voice response ending
+    # Voice response ending (Matthew Neural slowed)
     # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
@@ -7065,6 +7176,7 @@ def voicemail_complete():
     response.hangup()
 
     return Response(str(response), mimetype="text/xml")
+
 
 
 
