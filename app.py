@@ -1134,6 +1134,57 @@ Fallback when nothing can be extracted:
 
 This rule governs ONLY the *first* SMS after voicemail.
 
+### Rule 1.43.8 — Voicemail Intent Extraction
+When a customer leaves a voicemail, the OS must extract the **best possible scheduling intent** from the speech-to-text transcript.
+
+The OS must interpret voicemail content using the following principles:
+
+1. Identify the primary reason for the call (the “intent”):
+   • outlet issue → “an outlet issue”
+   • lighting issue → “a lighting issue”
+   • breaker / panel → “an electrical panel or breaker issue”
+   • EV / charger → “an EV charger installation”
+   • generator → “a generator issue”
+   • inspection → “a home electrical inspection”
+   • power loss terms → “a power-loss issue”
+   • hazard terms (smoke, burning, sparks, arcing) → escalate to Rule 1.43.9
+
+2. If multiple possible intents appear → choose the most specific.
+
+3. If no recognizable keywords exist → fallback intent = “your electrical issue”.
+
+4. This extracted intent must be used in the FIRST outbound SMS from voicemail:
+   “This is Prevolt Electric — I saw you called about {intent}. What’s the address and best time for the visit?”
+
+5. Intent extraction cannot override or contradict Emergency Mode (Rule 1.43.9).
+
+---
+
+### Rule 1.43.9 — Emergency-Intent Voicemail Auto-Classification
+When a voicemail contains ANY signal of an electrical hazard, the OS must automatically classify the appointment as an **emergency (TROUBLESHOOT_395)** and activate Emergency Mode immediately.
+
+Hazard signals include but are not limited to:
+• “no power”, “partial power”, “power out”
+• “burning smell”, “smoke”, “sparks”, “arcing”
+• “boom”, “pop”, “bang”
+• “hot outlet”, “hot panel”, “hot wire”
+• “tree ripped the wires”, “line down”, “service cable ripped”
+• “water near the panel”, “flooding”, “leak near electrical”
+
+Upon detection:
+1. appointment_type ← TROUBLESHOOT_395  
+2. OS must switch into Emergency Mode (SRB-2 rules apply)  
+3. OS must NOT ask non-emergency window questions  
+4. OS must ask for **address → time → confirmation**, in that order  
+5. The FIRST SMS must begin with a calm, urgent tone:  
+   “This is Prevolt Electric — I saw your message about a possible electrical hazard. Let’s get you taken care of.”  
+6. If transcript contains *immediate danger* indicators (“fire”, “active smoke”, “someone was shocked”):  
+   OS must include life-safety guidance:  
+   “If you see fire, active smoke, or someone may be injured, call 911 first. Once everything is safe, I can help.”  
+7. Emergency classification cannot be undone unless the customer explicitly states it is NOT an emergency.
+
+Emergency-intent voicemail triage must execute **before all other SRB scheduling logic**.
+
 
 
 ## SRB-2 — Emergency, Hazard, Outage & High-Urgency Engine  
