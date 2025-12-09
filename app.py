@@ -6798,29 +6798,90 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
 
 # ---------------------------------------------------
-# Voice: Incoming Call
+# Voice: Incoming Call (IVR + Spam Filter)
 # ---------------------------------------------------
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
     response = VoiceResponse()
 
-    # Use a natural, human-sounding neural voice
-    response.say(
+    gather = Gather(
+        num_digits=1,
+        action="/handle-call-selection",
+        method="POST"
+    )
+
+    # Natural human-like male voice
+    gather.say(
         "Thanks for calling Prevolt Electric. "
-        "Please leave your name, address, and a brief description of your project. "
-        "We will text you shortly.",
-        voice="Polly.Joanna-Neural"
+        "To help us direct your call, please choose an option. "
+        "If you are a residential customer, press 1. "
+        "If you are a commercial, government, or facility customer, press 2.",
+        voice="Polly.Matthew-Neural"
     )
 
-    response.record(
-        max_length=60,
-        play_beep=True,
-        trim="do-not-trim",
-        action="/voicemail-complete",
-    )
+    response.append(gather)
 
-    response.hangup()
+    # If caller does nothing → replay message
+    response.say(
+        "Sorry, I didn't get that.",
+        voice="Polly.Matthew-Neural"
+    )
+    response.redirect("/incoming-call")
+
     return Response(str(response), mimetype="text/xml")
+
+
+# ---------------------------------------------------
+# Handle Residential vs Commercial
+# ---------------------------------------------------
+@app.route("/handle-call-selection", methods=["POST"])
+def handle_call_selection():
+    digit = request.form.get("Digits", "")
+    response = VoiceResponse()
+
+    # -----------------------------
+    # Option 1 → Residential → Voicemail → OS SMS flow
+    # -----------------------------
+    if digit == "1":
+        response.say(
+            "No problem. Please leave your name, your address, "
+            "and a brief description of what you need help with. "
+            "We will text you shortly.",
+            voice="Polly.Matthew-Neural"
+        )
+        response.record(
+            max_length=60,
+            play_beep=True,
+            trim="do-not-trim",
+            action="/voicemail-complete",
+        )
+        response.hangup()
+        return Response(str(response), mimetype="text/xml")
+
+    # -----------------------------
+    # Option 2 → Commercial / Government → Forward to Kyle directly
+    # -----------------------------
+    elif digit == "2":
+        # PLACEHOLDER NUMBER – replace when ready
+        response.say(
+            "Connecting you now.",
+            voice="Polly.Matthew-Neural"
+        )
+        response.dial("+15555555555")  # <-- Replace this when you pick a number
+        return Response(str(response), mimetype="text/xml")
+
+    # -----------------------------
+    # Invalid input → retry
+    # -----------------------------
+    else:
+        response.say(
+            "Sorry, I didn't understand that.",
+            voice="Polly.Matthew-Neural"
+        )
+        response.redirect("/incoming-call")
+        return Response(str(response), mimetype="text/xml")
+
+
 
 
 
