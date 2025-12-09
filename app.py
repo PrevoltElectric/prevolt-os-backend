@@ -84,7 +84,8 @@ conversations = {}
 # ---------------------------------------------------
 def send_sms(to_number: str, body: str) -> None:
     """
-    Forces all outbound messages into WhatsApp sandbox for testing.
+    For now, force all outbound messages to WhatsApp sandbox to your cell
+    so you can test end-to-end without A2P headaches.
     """
     if not twilio_client:
         print("Twilio not configured; WhatsApp message not sent.")
@@ -93,7 +94,7 @@ def send_sms(to_number: str, body: str) -> None:
 
     try:
         whatsapp_from = "whatsapp:+14155238886"   # Twilio Sandbox
-        whatsapp_to = "whatsapp:+18609701727"     # Your cell phone for testing
+        whatsapp_to = "whatsapp:+18609701727"     # <-- YOUR CELL
 
         msg = twilio_client.messages.create(
             body=body,
@@ -111,8 +112,10 @@ def send_sms(to_number: str, body: str) -> None:
 # ---------------------------------------------------
 def transcribe_recording(recording_url: str) -> str:
     """
-    Downloads voicemail audio from Twilio (wav/mp3) → Whisper.
+    Downloads the voicemail from Twilio (wav or mp3) and sends it to Whisper.
+    Auto-fallback: try .wav first, then .mp3.
     """
+
     wav_url = recording_url + ".wav"
     mp3_url = recording_url + ".mp3"
 
@@ -127,9 +130,11 @@ def transcribe_recording(recording_url: str) -> str:
         resp.raise_for_status()
         return resp
 
-    resp = download(wav_url) or download(mp3_url)
+    resp = download(wav_url)
     if resp is None:
-        print("Voicemail download FAILED:", recording_url)
+        resp = download(mp3_url)
+    if resp is None:
+        print("Voicemail download FAILED for:", recording_url)
         return ""
 
     tmp_path = "/tmp/prevolt_voicemail.wav"
@@ -137,25 +142,19 @@ def transcribe_recording(recording_url: str) -> str:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
-    try:
-        with open(tmp_path, "rb") as audio_file:
-            transcript = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-            )
-        return transcript.text.strip()
-    except Exception as e:
-        print("Whisper transcription FAILED:", repr(e))
-        return ""
+    with open(tmp_path, "rb") as audio_file:
+        transcript = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+        )
+
+    return transcript.text.strip()
 
 
 # ---------------------------------------------------
-# Step 2 — Transcript Cleanup (Electrical-domain correction)
+# Step 2 — Cleanup (improve clarity)
 # ---------------------------------------------------
 def clean_transcript_text(raw_text: str) -> str:
-    """
-    Cleans grammar + fixes transcription errors + preserves meaning EXACTLY.
-    """
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -163,9 +162,10 @@ def clean_transcript_text(raw_text: str) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You clean up voicemail transcripts for an electrical contractor. "
-                        "Correct misheard electrical terminology (EV charger, panel, breaker, GFCI, etc.), "
-                        "fix grammar lightly, but DO NOT change meaning, DO NOT add details."
+                        "You clean up voicemail transcriptions for an electrical contractor. "
+                        "Fix obvious transcription mistakes and electrical terminology, "
+                        'improve grammar slightly, but preserve the customer\'s meaning EXACTLY. '
+                        "Do NOT add details. Do NOT change the problem description."
                     ),
                 },
                 {"role": "user", "content": raw_text},
@@ -179,12 +179,12 @@ def clean_transcript_text(raw_text: str) -> str:
 
 
 # ---------------------------------------------------
-# Step 3 — Initial SMS (FINAL — Ultra-Deterministic Classifier)
+# Step 3 — Generate Initial SMS (Ultra-Deterministic Classifier)
 # ---------------------------------------------------
 def generate_initial_sms(cleaned_text: str) -> dict:
     """
     This is the ONLY classifier used for voicemail → first SMS.
-    Deterministic. No duplicates exist elsewhere.
+    Deterministic. No duplicates.
     """
     try:
         completion = openai_client.chat.completions.create(
@@ -194,22 +194,21 @@ def generate_initial_sms(cleaned_text: str) -> dict:
                     "role": "system",
                     "content": (
                         "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
-                        "Classify the voicemail into EXACTLY ONE appointment_type.\n\n"
+                        "Classify the voicemail into EXACTLY ONE appointment type.\n\n"
                         "==============================\n"
                         " APPOINTMENT TYPE RULES\n"
                         "==============================\n"
-                        "TROUBLESHOOT_395 = ANY active problem, outage, burning smell, sparking, fire, wires down, "
-                        "tree damage, main wires pulled, breakers tripping, no/partial power, safety issues.\n\n"
+                        "TROUBLESHOOT_395 = ANY active problem, outage, burning smell, sparking, fire, "
+                        "wires down, tree damage, main wires pulled, breakers tripping, no/partial power, safety issues.\n\n"
                         "WHOLE_HOME_INSPECTION = ONLY when caller clearly states inspection for home purchase, "
                         "safety review, insurance, or explicitly says 'inspection'.\n\n"
                         "EVAL_195 = Installs, upgrades, quotes, EV chargers, generators, panel upgrades, "
                         "renovations, or pricing inquiries.\n\n"
                         "RULES:\n"
                         "• When in doubt → choose TROUBLESHOOT_395.\n"
-                        "• NEVER soften classification.\n"
                         "• SMS MUST start with: 'Hi, this is Prevolt Electric —'\n"
                         "• Mention price ONCE.\n"
-                        "• NO emojis. NO fluff. NO asking to repeat voicemail.\n\n"
+                        "• No emojis. No fluff. No asking to repeat voicemail.\n\n"
                         "Return STRICT JSON {sms_body, category, appointment_type}."
                     ),
                 },
@@ -217,12 +216,12 @@ def generate_initial_sms(cleaned_text: str) -> dict:
             ],
         )
 
-        result = json.loads(completion.choices[0].message.content)
+        data = json.loads(completion.choices[0].message.content)
 
         return {
-            "sms_body": result["sms_body"].strip(),
-            "category": result["category"],
-            "appointment_type": result["appointment_type"],
+            "sms_body": data["sms_body"].strip(),
+            "category": data["category"],
+            "appointment_type": data["appointment_type"],
         }
 
     except Exception as e:
@@ -238,7 +237,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 
 # ---------------------------------------------------
-# Step 4 — Generate Replies (STATE MACHINE BRAIN ENTRYPOINT)
+# Step 4 — Generate Replies (THE BRAIN)
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -250,9 +249,7 @@ def generate_reply_for_inbound(
     scheduled_time,
     address,
 ) -> dict:
-    """
-    Main conversational engine. (Header only — your full SRB logic continues below.)
-    """
+
     try:
         if ZoneInfo:
             tz = ZoneInfo("America/New_York")
@@ -266,13 +263,13 @@ def generate_reply_for_inbound(
         phone = request.form.get("From", "").replace("whatsapp:", "")
         conv = conversations.get(phone, {})
 
-        # Your existing SRB logic continues from here…
-        # (We do not touch it in this patch.)
+        # Your existing SRB logic continues…
         return {}
 
     except Exception as e:
         print("Inbound reply generation error:", repr(e))
         return {}
+
 
 
         system_prompt = """
