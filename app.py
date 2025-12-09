@@ -7425,48 +7425,54 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
 
 
 # ---------------------------------------------------
-# Send to Square
+# Send to Square (wrapped in a function)
 # ---------------------------------------------------
-try:
-    resp = requests.post(
-        "https://connect.squareup.com/v2/bookings",
-        headers=square_headers(),
-        json=booking_payload,
-        timeout=10,
+def send_booking_to_square(phone, convo, booking_payload, scheduled_date, scheduled_time, appointment_type):
+    """
+    Safely send booking_payload to Square and update convo state.
+    Returns a dict: {success, error, booking_id}
+    """
+
+    try:
+        resp = requests.post(
+            "https://connect.squareup.com/v2/bookings",
+            headers=square_headers(),
+            json=booking_payload,
+            timeout=10,
+        )
+    except Exception as e:
+        return fail(f"Square API exception: {repr(e)}")
+
+    if resp.status_code not in (200, 201):
+        return fail(f"Square booking failed [{resp.status_code}]: {resp.text}")
+
+    # Parse response JSON safely
+    try:
+        data = resp.json()
+    except Exception as e:
+        return fail(f"Invalid JSON in Square response: {repr(e)}")
+
+    booking = data.get("booking")
+    if not booking:
+        return fail(f"Square response missing 'booking': {data}")
+
+    booking_id = booking.get("id")
+
+    # Mark booking in conversation state
+    convo["booking_created"] = True
+    convo["square_booking_id"] = booking_id
+
+    print(
+        f"Square booking created for {phone}: {booking_id} "
+        f"{scheduled_date} {scheduled_time} ({appointment_type})"
     )
-except Exception as e:
-    return fail(f"Square API exception: {repr(e)}")
 
-if resp.status_code not in (200, 201):
-    return fail(f"Square booking failed [{resp.status_code}]: {resp.text}")
-
-# Parse response JSON safely
-try:
-    data = resp.json()
-except Exception as e:
-    return fail(f"Invalid JSON in Square response: {repr(e)}")
-
-booking = data.get("booking")
-if not booking:
-    return fail(f"Square response missing 'booking': {data}")
-
-booking_id = booking.get("id")
-
-# Mark booking in conversation state
-convo["booking_created"] = True
-convo["square_booking_id"] = booking_id
-
-print(
-    f"Square booking created for {phone}: {booking_id} "
-    f"{scheduled_date} {scheduled_time} ({appointment_type})"
-)
-
-# SUCCESS RETURN
-return {
-    "success": True,
-    "error": None,
-    "booking_id": booking_id,
-}
+    # SUCCESS RETURN
+    return {
+        "success": True,
+        "error": None,
+        "booking_id": booking_id,
+    }
 
 
 # ---------------------------------------------------
@@ -7601,7 +7607,6 @@ def incoming_sms():
             print("Early normalization failed:", repr(e))
             pass
 
-
     # ---------------------------------------------------
     # 1) COLD INBOUND — INITIALIZE NEW CONVO
     # ---------------------------------------------------
@@ -7629,7 +7634,6 @@ def incoming_sms():
         }
         return Response(str(resp), mimetype="text/xml")
 
-
     # ---------------------------------------------------
     # 2) APPOINTMENT TYPE FIREWALL
     # ---------------------------------------------------
@@ -7638,7 +7642,6 @@ def incoming_sms():
     appt = sanitize_appt_type(raw_appt or raw_cat or "TROUBLESHOOT_395")
     convo["appointment_type"] = appt
     forced_type = appt
-
 
     # ---------------------------------------------------
     # 3) ADDRESS STATE CONFIRMATION (CT/MA)
@@ -7684,7 +7687,6 @@ def incoming_sms():
             resp.message("Thanks — we have the address confirmed.")
             return Response(str(resp), mimetype="text/xml")
 
-
     # ---------------------------------------------------
     # 4) NORMAL FLOW
     # ---------------------------------------------------
@@ -7703,7 +7705,6 @@ def incoming_sms():
         address=convo.get("address"),
     )
 
-
     # ---------------------------------------------------
     # 5) UPDATE STATE SAFELY
     # ---------------------------------------------------
@@ -7716,13 +7717,11 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-
     # ---------------------------------------------------
     # 6) HARD APPT-TYPE PROTECTION
     # ---------------------------------------------------
     incoming_apt = sanitize_appt_type(ai_reply.get("appointment_type"))
     convo["appointment_type"] = incoming_apt
-
 
     # ---------------------------------------------------
     # 7) SEND SMS
