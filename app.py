@@ -6898,6 +6898,46 @@ def handle_call_selection():
         return Response(str(response), mimetype="text/xml")
 
 
+# ===================================================
+# Helper: Build Intent-Aware Kickoff Message
+# ===================================================
+def build_kickoff_message(intent, transcript):
+    """
+    Returns a customized kickoff SMS based on voicemail intent.
+    This is where we shape the first message the user receives
+    after leaving a voicemail.
+    """
+
+    category = intent.get("category")
+    appt = intent.get("appointment_type")
+
+    # --- CATEGORY-BASED INTRO LOGIC ---
+
+    if category == "panel_upgrade":
+        return "Got your message about the electrical panel upgrade. What town is the project in?"
+
+    if category == "outlet_switch":
+        return "Got your message about the outlet or switch problem — is this at your home address?"
+
+    if category == "ev_charger":
+        return "Got your message about installing an EV charger. What town should we head to?"
+
+    if category == "generator":
+        return "Got your generator message — when do you need the work completed?"
+
+    if appt == "TROUBLESHOOT_395":
+        return "Got your message — sounds like an electrical issue. What address should we come out to?"
+
+    # --- DEFAULT FALLBACK ---
+    if transcript:
+        trimmed = transcript.strip()
+        if len(trimmed) > 80:
+            trimmed = trimmed[:77] + "..."
+        return f'Got your message: "{trimmed}" — how can we help?'
+
+    return "Thanks for your message — what electrical work do you need help with?"
+
+
 # ---------------------------------------------------
 # Voice → Voicemail Completion
 # ---------------------------------------------------
@@ -6908,11 +6948,47 @@ def voicemail_complete():
     recording_url = request.form.get("RecordingUrl", "")
     from_number = request.form.get("From", "")
 
+    # ---------------------------------------------------
+    # Pull transcription if Twilio provides it
+    # ---------------------------------------------------
+    transcript = request.form.get("TranscriptionText", "")
+    transcript_lower = (transcript or "").lower()
+
+    # ---------------------------------------------------
+    # Very lightweight intent extraction
+    # ---------------------------------------------------
+    intent = "your electrical issue"  # default fallback
+
+    keywords = {
+        "outlet": "an outlet issue",
+        "switch": "a switch issue",
+        "lights": "a lighting issue",
+        "light": "a lighting issue",
+        "panel": "an electrical panel issue",
+        "breaker": "a breaker issue",
+        "no power": "a power-loss issue",
+        "power": "a power issue",
+        "ev": "an EV charger issue",
+        "charger": "an EV charger issue",
+        "generator": "a generator issue",
+        "inspection": "a home electrical inspection",
+        "smoke": "a burning or smoke smell",
+        "burning": "a burning smell",
+        "sparks": "a sparking hazard",
+    }
+
+    for key, value in keywords.items():
+        if key in transcript_lower:
+            intent = value
+            break
+
+    # ---------------------------------------------------
     # Store voicemail data + init conversation
+    # ---------------------------------------------------
     conversations[from_number] = {
         "voicemail_url": recording_url,
-        "initial_sms": "",
-        "cleaned_transcript": "",
+        "initial_sms": transcript,
+        "cleaned_transcript": transcript,
         "category": None,
         "appointment_type": None,
         "first_sms_time": time.time(),
@@ -6927,21 +7003,32 @@ def voicemail_complete():
         "state_prompt_sent": False,
     }
 
-    # Kick off SMS workflow
+    # ---------------------------------------------------
+    # Send premium kickoff SMS using extracted intent
+    # ---------------------------------------------------
     try:
-        send_sms(
-            from_number,
-            "Thanks for calling Prevolt Electric. Got your message — what electrical work do you need help with?"
+        sms_message = (
+            f"This is Prevolt Electric — I saw you called about {intent}. "
+            f"What’s the address and best time for the visit?"
         )
+        send_sms(from_number, sms_message)
+
     except Exception as e:
         print("Error sending SMS after voicemail:", repr(e))
 
+    # ---------------------------------------------------
+    # Voice response ending
+    # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
         '<speak><prosody rate="90%">Thanks, we received your message.</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
     response.hangup()
+
+    return Response(str(response), mimetype="text/xml")
+
+
 
 
 
