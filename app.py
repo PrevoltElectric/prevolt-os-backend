@@ -6810,13 +6810,14 @@ def incoming_call():
         method="POST"
     )
 
-    # Natural human-like male voice
+    # NOTE: Polly voices are NOT reliably supported inside <Gather><Say>
+    # Use a standard Twilio voice here to avoid application errors.
     gather.say(
         "Thanks for calling Prevolt Electric. "
         "To help us direct your call, please choose an option. "
         "If you are a residential customer, press 1. "
         "If you are a commercial, government, or facility customer, press 2.",
-        voice="Polly.Matthew-Neural"
+        voice="man"
     )
 
     response.append(gather)
@@ -6824,7 +6825,7 @@ def incoming_call():
     # If caller does nothing → replay message
     response.say(
         "Sorry, I didn't get that.",
-        voice="Polly.Matthew-Neural"
+        voice="Polly.Matthew-Neural"   # Polly OK here
     )
     response.redirect("/incoming-call")
 
@@ -6862,12 +6863,11 @@ def handle_call_selection():
     # Option 2 → Commercial / Government → Forward to Kyle directly
     # -----------------------------
     elif digit == "2":
-        # PLACEHOLDER NUMBER – replace when ready
         response.say(
             "Connecting you now.",
             voice="Polly.Matthew-Neural"
         )
-        response.dial("+15555555555")  # <-- Replace this when you pick a number
+        response.dial("+15555555555")  # Replace later
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
