@@ -729,16 +729,17 @@ def normalize_address(raw: str, forced_state=None):
 
 
 # ====================================================================
-# ADDRESS INTAKE ENGINE — CLEAN + RELIABLE (NO LOOPS)
+# ADDRESS INTAKE ENGINE — CLEAN + RELIABLE (EMERGENCY-AWARE)
 # ====================================================================
 def handle_address_intake(conv, inbound_text, inbound_lower,
                           scheduled_date, scheduled_time, address):
 
+    # Basic token sanity check
     tokens = inbound_lower.replace(",", "").split()
-
     if len(tokens) < 3:
         return None
 
+    # Must contain a house number
     if not any(tok.isdigit() for tok in tokens):
         return None
 
@@ -750,12 +751,13 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
         "ln", "lane",
         "dr", "drive",
         "way",
-        "ct", "court"
+        "ct", "court",
     }
 
     if not any(tok in street_keywords for tok in tokens):
         return None
 
+    # Extract a raw address line
     m = re.search(r"\d{1,6}\s+[A-Za-z0-9\s\.\-]+", inbound_text)
     raw_addr = m.group(0).strip() if m else inbound_text.strip()
 
@@ -766,12 +768,65 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
     if norm_status == "ok" and parsed:
         conv["normalized_address"] = parsed
 
+        # ---------------------------------------------------
+        # EMERGENCY SHORTCUT:
+        # If this convo is already classified as a TROUBLESHOOT_395
+        # "Active problems" type case, and the customer is clearly
+        # talking about an active outage / tonight, we should NOT
+        # ask "what day" again. We go straight to "what time tonight".
+        # ---------------------------------------------------
+        appointment_type = (conv.get("appointment_type") or "").upper()
+        emergency_terms = [
+            "no power",
+            "no electricity",
+            "power outage",
+            "tree",
+            "lines down",
+            "service wires",
+            "burning smell",
+            "smoke",
+            "sparks",
+            "arcing",
+            "tonight",
+            "right now",
+            "asap",
+        ]
+
+        is_emergency_appt = appointment_type == "TROUBLESHOOT_395"
+        mentions_emergency = any(term in inbound_lower for term in emergency_terms)
+
+        if is_emergency_appt and mentions_emergency:
+            # Lock this as a same-day emergency visit
+            tz = ZoneInfo("America/New_York")
+            now_local = datetime.now(tz)
+            today_str = now_local.strftime("%Y-%m-%d")
+
+            # Preserve any existing scheduled_date if already set,
+            # otherwise default to today for emergency.
+            if not conv.get("scheduled_date"):
+                conv["scheduled_date"] = today_str
+
+            return {
+                "sms_body": (
+                    "Got it — we’ll treat this as an emergency visit for today. "
+                    "What time tonight works best for you?"
+                ),
+                "address": raw_addr,
+                "scheduled_date": conv["scheduled_date"],
+                "scheduled_time": None,
+                "appointment_type": appointment_type or "TROUBLESHOOT_395",
+            }
+
+        # ---------------------------------------------------
+        # NON-EMERGENCY PATH (EXISTING BEHAVIOR)
+        # ---------------------------------------------------
         if not conv.get("scheduled_date"):
             return {
                 "sms_body": "Got it — what day would you like us to come out?",
                 "address": raw_addr,
                 "scheduled_date": None,
                 "scheduled_time": None,
+                "appointment_type": appointment_type or "TROUBLESHOOT_395",
             }
 
         if conv.get("scheduled_date") and not conv.get("scheduled_time"):
@@ -782,115 +837,16 @@ def handle_address_intake(conv, inbound_text, inbound_lower,
                 "address": raw_addr,
                 "scheduled_date": conv["scheduled_date"],
                 "scheduled_time": None,
+                "appointment_type": appointment_type or "TROUBLESHOOT_395",
             }
 
+        # Address is good, and date + time are already populated
         return None
 
+    # Normalization failed — keep state but do not advance
     conv["normalized_address"] = None
     return None
 
-
-# ---------------------------------------------------
-# Prompt Builder
-# ---------------------------------------------------
-def build_llm_prompt(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    scheduled_date,
-    scheduled_time,
-    address,
-    today_date_str,
-    today_weekday
-):
-    return f"""
-You are Prevolt OS, the SMS assistant for Prevolt Electric.
-Follow internal SRB rules only. Output MUST be strict JSON.
-"""
-
-
-# ====================================================================
-# SRB-12 — Natural Language Date/Time Parsing
-# ====================================================================
-import re
-from datetime import timedelta
-
-def parse_natural_datetime(inbound_text: str, now_local):
-    text = inbound_text.lower().strip()
-
-    result = {
-        "has_datetime": False,
-        "date": None,
-        "time": None
-    }
-
-    same_day_terms = [
-        "today", "right now", "im home", "i am home",
-        "here now", "home now", "asap", "available now"
-    ]
-
-    if any(x in text for x in same_day_terms):
-        result["has_datetime"] = True
-        result["date"] = now_local.strftime("%Y-%m-%d")
-        result["time"] = (now_local + timedelta(hours=2)).strftime("%H:%M")
-        return result
-
-    if "tomorrow" in text:
-        t = now_local + timedelta(days=1)
-        result["has_datetime"] = True
-        result["date"] = t.strftime("%Y-%m-%d")
-        result["time"] = "09:00"
-        return result
-
-    weekdays = {
-        "monday": 0,
-        "tuesday": 1,
-        "wednesday": 2,
-        "thursday": 3,
-        "friday": 4,
-        "saturday": 5,
-        "sunday": 6,
-    }
-
-    for word, target_idx in weekdays.items():
-        if word in text:
-            today_idx = now_local.weekday()
-            delta = (target_idx - today_idx) % 7
-            if delta == 0:
-                delta = 7
-
-            visit_day = now_local + timedelta(days=delta)
-            result["has_datetime"] = True
-            result["date"] = visit_day.strftime("%Y-%m-%d")
-            result["time"] = "09:00"
-            return result
-
-    if any(x in text for x in ["any day", "whenever", "you pick", "flexible"]):
-        t = now_local + timedelta(days=1)
-        result["has_datetime"] = True
-        result["date"] = t.strftime("%Y-%m-%d")
-        result["time"] = "09:00"
-        return result
-
-    time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text)
-    if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2)) if time_match.group(2) else 0
-        meridiem = time_match.group(3)
-
-        if meridiem == "pm" and hour < 12:
-            hour += 12
-        if meridiem == "am" and hour == 12:
-            hour = 0
-
-        if 0 <= hour <= 23:
-            result["has_datetime"] = True
-            result["date"] = now_local.strftime("%Y-%m-%d")
-            result["time"] = f"{hour:02d}:{minute:02d}"
-            return result
-
-    return result
 
 
 # ====================================================================
