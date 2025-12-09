@@ -1031,44 +1031,6 @@ If the customer insists on an exact number, the OS must reply: “I’ll take a 
 #### Rule 1.43.7 — Tie-Breaker Priority  
 If a pricing question and a scheduling need appear in the same message, scheduling always takes priority. The OS must collect any missing field first, then optionally answer the price question if appropriate.
 
-### Rule 1.43.8 — Voicemail Intent Kickoff Rule
-When a conversation begins from a voicemail recording, the OS must:
-
-• infer the customer’s intent from their voicemail content (electrical issue, install request, power problem, etc.)  
-• open the SMS conversation with a **premium, context-aware greeting**, such as:  
-  “This is Prevolt Electric — I saw you called about {{intent}}. Let’s get you taken care of.”  
-• NEVER repeat or quote the voicemail back to the customer  
-• NEVER ask the generic “what electrical work do you need help with?” — the voicemail already told us  
-• immediately guide the user toward the **next missing scheduling field** (address → time → date)  
-• if intent is ambiguous, fall back to: “I saw you called earlier — what can we help you with today?”  
-• if voicemail contains hazard/emergency indicators, escalate using normal SRB-2 rules  
-• voicemail intent is used **only for the first message** — then normal SRB-1 progression resumes
-
-### Rule 1.43.9 — Emergency-Intent Voicemail Auto-Classification
-When a voicemail contains language indicating an active electrical hazard, outage, or safety concern, the OS must automatically classify the appointment as an emergency (TROUBLESHOOT_395).
-
-Hazard keywords include but are not limited to:
-• “no power”, “partial power”, “power out”
-• “burning smell”, “smoke”, “sparks”
-• “boom”, “pop”, “bang”
-• “hot outlet”, “hot panel”
-• “tree ripped the wires”, “line down”, “service cable ripped”
-• “flooding”, “water near electrical”, “leak in panel”
-
-Upon detection:
-1. appointment_type ← TROUBLESHOOT_395  
-2. OS enters Emergency Mode immediately (SRB-2 applies)  
-3. OS must NOT ask non-emergency window questions  
-4. OS must NOT ask for time twice  
-5. The first outbound SMS MUST begin with an urgent but calm tone:
-   “This is Prevolt Electric — I saw your message about a possible electrical hazard. Let’s get you taken care of.”
-6. OS must move directly to collecting the missing fields in this order:
-   • address → time (if missing) → confirmation  
-7. If voicemail implies **immediate danger**, OS must follow SRB-2 life-safety rules:
-   “If you see fire, active smoke, or someone was shocked, call 911 first. Once everything is safe, I can help.”
-
-Emergency-intent voicemail classification must trigger **before** any other scheduling logic, and it must never be undone unless the customer later clarifies it is not an emergency.
-
 
 ## SRB-2 — Emergency, Hazard, Outage & High-Urgency Engine  
 (The rule block governing all active electrical problems, outages, hazards, priority logic, triage, and emergency-specific NLP behavior.)
@@ -6936,46 +6898,6 @@ def handle_call_selection():
         return Response(str(response), mimetype="text/xml")
 
 
-# ===================================================
-# Helper: Build Intent-Aware Kickoff Message
-# ===================================================
-def build_kickoff_message(intent, transcript):
-    """
-    Returns a customized kickoff SMS based on voicemail intent.
-    This is where we shape the first message the user receives
-    after leaving a voicemail.
-    """
-
-    category = intent.get("category")
-    appt = intent.get("appointment_type")
-
-    # --- CATEGORY-BASED INTRO LOGIC ---
-
-    if category == "panel_upgrade":
-        return "Got your message about the electrical panel upgrade. What town is the project in?"
-
-    if category == "outlet_switch":
-        return "Got your message about the outlet or switch problem — is this at your home address?"
-
-    if category == "ev_charger":
-        return "Got your message about installing an EV charger. What town should we head to?"
-
-    if category == "generator":
-        return "Got your generator message — when do you need the work completed?"
-
-    if appt == "TROUBLESHOOT_395":
-        return "Got your message — sounds like an electrical issue. What address should we come out to?"
-
-    # --- DEFAULT FALLBACK ---
-    if transcript:
-        trimmed = transcript.strip()
-        if len(trimmed) > 80:
-            trimmed = trimmed[:77] + "..."
-        return f'Got your message: "{trimmed}" — how can we help?'
-
-    return "Thanks for your message — what electrical work do you need help with?"
-
-
 # ---------------------------------------------------
 # Voice → Voicemail Completion
 # ---------------------------------------------------
@@ -6986,47 +6908,11 @@ def voicemail_complete():
     recording_url = request.form.get("RecordingUrl", "")
     from_number = request.form.get("From", "")
 
-    # ---------------------------------------------------
-    # Pull transcription if Twilio provides it
-    # ---------------------------------------------------
-    transcript = request.form.get("TranscriptionText", "")
-    transcript_lower = (transcript or "").lower()
-
-    # ---------------------------------------------------
-    # Very lightweight intent extraction
-    # ---------------------------------------------------
-    intent = "your electrical issue"  # default fallback
-
-    keywords = {
-        "outlet": "an outlet issue",
-        "switch": "a switch issue",
-        "lights": "a lighting issue",
-        "light": "a lighting issue",
-        "panel": "an electrical panel issue",
-        "breaker": "a breaker issue",
-        "no power": "a power-loss issue",
-        "power": "a power issue",
-        "ev": "an EV charger issue",
-        "charger": "an EV charger issue",
-        "generator": "a generator issue",
-        "inspection": "a home electrical inspection",
-        "smoke": "a burning or smoke smell",
-        "burning": "a burning smell",
-        "sparks": "a sparking hazard",
-    }
-
-    for key, value in keywords.items():
-        if key in transcript_lower:
-            intent = value
-            break
-
-    # ---------------------------------------------------
     # Store voicemail data + init conversation
-    # ---------------------------------------------------
     conversations[from_number] = {
         "voicemail_url": recording_url,
-        "initial_sms": transcript,
-        "cleaned_transcript": transcript,
+        "initial_sms": "",
+        "cleaned_transcript": "",
         "category": None,
         "appointment_type": None,
         "first_sms_time": time.time(),
@@ -7041,32 +6927,21 @@ def voicemail_complete():
         "state_prompt_sent": False,
     }
 
-    # ---------------------------------------------------
-    # Send premium kickoff SMS using extracted intent
-    # ---------------------------------------------------
+    # Kick off SMS workflow
     try:
-        sms_message = (
-            f"This is Prevolt Electric — I saw you called about {intent}. "
-            f"What’s the address and best time for the visit?"
+        send_sms(
+            from_number,
+            "Thanks for calling Prevolt Electric. Got your message — what electrical work do you need help with?"
         )
-        send_sms(from_number, sms_message)
-
     except Exception as e:
         print("Error sending SMS after voicemail:", repr(e))
 
-    # ---------------------------------------------------
-    # Voice response ending
-    # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
         '<speak><prosody rate="90%">Thanks, we received your message.</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
     response.hangup()
-
-    return Response(str(response), mimetype="text/xml")
-
-
 
 
 
