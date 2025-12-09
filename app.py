@@ -7098,7 +7098,7 @@ def build_kickoff_message(intent, transcript):
 # ---------------------------------------------------
 # Voice → Voicemail Completion (Recording + Transcription Safe)
 # ---------------------------------------------------
-@app.route("/voicemail-complete", methods=["POST"])
+@app.route("/This is Prevolt electric", methods=["POST"])
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse
     import re
@@ -7147,7 +7147,7 @@ def voicemail_complete():
         return " ".join(cleaned).capitalize()
 
     # ---------------------------------------------------
-    # TIER-4 ADDRESS INTELLIGENCE EXTRACTOR
+    # TIER-4 ADDRESS EXTRACTION + TOWN/STATE
     # ---------------------------------------------------
     def extract_address(text):
         if not text:
@@ -7169,9 +7169,8 @@ def voicemail_complete():
             "windsor locks", "windsor", "enfield", "granby", "east granby",
             "hartford", "bloomfield", "wethersfield", "west hartford",
             "suffield", "somers", "ellington", "vernon", "east windsor",
-            "tolland", "farmington",
-            "springfield", "chicopee", "holyoke", "west springfield",
-            "agawam", "longmeadow", "east longmeadow", "ludlow"
+            "tolland", "farmington", "springfield", "chicopee", "holyoke",
+            "west springfield", "agawam", "longmeadow", "east longmeadow", "ludlow"
         ]
 
         extracted_town = None
@@ -7237,7 +7236,6 @@ def voicemail_complete():
     recording_url = request.form.get("RecordingUrl", "")
     from_number = request.form.get("From", "")
     raw_transcript = request.form.get("TranscriptionText") or ""
-
     cleaned_transcript = clean_transcript_text(raw_transcript.lower().strip())
 
     print("DEBUG → Voicemail recording:", recording_url)
@@ -7245,35 +7243,26 @@ def voicemail_complete():
     print("DEBUG → Voicemail transcript (cleaned):", repr(cleaned_transcript))
 
     # ---------------------------------------------------
-    # GOOGLE MAPS STRUCTURED + CONFIDENCE CHECK
+    # GOOGLE AUTOCORRECTION + CONFIDENCE CHECK
     # ---------------------------------------------------
     def google_clean_address(raw_addr):
-        """
-        Returns (final_address, structured_address, needs_confirmation)
-        """
         if not raw_addr:
             return None, None, False
-
         try:
             status, struct = google_normalize_address(raw_addr)
-
             if status != "ok" or not struct:
                 return raw_addr, None, False
-
             google_addr = struct.get("full_address") or raw_addr
             confidence = struct.get("confidence", 1.0)
-
             if confidence < 0.80:
                 return google_addr, struct, True
-
             return google_addr, struct, False
-
         except Exception as e:
             print("Google validation failed:", repr(e))
             return raw_addr, None, False
 
     # ---------------------------------------------------
-    # Handle transcription callback updates
+    # Handle transcription callback
     # ---------------------------------------------------
     if from_number in conversations and raw_transcript:
         print("DEBUG → Updating transcript only (callback).")
@@ -7305,19 +7294,15 @@ def voicemail_complete():
     ]
     detected_emergency = any(k in cleaned_transcript.lower() for k in emergency_keywords)
 
-    # ---------------------------------------------------
-    # Extract address + intent
-    # ---------------------------------------------------
     extracted_address = extract_address(cleaned_transcript.lower())
     intent = extract_intent(cleaned_transcript.lower())
-
     if detected_emergency:
         intent = "a possible electrical hazard"
 
     final_address, structured_addr, needs_confirmation = google_clean_address(extracted_address)
 
     # ---------------------------------------------------
-    # Create conversation bucket
+    # Initialize conversation bucket
     # ---------------------------------------------------
     conversations[from_number] = {
         "voicemail_url": recording_url,
@@ -7339,7 +7324,7 @@ def voicemail_complete():
     }
 
     # ---------------------------------------------------
-    # Build premium kickoff SMS (with confirmation logic)
+    # Kickoff SMS — emergency aware + address aware
     # ---------------------------------------------------
     try:
         if detected_emergency:
@@ -7353,12 +7338,11 @@ def voicemail_complete():
         if final_address:
             if needs_confirmation:
                 sms += (
-                    f"I found an address match as '{final_address}', but I need to confirm — "
-                    f"is this the correct address for your visit?"
+                    f"I found an address match as '{final_address}', but need to confirm — "
+                    f"is this correct?"
                 )
             else:
-                sms += f"I have your address as {final_address}. "
-                sms += "What’s the best time for the visit?"
+                sms += f"I have your address as {final_address}. What’s the best time for the visit?"
         else:
             sms += "What’s the address and best time for the visit?"
 
@@ -7368,7 +7352,7 @@ def voicemail_complete():
         print("Error sending kickoff SMS:", repr(e))
 
     # ---------------------------------------------------
-    # Voice goodbye
+    # Voice Goodbye
     # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
@@ -7384,6 +7368,7 @@ def voicemail_complete():
 
 
 
+
 # ---------------------------------------------------
 # Incoming SMS / WhatsApp
 # ---------------------------------------------------
@@ -7392,13 +7377,15 @@ def incoming_sms():
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
-    # Normalize Twilio's WhatsApp prefix
+    # Normalize Twilio’s WhatsApp prefix
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
 
     convo = conversations.get(from_number)
 
-    # Cold inbound with no voicemail history
+    # ---------------------------------------------------
+    # COLD INBOUND (NO VOICEMAIL FOUND)
+    # ---------------------------------------------------
     if not convo:
         resp = MessagingResponse()
         resp.message(
@@ -7407,7 +7394,25 @@ def incoming_sms():
         )
         return Response(str(resp), mimetype="text/xml")
 
-    # Handle CT/MA reply after we asked specifically
+    # ------------------------------------------------------------
+    # PREVENT DOUBLE-INTRO AFTER VOICEMAIL
+    # ------------------------------------------------------------
+    # If voicemail already triggered a kickoff SMS,
+    # the FIRST inbound reply should NOT trigger generate_reply_for_inbound().
+    if convo.get("voicemail_url") and not convo.get("has_processed_first_inbound"):
+        convo["has_processed_first_inbound"] = True
+
+        resp = MessagingResponse()
+        if convo.get("address"):
+            resp.message("Got it — what time works best for your visit?")
+        else:
+            resp.message("Got it — what's the full address for the visit?")
+
+        return Response(str(resp), mimetype="text/xml")
+
+    # ---------------------------------------------------
+    # Handle CT/MA reply after we specifically asked
+    # ---------------------------------------------------
     if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
         upper = body.upper()
         if "CT" in upper or "CONNECTICUT" in upper:
@@ -7421,6 +7426,7 @@ def incoming_sms():
 
         raw_address = convo.get("address")
         status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
+
         if status != "ok" or not addr_struct:
             resp = MessagingResponse()
             resp.message(
@@ -7433,15 +7439,13 @@ def incoming_sms():
         convo["normalized_address"] = addr_struct
         convo["state_prompt_sent"] = False
 
-        # Attempt booking now that we have a fully normalized address
+        # Try booking
         try:
             maybe_create_square_booking(from_number, convo)
         except Exception as e:
             print("maybe_create_square_booking after CT/MA reply failed:", repr(e))
 
-        # ------------------------------------------------------------
-        # FINAL BOOKING CONFIRMATION (SEND ONCE, NEVER AGAIN)
-        # ------------------------------------------------------------
+        # Final booking confirmation
         if convo.get("booking_created") and not convo.get("booking_finalized"):
 
             def convert_to_ampm(hhmm):
@@ -7453,9 +7457,7 @@ def incoming_sms():
             appt_date = convo.get("scheduled_date")
             appt_time = convert_to_ampm(convo.get("scheduled_time"))
 
-            final_msg = (
-                f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
-            )
+            final_msg = f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
 
             convo["booking_finalized"] = True
 
@@ -7467,7 +7469,9 @@ def incoming_sms():
         resp.message("Thanks — that helps. We have everything we need for your visit.")
         return Response(str(resp), mimetype="text/xml")
 
-    # Normal conversational flow
+    # ---------------------------------------------------
+    # NORMAL CONVERSATIONAL FLOW
+    # ---------------------------------------------------
     convo["replied"] = True
 
     ai_reply = generate_reply_for_inbound(
@@ -7483,6 +7487,7 @@ def incoming_sms():
 
     sms_body = ai_reply.get("sms_body", "").strip()
 
+    # Update convo state
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
     if ai_reply.get("scheduled_time"):
@@ -7490,15 +7495,13 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # Attempt booking once we have a complete date + time + address
+    # Attempt booking
     try:
         maybe_create_square_booking(from_number, convo)
     except Exception as e:
         print("maybe_create_square_booking failed:", repr(e))
 
-    # ------------------------------------------------------------
-    # FINAL BOOKING CONFIRMATION (SEND ONCE, NEVER AGAIN)
-    # ------------------------------------------------------------
+    # Final confirmation once
     if convo.get("booking_created") and not convo.get("booking_finalized"):
 
         def convert_to_ampm(hhmm):
@@ -7510,9 +7513,7 @@ def incoming_sms():
         appt_date = convo.get("scheduled_date")
         appt_time = convert_to_ampm(convo.get("scheduled_time"))
 
-        final_msg = (
-            f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
-        )
+        final_msg = f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
 
         convo["booking_finalized"] = True
 
@@ -7520,13 +7521,14 @@ def incoming_sms():
         resp.message(final_msg)
         return Response(str(resp), mimetype="text/xml")
 
-    # If final confirmation matched → stop responding
+    # If AI gives no content → stop
     if sms_body == "":
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
     resp = MessagingResponse()
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
+
 
 
 # ---------------------------------------------------
