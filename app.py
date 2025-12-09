@@ -541,33 +541,30 @@ Never repeat it.
 ### Rule 1.10 — No Reversion to Non-Emergency Logic
 Once emergency logic is active, the OS must never use non-emergency time rules.
 
-### Rule 1.11 — Customer Provides a Time = Immediate Acceptance
-A time is considered **explicit** only when the customer provides a clear, 
-specific time expression such as:
+### Rule 1.11A — Time-of-Day Phrases Are NOT Explicit Times
+The following phrases MUST NOT be treated as explicit times:
 
-• “5pm”, “5:00”, “5:30”
-• “after 1”, “around 2”, “3:30”
-• “noon”, “midday”
-• “this afternoon at 2”
-• “later today at 1”
+• “today”
+• “this morning”
+• “this afternoon”
+• “this evening”
+• “later today”
+• “sometime today”
+• “later on”
+• “I’m around today”
+• “I’ll be home this afternoon”
+• “today works”
+• “I’m available today”
 
-The following phrases are **NOT explicit times** and must NOT trigger 
-time acceptance or immediate confirmation:
+These indicate **date only**, not a specific time.
 
-• “anytime”
-• “whenever”
-• “as soon as possible”
-• “later”
-• “sometime”
-• “you pick a time”
-• “whenever works”
+When they appear:
+→ scheduled_date may be set (TODAY)  
+→ scheduled_time must remain unset  
+→ OS MUST ask: “What time works for you?”  
+→ OS must NOT auto-select a time (e.g., 3:00 PM or 3:30 PM).
 
-For explicit times:
-→ Extract → convert → save → move immediately to address collection.
 
-For ambiguous/vague times:
-→ Follow Section 1 logic:
-   Ask once for missing field → then apply Rule 1.29 defaults.
 
 ### SRB-1.A — Ambiguous Time Phrases Do NOT Count as Times
 The following phrases must NOT be treated as explicit times:
@@ -6806,19 +6803,25 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
     response = VoiceResponse()
+
+    # Use a natural, human-sounding neural voice
     response.say(
         "Thanks for calling Prevolt Electric. "
         "Please leave your name, address, and a brief description of your project. "
-        "We will text you shortly."
+        "We will text you shortly.",
+        voice="Polly.Joanna-Neural"
     )
+
     response.record(
         max_length=60,
         play_beep=True,
         trim="do-not-trim",
         action="/voicemail-complete",
     )
+
     response.hangup()
     return Response(str(response), mimetype="text/xml")
+
 
 
 # ---------------------------------------------------
