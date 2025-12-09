@@ -6816,8 +6816,8 @@ def incoming_call():
     # FULL SSML — Slowed down + pauses + Matthew voice
     gather.say(
         '<speak>'
-            '<prosody rate="90%">'
-                'Thanks for calling Preavolt Electric.<break time="0.7s"/>'
+            '<prosody rate="95%">'
+                'Thanks for calling PREE-volt Electric.<break time="0.7s"/>'
                 'To help us direct your call, please choose an option.<break time="0.6s"/>'
                 'If you are a residential customer, press 1.<break time="0.6s"/>'
                 'If you are a commercial, government, or facility customer, press 2.'
@@ -6830,7 +6830,7 @@ def incoming_call():
 
     # No input → replay menu
     response.say(
-        '<speak><prosody rate="90%">Sorry, I did not get that. Let me repeat the options.</prosody></speak>',
+        '<speak><prosody rate="95%">Sorry, I did not get that. Let me repeat the options.</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
     response.redirect("/incoming-call")
@@ -6854,8 +6854,8 @@ def handle_call_selection():
     if digit == "1":
         response.say(
             '<speak>'
-                '<prosody rate="90%">'
-                    'Welcome to Preavolt Electric’s premium residential service desk.<break time="0.7s"/>'
+                '<prosody rate="95%">'
+                    'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
                     'You’ll leave a quick message, and our team will text you right away to assist.<break time="0.8s"/>'
                     'Please leave your name,<break time="0.4s"/> your address,<break time="0.4s"/> '
                     'and a brief description of what you need help with.<break time="0.6s"/>'
