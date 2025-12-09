@@ -6968,7 +6968,7 @@ def incoming_call():
         method="POST"
     )
 
-    # FULL SSML — Slowed down + pauses + Matthew voice
+    # FULL SSML — Matthew voice with natural pacing
     gather.say(
         '<speak>'
             '<prosody rate="95%">'
@@ -7020,11 +7020,14 @@ def handle_call_selection():
             voice="Polly.Matthew-Neural"
         )
 
+        # ENABLE TRANSCRIPTION
         response.record(
             max_length=60,
             play_beep=True,
             trim="do-not-trim",
-            action="/voicemail-complete",
+            action="/voicemail-complete",             # Called after recording
+            transcribe=True,                          # <<< Enables transcription
+            transcribe_callback="/voicemail-complete" # <<< Transcript also sent here
         )
 
         response.hangup()
@@ -7038,7 +7041,7 @@ def handle_call_selection():
             '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
             voice="Polly.Matthew-Neural"
         )
-        response.dial("+15555555555")  # Replace with your real number
+        response.dial("+15555555555")  # Replace with your real direct number
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
@@ -7067,7 +7070,6 @@ def build_kickoff_message(intent, transcript):
     appt = intent.get("appointment_type")
 
     # --- CATEGORY-BASED INTRO LOGIC ---
-
     if category == "panel_upgrade":
         return "Got your message about the electrical panel upgrade. What town is the project in?"
 
@@ -7094,20 +7096,30 @@ def build_kickoff_message(intent, transcript):
 
 
 # ---------------------------------------------------
-# Voice → Voicemail Completion
+# Voice → Voicemail Completion (Recording + Transcription Safe)
 # ---------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse
 
+    # -------------------------------------------
+    # Extract common fields (may vary by webhook type)
+    # -------------------------------------------
     recording_url = request.form.get("RecordingUrl", "")
     from_number = request.form.get("From", "")
+    transcript = request.form.get("TranscriptionText") or ""
+    transcript_lower = transcript.lower().strip()
 
-    # ---------------------------------------------------
-    # Pull transcription if Twilio provides it
-    # ---------------------------------------------------
-    transcript = request.form.get("TranscriptionText", "") or ""
-    transcript_lower = transcript.lower()
+    print("DEBUG → Voicemail recording:", recording_url)
+    print("DEBUG → Voicemail transcript:", repr(transcript))
+
+    # If this is ONLY the transcription callback
+    # and conversation already exists → update transcript and exit cleanly.
+    if from_number in conversations and transcript:
+        print("DEBUG → Updating transcript only (transcription callback).")
+        conversations[from_number]["initial_sms"] = transcript
+        conversations[from_number]["cleaned_transcript"] = transcript
+        return Response("OK", mimetype="text/plain")
 
     # ---------------------------------------------------
     # Rule 1.43.9 — Emergency-intent auto-classification
@@ -7125,17 +7137,19 @@ def voicemail_complete():
     detected_emergency = any(k in transcript_lower for k in emergency_keywords)
 
     # ---------------------------------------------------
-    # Lightweight address extraction attempt
+    # Lightweight Address Extraction (best-effort)
     # ---------------------------------------------------
     import re
-    address_match = re.search(r"\d{1,5} .+?(ct|street|st|road|rd|lane|ln|ave|avenue|blvd|drive|dr|circle|cir)\b",
-                              transcript_lower)
+    address_match = re.search(
+        r"\d{1,5} [A-Za-z0-9 .'-]+(?:street|st|road|rd|lane|ln|ave|avenue|blvd|drive|dr|circle|cir|ct)\b",
+        transcript_lower
+    )
     extracted_address = address_match.group(0) if address_match else None
 
     # ---------------------------------------------------
-    # Lightweight intent extraction
+    # Lightweight Intent Extraction
     # ---------------------------------------------------
-    intent = "your electrical issue"  # fallback
+    intent = "your electrical issue"
 
     keywords = {
         "outlet": "an outlet issue",
@@ -7152,7 +7166,7 @@ def voicemail_complete():
         "inspection": "a home electrical inspection",
         "smoke": "a burning or smoke smell",
         "burning": "a burning smell",
-        "sparks": "a sparking hazard"
+        "sparks": "a sparking hazard",
     }
 
     for key, value in keywords.items():
@@ -7160,21 +7174,18 @@ def voicemail_complete():
             intent = value
             break
 
-    # If emergency, override intent wording
     if detected_emergency:
         intent = "a possible electrical hazard"
 
     # ---------------------------------------------------
-    # Store voicemail data + init conversation
+    # Initialize or overwrite conversation bucket
     # ---------------------------------------------------
     conversations[from_number] = {
         "voicemail_url": recording_url,
         "initial_sms": transcript,
         "cleaned_transcript": transcript,
         "category": None,
-        "appointment_type": (
-            "TROUBLESHOOT_395" if detected_emergency else None
-        ),
+        "appointment_type": "TROUBLESHOOT_395" if detected_emergency else None,
         "first_sms_time": time.time(),
         "replied": False,
         "followup_sent": False,
@@ -7188,28 +7199,27 @@ def voicemail_complete():
     }
 
     # ---------------------------------------------------
-    # Build premium kickoff SMS (emergency-aware)
+    # Build premium kickoff SMS
     # ---------------------------------------------------
     try:
         if detected_emergency:
-            # Emergency SMS tone (Rule 1.43.9)
             sms_message = (
                 "This is Prevolt Electric — I saw your message about a possible electrical hazard. "
                 "Let’s get you taken care of. "
             )
         else:
-            sms_message = (
-                f"This is Prevolt Electric — I saw you called about {intent}. "
-            )
+            sms_message = f"This is Prevolt Electric — I saw you called about {intent}. "
 
-        # If address was extracted → include it
+        # Address-awareness in first message
         if extracted_address:
             sms_message += f"I have your address as {extracted_address}. "
 
-        # Always close with request for missing fields
-        sms_message += "What’s the address and best time for the visit?" \
-            if not extracted_address else \
+        # Missing field logic
+        sms_message += (
             "What’s the best time for the visit?"
+            if extracted_address
+            else "What’s the address and best time for the visit?"
+        )
 
         send_sms(from_number, sms_message)
 
@@ -7217,7 +7227,7 @@ def voicemail_complete():
         print("Error sending SMS after voicemail:", repr(e))
 
     # ---------------------------------------------------
-    # Voice response ending (Matthew Neural slowed)
+    # Voice response ending
     # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
