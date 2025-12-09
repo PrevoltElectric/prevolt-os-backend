@@ -6152,7 +6152,7 @@ OS must:
 6. OS must move directly to:
    - collecting address, or
    - final confirmation if address already collected.
-
+"""
         # ---------------------------------------------------
         # INSERTED OPTION A — VOICEMAIL INTENT/TOWN/PARTIAL ADDRESS INJECTION
         # ---------------------------------------------------
@@ -6244,9 +6244,6 @@ OUTPUT FORMAT (STRICT JSON)
                 model_date = today_patch
 
         # ---------- OPTION A1 — EMERGENCY TIME W/ NO DATE FIX ----------
-        # Only applies to TROUBLESHOOT_395
-        # Only fires when LLM gave us a time but no date
-        # Zero override of time, zero emergency forcing
         appointment_type_lower = str(appointment_type).lower()
         if (model_time and not model_date and
                 appointment_type_lower == "troubleshoot_395"):
@@ -6311,6 +6308,7 @@ OUTPUT FORMAT (STRICT JSON)
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
 
 
 
