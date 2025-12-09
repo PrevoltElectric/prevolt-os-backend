@@ -3,7 +3,6 @@ import json
 import time
 import uuid
 import requests
-import re
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
@@ -12,10 +11,10 @@ from twilio.rest import Client
 from openai import OpenAI
 
 try:
+    # Python 3.9+
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
-
 
 # ---------------------------------------------------
 # Environment & Clients
@@ -78,41 +77,29 @@ conversations = {}
 #   "state_prompt_sent": bool,
 # }
 
-# ---------------------------------------------------
-# Dispatch origin (fallback starting point for tech)
-# ---------------------------------------------------
-DISPATCH_ORIGIN_ADDRESS = "45 Dickerman Ave, Windsor Locks, CT 06096"
-TECH_CURRENT_ADDRESS = None  # Override dynamically if needed
-
 
 # ---------------------------------------------------
-# Utility: Send outbound message via WhatsApp Sandbox
+# Utility: Send outbound message via WhatsApp (testing)
 # ---------------------------------------------------
 def send_sms(to_number: str, body: str) -> None:
     """
-    Sends outbound messages to WhatsApp Sandbox for testing.
-    The caller MUST join the sandbox before receiving messages.
+    For now, force all outbound messages to WhatsApp sandbox to your cell
+    so you can test end-to-end without A2P headaches.
     """
-
     if not twilio_client:
         print("Twilio not configured; WhatsApp message not sent.")
         print("Intended WhatsApp message:", body)
         return
 
     try:
-        # Normalize "to" field → must be whatsapp:+1XXXXXXXXXX
-        to_number = to_number.replace("whatsapp:", "")
-        to_number = f"whatsapp:{to_number}"
-
-        # Your WhatsApp Sandbox From Number
-        whatsapp_from = "whatsapp:+14155238886"
+        whatsapp_from = "whatsapp:+14155238886"  # Twilio Sandbox
+        whatsapp_to = "whatsapp:+18609701727"    # <-- YOUR CELL
 
         msg = twilio_client.messages.create(
             body=body,
             from_=whatsapp_from,
-            to=to_number,
+            to=whatsapp_to,
         )
-
         print("WhatsApp sent. SID:", msg.sid)
 
     except Exception as e:
@@ -191,46 +178,113 @@ def clean_transcript_text(raw_text: str) -> str:
         return raw_text
 
 
-# ===================================================
-# MASTER PRIORITIZATION LAYER RULES (GLOBAL VARIABLE)
-# ===================================================
-MPL_RULES = """
-### MPL-1 — Extract intent
-The OS must always detect whether the customer is giving date, time, address, confirmation, or new info.
 
-### MPL-2 — Move forward
-The OS must always move toward completing the booking, never backward.
+# ---------------------------------------------------
+# Step 3 — Generate Initial SMS (Ultra-Deterministic Classifier)
+# ---------------------------------------------------
+def generate_initial_sms(cleaned_text: str) -> dict:
+    try:
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
+                        "Your job is to classify the voicemail into EXACTLY ONE appointment type.\n\n"
+                        "APPOINTMENT TYPE RULES (DO NOT GUESS):\n"
+                        "1. TROUBLESHOOT_395 = ANY active problem, urgent issue, outage, burning smell, fire, "
+                        "   wires down, tree damage, main wires pulled, breaker tripping, no power, partial power, "
+                        "   anything dangerous, anything affecting existing equipment.\n"
+                        "2. WHOLE_HOME_INSPECTION = ONLY when caller explicitly says: "
+                        "   'inspection', 'whole home inspection', 'electrical inspection', "
+                        "   or requests a safety inspection for insurance or buying a home.\n"
+                        "3. EVAL_195 = Quotes, upgrades, installs, adding circuits, panel upgrades, EV chargers, "
+                        "   generator installs, renovations, pricing requests, or non-emergency consultations.\n\n"
+                        "NEVER misclassify outages as inspections or evals. When in doubt between eval and troubleshoot → choose TROUBLESHOOT.\n"
+                        "NEVER soften or second-guess. Use hard classification logic ONLY based on the voicemail.\n\n"
+                        "SMS RULES:\n"
+                        "• Must begin with: 'Hi, this is Prevolt Electric —'\n"
+                        "• Mention the price ONCE.\n"
+                        "• No small talk, no emojis, no fluff.\n"
+                        "• Do NOT ask them to repeat the voicemail.\n\n"
+                        "Return STRICT JSON: {sms_body, category, appointment_type}."
+                    ),
+                },
+                {"role": "user", "content": cleaned_text},
+            ],
+        )
 
-### MPL-3 — No repetition
-Never ask for anything that the OS already has stored.
+        data = json.loads(completion.choices[0].message.content)
 
-### MPL-4 — Only ask the missing piece
-If OS has date + address → ask time.
-If OS has time + address → ask date.
-If OS has date + time → ask address.
-If all three → finalize.
+        return {
+            "sms_body": data["sms_body"].strip(),
+            "category": data["category"],
+            "appointment_type": data["appointment_type"],
+        }
 
-### MPL-5 — Confirmations end the conversation
-If user says “yes”, “confirmed”, “sounds good”, “ok perfect” → OS sends **no further messages**.
+    except Exception as e:
+        print("Initial SMS FAILED:", repr(e))
+        return {
+            "sms_body": (
+                "Hi, this is Prevolt Electric — I received your message. "
+                "The next step is a $195 on-site consultation and quote visit. "
+                "What day works for you?"
+            ),
+            "category": "OTHER",
+            "appointment_type": "EVAL_195",
+        }
 
-### MPL-6 — Extract date/time/address automatically
-The OS must read natural language and auto-fill:
-• scheduled_date
-• scheduled_time
-• address
 
-### MPL-7 — Keep messages short
-No fluff, no filler, no emojis.
+    # ----------------------------------------
+    # NON-EMERGENCY → Use LLM classification
+    # ----------------------------------------
+    try:
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
+                        "Generate ONLY the FIRST outbound SMS after reading voicemail.\n\n"
+                        "Rules:\n"
+                        "• MUST start with: 'Hi, this is Prevolt Electric —'\n"
+                        "• NEVER ask customer to repeat their voicemail.\n"
+                        "• Determine correct appointment type:\n"
+                        "   - Installs/quotes/upgrades → EVAL_195\n"
+                        "   - Active problems (non-emergency) → TROUBLESHOOT_395\n"
+                        "   - Whole home inspection → WHOLE_HOME_INSPECTION\n"
+                        "• Mention price once only.\n"
+                        "• No photos. No AI mentions. No Kyle.\n\n"
+                        "Return STRICT JSON with keys: sms_body, category, appointment_type."
+                    ),
+                },
+                {"role": "user", "content": cleaned_text},
+            ],
+        )
 
-### MPL-8 — High-trust emergency handling
-If issue is urgent, OS must expedite the flow and skip any irrelevant steps.
+        data = json.loads(completion.choices[0].message.content)
 
-### MPL-9 — Resolve customer confusion
-If customer asks questions, answer once, then return to scheduling.
+        return {
+            "sms_body": data["sms_body"].strip(),
+            "category": data["category"],
+            "appointment_type": data["appointment_type"],
+        }
 
-### MPL-10 — Safety override
-If message implies danger, OS prioritizes dispatch workflow.
-"""
+    except Exception as e:
+        print("Initial SMS FAILED:", repr(e))
+        return {
+            "sms_body": (
+                "Hi, this is Prevolt Electric — I received your message. "
+                "The next step is a $195 on-site consultation and quote visit. "
+                "What day works for you?"
+            ),
+            "category": "OTHER",
+            "appointment_type": "EVAL_195",
+        }
+
+
 
 # ---------------------------------------------------
 # Step 3 — Generate Initial SMS
@@ -282,788 +336,8 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 
 # ---------------------------------------------------
-# NON-EMERGENCY SAME-DAY AVAILABILITY HELPERS
+# Step 4 — Generate Replies (THE BRAIN)
 # ---------------------------------------------------
-
-def get_today_available_slot(appointment_type: str) -> str | None:
-    """
-    Returns the earliest available HH:MM time slot TODAY from Square calendar.
-    Returns None if there is no remaining availability today.
-    """
-
-    try:
-        # This function calls your existing Square query helper:
-        # get_square_availability(date_str, appointment_type)
-        # which MUST already exist in your project.
-
-        tz = ZoneInfo("America/New_York")
-        now_local = datetime.now(tz)
-        today = now_local.strftime("%Y-%m-%d")
-
-        slots = get_square_availability(today, appointment_type)
-
-        if not slots:
-            return None
-
-        # Filter out times that have already passed today
-        valid = []
-        for t in slots:
-            slot_dt = datetime.strptime(f"{today} {t}", "%Y-%m-%d %H:%M")
-            if slot_dt > now_local:
-                valid.append(t)
-
-        if not valid:
-            return None
-
-        # Earliest valid slot
-        return sorted(valid)[0]
-
-    except Exception as e:
-        print("get_today_available_slot FAILED:", repr(e))
-        return None
-
-
-
-def get_next_available_day_slot(appointment_type: str):
-    """
-    Finds the next day with ANY availability.
-    Returns tuple: (YYYY-MM-DD, HH:MM)
-    """
-
-    try:
-        tz = ZoneInfo("America/New_York")
-        now_local = datetime.now(tz)
-
-        for offset in range(1, 10):  # search next 10 days
-            day = (now_local + timedelta(days=offset)).strftime("%Y-%m-%d")
-            slots = get_square_availability(day, appointment_type)
-
-            if slots:
-                early = sorted(slots)[0]
-                return (day, early)
-
-        return None
-
-    except Exception as e:
-        print("get_next_available_day_slot FAILED:", repr(e))
-        return None
-
-
-
-
-
-# ---------------------------------------------------
-# EMERGENCY TRAVEL-TIME ARRIVAL (ALREADY IN YOUR CODE)
-# ---------------------------------------------------
-
-def compute_emergency_arrival_time(now_local, travel_minutes):
-    """
-    Maintains your existing emergency logic.
-    Always rounds to next 5-minute mark.
-    """
-    if travel_minutes is None:
-        travel_minutes = 20
-
-    eta = now_local + timedelta(minutes=travel_minutes)
-
-    minute = (eta.minute + 4) // 5 * 5
-    if minute == 60:
-        eta = eta.replace(hour=eta.hour+1, minute=0)
-    else:
-        eta = eta.replace(minute=minute)
-
-    return eta.strftime("%H:%M")
-# ---------------------------------------------------
-# Address Normalization Helper (Safe & Lightweight)
-# ---------------------------------------------------
-import re
-
-def normalize_possible_address(text: str):
-    """
-    Attempts to extract a street address from customer text.
-    Returns a minimal normalized structure if confident,
-    otherwise returns None.
-
-    This is intentionally lightweight because Section 4 logic
-    only needs enough structure for travel-time & Square booking.
-    """
-
-    if not text:
-        return None
-
-    t = text.strip().lower()
-
-    # Basic pattern: number + street name + suffix
-    pattern = r"(\d{1,6}[a-zA-Z]?)\s+([a-zA-Z0-9\s]+?)\s+(st|street|rd|road|ave|avenue|blvd|dr|drive|ln|lane|ct|court)"
-    match = re.search(pattern, t)
-
-    if not match:
-        return None
-
-    number = match.group(1).strip()
-    street = match.group(2).strip().title()
-    suffix = match.group(3).strip().title()
-
-    full = f"{number} {street} {suffix}"
-
-    return {
-        "number": number,
-        "street": street,
-        "suffix": suffix,
-        "full": full,
-    }
-
-# ====================================================================
-# MISSING HELPERS REQUIRED BY SECTION 4 (SAFE MINIMAL VERSIONS)
-# ====================================================================
-
-
-# ---------------------------------------------------
-# Format address for travel-time logic
-# ---------------------------------------------------
-def format_full_address(norm: dict) -> str:
-    """
-    Returns a safe human-readable address string.
-    """
-    if not norm:
-        return ""
-    line = norm.get("address_line_1") or norm.get("full") or ""
-    loc = norm.get("locality") or ""
-    st  = norm.get("administrative_district_level_1") or ""
-    zipc = norm.get("postal_code") or ""
-
-    return f"{line}, {loc} {st} {zipc}".strip(", ").strip()
-
-
-
-# ---------------------------------------------------
-# Finalization readiness checker
-# ---------------------------------------------------
-def ready_to_finalize(conv, scheduled_date, scheduled_time, address):
-    """
-    Returns True if all fields required for booking are present.
-    """
-    if not conv:
-        return False
-
-    if not (scheduled_date and scheduled_time and address):
-        return False
-
-    if not conv.get("appointment_type"):
-        return False
-
-    return True
-
-
-# ---------------------------------------------------
-# Dispatch constants (safe defaults)
-# ---------------------------------------------------
-TECH_CURRENT_ADDRESS = "1 Granby CT"          # can be replaced with live GPS later
-DISPATCH_ORIGIN_ADDRESS = "1 Granby CT"       # fallback dispatch origin
-
-# ====================================================================
-#                    >>>>>  SECTION 4 FULLY PATCHED  <<<<<
-# ====================================================================
-
-import json
-import re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
-
-# ---------------------------------------------------
-# Boolean Helper
-# ---------------------------------------------------
-def contains_any(msg, terms):
-    return any(t in msg for t in terms)
-
-
-# ---------------------------------------------------
-# Confirmation Helper
-# ---------------------------------------------------
-def is_customer_confirmation(msg):
-    confirmations = [
-        "yes", "sounds good", "that works",
-        "ok", "okay", "perfect", "confirm"
-    ]
-    msg = msg.lower().strip()
-    return any(c == msg or c in msg for c in confirmations)
-
-
-# ---------------------------------------------------
-# Address Detector
-# ---------------------------------------------------
-def is_customer_address_only(text: str) -> bool:
-    text = text.lower().strip()
-
-    if not re.search(r"\b\d{1,5}\b", text):
-        return False
-
-    cleaned = re.sub(
-        r"\b(in|at|on|by|my|is|the|we|live|lives|are|i|am|it's|its|address|addr|please|pls|come|to)\b",
-        "",
-        text,
-    ).strip()
-
-    return bool(re.search(r"\b\d{1,5}\s+[a-z]+", cleaned))
-
-
-# ---------------------------------------------------
-# Basic Lightweight Address Parse
-# ---------------------------------------------------
-def normalize_possible_address(text: str):
-    if not text:
-        return None
-
-    t = text.lower()
-    pattern = r"(\d{1,6}[a-z]?)\s+([a-z0-9\s]+?)\s+(st|street|rd|road|ave|avenue|blvd|ln|lane|dr|drive|ct|court)"
-    m = re.search(pattern, t)
-    if not m:
-        return None
-
-    num = m.group(1).title()
-    street = m.group(2).title()
-    suf = m.group(3).title()
-    full = f"{num} {street} {suf}"
-
-    return {
-        "address_line_1": full,
-        "locality": None,
-        "administrative_district_level_1": None,
-        "postal_code": None,
-    }
-
-
-# ---------------------------------------------------
-# Prompt Builder
-# ---------------------------------------------------
-def build_llm_prompt(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    scheduled_date,
-    scheduled_time,
-    address,
-    today_date_str,
-    today_weekday
-):
-    return f"""
-You are Prevolt OS, the SMS assistant for Prevolt Electric.
-Follow internal SRB rules only. Output MUST be strict JSON.
-"""
-
-
-# ====================================================================
-# SRB-12 — Natural Language Date/Time Parsing
-# ====================================================================
-def parse_natural_datetime(text: str, now_local) -> dict:
-    t = text.lower().strip()
-    today = now_local.date()
-    tomorrow = today + timedelta(days=1)
-
-    out = {"has_datetime": False, "date": None, "time": None}
-
-    if "tomorrow" in t:
-        out["date"] = tomorrow.strftime("%Y-%m-%d")
-        out["has_datetime"] = True
-    elif "today" in t:
-        out["date"] = today.strftime("%Y-%m-%d")
-        out["has_datetime"] = True
-
-    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t)
-    if m:
-        h = int(m.group(1))
-        minute = int(m.group(2) or 0)
-        ampm = m.group(3)
-
-        if ampm == "pm" and h != 12:
-            h += 12
-        if ampm == "am" and h == 12:
-            h = 0
-
-        if 0 <= h <= 23:
-            out["time"] = f"{h:02d}:{minute:02d}"
-            out["has_datetime"] = True
-
-    return out
-
-
-# ====================================================================
-# SRB-13 — State Machine
-# ====================================================================
-def get_current_state(conv: dict) -> str:
-    if not conv:
-        return "new_job"
-    if not conv.get("appointment_type"):
-        return "need_type"
-    if not conv.get("address"):
-        return "need_address"
-    if not conv.get("scheduled_date"):
-        return "need_date"
-    if not conv.get("scheduled_time"):
-        return "need_time"
-    return "ready"
-
-
-def enforce_state_lock(state: str, conv: dict):
-    if conv.get("final_confirmation_sent"):
-        return {
-            "interrupt": True,
-            "reply": {
-                "sms_body": "",
-                "scheduled_date": conv.get("scheduled_date"),
-                "scheduled_time": conv.get("scheduled_time"),
-                "address": conv.get("address"),
-            }
-        }
-    return {"interrupt": False}
-
-
-# ====================================================================
-# SRB-14 — Human Intent Interpreter
-# ====================================================================
-def srb14_interpret_human_intent(conv: dict, inbound_lower: str):
-
-    aff = [
-        "yes", "yeah", "yep", "sure", "sounds good", "that works",
-        "ok", "okay", "perfect", "please come", "come today"
-    ]
-    if any(a in inbound_lower for a in aff):
-        conv["intent_affirm"] = True
-
-    avail = [
-        "i'm home", "im home", "home now", "at the house",
-        "here now", "someone is here", "i'm available",
-        "available now", "available today"
-    ]
-    if any(a in inbound_lower for a in avail):
-        conv["intent_available"] = True
-
-    today_terms = ["today", "later today", "this afternoon", "this morning"]
-    if any(t in inbound_lower for t in today_terms):
-        conv["intent_today"] = True
-
-    emergencies = ["no power", "partial power", "fire", "sparks", "smoke", "burning", "tree", "arcing"]
-    if any(e in inbound_lower for e in emergencies):
-        return None
-
-    if conv.get("intent_affirm") and conv.get("intent_available") and not conv.get("scheduled_date"):
-        return {"sms_body": "Got it — what day would you like us to come out?"}
-
-    if conv.get("intent_affirm") and not conv.get("address"):
-        return {"sms_body": "Perfect — what’s the full service address?"}
-
-    if conv.get("intent_affirm") and conv.get("scheduled_date") and not conv.get("scheduled_time"):
-        return {"sms_body": f"What time works for your visit on {conv['scheduled_date']}?"}
-
-    return None
-
-
-# ====================================================================
-# Google Address Normalization (stub wrapper)
-# ====================================================================
-def try_normalize_with_google(raw: str):
-    if not raw:
-        return None
-
-    base = normalize_possible_address(raw)
-    if not base:
-        return None
-
-    return {
-        "address_line_1": base["address_line_1"],
-        "locality": None,
-        "administrative_district_level_1": None,
-        "postal_code": None,
-    }
-
-
-def normalize_address(raw: str):
-    try:
-        parsed = try_normalize_with_google(raw)
-        if parsed is None:
-            return ("error", None)
-
-        if not parsed.get("administrative_district_level_1"):
-            return ("needs_state", parsed)
-
-        return ("ok", parsed)
-    except:
-        return ("error", None)
-
-
-# ====================================================================
-# ADDRESS INTAKE ENGINE — MUST RUN BEFORE EMERGENCY
-# ====================================================================
-def handle_address_intake(conv, inbound_text, inbound_lower, scheduled_date, scheduled_time, address):
-
-    if not is_customer_address_only(inbound_lower):
-        return None
-
-    clean = inbound_text.strip()
-    conv["address"] = clean
-
-    status, parsed = normalize_address(clean)
-
-    if status == "ok":
-        conv["normalized_address"] = parsed
-        return None
-
-    if status == "needs_state":
-        if not conv.get("state_prompt_sent"):
-            conv["state_prompt_sent"] = True
-            return {
-                "sms_body": "Just confirming — is that address in Connecticut or Massachusetts?",
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": clean,
-            }
-
-        return {
-            "sms_body": "Connecticut or Massachusetts?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": clean,
-        }
-
-    conv["normalized_address"] = None
-    return None
-
-
-# ====================================================================
-# EMERGENCY ENGINE — RUNS AFTER ADDRESS INTAKE
-# ====================================================================
-def handle_emergency(conv, category, inbound_lower, address, now_local,
-                     today_date_str, scheduled_date, scheduled_time, phone):
-
-    emergency_terms = [
-        "no power", "partial power", "tree hit", "tree took",
-        "tree took my wires", "wires pulled off", "power line down",
-        "burning smell", "smoke smell", "fire", "sparks",
-        "melted outlet", "melted plug", "buzzing panel",
-        "arcing", "breaker arcing", "breaker won't reset", "breaker wont reset",
-    ]
-
-    is_emergency = contains_any(inbound_lower, emergency_terms)
-
-    if category == "Active problems":
-        is_emergency = True
-
-    if not is_emergency:
-        return None
-
-    conv["appointment_type"] = "TROUBLESHOOT_395"
-
-    final_addr = conv.get("address") or address
-    if not final_addr:
-        return {
-            "sms_body": "Got it — we can prioritize this. What’s the full service address?",
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": None,
-        }
-
-    travel_minutes = None
-    norm = conv.get("normalized_address")
-    if norm:
-        dest = format_full_address(norm)
-        origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
-        travel_minutes = compute_travel_time_minutes(origin, dest)
-
-    emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
-
-    scheduled_date = today_date_str
-    scheduled_time = emergency_time
-
-    conv["scheduled_date"] = scheduled_date
-    conv["scheduled_time"] = scheduled_time
-    conv["autobooked"] = True
-
-    sq = maybe_create_square_booking(phone, {
-        "scheduled_date": scheduled_date,
-        "scheduled_time": scheduled_time,
-        "address": final_addr,
-    })
-
-    if not sq.get("success"):
-        return {
-            "sms_body": "Before I finalize this emergency visit, I still need the complete service address.",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": final_addr,
-        }
-
-    conv["final_confirmation_sent"] = True
-
-    try:
-        t_nice = datetime.strptime(scheduled_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
-    except:
-        t_nice = scheduled_time
-
-    return {
-        "sms_body": (
-            f"You're all set — emergency troubleshoot scheduled for about {t_nice}. "
-            "A Square confirmation will follow."
-        ),
-        "scheduled_date": scheduled_date,
-        "scheduled_time": scheduled_time,
-        "address": final_addr,
-    }
-
-
-# ====================================================================
-# FOLLOW-UP QUESTION ENGINE
-# ====================================================================
-def handle_followup_questions(conv, appointment_type, inbound_lower,
-                              scheduled_date, scheduled_time, address):
-
-    if conv.get("appointment_type") is None and appointment_type is None:
-        return {
-            "sms_body": (
-                "Before I schedule anything, which type of visit is this?\n"
-                "1) $195 on-site evaluation\n"
-                "2) Full-home inspection\n"
-                "3) Troubleshoot and repair\n\nReply 1, 2, or 3."
-            ),
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-        }
-
-    if not conv.get("address") and not is_customer_address_only(inbound_lower):
-        return {
-            "sms_body": "What’s the full service address for this visit?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": None,
-        }
-
-    if conv.get("state_prompt_sent") and not conv.get("normalized_address"):
-        return {
-            "sms_body": "Just confirming — is the address in Connecticut or Massachusetts?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": conv.get("address"),
-        }
-
-    if not conv.get("scheduled_date") and scheduled_date is None:
-        return {
-            "sms_body": "What day works best for your visit?",
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": conv.get("address"),
-        }
-
-    if not conv.get("scheduled_time") and scheduled_time is None:
-        return {
-            "sms_body": f"What time works for your visit on {scheduled_date or 'that day'}?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": None,
-            "address": conv.get("address"),
-        }
-
-    if conv.get("appointment_type") == "INSPECTION" and not conv.get("square_footage"):
-        if "sq" not in inbound_lower:
-            return {
-                "sms_body": "For the home inspection, what’s the approximate square footage?",
-                "scheduled_date": scheduled_date,
-                "scheduled_time": scheduled_time,
-                "address": conv.get("address"),
-            }
-
-    return None
-
-
-# ====================================================================
-# HOME-TODAY ENGINE
-# ====================================================================
-def handle_home_today(conv, inbound_lower, appointment_type, address, today_date_str):
-
-    home_terms = [
-        "im home today", "home today", "available today",
-        "any time today", "anytime today", "today works",
-        "free today", "free all day", "home all day",
-    ]
-
-    if contains_any(inbound_lower, home_terms):
-        conv["home_today_intent"] = True
-
-    if not conv.get("home_today_intent"):
-        return None
-
-    if not address:
-        return {
-            "sms_body": "Got it — are you home today at the property? What’s the address?",
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": None,
-        }
-
-    slot = get_today_available_slot(appointment_type)
-    if slot:
-        conv["scheduled_date"] = today_date_str
-        conv["scheduled_time"] = slot
-        conv["autobooked"] = True
-        return {
-            "sms_body": f"We have an opening today at {slot}. Does that work?",
-            "scheduled_date": today_date_str,
-            "scheduled_time": slot,
-            "address": address,
-        }
-
-    nxt = get_next_available_day_slot(appointment_type)
-    if nxt:
-        nxt_date, nxt_time = nxt
-        return {
-            "sms_body": f"We're booked today. Next opening is {nxt_date} at {nxt_time}. Does that work?",
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": address,
-        }
-
-    return {
-        "sms_body": "We're booked solid for a few days — want a sooner-opening notification?",
-        "scheduled_date": None,
-        "scheduled_time": None,
-        "address": address,
-    }
-
-
-# ====================================================================
-# CONFIRMATION ENGINE
-# ====================================================================
-def handle_confirmation(conv, inbound_lower, phone):
-    if not is_customer_confirmation(inbound_lower):
-        return None
-
-    if not (
-        conv.get("scheduled_date") and
-        conv.get("scheduled_time") and
-        conv.get("address")
-    ):
-        return None
-
-    sq = maybe_create_square_booking(phone, {
-        "scheduled_date": conv["scheduled_date"],
-        "scheduled_time": conv["scheduled_time"],
-        "address": conv["address"],
-    })
-
-    if not sq.get("success"):
-        return {
-            "sms_body": "Almost done — I still need the full service address.",
-            "scheduled_date": conv["scheduled_date"],
-            "scheduled_time": conv["scheduled_time"],
-            "address": conv["address"],
-        }
-
-    conv["final_confirmation_sent"] = True
-
-    try:
-        t_nice = datetime.strptime(conv["scheduled_time"], "%H:%M").strftime("%I:%M %p").lstrip("0")
-    except:
-        t_nice = conv["scheduled_time"]
-
-    return {
-        "sms_body": f"Perfect — you're all set. We’ll see you then at {t_nice}.",
-        "scheduled_date": conv["scheduled_date"],
-        "scheduled_time": conv["scheduled_time"],
-        "address": conv["address"],
-    }
-
-
-# ====================================================================
-# FINAL AUTOBOOK ENGINE
-# ====================================================================
-def attempt_final_autobook(conv, phone, scheduled_date, scheduled_time, address):
-    if not ready_to_finalize(conv, scheduled_date, scheduled_time, address):
-        return None
-
-    sq = maybe_create_square_booking(phone, {
-        "scheduled_date": scheduled_date,
-        "scheduled_time": scheduled_time,
-        "address": address,
-    })
-
-    if not sq.get("success"):
-        return {
-            "sms_body": "One more thing — what's the full service address?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": None,
-        }
-
-    conv["final_confirmation_sent"] = True
-    conv["address"] = address
-
-    try:
-        t_nice = datetime.strptime(scheduled_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
-    except:
-        t_nice = scheduled_time
-
-    return {
-        "sms_body": (
-            f"You're all set — visit scheduled for {scheduled_date} at {t_nice}. "
-            "A Square confirmation will follow."
-        ),
-        "scheduled_date": scheduled_date,
-        "scheduled_time": scheduled_time,
-        "address": address,
-    }
-
-
-# ====================================================================
-# LLM FALLBACK ENGINE
-# ====================================================================
-def run_llm_fallback(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    scheduled_date,
-    scheduled_time,
-    address,
-    today_date_str,
-    today_weekday,
-    inbound_text,
-):
-    system_prompt = build_llm_prompt(
-        cleaned_transcript,
-        category,
-        appointment_type,
-        initial_sms,
-        scheduled_date,
-        scheduled_time,
-        address,
-        today_date_str,
-        today_weekday,
-    )
-
-    completion = openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": inbound_text},
-        ],
-    )
-
-    raw = completion.choices[0].message.content.strip()
-
-    try:
-        return json.loads(raw)
-    except:
-        return {
-            "sms_body": raw,
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": address,
-        }
-
-
-# ====================================================================
-# MAIN ENTRYPOINT — generate_reply_for_inbound()
-# ====================================================================
 def generate_reply_for_inbound(
     cleaned_transcript,
     category,
@@ -1075,108 +349,129 @@ def generate_reply_for_inbound(
     address,
 ) -> dict:
 
-    tz = ZoneInfo("America/New_York")
-    now_local = datetime.now(tz)
-    phone = request.form.get("From", "").replace("whatsapp:", "")
-    inbound_lower = inbound_text.strip().lower()
-    today_date_str = now_local.strftime("%Y-%m-%d")
-    today_weekday = now_local.strftime("%A")
+    try:
+        # ---------------------------------------------------
+        # Local date/time for Option A date conversion
+        # ---------------------------------------------------
+        if ZoneInfo:
+            tz = ZoneInfo("America/New_York")
+        else:
+            tz = timezone(timedelta(hours=-5))
 
-    conversations.setdefault(phone, {})
-    conv = conversations[phone]
+        now_local = datetime.now(tz)
+        today_date_str = now_local.strftime("%Y-%m-%d")
+        today_weekday = now_local.strftime("%A")
 
-    # 1) State Machine Lock
-    state = get_current_state(conv)
-    lock = enforce_state_lock(state, conv)
-    if lock.get("interrupt"):
-        return lock["reply"]
+        # ---------------------------------------------------
+        # Session Reset Logic (prevents ghost-state)
+        # ---------------------------------------------------
+        phone = request.form.get("From", "").replace("whatsapp:", "")
+        last_time = conversations.get(phone, {}).get("first_sms_time")
+        should_reset = False
 
-    # 2) Human Intent Interpreter
-    intent_reply = srb14_interpret_human_intent(conv, inbound_lower)
-    if intent_reply:
-        return intent_reply
+        # Reset if conversation is older than 60 minutes
+        if last_time:
+            try:
+                # Ensure last_time is a datetime
+                elapsed_minutes = (now_local - last_time).total_seconds() / 60
+                if elapsed_minutes > 60:
+                    should_reset = True
+            except Exception:
+                # If corrupted/old format → force reset
+                should_reset = True
 
-    # 3) ADDRESS INTAKE — must run BEFORE emergency logic
-    addr_reply = handle_address_intake(
-        conv, inbound_text, inbound_lower,
-        scheduled_date, scheduled_time, address
-    )
-    if addr_reply:
-        return addr_reply
+        # Reset if user signals a brand-new issue
+        if inbound_text.strip().lower() in [
+            "hi", "hello", "hey",
+            "new issue", "another issue",
+            "new problem", "i need help",
+            "i have a new problem",
+        ]:
+            should_reset = True
 
-    address = conv.get("address") or address
+        # Perform reset if needed
+        if should_reset:
+            conversations[phone] = {
+                "cleaned_transcript": cleaned_transcript,
+                "category": category,
+                "appointment_type": appointment_type,
+                "initial_sms": initial_sms,
+                "first_sms_time": now_local,
+                "replied": False,
+                "followup_sent": False,
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": None,
+                "normalized_address": None,
+                "booking_created": False,
+                "square_booking_id": None,
+                "state_prompt_sent": False,
+            }
 
-    # 4) EMERGENCY ENGINE (now safe)
-    emergency_reply = handle_emergency(
-        conv, category, inbound_lower, address,
-        now_local, today_date_str, scheduled_date,
-        scheduled_time, phone
-    )
-    if emergency_reply:
-        return emergency_reply
+        system_prompt = """
+You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
 
-    # 5) Natural Date/Time Parse
-    dt = parse_natural_datetime(inbound_text, now_local)
-    if dt["has_datetime"]:
-        conv["scheduled_date"] = dt["date"]
-        conv["scheduled_time"] = dt["time"]
-        scheduled_date = dt["date"]
-        scheduled_time = dt["time"]
-
-    # 6) Follow-Up Question Engine
-    follow_reply = handle_followup_questions(
-        conv, appointment_type, inbound_lower,
-        scheduled_date, scheduled_time, address
-    )
-    if follow_reply:
-        return follow_reply
-
-    # 7) Persist type
-    if appointment_type is None:
-        appointment_type = conv.get("appointment_type")
-    conv["appointment_type"] = appointment_type
-
-    # 8) Confirmation Engine
-    confirm_reply = handle_confirmation(conv, inbound_lower, phone)
-    if confirm_reply:
-        return confirm_reply
-
-    # 9) Home Today Logic
-    home_reply = handle_home_today(
-        conv, inbound_lower, appointment_type,
-        address, today_date_str
-    )
-    if home_reply:
-        return home_reply
-
-    # 10) Final Autobook
-    final_reply = attempt_final_autobook(
-        conv, phone, scheduled_date, scheduled_time, address
-    )
-    if final_reply:
-        return final_reply
-
-    # 11) LLM Fallback
-    return run_llm_fallback(
-        cleaned_transcript,
-        category,
-        appointment_type,
-        initial_sms,
-        scheduled_date,
-        scheduled_time,
-        address,
-        today_date_str,
-        today_weekday,
-        inbound_text
-    )
+Today is {today_date_str}, a {today_weekday}, local time America/New_York.
 
 
+===================================================
+STRICT CONVERSATION FLOW RULES
+===================================================
+1. NEVER repeat a question already asked.
+2. NEVER restart the conversation.
+3. NEVER ask again for date, time, or address if already collected.
+4. NEVER restate prices.
+5. ALWAYS move the conversation forward.
+6. If customer gives date AND time → accept once.
+7. If customer gives address → accept once.
+8. When date + time + address are all collected → send FINAL confirmation with NO question mark.
+9. After customer replies “yes / sounds good / confirmed” → send NOTHING further.
+10. No AI mentions. No quoting their text.
+11. Keep messages short and human.
 
-# ===================================================
-# SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
-# ===================================================
+===================================================
+MASTER PRIORITIZATION LAYER (MPL)
+===================================================
+THESE PRIORITIES OVERRIDE ALL OTHER RULES:
 
-SCHEDULING_RULES = """
+1. Emergency mode rules override ALL other scheduling rules.
+   - If appointment_type = TROUBLESHOOT_395 → ignore ALL non-emergency windows.
+   - Never use “morning/afternoon” logic.
+   - Never ask fallback twice.
+   - Any time given (including “now”) must be immediately accepted once per Rule 1.11.
+
+2. Once time is collected, it cannot be re-asked unless customer explicitly changes it.
+
+3. Once emergency fallback is used once (Rule 1.8), it must NEVER be used again.
+
+4. When conflicts exist between SRBs, the higher-numbered module loses to the lower-numbered one.
+   Priority: SRB-1 > SRB-2 > SRB-3 > SRB-4 > … > SRB-20.
+
+5. Rules must be checked in this order:
+   a. Emergency overrides
+   b. Previously collected fields (date/time/address)
+   c. Fallback constraints
+   d. Non-emergency time windows (ONLY if not in emergency mode)
+   e. Clarification rules
+   f. Tone rules
+   g. Safety rules
+   h. Everything else
+
+6. The OS must NEVER revert to non-emergency logic once emergency mode is active.
+
+7. If two rules contradict, ALWAYS obey the higher-priority MPL directive.
+
+8. In emergency mode, ALL date-only and day-only rules (1.12–1.18) are disabled and must NOT trigger any additional time questions once a time has been collected.
+9. If the customer says “now”, “as soon as possible”, “I’m home now”, or any equivalent:
+   - Immediately set scheduled_time to the current local time (rounded to the next 5 minutes).
+   - OS must NOT ask for another time or day.
+   - OS must move directly to address (if not collected), or confirmation (if address already collected).
+
+
+===================================================
+SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
+===================================================
+
 ## SRB-1 — Scheduling, Time, Dispatch & Emergency Engine  
 (The primary logic block governing all scheduling behavior in Prevolt OS.)
 
@@ -6536,20 +5831,33 @@ OUTPUT FORMAT (STRICT JSON)
   "address": "string or null"
 }}
 """
+        system_prompt = system_prompt.replace("{today_date_str}", today_date_str)
+        system_prompt = system_prompt.replace("{today_weekday}", today_weekday)
+
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": inbound_text},
+            ],
+        )
+
+
+        return json.loads(completion.choices[0].message.content)
+
+    except Exception as e:
+        print("Inbound reply FAILED:", repr(e))
+        return {
+            "sms_body": "Got it.",
+            "scheduled_date": scheduled_date,
+            "scheduled_time": scheduled_time,
+            "address": address,
+        }
+
+
 # ---------------------------------------------------
 # Google Maps helper (travel time)
 # ---------------------------------------------------
-# ---------------------------------------------------
-# Format full address from normalized structure
-# ---------------------------------------------------
-def format_full_address(addr_struct: dict) -> str:
-    return (
-        f"{addr_struct['address_line_1']}, "
-        f"{addr_struct['locality']}, "
-        f"{addr_struct['administrative_district_level_1']} "
-        f"{addr_struct['postal_code']}"
-    )
-
 def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
     """
     Uses Google Maps Distance Matrix API to estimate travel time in minutes.
@@ -6591,37 +5899,6 @@ def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
 # ---------------------------------------------------
 # Google Maps — Address Normalization (CT/MA-aware)
 # ---------------------------------------------------
-# ---------------------------------------------------
-# Compute emergency arrival window (rounded to next hour)
-# ---------------------------------------------------
-def compute_emergency_arrival_time(now_local, travel_minutes: float | None) -> str:
-    """
-    Computes an emergency arrival time:
-    • Round current time UP to next whole hour
-    • Add travel duration if available
-    • Return an HH:MM 24h string
-
-    Example:
-      now_local = 1:37pm (13:37)
-      next whole hour = 14:00
-      travel = 22 minutes
-      final = 14:22 → round again to 15:00 for whole-hour SLA
-    """
-
-    # Start with next whole hour
-    next_hour = (now_local + timedelta(hours=1)).replace(
-        minute=0, second=0, microsecond=0
-    )
-
-    # If we have a travel estimate, add it
-    if travel_minutes:
-        next_hour = next_hour + timedelta(minutes=travel_minutes)
-
-    # Now re-round to whole hour again (SLA rule)
-    final_hour = next_hour.replace(minute=0, second=0, microsecond=0)
-
-    return final_hour.strftime("%H:%M")
-
 def normalize_address(raw_address: str, forced_state: str | None = None) -> tuple[str, dict | None]:
     """
     Normalize a freeform address like:
@@ -6849,179 +6126,106 @@ def is_within_normal_hours(time_str: str) -> bool:
 
 
 # ---------------------------------------------------
-# Create Square Booking (SAFE WRAPPED VERSION)
+# Create Square Booking (with address normalization)
 # ---------------------------------------------------
-def maybe_create_square_booking(phone: str, convo: dict) -> dict:
+def maybe_create_square_booking(phone: str, convo: dict) -> None:
     """
-    Fully safe version — returns a structured dict:
-    {
-        "success": True/False,
-        "error": "...",
-        "booking_id": "..."
-    }
-    Never throws errors, never returns None.
+    Create a Square booking once we have date, time, and address.
+    Square bookings CANNOT include the 'country' field inside booking.address.
+    Customer profiles CAN include country, but bookings cannot.
     """
-
-    # ---- BASE RETURN TEMPLATE ----
-    def fail(msg):
-        print(msg)
-        return {"success": False, "error": msg, "booking_id": None}
-
-    # Prevent duplicate bookings
     if convo.get("booking_created"):
-        return {
-            "success": True,
-            "error": None,
-            "booking_id": convo.get("square_booking_id"),
-        }
+        return
 
     scheduled_date = convo.get("scheduled_date")
     scheduled_time = convo.get("scheduled_time")
     raw_address = convo.get("address")
     appointment_type = convo.get("appointment_type")
 
-    # Required
     if not (scheduled_date and scheduled_time and raw_address):
-        return fail("Missing scheduled_date/time/address — cannot create booking.")
+        return
 
-    # Map service variation
-    try:
-        variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
-    except Exception as e:
-        return fail(f"Variation mapping failed: {repr(e)}")
-
+    variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
     if not variation_id:
-        return fail(f"Unknown appointment_type; cannot map: {appointment_type}")
+        print("Unknown appointment_type; cannot map:", appointment_type)
+        return
 
     # Weekend rule
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
-        return fail(f"Weekend non-emergency booking blocked for {phone}")
+        print("Weekend non-emergency booking blocked:", phone, scheduled_date)
+        return
 
-    # Business hours rule
+    # Time window rule (non-emergency)
     if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(scheduled_time):
-        return fail(f"Non-emergency time outside 9–4: {scheduled_time}")
+        print("Non-emergency time outside 9–4; booking not auto-created:", phone, scheduled_time)
+        return
 
-    # Config check
     if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
-        return fail("Square configuration incomplete; skipping booking creation.")
+        print("Square configuration incomplete; skipping booking creation.")
+        return
 
-    # ---------------------------------------------------
-    # Address Normalization
-    # ---------------------------------------------------
+    # Normalize or reuse
     addr_struct = convo.get("normalized_address")
-
     if not addr_struct:
-        try:
-            status, addr_struct = normalize_address(raw_address)
-        except Exception as e:
-            return fail(f"Address normalization exception: {repr(e)}")
-
+        status, addr_struct = normalize_address(raw_address)
         if status == "ok":
             convo["normalized_address"] = addr_struct
-
         elif status == "needs_state":
-            # Ask CT/MA only once
             if not convo.get("state_prompt_sent"):
                 send_sms(
                     phone,
                     "Just to confirm, is this address in Connecticut or Massachusetts?"
                 )
                 convo["state_prompt_sent"] = True
-
-            return fail(f"Address needs CT/MA confirmation for: {raw_address}")
-
+            print("Address needs CT/MA confirmation for:", raw_address)
+            return
         else:
-            return fail(f"Address normalization failed for: {raw_address}")
+            print("Address normalization failed; cannot create booking for:", raw_address)
+            return
 
-    # ---------------------------------------------------
-    # Travel Time (origin → customer)
-    # ---------------------------------------------------
+    # Travel time check
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
-    travel_minutes = None
-
     if origin:
-        try:
-            destination_for_travel = (
-                f"{addr_struct.get('address_line_1', '')}, "
-                f"{addr_struct.get('locality', '')}, "
-                f"{addr_struct.get('administrative_district_level_1', '')} "
-                f"{addr_struct.get('postal_code', '')}"
-            )
-        except Exception:
-            return fail("Invalid address structure for travel computation.")
-
+        destination_for_travel = (
+            f"{addr_struct['address_line_1']}, "
+            f"{addr_struct['locality']}, "
+            f"{addr_struct['administrative_district_level_1']} "
+            f"{addr_struct['postal_code']}"
+        )
         travel_minutes = compute_travel_time_minutes(origin, destination_for_travel)
-
         if travel_minutes is not None:
             print(
                 f"Estimated travel from origin to job: ~{travel_minutes:.1f} minutes "
                 f"for {phone} at {destination_for_travel}"
             )
             if travel_minutes > MAX_TRAVEL_MINUTES:
-                return fail("Travel exceeds maximum allowed minutes — auto-book canceled.")
+                print("Travel exceeds max; skipping auto-book.")
+                return
 
-    # ---------------------------------------------------
-    # EMERGENCY MODE TIME OVERRIDE
-    # ---------------------------------------------------
-    if appointment_type == "TROUBLESHOOT_395":
-        now_local = datetime.now(ZoneInfo("America/New_York"))
-
-        try:
-            emergency_time = compute_emergency_arrival_time(now_local, travel_minutes)
-        except Exception as e:
-            return fail(f"Emergency arrival computation failed: {repr(e)}")
-
-        print(
-            f"Emergency mode active — overriding schedule time "
-            f"{scheduled_date} {scheduled_time} → {scheduled_date} {emergency_time}"
-        )
-
-        scheduled_time = emergency_time
-        convo["scheduled_time"] = emergency_time
-
-    # ---------------------------------------------------
-    # Create/Search Square Customer
-    # ---------------------------------------------------
-    try:
-        customer_id = square_create_or_get_customer(phone, addr_struct)
-    except Exception as e:
-        return fail(f"Square customer lookup failed: {repr(e)}")
-
+    # Create or find customer (customers CAN include country)
+    customer_id = square_create_or_get_customer(phone, addr_struct)
     if not customer_id:
-        return fail("Square customer_id lookup returned None.")
+        print("No customer_id; cannot create booking.")
+        return
 
-    # ---------------------------------------------------
-    # Convert Local Time → UTC
-    # ---------------------------------------------------
-    try:
-        start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
-    except Exception as e:
-        return fail(f"Local datetime parsing failed: {repr(e)}")
-
+    # Convert local → UTC
+    start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
     if not start_at_utc:
-        return fail("parse_local_datetime returned None — invalid date/time.")
+        print("Could not parse scheduled date/time; skipping booking.")
+        return
 
     idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
 
-    # ---------------------------------------------------
-    # Booking Address (Square CANNOT accept the 'country' field)
-    # ---------------------------------------------------
-    try:
-        booking_address = {
-            "address_line_1": addr_struct.get("address_line_1", ""),
-            "locality": addr_struct.get("locality", ""),
-            "administrative_district_level_1": addr_struct.get("administrative_district_level_1", ""),
-            "postal_code": addr_struct.get("postal_code", ""),
-        }
+    # Square booking.address MUST NOT include "country"
+    booking_address = {
+        "address_line_1": addr_struct["address_line_1"],
+        "locality": addr_struct["locality"],
+        "administrative_district_level_1": addr_struct["administrative_district_level_1"],
+        "postal_code": addr_struct["postal_code"],
+    }
+    if "address_line_2" in addr_struct and addr_struct["address_line_2"]:
+        booking_address["address_line_2"] = addr_struct["address_line_2"]
 
-        if addr_struct.get("address_line_2"):
-            booking_address["address_line_2"] = addr_struct["address_line_2"]
-    except Exception as e:
-        return fail(f"Booking address construction failed: {repr(e)}")
-
-    # ---------------------------------------------------
-    # Build Final Payload
-    # ---------------------------------------------------
     booking_payload = {
         "idempotency_key": idempotency_key,
         "booking": {
@@ -7044,9 +6248,6 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
         },
     }
 
-    # ---------------------------------------------------
-    # Send to Square
-    # ---------------------------------------------------
     try:
         resp = requests.post(
             "https://connect.squareup.com/v2/bookings",
@@ -7054,40 +6255,44 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
             json=booking_payload,
             timeout=10,
         )
-    except Exception as e:
-        return fail(f"Square API exception: {repr(e)}")
+        if resp.status_code not in (200, 201):
+            print("Square booking create failed:", resp.status_code, resp.text)
+            return
 
-    if resp.status_code not in (200, 201):
-        return fail(f"Square booking failed [{resp.status_code}]: {resp.text}")
-
-    # Parse response JSON safely
-    try:
         data = resp.json()
+        booking = data.get("booking")
+        booking_id = booking.get("id") if booking else None
+
+        convo["booking_created"] = True
+        convo["square_booking_id"] = booking_id
+
+        print(
+            f"Square booking created for {phone}: {booking_id} "
+            f"{scheduled_date} {scheduled_time} ({appointment_type})"
+        )
+
+        # ---------------------------------------------------
+        # Reset conversation AFTER successful booking
+        # ---------------------------------------------------
+        conversations[phone] = {
+            "cleaned_transcript": None,
+            "category": None,
+            "appointment_type": None,
+            "initial_sms": None,
+            "first_sms_time": None,
+            "replied": False,
+            "followup_sent": False,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
+            "normalized_address": None,
+            "booking_created": True,
+            "square_booking_id": booking_id,
+            "state_prompt_sent": False,
+        }
+
     except Exception as e:
-        return fail(f"Invalid JSON in Square response: {repr(e)}")
-
-    booking = data.get("booking")
-    if not booking:
-        return fail(f"Square response missing 'booking': {data}")
-
-    booking_id = booking.get("id")
-
-    # Mark booking in conversation state
-    convo["booking_created"] = True
-    convo["square_booking_id"] = booking_id
-
-    print(
-        f"Square booking created for {phone}: {booking_id} "
-        f"{scheduled_date} {scheduled_time} ({appointment_type})"
-    )
-
-    # SUCCESS RETURN
-    return {
-        "success": True,
-        "error": None,
-        "booking_id": booking_id,
-    }
-
+        print("Square booking exception:", repr(e))
 
 
 # ---------------------------------------------------
@@ -7116,39 +6321,16 @@ def incoming_call():
 # ---------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
+    recording_url = request.form.get("RecordingUrl")
     caller = request.form.get("From")
-    recording_sid = request.form.get("RecordingSid")
-
-    print("Voicemail webhook hit. SID:", recording_sid, "Caller:", caller)
-
-    # ---- FIX: Twilio does NOT send RecordingUrl to the action callback ----
-    if not recording_sid:
-        print("ERROR: Missing RecordingSid in voicemail webhook.")
-        vr = VoiceResponse()
-        vr.hangup()
-        return Response(str(vr), mimetype="text/xml")
-
-    # Construct correct Twilio recording URL
-    recording_url = (
-        f"https://api.twilio.com/2010-04-01/Accounts/"
-        f"{TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}"
-    )
 
     try:
-        print("Downloading and transcribing voicemail from:", recording_url)
-
         raw = transcribe_recording(recording_url)
-        print("Raw transcript:", raw)
-
         cleaned = clean_transcript_text(raw)
-        print("Cleaned transcript:", cleaned)
-
         sms_info = generate_initial_sms(cleaned)
-        print("Initial SMS info:", sms_info)
 
         send_sms(caller, sms_info["sms_body"])
 
-        # Initialize their conversation state
         conversations[caller] = {
             "cleaned_transcript": cleaned,
             "category": sms_info["category"],
@@ -7169,10 +6351,9 @@ def voicemail_complete():
     except Exception as e:
         print("Voicemail fail:", repr(e))
 
-    vr = VoiceResponse()
-    vr.hangup()
-    return Response(str(vr), mimetype="text/xml")
-
+    response = VoiceResponse()
+    response.hangup()
+    return Response(str(response), mimetype="text/xml")
 
 
 # ---------------------------------------------------
