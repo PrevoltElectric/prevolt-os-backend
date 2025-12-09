@@ -5,10 +5,11 @@ import uuid
 import requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Gather, Dial
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from openai import OpenAI
+
 
 try:
     # Python 3.9+
@@ -6810,14 +6811,13 @@ def incoming_call():
         method="POST"
     )
 
-    # NOTE: Polly voices are NOT reliably supported inside <Gather><Say>
-    # Use a standard Twilio voice here to avoid application errors.
+    # Fully supported Matthew Neural voice everywhere
     gather.say(
         "Thanks for calling Prevolt Electric. "
         "To help us direct your call, please choose an option. "
         "If you are a residential customer, press 1. "
         "If you are a commercial, government, or facility customer, press 2.",
-        voice="man"
+        voice="Polly.Matthew-Neural"
     )
 
     response.append(gather)
@@ -6825,7 +6825,7 @@ def incoming_call():
     # If caller does nothing → replay message
     response.say(
         "Sorry, I didn't get that.",
-        voice="Polly.Matthew-Neural"   # Polly OK here
+        voice="Polly.Matthew-Neural"
     )
     response.redirect("/incoming-call")
 
