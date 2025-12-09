@@ -6815,7 +6815,7 @@ def incoming_call():
 
     # 100% Matthew Neural for greeting + menu
     gather.say(
-        "Thank you for calling Pre-volt electric "
+        "Thanks for calling Prevolt electric "
         "To help us direct your call, please choose an option. "
         "If you are a residential customer, press 1. "
         "If you are a commercial, government, or facility customer, press 2.",
@@ -6849,7 +6849,7 @@ def handle_call_selection():
     # -----------------------------
     if digit == "1":
         response.say(
-            "Welcome to Pre-volt Electric’s premier residential service desk."
+            "Welcome to Prevolt Electric’s premier residential service desk."
             "You’ll leave a quick message, and our team will text you right away to assist."
             "Please leave your name, your address, "
             "and a brief description of what you need help with. "
