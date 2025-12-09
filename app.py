@@ -475,6 +475,14 @@ SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
 ## SRB-1 — Scheduling, Time, Dispatch & Emergency Engine  
 (The primary logic block governing all scheduling behavior in Prevolt OS.)
 
+Ambiguous time phrases ("any time", "whenever", "later", "sometime", "around", 
+"as soon as possible", "whenever works", "you pick the time") shall NOT count as explicit times.
+
+Instead the OS must:
+• Ask once for the specific missing field (time or date)
+• If still ambiguous, apply default interpretation (Rule 1.29)
+• These phrases also MUST NOT activate Immediate Dispatch Mode unless paired with true urgency keywords.
+
 ### Rule 1.1 — Single Source of Scheduling Truth
 All scheduling decisions must be derived from a unified internal model:
 • scheduled_date  
@@ -534,14 +542,60 @@ Never repeat it.
 Once emergency logic is active, the OS must never use non-emergency time rules.
 
 ### Rule 1.11 — Customer Provides a Time = Immediate Acceptance
-Any explicit or implicit time counts:
-• “5pm”  
-• “after 1”  
-• “3:30”  
-• “noon”  
-• “anytime”  
-• “as soon as possible”  
-Extract → convert → save → move to address.
+A time is considered **explicit** only when the customer provides a clear, 
+specific time expression such as:
+
+• “5pm”, “5:00”, “5:30”
+• “after 1”, “around 2”, “3:30”
+• “noon”, “midday”
+• “this afternoon at 2”
+• “later today at 1”
+
+The following phrases are **NOT explicit times** and must NOT trigger 
+time acceptance or immediate confirmation:
+
+• “anytime”
+• “whenever”
+• “as soon as possible”
+• “later”
+• “sometime”
+• “you pick a time”
+• “whenever works”
+
+For explicit times:
+→ Extract → convert → save → move immediately to address collection.
+
+For ambiguous/vague times:
+→ Follow Section 1 logic:
+   Ask once for missing field → then apply Rule 1.29 defaults.
+
+### SRB-1.A — Ambiguous Time Phrases Do NOT Count as Times
+The following phrases must NOT be treated as explicit times:
+
+“any time”, “anytime”, “whenever”, 
+“later”, “sometime”, “around”, 
+“as soon as possible”, “asap”, 
+“I'm around”, “I'm home today”, 
+“I'm here all day”, “it doesn’t matter”,
+“whenever works”, “whenever you can”,
+“sometime today”, “later today”.
+
+Rules for handling them:
+
+1. These phrases DO NOT satisfy scheduled_time.
+2. If time is missing:
+   → OS asks ONCE: “What time works for you?”
+3. If customer ignores that question:
+   → OS applies Rule 1.29 (default time selection).
+4. These phrases also MUST NOT set scheduled_date.
+5. These phrases must NOT trigger SRB-1.11 (time acceptance).
+6. These phrases cannot override emergency rules — only explicit times can.
+
+This rule exists to prevent:
+• dual-triggering of SRB-1.12 and SRB-1.13  
+• infinite loops  
+• ambiguous values being interpreted as explicit times
+
 
 ### Rule 1.12 — Customer Provides Only Date
 If customer gives only a date:
@@ -590,6 +644,33 @@ When Immediate Dispatch Mode is active:
 3. Do NOT request clarification of time.  
 4. Compute earliest reasonable arrival using travel time + availability.  
 5. Save the computed time as scheduled_time.
+
+### Rule 1.17A — Immediate Dispatch Time Calculation (Emergency Only)
+Immediate Dispatch Mode may activate ONLY when BOTH conditions are true:
+
+1. appointment_type = TROUBLESHOOT_395  
+2. The customer expresses true urgency using phrases such as:
+   “now”, “right now”, “asap”, “immediately”, 
+   “no power”, “partial power”, “burning smell”, 
+   “fire”, “sparks”, “smoke”, “tree ripped wires”, 
+   “boom”, “pop”, “outage”, “danger”, “emergency”.
+
+When Immediate Dispatch Mode is triggered:
+
+1. OS must assume TODAY as the scheduled_date.
+2. OS must calculate the arrival time as:
+   • current local time in America/New_York  
+   • rounded UP to the nearest 30-minute mark  
+3. OS must save this as scheduled_time.
+4. OS must use human AM/PM formatting in confirmations.
+5. OS must NOT ask for a time once this mode is triggered.
+6. OS may ask for the address ONLY if it is missing.
+7. If address is already known:
+   → OS must immediately move to final confirmation.
+8. OS must NOT override or modify the customer’s explicit time 
+   if they already provided one.
+
+
 
 ### Rule 1.18 — Square Availability Integration (Logical)
 The OS must logically reference Square’s availability rules:
@@ -5872,8 +5953,7 @@ OUTPUT FORMAT (STRICT JSON)
         today_patch = now_local_patch.strftime("%Y-%m-%d")
 
         # ---------- RULE A ----------
-        # If TIME provided but DATE missing, infer TODAY from:
-        # "today", "anytime", "this afternoon", "whenever", "now"
+        # If TIME provided but DATE missing, infer TODAY
         if model_time and not model_date:
             if any(phrase in inbound_lower for phrase in [
                 "today", "this", "anytime", "whenever", "now", "soon",
@@ -5885,33 +5965,24 @@ OUTPUT FORMAT (STRICT JSON)
         # ---------- RULE B ----------
         # If DATE provided but TIME missing, infer time from vague time phrases
         if model_date and not model_time:
-            # Vague morning → 09:00
             if "morning" in inbound_lower:
                 model_time = "09:00"
-
-            # Afternoon → 13:00
             elif "afternoon" in inbound_lower:
                 model_time = "13:00"
-
-            # Evening → 16:00 (non-emergency), 18:00 emergency
             elif "evening" in inbound_lower:
                 model_time = "16:00"
-
-            # “Whenever”, “sometime”, “whenever works” → choose nearest valid anchor
             elif any(x in inbound_lower for x in ["whenever", "sometime", "anytime"]):
-                # Afternoon is safest default
                 model_time = "13:00"
 
         # ---------- RULE C ----------
         # Prevent past-time bookings
-        # If model_date is today AND model_time < now → bump to next available 30-minute block
         if model_date == today_patch and model_time:
             try:
                 t_obj = datetime.strptime(model_time, "%H:%M").time()
                 now_t = now_local_patch.time()
 
                 if t_obj < now_t:
-                    # Round to next 30 minutes
+                    # Round to next 30min block
                     minute = (now_local_patch.minute + 29) // 30 * 30
                     hour = now_local_patch.hour + (1 if minute == 60 else 0)
                     minute = 0 if minute == 60 else minute
@@ -5926,19 +5997,27 @@ OUTPUT FORMAT (STRICT JSON)
                 pass
 
         # ---------- RULE D ----------
-        # If neither date nor time were given, leave untouched (conversation continues)
-        # If BOTH appear present → prevent SRB-1.12 / 1.13 from re-triggering
+        # If both present → suppress further date/time asks
         if model_date and model_time:
-            # Mark fully satisfied to suppress re-asks downstream
             pass
 
-        # ---------------------------------------
+        # ---------------------------------------------------------
+        # ⭐ HUMAN AM/PM FORMATTING PATCH (NEW)
+        # ---------------------------------------------------------
+        human_time = None
+        if model_time:
+            try:
+                human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p")
+            except:
+                human_time = model_time  # fallback (should never happen)
+
+        # ---------------------------------------------------------
         # Return patched structure
-        # ---------------------------------------
+        # ---------------------------------------------------------
         return {
-            "sms_body": sms_body,
+            "sms_body": sms_body.replace(model_time, human_time) if (sms_body and human_time) else sms_body,
             "scheduled_date": model_date,
-            "scheduled_time": model_time,
+            "scheduled_time": model_time,    # internal stays 24-hour for Square
             "address": model_address,
         }
 
@@ -5950,6 +6029,7 @@ OUTPUT FORMAT (STRICT JSON)
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
 
 
 
