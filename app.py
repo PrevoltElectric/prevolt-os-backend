@@ -6413,6 +6413,16 @@ def incoming_sms():
         except Exception as e:
             print("maybe_create_square_booking after CT/MA reply failed:", repr(e))
 
+        # ✔ NEW: If booking occurred, immediately send confirmation and EXIT
+        if convo.get("booking_created"):
+            final_msg = (
+                f"All set! Your appointment is confirmed for "
+                f"{convo.get('scheduled_date')} at {convo.get('scheduled_time')}."
+            )
+            resp = MessagingResponse()
+            resp.message(final_msg)
+            return Response(str(resp), mimetype="text/xml")
+
         resp = MessagingResponse()
         resp.message("Thanks — that helps. We have everything we need for your visit.")
         return Response(str(resp), mimetype="text/xml")
@@ -6445,6 +6455,17 @@ def incoming_sms():
         maybe_create_square_booking(from_number, convo)
     except Exception as e:
         print("maybe_create_square_booking failed:", repr(e))
+
+    # ⭐⭐⭐ SURGICAL FIX: IF A BOOKING WAS CREATED, SEND FINAL CONFIRMATION AND EXIT
+    if convo.get("booking_created"):
+        final_msg = (
+            f"All set! Your appointment is confirmed for "
+            f"{convo.get('scheduled_date')} at {convo.get('scheduled_time')}."
+        )
+        resp = MessagingResponse()
+        resp.message(final_msg)
+        return Response(str(resp), mimetype="text/xml")
+    # ⭐⭐⭐ END OF FIX
 
     # If final confirmation matched → stop responding
     if sms_body == "":
