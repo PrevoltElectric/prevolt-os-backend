@@ -5,11 +5,10 @@ import uuid
 import requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse, Gather, Dial
+from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from openai import OpenAI
-
 
 try:
     # Python 3.9+
@@ -476,14 +475,6 @@ SCHEDULING RULES — FINAL, TIME-AWARE, LOOP-PROOF
 ## SRB-1 — Scheduling, Time, Dispatch & Emergency Engine  
 (The primary logic block governing all scheduling behavior in Prevolt OS.)
 
-Ambiguous time phrases ("any time", "whenever", "later", "sometime", "around", 
-"as soon as possible", "whenever works", "you pick the time") shall NOT count as explicit times.
-
-Instead the OS must:
-• Ask once for the specific missing field (time or date)
-• If still ambiguous, apply default interpretation (Rule 1.29)
-• These phrases also MUST NOT activate Immediate Dispatch Mode unless paired with true urgency keywords.
-
 ### Rule 1.1 — Single Source of Scheduling Truth
 All scheduling decisions must be derived from a unified internal model:
 • scheduled_date  
@@ -542,58 +533,15 @@ Never repeat it.
 ### Rule 1.10 — No Reversion to Non-Emergency Logic
 Once emergency logic is active, the OS must never use non-emergency time rules.
 
-### Rule 1.11A — Time-of-Day Phrases Are NOT Explicit Times
-The following phrases MUST NOT be treated as explicit times:
-
-• “today”
-• “this morning”
-• “this afternoon”
-• “this evening”
-• “later today”
-• “sometime today”
-• “later on”
-• “I’m around today”
-• “I’ll be home this afternoon”
-• “today works”
-• “I’m available today”
-
-These indicate **date only**, not a specific time.
-
-When they appear:
-→ scheduled_date may be set (TODAY)  
-→ scheduled_time must remain unset  
-→ OS MUST ask: “What time works for you?”  
-→ OS must NOT auto-select a time (e.g., 3:00 PM or 3:30 PM).
-
-
-
-### SRB-1.A — Ambiguous Time Phrases Do NOT Count as Times
-The following phrases must NOT be treated as explicit times:
-
-“any time”, “anytime”, “whenever”, 
-“later”, “sometime”, “around”, 
-“as soon as possible”, “asap”, 
-“I'm around”, “I'm home today”, 
-“I'm here all day”, “it doesn’t matter”,
-“whenever works”, “whenever you can”,
-“sometime today”, “later today”.
-
-Rules for handling them:
-
-1. These phrases DO NOT satisfy scheduled_time.
-2. If time is missing:
-   → OS asks ONCE: “What time works for you?”
-3. If customer ignores that question:
-   → OS applies Rule 1.29 (default time selection).
-4. These phrases also MUST NOT set scheduled_date.
-5. These phrases must NOT trigger SRB-1.11 (time acceptance).
-6. These phrases cannot override emergency rules — only explicit times can.
-
-This rule exists to prevent:
-• dual-triggering of SRB-1.12 and SRB-1.13  
-• infinite loops  
-• ambiguous values being interpreted as explicit times
-
+### Rule 1.11 — Customer Provides a Time = Immediate Acceptance
+Any explicit or implicit time counts:
+• “5pm”  
+• “after 1”  
+• “3:30”  
+• “noon”  
+• “anytime”  
+• “as soon as possible”  
+Extract → convert → save → move to address.
 
 ### Rule 1.12 — Customer Provides Only Date
 If customer gives only a date:
@@ -643,44 +591,6 @@ When Immediate Dispatch Mode is active:
 4. Compute earliest reasonable arrival using travel time + availability.  
 5. Save the computed time as scheduled_time.
 
-### Rule 1.17A — Emergency Immediate-Time Rounding (AI-Controlled)
-
-When appointment_type = TROUBLESHOOT_395 AND the customer expresses 
-urgency (“now”, “right now”, “asap”, “immediately”, “urgent”, 
-“no power”, “sparks”, “burning smell”, “smoke”, “tree ripped wires”, etc.):
-
-1. OS must assume the appointment is for TODAY.
-
-2. OS must compute the arrival time based on the current America/New_York
-   local time, rounded UP to the next 30-minute interval:
-      • 00–29 minutes → round to :30
-      • 30–59 minutes → round to the next full hour (“:00”)
-
-3. OS must ALWAYS choose a time that is equal to or later than the
-   current real-world time. Never choose a morning time if it is afternoon.
-
-4. OS must NOT request any additional time clarification.
-   The rounded time is final unless the customer explicitly changes it.
-
-5. If address is already collected → OS must immediately move to
-   FINAL CONFIRMATION (no question mark).
-
-6. If address is missing → OS must say ONLY:
-      “Got it — what’s the address for the visit?”
-   No other questions are allowed.
-
-7. OS must always format the scheduled_time in 24-hour internal format,
-   but use AM/PM formatting in human messages.
-
-8. OS must NOT override the appointment_type or date
-   unless the customer explicitly changes them.
-
-This rule overrides ALL other time rules, including SRB-1.12, 
-SRB-1.13, SRB-1.14, SRB-1.29, and all fallback logic.
-
-
-
-
 ### Rule 1.18 — Square Availability Integration (Logical)
 The OS must logically reference Square’s availability rules:
 • Never book over an existing appointment.  
@@ -699,46 +609,6 @@ Arrival = now_local + travel_minutes (rounded to nearest 5 minutes).
 Computed time must be saved in:
 • HH:MM (24-hour)  
 • And referenced in human text as standard time (“2:15pm”).
-
-### Rule 1.20A — Human-Facing Time Formatting (AM/PM Standard)
-
-The OS must ALWAYS communicate times to customers using standard 
-American AM/PM formatting, even though all internal scheduling values 
-(scheduled_time) must remain in 24-hour “HH:MM” format.
-
-Rules for output formatting:
-
-1. Convert 24-hour internal time to AM/PM when speaking to the customer:
-      00:00 → 12:00 AM
-      12:00 → 12:00 PM
-      13:00 → 1:00 PM
-      15:30 → 3:30 PM
-
-2. Remove any leading zeros in the hour:
-      “09:00” → “9:00 AM”
-      “07:30” → “7:30 AM”
-
-3. Always include a space before AM/PM:
-      “3:00PM” ❌  → “3:00 PM” ✔
-
-4. Never mix formats:
-      No “15:00” for customers.
-      No “3pm” (must be “3:00 PM”).
-
-5. In all confirmation messages, status updates, and emergency overrides:
-      The final human-facing time must use AM/PM formatting.
-
-6. Internal scheduling fields must remain:
-      scheduled_time = "HH:MM"
-   but human text must ALWAYS use AM/PM.
-
-These formatting rules apply to:
-• all confirmation messages  
-• all “we’ll see you at ___” messages  
-• all emergency dispatch messages  
-• all time clarifications  
-• all AI-generated replies involving time  
-
 
 ### Rule 1.21 — Address Always Collected After Time
 Once scheduled_time is stored:
@@ -820,372 +690,6 @@ After booking (Square sends external confirmation):
 ### Rule 1.36 — No Additional Messages After Confirmation
 After customer says “yes”, “sounds good”, or “confirmed”:
 → OS must send nothing further.
-
-### Rule 1.37 — Post-Booking Conversation Continuation
-
-Once an appointment is successfully booked (scheduled_date, scheduled_time, 
-and address are all set and Square booking is created), the OS MUST continue 
-to answer any customer questions that do not alter the appointment itself.
-
-Allowed post-booking responses include:
-• general service questions (“Do you install EV chargers?”)  
-• preparation questions (“Do I need to be home?”)  
-• safety questions (“Should I shut anything off?”)  
-• clarification questions (“Is the price still $195?”)  
-• scope questions (“Can you also look at my panel?”)  
-
-The OS MUST:
-1. Answer the question normally.  
-2. NOT attempt to reschedule, re-confirm, or restart the flow.  
-3. NOT ask any new scheduling questions unless the customer explicitly requests a change.  
-4. ALWAYS end the answer with:  
-      “You’re all set for {formatted_time}.”  
-   to remind them the booking remains intact.
-
-If the customer explicitly requests a change (date/time/address):
-→ jump to the corresponding modification rule (1.24, 1.25, or 1.26).  
-Otherwise:  
-→ treat the conversation as informational only and never reopen scheduling.
-
-### Rule 1.38 — Non-Emergency Time Selection Must Choose Earliest Valid Slot
-
-For appointment types EVAL_195 and WHOLE_HOME_INSPECTION, when the customer 
-expresses general availability without giving a specific time (examples: 
-"any time works", "whenever", "I'm around all day", "sometime tomorrow"):
-
-The OS MUST:
-1. NOT interpret vague phrases as explicit times.  
-2. Ask once for a specific time (per Rule 1.2).  
-3. If the customer still gives no explicit time, choose the earliest valid slot 
-   in the standard scheduling window.
-
-The earliest valid slot is:
-→ 09:00 for non-emergency weekdays.  
-→ If 09:00 has passed today, choose the next 30-minute increment (09:30, 10:00, etc.)  
-→ Never choose a random time such as 11:30 or 3 PM unless the customer said so.
-
-This ensures:
-• deterministic scheduling  
-• no random midday selection  
-• no ambiguous “afternoon” defaults for non-emergency jobs
-
-Once the OS assigns the time, it must save it immediately and proceed to address confirmation.
-
-### Rule 1.39 — High-Precision Emergency Override Activation
-
-Emergency override timing (Immediate Dispatch Mode) MUST activate ONLY when ALL 
-of the following conditions are true:
-
-1. appointment_type == TROUBLESHOOT_395  
-2. The customer expresses TRUE urgency or danger using phrases such as:
-   • "no power"  
-   • "partial power"  
-   • "tree ripped wires"  
-   • "burning smell"  
-   • "fire"  
-   • "sparks"  
-   • "smoke"  
-   • "boom" / "pop"  
-   • "active hazard"  
-   • "it’s dangerous"  
-   • "something is burning"  
-   • "outlet is hot"  
-   • “I’m worried something will catch fire”
-
-3. The customer ALSO indicates a desire for immediate arrival using one of:
-   • "now"  
-   • "right now"  
-   • "asap"  
-   • "immediately"  
-   • "come now"  
-   • "we’re home now"  
-   • "I’m standing by"  
-   • "ready anytime today"
-
-4. The OS has not already saved a confirmed scheduled_time from the customer.
-
-If ALL four conditions are met →  
-The OS must enter **Immediate Dispatch Mode** as defined in Rule 1.17A.
-
-If any condition is missing:  
-→ The OS must NOT activate emergency override timing.  
-→ The OS must proceed with normal emergency scheduling rules (1.7, 1.8, 1.11).
-
-This prevents false emergency dispatches caused by casual phrases (“asap”, “whenever”, 
-“soon”) and ensures emergency overrides apply ONLY to genuine hazard scenarios.
-
-### Rule 1.40 — Human-Friendly Time Formatting (AM/PM Output Only)
-
-All OS messages shown to the customer must use standard AM/PM time, never 24-hour format.
-
-Internal time representation (HH:MM 24h) is retained ONLY for scheduling logic and 
-Square booking, but ALL external messages MUST convert to:
-
-• h:mmam  
-• h:mmpm  
-
-Formatting rules:
-1. Remove leading zeros → "09:00" → "9:00am".
-2. Convert 12:00 → 12:00pm.
-3. Convert 00:00 → 12:00am.
-4. Convert 13:00–23:59 → subtract 12 hours and append "pm".
-5. Always include “am” or “pm” in lowercase.
-6. When referring to same-day visits:
-   • Before noon → “this morning at {time}”
-   • 12pm–5pm → “this afternoon at {time}”
-   • After 5pm → “this evening at {time}”
-
-7. Final confirmation messages MUST use AM/PM:
-   “All set — we’ll see you tomorrow at 1:30pm.”
-
-8. Immediate Dispatch Mode confirmations MUST also use AM/PM:
-   “We’ll head over and arrive around 2:00pm.”
-
-### Rule 1.41 — Question-Aware Responsiveness (Post-Scheduling Intelligence)
-
-Once scheduled_date, scheduled_time, and address are all set — the OS still must 
-answer customer questions normally unless:
-
-• the question attempts to reschedule (handled by 1.24–1.26), or  
-• the customer is explicitly confirming (handled by 1.34–1.36).
-
-The OS MUST respond to customer questions even AFTER a booking is created.
-
-Valid questions include but are not limited to:
-• pricing questions  
-• preparation questions  
-• arrival instructions  
-• access instructions  
-• scope-of-work questions  
-• payment method questions  
-• technician questions  
-• general electrical questions (non-diagnostic per Rule 2.8)  
-
-Behavioral requirements:
-1. OS must acknowledge and answer the question in one short, natural sentence.  
-2. OS must not modify any scheduling fields unless the customer is changing the appointment.  
-3. OS must not re-trigger confirmation or scheduling prompts.  
-4. After answering the question, OS stops talking — no extra conversation.  
-5. OS must NOT ask any new scheduling questions once a booking exists.
-
-Examples:
-Customer (after booking): “Do I need to be home?”
-→ “Someone just needs to be there to let us in — that’s all.”
-
-Customer: “Can you also look at a loose outlet while you're here?”
-→ “Yep, we can check that while we’re there.”
-
-Customer: “Do you take cards?”
-→ “Yes, we take cards.”
-
-Customer: “How long will it take?”
-→ “Most visits take about an hour.”
-
-The OS must remain human, short, and helpful — without changing the schedule.
-
-### Rule 1.42 — One-Response Limit After Booking (Hard Stop Rule)
-
-After an appointment is booked and confirmed, the OS must obey a strict
-one-response rule:
-
-1. If the customer sends any question (pricing, prep, access, scope, etc.),  
-   the OS answers with ONE short, human sentence.
-
-2. The OS must NOT:
-   • send follow-up questions  
-   • add disclaimers  
-   • send a closing message  
-   • repeat the appointment info  
-   • attempt to re-confirm  
-   • attempt to re-open scheduling flow  
-   • ask for additional details unless customer explicitly requests changes  
-
-3. The OS must NEVER send more than one message per customer message.
-
-4. After sending the single answer, OS enters SILENT MODE until
-   the customer speaks again.
-
-5. If the next customer message indicates they want to modify the
-   appointment (different time, date, address, etc.), then SRB-1.24,
-   1.25, or 1.26 apply — otherwise OS stays silent.
-
-Outcome:
-• OS behaves like a real human operator.  
-• No “robotic follow-ups.”  
-• No accidental loops or repeated confirmations.  
-
-### Rule 1.43 — Price Questions, Clarifications & No-Diagnosis Enforcement  
-When the customer asks any price-related question (“how much”, “what do you charge”, “can you quote this”, etc.) or asks any technical question (“what’s wrong”, “is it dangerous”, “could it be the breaker”), the OS must follow the rules below without interrupting scheduling logic.
-#### Rule 1.43.1 — No Remote Diagnosis  
-If the customer asks any technical question, the OS must not diagnose and must reply: “I’ll need to take a look in person — what’s the address for the visit?” The OS must never guess causes, give repair theories, offer DIY instructions, or provide safety opinions. Scheduling continues normally.
-#### Rule 1.43.2 — Price Question Redirect  
-If the customer asks any pricing question, the OS must answer using the fixed Prevolt rules: • $195 to come out and evaluate a single issue • $395 for troubleshoot and repair (covers first GFCI/device if needed) • $375–$650 for full-home inspections based on square footage. The OS must respond in one clean sentence and immediately return to the next missing scheduling field.
-#### Rule 1.43.3 — Emergency Jobs Always Use TROUBLESHOOT_395 Pricing  
-If the appointment_type is TROUBLESHOOT_395, the OS must only use $395 emergency pricing and must never mention the $195 tier.
-#### Rule 1.43.4 — No Price Discussion After Scheduling Begins  
-Once the OS has collected any part of scheduling (date, time, or address), pricing questions must not restart the flow. The OS must answer briefly per Rule 1.43.2 and continue scheduling.
-#### Rule 1.43.5 — No Price Discussion After Confirmation  
-After the OS sends final confirmation (Rule 1.34), the OS must never reopen pricing topics even if the customer asks.
-#### Rule 1.43.6 — If Customer Pushes for Exact Quote  
-If the customer insists on an exact number, the OS must reply: “I’ll take a look on-site and give you an exact number before any work starts.” Then resume scheduling or end if already confirmed.
-#### Rule 1.43.7 — Tie-Breaker Priority  
-If a pricing question and a scheduling need appear in the same message, scheduling always takes priority. The OS must collect any missing field first, then optionally answer the price question if appropriate.
-
-### Rule 1.43.8 — Voicemail Intent Kickoff Rule
-When a conversation begins from a voicemail recording, the OS must:
-
-• infer the customer’s intent from their voicemail content (electrical issue, install request, power problem, etc.)  
-• open the SMS conversation with a **premium, context-aware greeting**, such as:  
-  “This is Prevolt Electric — I saw you called about {{intent}}. Let’s get you taken care of.”  
-• NEVER repeat or quote the voicemail back to the customer  
-• NEVER ask the generic “what electrical work do you need help with?” — the voicemail already told us  
-• immediately guide the user toward the **next missing scheduling field** (address → time → date)  
-• if intent is ambiguous, fall back to: “I saw you called earlier — what can we help you with today?”  
-• if voicemail contains hazard/emergency indicators, escalate using normal SRB-2 rules  
-• voicemail intent is used **only for the first message** — then normal SRB-1 progression resumes
-
-### Rule 1.43.9 — Emergency-Intent Voicemail Auto-Classification
-When a voicemail contains language indicating an active electrical hazard, outage, or safety concern, the OS must automatically classify the appointment as an emergency (TROUBLESHOOT_395).
-
-Hazard keywords include but are not limited to:
-• “no power”, “partial power”, “power out”
-• “burning smell”, “smoke”, “sparks”
-• “boom”, “pop”, “bang”
-• “hot outlet”, “hot panel”
-• “tree ripped the wires”, “line down”, “service cable ripped”
-• “flooding”, “water near electrical”, “leak in panel”
-
-Upon detection:
-1. appointment_type ← TROUBLESHOOT_395  
-2. OS enters Emergency Mode immediately (SRB-2 applies)  
-3. OS must NOT ask non-emergency window questions  
-4. OS must NOT ask for time twice  
-5. The first outbound SMS MUST begin with an urgent but calm tone:
-   “This is Prevolt Electric — I saw your message about a possible electrical hazard. Let’s get you taken care of.”
-6. OS must move directly to collecting the missing fields in this order:
-   • address → time (if missing) → confirmation  
-7. If voicemail implies **immediate danger**, OS must follow SRB-2 life-safety rules:
-   “If you see fire, active smoke, or someone was shocked, call 911 first. Once everything is safe, I can help.”
-
-Emergency-intent voicemail classification must trigger **before** any other scheduling logic, and it must never be undone unless the customer later clarifies it is not an emergency.
-
----
-
-### Rule 1.43.10 — Voicemail-Derived Intent Extraction (Non-Emergency)
-If voicemail transcription contains recognizable work-intent keywords, the OS must infer the job category BEFORE the first outbound SMS.
-
-Examples include:
-• “EV charger” → category = EV_CHARGER  
-• “outlet not working”, “dead outlet” → OUTLET_ISSUE  
-• “panel upgrade”, “breaker keeps tripping” → PANEL  
-• “generator”, “interlock” → GENERATOR  
-• “light fixture”, “recessed lights”, “ceiling fan” → LIGHTING  
-• “inspection”, “home inspection”, “knob and tube” → INSPECTION  
-
-Rules:
-1. OS must pre-populate category from voicemail.  
-2. OS must pre-populate appointment_type when clear (e.g., INSPECTION → WHOLE_HOME_INSPECTION).  
-3. OS must never classify as EMERGENCY unless Rule 1.43.9 applies.  
-4. If multiple intents are mentioned, use the most safety-critical one.  
-5. First outbound SMS must reference the inferred intent:
-   “This is Prevolt Electric — I saw you called about an EV charger installation.”
-
-If the AI cannot determine intent confidently, fallback is:
-   “your electrical issue.”
-
----
-
-### Rule 1.43.11 — Voicemail-Derived Address Extraction
-If voicemail includes a clear, complete address (or nearly complete):
-• Number + Street  
-• Town  
-• Optional ZIP  
-• Optional state  
-
-Then OS must:
-1. Save it immediately to convo["address"].  
-2. Attempt normalization BEFORE sending the first outbound SMS.  
-3. If state is missing → invoke SRB-CT/MA state-confirmation rules on the FIRST outbound message.  
-4. OS must NOT re-ask for address unless normalization fails.
-
-If voicemail gives partial address:
-• If town + street → OS must save partial and politely confirm missing pieces later.  
-
----
-
-### Rule 1.43.12 — Voicemail → First SMS Personalization Rule
-The OS must ALWAYS personalize the very first SMS after voicemail using extracted voicemail intent and (if detected) address.
-
-Template:
-“This is Prevolt Electric — I saw you called about {{intent}}. What’s the address and best time for the visit?”
-
-Examples:
-• “I saw you called about an EV charger installation…”  
-• “I saw you called about an outlet issue…”  
-• “I saw you called about your electrical panel…”  
-• If address already known:
-   “I saw you called about an outlet issue at 12 River Street in Windsor Locks.”
-
-Fallback when intent unknown:
-• “I saw you called about your electrical issue.”
-
-Fallback when nothing can be extracted:
-• “Thanks for calling Prevolt Electric — how can I help?”
-
-This rule governs ONLY the *first* SMS after voicemail.
-
-### Rule 1.43.8 — Voicemail Intent Extraction
-When a customer leaves a voicemail, the OS must extract the **best possible scheduling intent** from the speech-to-text transcript.
-
-The OS must interpret voicemail content using the following principles:
-
-1. Identify the primary reason for the call (the “intent”):
-   • outlet issue → “an outlet issue”
-   • lighting issue → “a lighting issue”
-   • breaker / panel → “an electrical panel or breaker issue”
-   • EV / charger → “an EV charger installation”
-   • generator → “a generator issue”
-   • inspection → “a home electrical inspection”
-   • power loss terms → “a power-loss issue”
-   • hazard terms (smoke, burning, sparks, arcing) → escalate to Rule 1.43.9
-
-2. If multiple possible intents appear → choose the most specific.
-
-3. If no recognizable keywords exist → fallback intent = “your electrical issue”.
-
-4. This extracted intent must be used in the FIRST outbound SMS from voicemail:
-   “This is Prevolt Electric — I saw you called about {intent}. What’s the address and best time for the visit?”
-
-5. Intent extraction cannot override or contradict Emergency Mode (Rule 1.43.9).
-
----
-
-### Rule 1.43.9 — Emergency-Intent Voicemail Auto-Classification
-When a voicemail contains ANY signal of an electrical hazard, the OS must automatically classify the appointment as an **emergency (TROUBLESHOOT_395)** and activate Emergency Mode immediately.
-
-Hazard signals include but are not limited to:
-• “no power”, “partial power”, “power out”
-• “burning smell”, “smoke”, “sparks”, “arcing”
-• “boom”, “pop”, “bang”
-• “hot outlet”, “hot panel”, “hot wire”
-• “tree ripped the wires”, “line down”, “service cable ripped”
-• “water near the panel”, “flooding”, “leak near electrical”
-
-Upon detection:
-1. appointment_type ← TROUBLESHOOT_395  
-2. OS must switch into Emergency Mode (SRB-2 rules apply)  
-3. OS must NOT ask non-emergency window questions  
-4. OS must ask for **address → time → confirmation**, in that order  
-5. The FIRST SMS must begin with a calm, urgent tone:  
-   “This is Prevolt Electric — I saw your message about a possible electrical hazard. Let’s get you taken care of.”  
-6. If transcript contains *immediate danger* indicators (“fire”, “active smoke”, “someone was shocked”):  
-   OS must include life-safety guidance:  
-   “If you see fire, active smoke, or someone may be injured, call 911 first. Once everything is safe, I can help.”  
-7. Emergency classification cannot be undone unless the customer explicitly states it is NOT an emergency.
-
-Emergency-intent voicemail triage must execute **before all other SRB scheduling logic**.
-
-
 
 ## SRB-2 — Emergency, Hazard, Outage & High-Urgency Engine  
 (The rule block governing all active electrical problems, outages, hazards, priority logic, triage, and emergency-specific NLP behavior.)
@@ -6368,7 +5872,8 @@ OUTPUT FORMAT (STRICT JSON)
         today_patch = now_local_patch.strftime("%Y-%m-%d")
 
         # ---------- RULE A ----------
-        # If TIME provided but DATE missing, infer TODAY
+        # If TIME provided but DATE missing, infer TODAY from:
+        # "today", "anytime", "this afternoon", "whenever", "now"
         if model_time and not model_date:
             if any(phrase in inbound_lower for phrase in [
                 "today", "this", "anytime", "whenever", "now", "soon",
@@ -6380,24 +5885,33 @@ OUTPUT FORMAT (STRICT JSON)
         # ---------- RULE B ----------
         # If DATE provided but TIME missing, infer time from vague time phrases
         if model_date and not model_time:
+            # Vague morning → 09:00
             if "morning" in inbound_lower:
                 model_time = "09:00"
+
+            # Afternoon → 13:00
             elif "afternoon" in inbound_lower:
                 model_time = "13:00"
+
+            # Evening → 16:00 (non-emergency), 18:00 emergency
             elif "evening" in inbound_lower:
                 model_time = "16:00"
+
+            # “Whenever”, “sometime”, “whenever works” → choose nearest valid anchor
             elif any(x in inbound_lower for x in ["whenever", "sometime", "anytime"]):
+                # Afternoon is safest default
                 model_time = "13:00"
 
         # ---------- RULE C ----------
         # Prevent past-time bookings
+        # If model_date is today AND model_time < now → bump to next available 30-minute block
         if model_date == today_patch and model_time:
             try:
                 t_obj = datetime.strptime(model_time, "%H:%M").time()
                 now_t = now_local_patch.time()
 
                 if t_obj < now_t:
-                    # Round to next 30min block
+                    # Round to next 30 minutes
                     minute = (now_local_patch.minute + 29) // 30 * 30
                     hour = now_local_patch.hour + (1 if minute == 60 else 0)
                     minute = 0 if minute == 60 else minute
@@ -6412,27 +5926,19 @@ OUTPUT FORMAT (STRICT JSON)
                 pass
 
         # ---------- RULE D ----------
-        # If both present → suppress further date/time asks
+        # If neither date nor time were given, leave untouched (conversation continues)
+        # If BOTH appear present → prevent SRB-1.12 / 1.13 from re-triggering
         if model_date and model_time:
+            # Mark fully satisfied to suppress re-asks downstream
             pass
 
-        # ---------------------------------------------------------
-        # ⭐ HUMAN AM/PM FORMATTING PATCH (NEW)
-        # ---------------------------------------------------------
-        human_time = None
-        if model_time:
-            try:
-                human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p")
-            except:
-                human_time = model_time  # fallback (should never happen)
-
-        # ---------------------------------------------------------
+        # ---------------------------------------
         # Return patched structure
-        # ---------------------------------------------------------
+        # ---------------------------------------
         return {
-            "sms_body": sms_body.replace(model_time, human_time) if (sms_body and human_time) else sms_body,
+            "sms_body": sms_body,
             "scheduled_date": model_date,
-            "scheduled_time": model_time,    # internal stays 24-hour for Square
+            "scheduled_time": model_time,
             "address": model_address,
         }
 
@@ -6444,7 +5950,6 @@ OUTPUT FORMAT (STRICT JSON)
             "scheduled_time": scheduled_time,
             "address": address,
         }
-
 
 
 
@@ -6954,419 +6459,64 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
 
 # ---------------------------------------------------
-# Voice: Incoming Call (IVR + Spam Filter)
+# Voice: Incoming Call
 # ---------------------------------------------------
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
-    from twilio.twiml.voice_response import Gather, VoiceResponse
-
-    response = VoiceResponse()
-
-    gather = Gather(
-        num_digits=1,
-        action="/handle-call-selection",
-        method="POST"
-    )
-
-    # FULL SSML — Matthew voice with natural pacing
-    gather.say(
-        '<speak>'
-            '<prosody rate="95%">'
-                'Thanks for calling PREE-volt Electric.<break time="0.7s"/>'
-                'To help us direct your call, please choose an option.<break time="0.6s"/>'
-                'If you are a residential customer, press 1.<break time="0.6s"/>'
-                'If you are a commercial, government, or facility customer, press 2.'
-            '</prosody>'
-        '</speak>',
-        voice="Polly.Matthew-Neural"
-    )
-
-    response.append(gather)
-
-    # No input → replay menu
-    response.say(
-        '<speak><prosody rate="95%">Sorry, I did not get that. Let me repeat the options.</prosody></speak>',
-        voice="Polly.Matthew-Neural"
-    )
-    response.redirect("/incoming-call")
-
-    return Response(str(response), mimetype="text/xml")
-
-
-# ---------------------------------------------------
-# Handle Residential vs Commercial
-# ---------------------------------------------------
-@app.route("/handle-call-selection", methods=["POST"])
-def handle_call_selection():
-    from twilio.twiml.voice_response import VoiceResponse
-
-    digit = request.form.get("Digits", "")
-    response = VoiceResponse()
-
-    # -----------------------------
-    # OPTION 1 → RESIDENTIAL FLOW
-    # -----------------------------
-    if digit == "1":
-        response.say(
-            '<speak>'
-                '<prosody rate="95%">'
-                    'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
-                    'You’ll leave a quick message, and our team will text you right away to assist.<break time="0.8s"/>'
-                    'Please leave your name,<break time="0.4s"/> your address,<break time="0.4s"/> '
-                    'and a brief description of what you need help with.<break time="0.6s"/>'
-                    'We will text you shortly.'
-                '</prosody>'
-            '</speak>',
-            voice="Polly.Matthew-Neural"
-        )
-
-        # ENABLE TRANSCRIPTION
-        response.record(
-            max_length=60,
-            play_beep=True,
-            trim="do-not-trim",
-            action="/voicemail-complete",             # Called after recording
-            transcribe=True,                          # <<< Enables transcription
-            transcribe_callback="/voicemail-complete" # <<< Transcript also sent here
-        )
-
-        response.hangup()
-        return Response(str(response), mimetype="text/xml")
-
-    # -----------------------------
-    # OPTION 2 → COMMERCIAL / GOVERNMENT ROUTING
-    # -----------------------------
-    elif digit == "2":
-        response.say(
-            '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
-            voice="Polly.Matthew-Neural"
-        )
-        response.dial("+15555555555")  # Replace with your real direct number
-        return Response(str(response), mimetype="text/xml")
-
-    # -----------------------------
-    # INVALID INPUT → Replay Menu
-    # -----------------------------
-    else:
-        response.say(
-            '<speak><prosody rate="90%">Sorry, I didn’t understand that.</prosody></speak>',
-            voice="Polly.Matthew-Neural"
-        )
-        response.redirect("/incoming-call")
-        return Response(str(response), mimetype="text/xml")
-
-
-# ===================================================
-# Helper: Build Intent-Aware Kickoff Message
-# ===================================================
-def build_kickoff_message(intent, transcript):
-    """
-    Returns a customized kickoff SMS based on voicemail intent.
-    This is where we shape the first message the user receives
-    after leaving a voicemail.
-    """
-
-    category = intent.get("category")
-    appt = intent.get("appointment_type")
-
-    # --- CATEGORY-BASED INTRO LOGIC ---
-    if category == "panel_upgrade":
-        return "Got your message about the electrical panel upgrade. What town is the project in?"
-
-    if category == "outlet_switch":
-        return "Got your message about the outlet or switch problem — is this at your home address?"
-
-    if category == "ev_charger":
-        return "Got your message about installing an EV charger. What town should we head to?"
-
-    if category == "generator":
-        return "Got your generator message — when do you need the work completed?"
-
-    if appt == "TROUBLESHOOT_395":
-        return "Got your message — sounds like an electrical issue. What address should we come out to?"
-
-    # --- DEFAULT FALLBACK ---
-    if transcript:
-        trimmed = transcript.strip()
-        if len(trimmed) > 80:
-            trimmed = trimmed[:77] + "..."
-        return f'Got your message: "{trimmed}" — how can we help?'
-
-    return "Thanks for your message — what electrical work do you need help with?"
-
-
-# ---------------------------------------------------
-# Voice → Voicemail Completion (Recording + Transcription Safe)
-# ---------------------------------------------------
-@app.route("/This is Prevolt electric", methods=["POST"])
-def voicemail_complete():
-    from twilio.twiml.voice_response import VoiceResponse
-    import re
-    from difflib import get_close_matches
-
-    # ---------------------------------------------------
-    # UNIVERSAL ELECTRICAL-DOMAIN TRANSCRIPT CLEANER
-    # ---------------------------------------------------
-    def clean_transcript_text(t: str) -> str:
-        if not t:
-            return ""
-        t = t.lower()
-
-        replacements = {
-            "pre boost": "prevolt", "pre bolt": "prevolt", "pre vote": "prevolt",
-            "pre volt": "prevolt", "pree volt": "prevolt", "free volt": "prevolt",
-            "preavolt": "prevolt",
-
-            "easy charger": "ev charger", "easy char": "ev charger",
-            "evy charger": "ev charger", "e z charger": "ev charger",
-            "e v charger": "ev charger",
-
-            "pannel": "panel", "break her": "breaker", "breakor": "breaker",
-            "out lit": "outlet", "light fix sure": "light fixture",
-
-            "g f i": "gfci", "g f c i": "gfci", "gfi": "gfci",
-        }
-        for wrong, correct in replacements.items():
-            t = t.replace(wrong, correct)
-
-        vocab = [
-            "ev", "ev charger", "charger", "panel", "breaker", "outlet", "switch",
-            "gfci", "light", "lights", "smoke", "burning", "sparks",
-            "generator", "inspection", "service cable", "arc", "arcing",
-            "power", "no power"
-        ]
-
-        cleaned = []
-        for w in t.split():
-            if w in vocab:
-                cleaned.append(w)
-                continue
-            close = get_close_matches(w, vocab, n=1, cutoff=0.80)
-            cleaned.append(close[0] if close else w)
-
-        return " ".join(cleaned).capitalize()
-
-    # ---------------------------------------------------
-    # TIER-4 ADDRESS EXTRACTION + TOWN/STATE
-    # ---------------------------------------------------
-    def extract_address(text):
-        if not text:
-            return None
-        t = text.lower()
-
-        street_pattern = (
-            r"\d{1,6}\s+[a-z0-9 .'-]+?"
-            r"\b(street|st|road|rd|lane|ln|drive|dr|ave|avenue|blvd|circle|cir|court|ct|way|highway|hwy)\b"
-        )
-        m = re.search(street_pattern, t)
-        if m:
-            return m.group(0).strip()
-
-        m2 = re.search(r"\d{1,6}\s+[a-z0-9 .'-]+", t)
-        partial_address = m2.group(0).strip() if m2 else None
-
-        towns = [
-            "windsor locks", "windsor", "enfield", "granby", "east granby",
-            "hartford", "bloomfield", "wethersfield", "west hartford",
-            "suffield", "somers", "ellington", "vernon", "east windsor",
-            "tolland", "farmington", "springfield", "chicopee", "holyoke",
-            "west springfield", "agawam", "longmeadow", "east longmeadow", "ludlow"
-        ]
-
-        extracted_town = None
-        for town in towns:
-            if town in t:
-                extracted_town = town
-                break
-
-        if not extracted_town:
-            close = get_close_matches(t, towns, n=1, cutoff=0.80)
-            if close:
-                extracted_town = close[0]
-
-        state = None
-        if "connecticut" in t or "ct" in t:
-            state = "CT"
-        elif "massachusetts" in t or "ma" in t:
-            state = "MA"
-
-        merged = None
-        if partial_address and extracted_town:
-            merged = f"{partial_address}, {extracted_town}"
-        elif partial_address:
-            merged = partial_address
-        elif extracted_town:
-            merged = extracted_town
-
-        if merged and not state:
-            state = "CT"
-        if merged and state:
-            merged = f"{merged}, {state}"
-
-        return merged
-
-    # ---------------------------------------------------
-    # INTENT EXTRACTOR
-    # ---------------------------------------------------
-    def extract_intent(text):
-        if not text:
-            return "your electrical issue"
-
-        patterns = {
-            "ev charger installation": ["ev", "ev charger", "charger"],
-            "generator issue": ["generator", "gen"],
-            "panel upgrade": ["panel", "service upgrade"],
-            "outlet issue": ["outlet", "gfci", "plug"],
-            "switch issue": ["switch"],
-            "lighting issue": ["light", "lights", "fixture"],
-            "power outage": ["no power", "partial power", "power out"],
-            "burning smell": ["burning", "smoke", "sparks"],
-            "inspection": ["inspection"],
-        }
-
-        for intent, keys in patterns.items():
-            for k in keys:
-                if k in text:
-                    return intent
-        return "your electrical issue"
-
-    # ---------------------------------------------------
-    # Extract raw fields
-    # ---------------------------------------------------
-    recording_url = request.form.get("RecordingUrl", "")
-    from_number = request.form.get("From", "")
-    raw_transcript = request.form.get("TranscriptionText") or ""
-    cleaned_transcript = clean_transcript_text(raw_transcript.lower().strip())
-
-    print("DEBUG → Voicemail recording:", recording_url)
-    print("DEBUG → Voicemail transcript (raw):", repr(raw_transcript))
-    print("DEBUG → Voicemail transcript (cleaned):", repr(cleaned_transcript))
-
-    # ---------------------------------------------------
-    # GOOGLE AUTOCORRECTION + CONFIDENCE CHECK
-    # ---------------------------------------------------
-    def google_clean_address(raw_addr):
-        if not raw_addr:
-            return None, None, False
-        try:
-            status, struct = google_normalize_address(raw_addr)
-            if status != "ok" or not struct:
-                return raw_addr, None, False
-            google_addr = struct.get("full_address") or raw_addr
-            confidence = struct.get("confidence", 1.0)
-            if confidence < 0.80:
-                return google_addr, struct, True
-            return google_addr, struct, False
-        except Exception as e:
-            print("Google validation failed:", repr(e))
-            return raw_addr, None, False
-
-    # ---------------------------------------------------
-    # Handle transcription callback
-    # ---------------------------------------------------
-    if from_number in conversations and raw_transcript:
-        print("DEBUG → Updating transcript only (callback).")
-
-        conversations[from_number]["initial_sms"] = cleaned_transcript
-        conversations[from_number]["cleaned_transcript"] = cleaned_transcript
-
-        extracted = extract_address(cleaned_transcript)
-        final_addr, structured, needs_conf = google_clean_address(extracted)
-
-        conversations[from_number]["address"] = (
-            conversations[from_number]["address"] or final_addr
-        )
-        conversations[from_number]["normalized_address"] = (
-            conversations[from_number]["normalized_address"] or structured
-        )
-        conversations[from_number]["needs_address_confirmation"] = needs_conf
-
-        return Response("OK", mimetype="text/plain")
-
-    # ---------------------------------------------------
-    # Emergency detection
-    # ---------------------------------------------------
-    emergency_keywords = [
-        "no power", "partial power", "power out", "burning", "burning smell",
-        "smoke", "smoke smell", "sparks", "spark", "boom", "pop", "bang",
-        "hot outlet", "hot panel", "tree ripped", "line down", "wire down",
-        "service cable", "arc", "arcing", "water near", "leak", "flood"
-    ]
-    detected_emergency = any(k in cleaned_transcript.lower() for k in emergency_keywords)
-
-    extracted_address = extract_address(cleaned_transcript.lower())
-    intent = extract_intent(cleaned_transcript.lower())
-    if detected_emergency:
-        intent = "a possible electrical hazard"
-
-    final_address, structured_addr, needs_confirmation = google_clean_address(extracted_address)
-
-    # ---------------------------------------------------
-    # Initialize conversation bucket
-    # ---------------------------------------------------
-    conversations[from_number] = {
-        "voicemail_url": recording_url,
-        "initial_sms": cleaned_transcript,
-        "cleaned_transcript": cleaned_transcript,
-        "category": None,
-        "appointment_type": "TROUBLESHOOT_395" if detected_emergency else None,
-        "first_sms_time": time.time(),
-        "replied": False,
-        "followup_sent": False,
-        "scheduled_date": None,
-        "scheduled_time": None,
-        "address": final_address,
-        "normalized_address": structured_addr,
-        "needs_address_confirmation": needs_confirmation,
-        "booking_created": False,
-        "square_booking_id": None,
-        "state_prompt_sent": False,
-    }
-
-    # ---------------------------------------------------
-    # Kickoff SMS — emergency aware + address aware
-    # ---------------------------------------------------
-    try:
-        if detected_emergency:
-            sms = (
-                "This is Prevolt Electric — I saw your message about a possible electrical hazard. "
-                "Let’s get you taken care of. "
-            )
-        else:
-            sms = f"This is Prevolt Electric — I saw you called about {intent}. "
-
-        if final_address:
-            if needs_confirmation:
-                sms += (
-                    f"I found an address match as '{final_address}', but need to confirm — "
-                    f"is this correct?"
-                )
-            else:
-                sms += f"I have your address as {final_address}. What’s the best time for the visit?"
-        else:
-            sms += "What’s the address and best time for the visit?"
-
-        send_sms(from_number, sms)
-
-    except Exception as e:
-        print("Error sending kickoff SMS:", repr(e))
-
-    # ---------------------------------------------------
-    # Voice Goodbye
-    # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
-        '<speak><prosody rate="90%">Thanks, we received your message.</prosody></speak>',
-        voice="Polly.Matthew-Neural"
+        "Thanks for calling Prevolt Electric. "
+        "Please leave your name, address, and a brief description of your project. "
+        "We will text you shortly."
+    )
+    response.record(
+        max_length=60,
+        play_beep=True,
+        trim="do-not-trim",
+        action="/voicemail-complete",
     )
     response.hangup()
-
     return Response(str(response), mimetype="text/xml")
 
 
+# ---------------------------------------------------
+# Voicemail Complete → Transcribe → Initial SMS
+# ---------------------------------------------------
+@app.route("/voicemail-complete", methods=["POST"])
+def voicemail_complete():
+    recording_url = request.form.get("RecordingUrl")
+    caller = request.form.get("From")
 
+    try:
+        raw = transcribe_recording(recording_url)
+        cleaned = clean_transcript_text(raw)
+        sms_info = generate_initial_sms(cleaned)
 
+        send_sms(caller, sms_info["sms_body"])
 
+        conversations[caller] = {
+            "cleaned_transcript": cleaned,
+            "category": sms_info["category"],
+            "appointment_type": sms_info["appointment_type"],
+            "initial_sms": sms_info["sms_body"],
+            "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
+            "replied": False,
+            "followup_sent": False,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
+            "normalized_address": None,
+            "booking_created": False,
+            "square_booking_id": None,
+            "state_prompt_sent": False,
+        }
+
+    except Exception as e:
+        print("Voicemail fail:", repr(e))
+
+    response = VoiceResponse()
+    response.hangup()
+    return Response(str(response), mimetype="text/xml")
 
 
 # ---------------------------------------------------
@@ -7377,15 +6527,13 @@ def incoming_sms():
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
-    # Normalize Twilio’s WhatsApp prefix
+    # Normalize Twilio's WhatsApp prefix
     if from_number.startswith("whatsapp:"):
         from_number = from_number.replace("whatsapp:", "")
 
     convo = conversations.get(from_number)
 
-    # ---------------------------------------------------
-    # COLD INBOUND (NO VOICEMAIL FOUND)
-    # ---------------------------------------------------
+    # Cold inbound with no voicemail history
     if not convo:
         resp = MessagingResponse()
         resp.message(
@@ -7394,25 +6542,7 @@ def incoming_sms():
         )
         return Response(str(resp), mimetype="text/xml")
 
-    # ------------------------------------------------------------
-    # PREVENT DOUBLE-INTRO AFTER VOICEMAIL
-    # ------------------------------------------------------------
-    # If voicemail already triggered a kickoff SMS,
-    # the FIRST inbound reply should NOT trigger generate_reply_for_inbound().
-    if convo.get("voicemail_url") and not convo.get("has_processed_first_inbound"):
-        convo["has_processed_first_inbound"] = True
-
-        resp = MessagingResponse()
-        if convo.get("address"):
-            resp.message("Got it — what time works best for your visit?")
-        else:
-            resp.message("Got it — what's the full address for the visit?")
-
-        return Response(str(resp), mimetype="text/xml")
-
-    # ---------------------------------------------------
-    # Handle CT/MA reply after we specifically asked
-    # ---------------------------------------------------
+    # Handle CT/MA reply after we asked specifically
     if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
         upper = body.upper()
         if "CT" in upper or "CONNECTICUT" in upper:
@@ -7420,14 +6550,15 @@ def incoming_sms():
         elif "MA" in upper or "MASS" in upper or "MASSACHUSETTS" in upper:
             chosen_state = "MA"
         else:
+            # Not clearly CT or MA; ask again
             resp = MessagingResponse()
             resp.message("Please reply with either CT or MA so we can confirm the address.")
             return Response(str(resp), mimetype="text/xml")
 
         raw_address = convo.get("address")
         status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
-
         if status != "ok" or not addr_struct:
+            # Still no good; ask for full address details
             resp = MessagingResponse()
             resp.message(
                 "I still couldn't verify the address. "
@@ -7439,28 +6570,18 @@ def incoming_sms():
         convo["normalized_address"] = addr_struct
         convo["state_prompt_sent"] = False
 
-        # Try booking
+        # Attempt booking now that we have a fully normalized address
         try:
             maybe_create_square_booking(from_number, convo)
         except Exception as e:
             print("maybe_create_square_booking after CT/MA reply failed:", repr(e))
 
-        # Final booking confirmation
-        if convo.get("booking_created") and not convo.get("booking_finalized"):
-
-            def convert_to_ampm(hhmm):
-                if not hhmm:
-                    return ""
-                t = datetime.strptime(hhmm, "%H:%M")
-                return t.strftime("%-I:%M %p")
-
-            appt_date = convo.get("scheduled_date")
-            appt_time = convert_to_ampm(convo.get("scheduled_time"))
-
-            final_msg = f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
-
-            convo["booking_finalized"] = True
-
+        # ✔ NEW: If booking occurred, immediately send confirmation and EXIT
+        if convo.get("booking_created"):
+            final_msg = (
+                f"All set! Your appointment is confirmed for "
+                f"{convo.get('scheduled_date')} at {convo.get('scheduled_time')}."
+            )
             resp = MessagingResponse()
             resp.message(final_msg)
             return Response(str(resp), mimetype="text/xml")
@@ -7469,9 +6590,7 @@ def incoming_sms():
         resp.message("Thanks — that helps. We have everything we need for your visit.")
         return Response(str(resp), mimetype="text/xml")
 
-    # ---------------------------------------------------
-    # NORMAL CONVERSATIONAL FLOW
-    # ---------------------------------------------------
+    # Normal conversational flow
     convo["replied"] = True
 
     ai_reply = generate_reply_for_inbound(
@@ -7487,7 +6606,6 @@ def incoming_sms():
 
     sms_body = ai_reply.get("sms_body", "").strip()
 
-    # Update convo state
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
     if ai_reply.get("scheduled_time"):
@@ -7495,33 +6613,24 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # Attempt booking
+    # Attempt booking once we have a complete date + time + address
     try:
         maybe_create_square_booking(from_number, convo)
     except Exception as e:
         print("maybe_create_square_booking failed:", repr(e))
 
-    # Final confirmation once
-    if convo.get("booking_created") and not convo.get("booking_finalized"):
-
-        def convert_to_ampm(hhmm):
-            if not hhmm:
-                return ""
-            t = datetime.strptime(hhmm, "%H:%M")
-            return t.strftime("%-I:%M %p")
-
-        appt_date = convo.get("scheduled_date")
-        appt_time = convert_to_ampm(convo.get("scheduled_time"))
-
-        final_msg = f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
-
-        convo["booking_finalized"] = True
-
+    # ⭐⭐⭐ SURGICAL FIX: IF A BOOKING WAS CREATED, SEND FINAL CONFIRMATION AND EXIT
+    if convo.get("booking_created"):
+        final_msg = (
+            f"All set! Your appointment is confirmed for "
+            f"{convo.get('scheduled_date')} at {convo.get('scheduled_time')}."
+        )
         resp = MessagingResponse()
         resp.message(final_msg)
         return Response(str(resp), mimetype="text/xml")
+    # ⭐⭐⭐ END OF FIX
 
-    # If AI gives no content → stop
+    # If final confirmation matched → stop responding
     if sms_body == "":
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
@@ -7529,6 +6638,27 @@ def incoming_sms():
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
 
+
+# ---------------------------------------------------
+# Follow-up Cron (10 minutes)
+# ---------------------------------------------------
+@app.route("/cron-followups", methods=["GET"])
+def cron_followups():
+    now = time.time()
+    sent_count = 0
+
+    for phone, convo in conversations.items():
+        if convo.get("replied"):
+            continue
+        if convo.get("followup_sent"):
+            continue
+
+        if now - convo.get("first_sms_time", 0) >= 600:
+            send_sms(phone, "Just checking in — still interested?")
+            convo["followup_sent"] = True
+            sent_count += 1
+
+    return f"Sent {sent_count} follow-up(s)."
 
 
 # ---------------------------------------------------
