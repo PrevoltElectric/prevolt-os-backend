@@ -6954,151 +6954,9 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
 
 # ---------------------------------------------------
-# Voice: Incoming Call (IVR + Spam Filter)
-# ---------------------------------------------------
-@app.route("/incoming-call", methods=["POST"])
-def incoming_call():
-    from twilio.twiml.voice_response import Gather, VoiceResponse
-
-    response = VoiceResponse()
-
-    gather = Gather(
-        num_digits=1,
-        action="/handle-call-selection",
-        method="POST"
-    )
-
-    # FULL SSML — Matthew voice with natural pacing
-    gather.say(
-        '<speak>'
-            '<prosody rate="95%">'
-                'Thanks for calling PREE-volt Electric.<break time="0.7s"/>'
-                'To help us direct your call, please choose an option.<break time="0.6s"/>'
-                'If you are a residential customer, press 1.<break time="0.6s"/>'
-                'If you are a commercial, government, or facility customer, press 2.'
-            '</prosody>'
-        '</speak>',
-        voice="Polly.Matthew-Neural"
-    )
-
-    response.append(gather)
-
-    # No input → replay menu
-    response.say(
-        '<speak><prosody rate="95%">Sorry, I did not get that. Let me repeat the options.</prosody></speak>',
-        voice="Polly.Matthew-Neural"
-    )
-    response.redirect("/incoming-call")
-
-    return Response(str(response), mimetype="text/xml")
-
-
-# ---------------------------------------------------
-# Handle Residential vs Commercial
-# ---------------------------------------------------
-@app.route("/handle-call-selection", methods=["POST"])
-def handle_call_selection():
-    from twilio.twiml.voice_response import VoiceResponse
-
-    digit = request.form.get("Digits", "")
-    response = VoiceResponse()
-
-    # -----------------------------
-    # OPTION 1 → RESIDENTIAL FLOW
-    # -----------------------------
-    if digit == "1":
-        response.say(
-            '<speak>'
-                '<prosody rate="95%">'
-                    'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
-                    'You’ll leave a quick message, and our team will text you right away to assist.<break time="0.8s"/>'
-                    'Please leave your name,<break time="0.4s"/> your address,<break time="0.4s"/> '
-                    'and a brief description of what you need help with.<break time="0.6s"/>'
-                    'We will text you shortly.'
-                '</prosody>'
-            '</speak>',
-            voice="Polly.Matthew-Neural"
-        )
-
-        # ENABLE TRANSCRIPTION
-        response.record(
-            max_length=60,
-            play_beep=True,
-            trim="do-not-trim",
-            action="/voicemail-complete",             # Called after recording
-            transcribe=True,                          # <<< Enables transcription
-            transcribe_callback="/voicemail-complete" # <<< Transcript also sent here
-        )
-
-        response.hangup()
-        return Response(str(response), mimetype="text/xml")
-
-    # -----------------------------
-    # OPTION 2 → COMMERCIAL / GOVERNMENT ROUTING
-    # -----------------------------
-    elif digit == "2":
-        response.say(
-            '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
-            voice="Polly.Matthew-Neural"
-        )
-        response.dial("+15555555555")  # Replace with your real direct number
-        return Response(str(response), mimetype="text/xml")
-
-    # -----------------------------
-    # INVALID INPUT → Replay Menu
-    # -----------------------------
-    else:
-        response.say(
-            '<speak><prosody rate="90%">Sorry, I didn’t understand that.</prosody></speak>',
-            voice="Polly.Matthew-Neural"
-        )
-        response.redirect("/incoming-call")
-        return Response(str(response), mimetype="text/xml")
-
-
-# ===================================================
-# Helper: Build Intent-Aware Kickoff Message
-# ===================================================
-def build_kickoff_message(intent, transcript):
-    """
-    Returns a customized kickoff SMS based on voicemail intent.
-    This is where we shape the first message the user receives
-    after leaving a voicemail.
-    """
-
-    category = intent.get("category")
-    appt = intent.get("appointment_type")
-
-    # --- CATEGORY-BASED INTRO LOGIC ---
-    if category == "panel_upgrade":
-        return "Got your message about the electrical panel upgrade. What town is the project in?"
-
-    if category == "outlet_switch":
-        return "Got your message about the outlet or switch problem — is this at your home address?"
-
-    if category == "ev_charger":
-        return "Got your message about installing an EV charger. What town should we head to?"
-
-    if category == "generator":
-        return "Got your generator message — when do you need the work completed?"
-
-    if appt == "TROUBLESHOOT_395":
-        return "Got your message — sounds like an electrical issue. What address should we come out to?"
-
-    # --- DEFAULT FALLBACK ---
-    if transcript:
-        trimmed = transcript.strip()
-        if len(trimmed) > 80:
-            trimmed = trimmed[:77] + "..."
-        return f'Got your message: "{trimmed}" — how can we help?'
-
-    return "Thanks for your message — what electrical work do you need help with?"
-
-
-# ---------------------------------------------------
 # Voice → Voicemail Completion (Recording + Transcription Safe)
 # ---------------------------------------------------
-@app.route("/This is Prevolt electric", methods=["POST"])
+@app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse
     import re
@@ -7296,6 +7154,7 @@ def voicemail_complete():
 
     extracted_address = extract_address(cleaned_transcript.lower())
     intent = extract_intent(cleaned_transcript.lower())
+
     if detected_emergency:
         intent = "a possible electrical hazard"
 
@@ -7362,6 +7221,7 @@ def voicemail_complete():
     response.hangup()
 
     return Response(str(response), mimetype="text/xml")
+
 
 
 
