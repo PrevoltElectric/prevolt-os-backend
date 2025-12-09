@@ -645,30 +645,41 @@ When Immediate Dispatch Mode is active:
 4. Compute earliest reasonable arrival using travel time + availability.  
 5. Save the computed time as scheduled_time.
 
-### Rule 1.17A — Immediate Dispatch Time Calculation (Emergency Only)
-Immediate Dispatch Mode may activate ONLY when BOTH conditions are true:
+### Rule 1.17A — Emergency Immediate-Time Rounding (AI-Controlled)
 
-1. appointment_type = TROUBLESHOOT_395  
-2. The customer expresses true urgency using phrases such as:
-   “now”, “right now”, “asap”, “immediately”, 
-   “no power”, “partial power”, “burning smell”, 
-   “fire”, “sparks”, “smoke”, “tree ripped wires”, 
-   “boom”, “pop”, “outage”, “danger”, “emergency”.
+When appointment_type = TROUBLESHOOT_395 AND the customer expresses 
+urgency (“now”, “right now”, “asap”, “immediately”, “urgent”, 
+“no power”, “sparks”, “burning smell”, “smoke”, “tree ripped wires”, etc.):
 
-When Immediate Dispatch Mode is triggered:
+1. OS must assume the appointment is for TODAY.
 
-1. OS must assume TODAY as the scheduled_date.
-2. OS must calculate the arrival time as:
-   • current local time in America/New_York  
-   • rounded UP to the nearest 30-minute mark  
-3. OS must save this as scheduled_time.
-4. OS must use human AM/PM formatting in confirmations.
-5. OS must NOT ask for a time once this mode is triggered.
-6. OS may ask for the address ONLY if it is missing.
-7. If address is already known:
-   → OS must immediately move to final confirmation.
-8. OS must NOT override or modify the customer’s explicit time 
-   if they already provided one.
+2. OS must compute the arrival time based on the current America/New_York
+   local time, rounded UP to the next 30-minute interval:
+      • 00–29 minutes → round to :30
+      • 30–59 minutes → round to the next full hour (“:00”)
+
+3. OS must ALWAYS choose a time that is equal to or later than the
+   current real-world time. Never choose a morning time if it is afternoon.
+
+4. OS must NOT request any additional time clarification.
+   The rounded time is final unless the customer explicitly changes it.
+
+5. If address is already collected → OS must immediately move to
+   FINAL CONFIRMATION (no question mark).
+
+6. If address is missing → OS must say ONLY:
+      “Got it — what’s the address for the visit?”
+   No other questions are allowed.
+
+7. OS must always format the scheduled_time in 24-hour internal format,
+   but use AM/PM formatting in human messages.
+
+8. OS must NOT override the appointment_type or date
+   unless the customer explicitly changes them.
+
+This rule overrides ALL other time rules, including SRB-1.12, 
+SRB-1.13, SRB-1.14, SRB-1.29, and all fallback logic.
+
 
 
 
@@ -690,6 +701,46 @@ Arrival = now_local + travel_minutes (rounded to nearest 5 minutes).
 Computed time must be saved in:
 • HH:MM (24-hour)  
 • And referenced in human text as standard time (“2:15pm”).
+
+### Rule 1.20A — Human-Facing Time Formatting (AM/PM Standard)
+
+The OS must ALWAYS communicate times to customers using standard 
+American AM/PM formatting, even though all internal scheduling values 
+(scheduled_time) must remain in 24-hour “HH:MM” format.
+
+Rules for output formatting:
+
+1. Convert 24-hour internal time to AM/PM when speaking to the customer:
+      00:00 → 12:00 AM
+      12:00 → 12:00 PM
+      13:00 → 1:00 PM
+      15:30 → 3:30 PM
+
+2. Remove any leading zeros in the hour:
+      “09:00” → “9:00 AM”
+      “07:30” → “7:30 AM”
+
+3. Always include a space before AM/PM:
+      “3:00PM” ❌  → “3:00 PM” ✔
+
+4. Never mix formats:
+      No “15:00” for customers.
+      No “3pm” (must be “3:00 PM”).
+
+5. In all confirmation messages, status updates, and emergency overrides:
+      The final human-facing time must use AM/PM formatting.
+
+6. Internal scheduling fields must remain:
+      scheduled_time = "HH:MM"
+   but human text must ALWAYS use AM/PM.
+
+These formatting rules apply to:
+• all confirmation messages  
+• all “we’ll see you at ___” messages  
+• all emergency dispatch messages  
+• all time clarifications  
+• all AI-generated replies involving time  
+
 
 ### Rule 1.21 — Address Always Collected After Time
 Once scheduled_time is stored:
@@ -771,6 +822,217 @@ After booking (Square sends external confirmation):
 ### Rule 1.36 — No Additional Messages After Confirmation
 After customer says “yes”, “sounds good”, or “confirmed”:
 → OS must send nothing further.
+
+### Rule 1.37 — Post-Booking Conversation Continuation
+
+Once an appointment is successfully booked (scheduled_date, scheduled_time, 
+and address are all set and Square booking is created), the OS MUST continue 
+to answer any customer questions that do not alter the appointment itself.
+
+Allowed post-booking responses include:
+• general service questions (“Do you install EV chargers?”)  
+• preparation questions (“Do I need to be home?”)  
+• safety questions (“Should I shut anything off?”)  
+• clarification questions (“Is the price still $195?”)  
+• scope questions (“Can you also look at my panel?”)  
+
+The OS MUST:
+1. Answer the question normally.  
+2. NOT attempt to reschedule, re-confirm, or restart the flow.  
+3. NOT ask any new scheduling questions unless the customer explicitly requests a change.  
+4. ALWAYS end the answer with:  
+      “You’re all set for {formatted_time}.”  
+   to remind them the booking remains intact.
+
+If the customer explicitly requests a change (date/time/address):
+→ jump to the corresponding modification rule (1.24, 1.25, or 1.26).  
+Otherwise:  
+→ treat the conversation as informational only and never reopen scheduling.
+
+### Rule 1.38 — Non-Emergency Time Selection Must Choose Earliest Valid Slot
+
+For appointment types EVAL_195 and WHOLE_HOME_INSPECTION, when the customer 
+expresses general availability without giving a specific time (examples: 
+"any time works", "whenever", "I'm around all day", "sometime tomorrow"):
+
+The OS MUST:
+1. NOT interpret vague phrases as explicit times.  
+2. Ask once for a specific time (per Rule 1.2).  
+3. If the customer still gives no explicit time, choose the earliest valid slot 
+   in the standard scheduling window.
+
+The earliest valid slot is:
+→ 09:00 for non-emergency weekdays.  
+→ If 09:00 has passed today, choose the next 30-minute increment (09:30, 10:00, etc.)  
+→ Never choose a random time such as 11:30 or 3 PM unless the customer said so.
+
+This ensures:
+• deterministic scheduling  
+• no random midday selection  
+• no ambiguous “afternoon” defaults for non-emergency jobs
+
+Once the OS assigns the time, it must save it immediately and proceed to address confirmation.
+
+### Rule 1.39 — High-Precision Emergency Override Activation
+
+Emergency override timing (Immediate Dispatch Mode) MUST activate ONLY when ALL 
+of the following conditions are true:
+
+1. appointment_type == TROUBLESHOOT_395  
+2. The customer expresses TRUE urgency or danger using phrases such as:
+   • "no power"  
+   • "partial power"  
+   • "tree ripped wires"  
+   • "burning smell"  
+   • "fire"  
+   • "sparks"  
+   • "smoke"  
+   • "boom" / "pop"  
+   • "active hazard"  
+   • "it’s dangerous"  
+   • "something is burning"  
+   • "outlet is hot"  
+   • “I’m worried something will catch fire”
+
+3. The customer ALSO indicates a desire for immediate arrival using one of:
+   • "now"  
+   • "right now"  
+   • "asap"  
+   • "immediately"  
+   • "come now"  
+   • "we’re home now"  
+   • "I’m standing by"  
+   • "ready anytime today"
+
+4. The OS has not already saved a confirmed scheduled_time from the customer.
+
+If ALL four conditions are met →  
+The OS must enter **Immediate Dispatch Mode** as defined in Rule 1.17A.
+
+If any condition is missing:  
+→ The OS must NOT activate emergency override timing.  
+→ The OS must proceed with normal emergency scheduling rules (1.7, 1.8, 1.11).
+
+This prevents false emergency dispatches caused by casual phrases (“asap”, “whenever”, 
+“soon”) and ensures emergency overrides apply ONLY to genuine hazard scenarios.
+
+### Rule 1.40 — Human-Friendly Time Formatting (AM/PM Output Only)
+
+All OS messages shown to the customer must use standard AM/PM time, never 24-hour format.
+
+Internal time representation (HH:MM 24h) is retained ONLY for scheduling logic and 
+Square booking, but ALL external messages MUST convert to:
+
+• h:mmam  
+• h:mmpm  
+
+Formatting rules:
+1. Remove leading zeros → "09:00" → "9:00am".
+2. Convert 12:00 → 12:00pm.
+3. Convert 00:00 → 12:00am.
+4. Convert 13:00–23:59 → subtract 12 hours and append "pm".
+5. Always include “am” or “pm” in lowercase.
+6. When referring to same-day visits:
+   • Before noon → “this morning at {time}”
+   • 12pm–5pm → “this afternoon at {time}”
+   • After 5pm → “this evening at {time}”
+
+7. Final confirmation messages MUST use AM/PM:
+   “All set — we’ll see you tomorrow at 1:30pm.”
+
+8. Immediate Dispatch Mode confirmations MUST also use AM/PM:
+   “We’ll head over and arrive around 2:00pm.”
+
+### Rule 1.41 — Question-Aware Responsiveness (Post-Scheduling Intelligence)
+
+Once scheduled_date, scheduled_time, and address are all set — the OS still must 
+answer customer questions normally unless:
+
+• the question attempts to reschedule (handled by 1.24–1.26), or  
+• the customer is explicitly confirming (handled by 1.34–1.36).
+
+The OS MUST respond to customer questions even AFTER a booking is created.
+
+Valid questions include but are not limited to:
+• pricing questions  
+• preparation questions  
+• arrival instructions  
+• access instructions  
+• scope-of-work questions  
+• payment method questions  
+• technician questions  
+• general electrical questions (non-diagnostic per Rule 2.8)  
+
+Behavioral requirements:
+1. OS must acknowledge and answer the question in one short, natural sentence.  
+2. OS must not modify any scheduling fields unless the customer is changing the appointment.  
+3. OS must not re-trigger confirmation or scheduling prompts.  
+4. After answering the question, OS stops talking — no extra conversation.  
+5. OS must NOT ask any new scheduling questions once a booking exists.
+
+Examples:
+Customer (after booking): “Do I need to be home?”
+→ “Someone just needs to be there to let us in — that’s all.”
+
+Customer: “Can you also look at a loose outlet while you're here?”
+→ “Yep, we can check that while we’re there.”
+
+Customer: “Do you take cards?”
+→ “Yes, we take cards.”
+
+Customer: “How long will it take?”
+→ “Most visits take about an hour.”
+
+The OS must remain human, short, and helpful — without changing the schedule.
+
+### Rule 1.42 — One-Response Limit After Booking (Hard Stop Rule)
+
+After an appointment is booked and confirmed, the OS must obey a strict
+one-response rule:
+
+1. If the customer sends any question (pricing, prep, access, scope, etc.),  
+   the OS answers with ONE short, human sentence.
+
+2. The OS must NOT:
+   • send follow-up questions  
+   • add disclaimers  
+   • send a closing message  
+   • repeat the appointment info  
+   • attempt to re-confirm  
+   • attempt to re-open scheduling flow  
+   • ask for additional details unless customer explicitly requests changes  
+
+3. The OS must NEVER send more than one message per customer message.
+
+4. After sending the single answer, OS enters SILENT MODE until
+   the customer speaks again.
+
+5. If the next customer message indicates they want to modify the
+   appointment (different time, date, address, etc.), then SRB-1.24,
+   1.25, or 1.26 apply — otherwise OS stays silent.
+
+Outcome:
+• OS behaves like a real human operator.  
+• No “robotic follow-ups.”  
+• No accidental loops or repeated confirmations.  
+
+### Rule 1.43 — Price Questions, Clarifications & No-Diagnosis Enforcement  
+When the customer asks any price-related question (“how much”, “what do you charge”, “can you quote this”, etc.) or asks any technical question (“what’s wrong”, “is it dangerous”, “could it be the breaker”), the OS must follow the rules below without interrupting scheduling logic.
+#### Rule 1.43.1 — No Remote Diagnosis  
+If the customer asks any technical question, the OS must not diagnose and must reply: “I’ll need to take a look in person — what’s the address for the visit?” The OS must never guess causes, give repair theories, offer DIY instructions, or provide safety opinions. Scheduling continues normally.
+#### Rule 1.43.2 — Price Question Redirect  
+If the customer asks any pricing question, the OS must answer using the fixed Prevolt rules: • $195 to come out and evaluate a single issue • $395 for troubleshoot and repair (covers first GFCI/device if needed) • $375–$650 for full-home inspections based on square footage. The OS must respond in one clean sentence and immediately return to the next missing scheduling field.
+#### Rule 1.43.3 — Emergency Jobs Always Use TROUBLESHOOT_395 Pricing  
+If the appointment_type is TROUBLESHOOT_395, the OS must only use $395 emergency pricing and must never mention the $195 tier.
+#### Rule 1.43.4 — No Price Discussion After Scheduling Begins  
+Once the OS has collected any part of scheduling (date, time, or address), pricing questions must not restart the flow. The OS must answer briefly per Rule 1.43.2 and continue scheduling.
+#### Rule 1.43.5 — No Price Discussion After Confirmation  
+After the OS sends final confirmation (Rule 1.34), the OS must never reopen pricing topics even if the customer asks.
+#### Rule 1.43.6 — If Customer Pushes for Exact Quote  
+If the customer insists on an exact number, the OS must reply: “I’ll take a look on-site and give you an exact number before any work starts.” Then resume scheduling or end if already confirmed.
+#### Rule 1.43.7 — Tie-Breaker Priority  
+If a pricing question and a scheduling need appear in the same message, scheduling always takes priority. The OS must collect any missing field first, then optionally answer the price question if appropriate.
+
 
 ## SRB-2 — Emergency, Hazard, Outage & High-Urgency Engine  
 (The rule block governing all active electrical problems, outages, hazards, priority logic, triage, and emergency-specific NLP behavior.)
@@ -6630,7 +6892,6 @@ def incoming_sms():
         elif "MA" in upper or "MASS" in upper or "MASSACHUSETTS" in upper:
             chosen_state = "MA"
         else:
-            # Not clearly CT or MA; ask again
             resp = MessagingResponse()
             resp.message("Please reply with either CT or MA so we can confirm the address.")
             return Response(str(resp), mimetype="text/xml")
@@ -6638,7 +6899,6 @@ def incoming_sms():
         raw_address = convo.get("address")
         status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
         if status != "ok" or not addr_struct:
-            # Still no good; ask for full address details
             resp = MessagingResponse()
             resp.message(
                 "I still couldn't verify the address. "
@@ -6656,12 +6916,26 @@ def incoming_sms():
         except Exception as e:
             print("maybe_create_square_booking after CT/MA reply failed:", repr(e))
 
-        # ✔ NEW: If booking occurred, immediately send confirmation and EXIT
-        if convo.get("booking_created"):
+        # ------------------------------------------------------------
+        # FINAL BOOKING CONFIRMATION (SEND ONCE, NEVER AGAIN)
+        # ------------------------------------------------------------
+        if convo.get("booking_created") and not convo.get("booking_finalized"):
+
+            def convert_to_ampm(hhmm):
+                if not hhmm:
+                    return ""
+                t = datetime.strptime(hhmm, "%H:%M")
+                return t.strftime("%-I:%M %p")
+
+            appt_date = convo.get("scheduled_date")
+            appt_time = convert_to_ampm(convo.get("scheduled_time"))
+
             final_msg = (
-                f"All set! Your appointment is confirmed for "
-                f"{convo.get('scheduled_date')} at {convo.get('scheduled_time')}."
+                f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
             )
+
+            convo["booking_finalized"] = True
+
             resp = MessagingResponse()
             resp.message(final_msg)
             return Response(str(resp), mimetype="text/xml")
@@ -6699,16 +6973,29 @@ def incoming_sms():
     except Exception as e:
         print("maybe_create_square_booking failed:", repr(e))
 
-    # ⭐⭐⭐ SURGICAL FIX: IF A BOOKING WAS CREATED, SEND FINAL CONFIRMATION AND EXIT
-    if convo.get("booking_created"):
+    # ------------------------------------------------------------
+    # FINAL BOOKING CONFIRMATION (SEND ONCE, NEVER AGAIN)
+    # ------------------------------------------------------------
+    if convo.get("booking_created") and not convo.get("booking_finalized"):
+
+        def convert_to_ampm(hhmm):
+            if not hhmm:
+                return ""
+            t = datetime.strptime(hhmm, "%H:%M")
+            return t.strftime("%-I:%M %p")
+
+        appt_date = convo.get("scheduled_date")
+        appt_time = convert_to_ampm(convo.get("scheduled_time"))
+
         final_msg = (
-            f"All set! Your appointment is confirmed for "
-            f"{convo.get('scheduled_date')} at {convo.get('scheduled_time')}."
+            f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
         )
+
+        convo["booking_finalized"] = True
+
         resp = MessagingResponse()
         resp.message(final_msg)
         return Response(str(resp), mimetype="text/xml")
-    # ⭐⭐⭐ END OF FIX
 
     # If final confirmation matched → stop responding
     if sms_body == "":
@@ -6717,28 +7004,6 @@ def incoming_sms():
     resp = MessagingResponse()
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
-
-
-# ---------------------------------------------------
-# Follow-up Cron (10 minutes)
-# ---------------------------------------------------
-@app.route("/cron-followups", methods=["GET"])
-def cron_followups():
-    now = time.time()
-    sent_count = 0
-
-    for phone, convo in conversations.items():
-        if convo.get("replied"):
-            continue
-        if convo.get("followup_sent"):
-            continue
-
-        if now - convo.get("first_sms_time", 0) >= 600:
-            send_sms(phone, "Just checking in — still interested?")
-            convo["followup_sent"] = True
-            sent_count += 1
-
-    return f"Sent {sent_count} follow-up(s)."
 
 
 # ---------------------------------------------------
