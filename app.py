@@ -1368,12 +1368,9 @@ def generate_reply_for_inbound(
     if conv is None:
         conv = {}
 
-    # Appointment-type derivation (safe)
-    if appointment_type is not None:
-        pass
-    elif conv.get("appointment_type"):
-        appointment_type = conv["appointment_type"]
-
+    # -------------------------------------------
+    # UNIVERSAL TYPE SANITIZER (always available)
+    # -------------------------------------------
     VALID_TYPES = {
         "EVAL_195",
         "TROUBLESHOOT_395",
@@ -1381,35 +1378,55 @@ def generate_reply_for_inbound(
         "WHOLE_HOME_INSPECTION",
     }
 
-    if appointment_type and appointment_type.strip().upper() not in VALID_TYPES:
-        appointment_type = None
+    def force_type(value):
+        """Ensures type is always one of VALID_TYPES."""
+        if not value:
+            return "TROUBLESHOOT_395"
+        v = str(value).strip().upper()
+        if v not in VALID_TYPES:
+            return "TROUBLESHOOT_395"
+        return v
 
-    if appointment_type is None:
+    # ------------------------------------------------------------------
+    # INITIAL TYPE RESOLUTION (never allows None to escape this section)
+    # ------------------------------------------------------------------
+    if appointment_type is not None:
+        appointment_type = force_type(appointment_type)
+    elif conv.get("appointment_type"):
+        appointment_type = force_type(conv["appointment_type"])
+    else:
         appointment_type = "TROUBLESHOOT_395"
 
-    appointment_type = appointment_type.strip().upper()
+    appointment_type = force_type(appointment_type)
     conv["appointment_type"] = appointment_type
 
-    # State machine lock
+    # -------------------------------------------
+    # STATE MACHINE LOCK
+    # -------------------------------------------
     state = get_current_state(conv)
     lock = enforce_state_lock(state, conv)
     if lock.get("interrupt"):
-        if lock["reply"].get("appointment_type") is None:
-            lock["reply"]["appointment_type"] = conv.get("appointment_type")
-        return lock["reply"]
+        r = lock["reply"]
+        r["appointment_type"] = force_type(r.get("appointment_type") or conv["appointment_type"])
+        return r
 
-    # Emergency type protection
-    if conv.get("is_emergency") and conv.get("appointment_type") is None:
+    # -------------------------------------------
+    # EMERGENCY TYPE PROTECTION
+    # -------------------------------------------
+    if conv.get("is_emergency") and not conv.get("appointment_type"):
         conv["appointment_type"] = "TROUBLESHOOT_395"
 
-    # Intent engine
+    # -------------------------------------------
+    # INTENT ENGINE
+    # -------------------------------------------
     intent_reply = srb14_interpret_human_intent(conv, inbound_lower)
     if intent_reply:
-        if intent_reply.get("appointment_type") is None:
-            intent_reply["appointment_type"] = conv.get("appointment_type")
+        intent_reply["appointment_type"] = force_type(intent_reply.get("appointment_type") or conv["appointment_type"])
         return intent_reply
 
-    # Address intake
+    # -------------------------------------------
+    # ADDRESS INTAKE ENGINE
+    # -------------------------------------------
     addr_reply = handle_address_intake(
         conv,
         inbound_text,
@@ -1419,13 +1436,14 @@ def generate_reply_for_inbound(
         address
     )
     if addr_reply:
-        if addr_reply.get("appointment_type") is None:
-            addr_reply["appointment_type"] = conv.get("appointment_type")
+        addr_reply["appointment_type"] = force_type(addr_reply.get("appointment_type") or conv["appointment_type"])
         return addr_reply
 
     address = conv.get("address")
 
-    # Emergency engine
+    # -------------------------------------------
+    # EMERGENCY ENGINE
+    # -------------------------------------------
     emergency_reply = handle_emergency(
         conv,
         category,
@@ -1438,16 +1456,19 @@ def generate_reply_for_inbound(
         conv.get("phone") if conv.get("phone") else None
     )
     if emergency_reply:
-        if emergency_reply.get("appointment_type") is None:
-            emergency_reply["appointment_type"] = conv.get("appointment_type")
+        emergency_reply["appointment_type"] = force_type(emergency_reply.get("appointment_type") or conv["appointment_type"])
         return emergency_reply
 
-    # Troubleshoot case detection
+    # -------------------------------------------
+    # TROUBLESHOOT CASE DETECTION
+    # -------------------------------------------
     if is_troubleshoot_case(inbound_lower):
         conv["appointment_type"] = "TROUBLESHOOT_395"
         appointment_type = "TROUBLESHOOT_395"
 
-    # NLP date/time parse
+    # -------------------------------------------
+    # NLP DATE/TIME PARSER
+    # -------------------------------------------
     dt = parse_natural_datetime(inbound_text, now_local)
     if dt["has_datetime"]:
         conv["scheduled_date"] = dt["date"]
@@ -1455,7 +1476,9 @@ def generate_reply_for_inbound(
         scheduled_date = dt["date"]
         scheduled_time = dt["time"]
 
-    # Follow-up questions
+    # -------------------------------------------
+    # FOLLOW-UP QUESTIONS
+    # -------------------------------------------
     follow_reply = handle_followup_questions(
         conv,
         appointment_type,
@@ -1465,25 +1488,26 @@ def generate_reply_for_inbound(
         address
     )
     if follow_reply:
-        if follow_reply.get("appointment_type") is None:
-            follow_reply["appointment_type"] = conv.get("appointment_type")
+        follow_reply["appointment_type"] = force_type(follow_reply.get("appointment_type") or conv["appointment_type"])
         return follow_reply
 
-    # Appointment type lock
-    if appointment_type is None:
-        appointment_type = conv.get("appointment_type")
-    if appointment_type:
-        appointment_type = appointment_type.strip().upper()
+    # -------------------------------------------
+    # FINAL TYPE LOCK
+    # -------------------------------------------
+    appointment_type = force_type(conv.get("appointment_type"))
     conv["appointment_type"] = appointment_type
 
-    # Confirmation engine
+    # -------------------------------------------
+    # CONFIRMATION ENGINE
+    # -------------------------------------------
     confirm_reply = handle_confirmation(conv, inbound_lower, conv.get("phone"))
     if confirm_reply:
-        if confirm_reply.get("appointment_type") is None:
-            confirm_reply["appointment_type"] = conv.get("appointment_type")
+        confirm_reply["appointment_type"] = force_type(confirm_reply.get("appointment_type") or conv["appointment_type"])
         return confirm_reply
 
-    # Home-today engine
+    # -------------------------------------------
+    # HOME-TODAY ENGINE
+    # -------------------------------------------
     home_reply = handle_home_today(
         conv,
         inbound_lower,
@@ -1492,11 +1516,12 @@ def generate_reply_for_inbound(
         now_local.strftime("%Y-%m-%d")
     )
     if home_reply:
-        if home_reply.get("appointment_type") is None:
-            home_reply["appointment_type"] = conv.get("appointment_type")
+        home_reply["appointment_type"] = force_type(home_reply.get("appointment_type") or conv["appointment_type"])
         return home_reply
 
-    # Final autobook
+    # -------------------------------------------
+    # FINAL AUTOBOOK
+    # -------------------------------------------
     final_reply = attempt_final_autobook(
         conv,
         conv.get("phone"),
@@ -1505,11 +1530,12 @@ def generate_reply_for_inbound(
         address
     )
     if final_reply:
-        if final_reply.get("appointment_type") is None:
-            final_reply["appointment_type"] = conv.get("appointment_type")
+        final_reply["appointment_type"] = force_type(final_reply.get("appointment_type") or conv["appointment_type"])
         return final_reply
 
-    # LLM fallback
+    # -------------------------------------------
+    # LLM FALLBACK
+    # -------------------------------------------
     fallback = run_llm_fallback(
         cleaned_transcript,
         category,
@@ -1523,10 +1549,9 @@ def generate_reply_for_inbound(
         inbound_text
     )
 
-    if fallback.get("appointment_type") is None:
-        fallback["appointment_type"] = conv.get("appointment_type")
-
+    fallback["appointment_type"] = force_type(fallback.get("appointment_type") or conv["appointment_type"])
     return fallback
+
 
 
 
