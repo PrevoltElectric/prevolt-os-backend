@@ -93,8 +93,8 @@ def send_sms(to_number: str, body: str) -> None:
         return
 
     try:
-        whatsapp_from = "whatsapp:+14155238886"   # Twilio Sandbox
-        whatsapp_to = "whatsapp:+18609701727"     # <-- YOUR CELL
+        whatsapp_from = "whatsapp:+14155238886"  # Twilio Sandbox
+        whatsapp_to = "whatsapp:+18609701727"    # <-- YOUR CELL
 
         msg = twilio_client.messages.create(
             body=body,
@@ -116,6 +116,7 @@ def transcribe_recording(recording_url: str) -> str:
     Auto-fallback: try .wav first, then .mp3.
     """
 
+    # --- 1) Try WAV first ---
     wav_url = recording_url + ".wav"
     mp3_url = recording_url + ".mp3"
 
@@ -137,11 +138,13 @@ def transcribe_recording(recording_url: str) -> str:
         print("Voicemail download FAILED for:", recording_url)
         return ""
 
+    # --- 2) Save temp file ---
     tmp_path = "/tmp/prevolt_voicemail.wav"
     with open(tmp_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
+    # --- 3) Send to Whisper ---
     with open(tmp_path, "rb") as audio_file:
         transcript = openai_client.audio.transcriptions.create(
             model="whisper-1",
@@ -149,7 +152,6 @@ def transcribe_recording(recording_url: str) -> str:
         )
 
     return transcript.text.strip()
-
 
 # ---------------------------------------------------
 # Step 2 — Cleanup (improve clarity)
@@ -164,7 +166,7 @@ def clean_transcript_text(raw_text: str) -> str:
                     "content": (
                         "You clean up voicemail transcriptions for an electrical contractor. "
                         "Fix obvious transcription mistakes and electrical terminology, "
-                        'improve grammar slightly, but preserve the customer\'s meaning EXACTLY. '
+                        "improve grammar slightly, but preserve the customer's meaning EXACTLY. "
                         "Do NOT add details. Do NOT change the problem description."
                     ),
                 },
@@ -172,20 +174,16 @@ def clean_transcript_text(raw_text: str) -> str:
             ],
         )
         return completion.choices[0].message.content.strip()
-
     except Exception as e:
         print("Cleanup FAILED:", repr(e))
         return raw_text
+
 
 
 # ---------------------------------------------------
 # Step 3 — Generate Initial SMS (Ultra-Deterministic Classifier)
 # ---------------------------------------------------
 def generate_initial_sms(cleaned_text: str) -> dict:
-    """
-    This is the ONLY classifier used for voicemail → first SMS.
-    Deterministic. No duplicates.
-    """
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -194,22 +192,124 @@ def generate_initial_sms(cleaned_text: str) -> dict:
                     "role": "system",
                     "content": (
                         "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
-                        "Classify the voicemail into EXACTLY ONE appointment type.\n\n"
-                        "==============================\n"
-                        " APPOINTMENT TYPE RULES\n"
-                        "==============================\n"
-                        "TROUBLESHOOT_395 = ANY active problem, outage, burning smell, sparking, fire, "
-                        "wires down, tree damage, main wires pulled, breakers tripping, no/partial power, safety issues.\n\n"
-                        "WHOLE_HOME_INSPECTION = ONLY when caller clearly states inspection for home purchase, "
-                        "safety review, insurance, or explicitly says 'inspection'.\n\n"
-                        "EVAL_195 = Installs, upgrades, quotes, EV chargers, generators, panel upgrades, "
-                        "renovations, or pricing inquiries.\n\n"
-                        "RULES:\n"
-                        "• When in doubt → choose TROUBLESHOOT_395.\n"
-                        "• SMS MUST start with: 'Hi, this is Prevolt Electric —'\n"
-                        "• Mention price ONCE.\n"
-                        "• No emojis. No fluff. No asking to repeat voicemail.\n\n"
-                        "Return STRICT JSON {sms_body, category, appointment_type}."
+                        "Your job is to classify the voicemail into EXACTLY ONE appointment type.\n\n"
+                        "APPOINTMENT TYPE RULES (DO NOT GUESS):\n"
+                        "1. TROUBLESHOOT_395 = ANY active problem, urgent issue, outage, burning smell, fire, "
+                        "   wires down, tree damage, main wires pulled, breaker tripping, no power, partial power, "
+                        "   anything dangerous, anything affecting existing equipment.\n"
+                        "2. WHOLE_HOME_INSPECTION = ONLY when caller explicitly says: "
+                        "   'inspection', 'whole home inspection', 'electrical inspection', "
+                        "   or requests a safety inspection for insurance or buying a home.\n"
+                        "3. EVAL_195 = Quotes, upgrades, installs, adding circuits, panel upgrades, EV chargers, "
+                        "   generator installs, renovations, pricing requests, or non-emergency consultations.\n\n"
+                        "NEVER misclassify outages as inspections or evals. When in doubt between eval and troubleshoot → choose TROUBLESHOOT.\n"
+                        "NEVER soften or second-guess. Use hard classification logic ONLY based on the voicemail.\n\n"
+                        "SMS RULES:\n"
+                        "• Must begin with: 'Hi, this is Prevolt Electric —'\n"
+                        "• Mention the price ONCE.\n"
+                        "• No small talk, no emojis, no fluff.\n"
+                        "• Do NOT ask them to repeat the voicemail.\n\n"
+                        "Return STRICT JSON: {sms_body, category, appointment_type}."
+                    ),
+                },
+                {"role": "user", "content": cleaned_text},
+            ],
+        )
+
+        data = json.loads(completion.choices[0].message.content)
+
+        return {
+            "sms_body": data["sms_body"].strip(),
+            "category": data["category"],
+            "appointment_type": data["appointment_type"],
+        }
+
+    except Exception as e:
+        print("Initial SMS FAILED:", repr(e))
+        return {
+            "sms_body": (
+                "Hi, this is Prevolt Electric — I received your message. "
+                "The next step is a $195 on-site consultation and quote visit. "
+                "What day works for you?"
+            ),
+            "category": "OTHER",
+            "appointment_type": "EVAL_195",
+        }
+
+
+    # ----------------------------------------
+    # NON-EMERGENCY → Use LLM classification
+    # ----------------------------------------
+    try:
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
+                        "Generate ONLY the FIRST outbound SMS after reading voicemail.\n\n"
+                        "Rules:\n"
+                        "• MUST start with: 'Hi, this is Prevolt Electric —'\n"
+                        "• NEVER ask customer to repeat their voicemail.\n"
+                        "• Determine correct appointment type:\n"
+                        "   - Installs/quotes/upgrades → EVAL_195\n"
+                        "   - Active problems (non-emergency) → TROUBLESHOOT_395\n"
+                        "   - Whole home inspection → WHOLE_HOME_INSPECTION\n"
+                        "• Mention price once only.\n"
+                        "• No photos. No AI mentions. No Kyle.\n\n"
+                        "Return STRICT JSON with keys: sms_body, category, appointment_type."
+                    ),
+                },
+                {"role": "user", "content": cleaned_text},
+            ],
+        )
+
+        data = json.loads(completion.choices[0].message.content)
+
+        return {
+            "sms_body": data["sms_body"].strip(),
+            "category": data["category"],
+            "appointment_type": data["appointment_type"],
+        }
+
+    except Exception as e:
+        print("Initial SMS FAILED:", repr(e))
+        return {
+            "sms_body": (
+                "Hi, this is Prevolt Electric — I received your message. "
+                "The next step is a $195 on-site consultation and quote visit. "
+                "What day works for you?"
+            ),
+            "category": "OTHER",
+            "appointment_type": "EVAL_195",
+        }
+
+
+
+# ---------------------------------------------------
+# Step 3 — Generate Initial SMS
+# ---------------------------------------------------
+def generate_initial_sms(cleaned_text: str) -> dict:
+    try:
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Prevolt OS, the SMS assistant for Prevolt Electric. "
+                        "Generate the FIRST outbound SMS after reading voicemail.\n\n"
+                        "Rules:\n"
+                        "• MUST start with: 'Hi, this is Prevolt Electric —'\n"
+                        "• NEVER ask them to repeat their voicemail.\n"
+                        "• Determine correct appointment type:\n"
+                        "   - Installs/quotes/upgrades → EVAL_195\n"
+                        "   - Active problems → TROUBLESHOOT_395\n"
+                        "   - Whole house inspection → WHOLE_HOME_INSPECTION\n"
+                        "• Mention price once only.\n"
+                        "• No photos. No AI mentions. No Kyle.\n\n"
+                        "Return STRICT JSON with keys: sms_body, category, appointment_type."
                     ),
                 },
                 {"role": "user", "content": cleaned_text},
@@ -251,6 +351,9 @@ def generate_reply_for_inbound(
 ) -> dict:
 
     try:
+        # ---------------------------------------------------
+        # Local date/time for Option A date conversion
+        # ---------------------------------------------------
         if ZoneInfo:
             tz = ZoneInfo("America/New_York")
         else:
@@ -260,17 +363,51 @@ def generate_reply_for_inbound(
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday = now_local.strftime("%A")
 
+        # ---------------------------------------------------
+        # Session Reset Logic (prevents ghost-state)
+        # ---------------------------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
-        conv = conversations.get(phone, {})
+        last_time = conversations.get(phone, {}).get("first_sms_time")
+        should_reset = False
 
-        # Your existing SRB logic continues…
-        return {}
+        # Reset if conversation is older than 60 minutes
+        if last_time:
+            try:
+                # Ensure last_time is a datetime
+                elapsed_minutes = (now_local - last_time).total_seconds() / 60
+                if elapsed_minutes > 60:
+                    should_reset = True
+            except Exception:
+                # If corrupted/old format → force reset
+                should_reset = True
 
-    except Exception as e:
-        print("Inbound reply generation error:", repr(e))
-        return {}
+        # Reset if user signals a brand-new issue
+        if inbound_text.strip().lower() in [
+            "hi", "hello", "hey",
+            "new issue", "another issue",
+            "new problem", "i need help",
+            "i have a new problem",
+        ]:
+            should_reset = True
 
-
+        # Perform reset if needed
+        if should_reset:
+            conversations[phone] = {
+                "cleaned_transcript": cleaned_transcript,
+                "category": category,
+                "appointment_type": appointment_type,
+                "initial_sms": initial_sms,
+                "first_sms_time": now_local,
+                "replied": False,
+                "followup_sent": False,
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": None,
+                "normalized_address": None,
+                "booking_created": False,
+                "square_booking_id": None,
+                "state_prompt_sent": False,
+            }
 
         system_prompt = """
 You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
@@ -6817,9 +6954,151 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
 
 # ---------------------------------------------------
+# Voice: Incoming Call (IVR + Spam Filter)
+# ---------------------------------------------------
+@app.route("/incoming-call", methods=["POST"])
+def incoming_call():
+    from twilio.twiml.voice_response import Gather, VoiceResponse
+
+    response = VoiceResponse()
+
+    gather = Gather(
+        num_digits=1,
+        action="/handle-call-selection",
+        method="POST"
+    )
+
+    # FULL SSML — Matthew voice with natural pacing
+    gather.say(
+        '<speak>'
+            '<prosody rate="95%">'
+                'Thanks for calling PREE-volt Electric.<break time="0.7s"/>'
+                'To help us direct your call, please choose an option.<break time="0.6s"/>'
+                'If you are a residential customer, press 1.<break time="0.6s"/>'
+                'If you are a commercial, government, or facility customer, press 2.'
+            '</prosody>'
+        '</speak>',
+        voice="Polly.Matthew-Neural"
+    )
+
+    response.append(gather)
+
+    # No input → replay menu
+    response.say(
+        '<speak><prosody rate="95%">Sorry, I did not get that. Let me repeat the options.</prosody></speak>',
+        voice="Polly.Matthew-Neural"
+    )
+    response.redirect("/incoming-call")
+
+    return Response(str(response), mimetype="text/xml")
+
+
+# ---------------------------------------------------
+# Handle Residential vs Commercial
+# ---------------------------------------------------
+@app.route("/handle-call-selection", methods=["POST"])
+def handle_call_selection():
+    from twilio.twiml.voice_response import VoiceResponse
+
+    digit = request.form.get("Digits", "")
+    response = VoiceResponse()
+
+    # -----------------------------
+    # OPTION 1 → RESIDENTIAL FLOW
+    # -----------------------------
+    if digit == "1":
+        response.say(
+            '<speak>'
+                '<prosody rate="95%">'
+                    'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
+                    'You’ll leave a quick message, and our team will text you right away to assist.<break time="0.8s"/>'
+                    'Please leave your name,<break time="0.4s"/> your address,<break time="0.4s"/> '
+                    'and a brief description of what you need help with.<break time="0.6s"/>'
+                    'We will text you shortly.'
+                '</prosody>'
+            '</speak>',
+            voice="Polly.Matthew-Neural"
+        )
+
+        # ENABLE TRANSCRIPTION
+        response.record(
+            max_length=60,
+            play_beep=True,
+            trim="do-not-trim",
+            action="/voicemail-complete",             # Called after recording
+            transcribe=True,                          # <<< Enables transcription
+            transcribe_callback="/voicemail-complete" # <<< Transcript also sent here
+        )
+
+        response.hangup()
+        return Response(str(response), mimetype="text/xml")
+
+    # -----------------------------
+    # OPTION 2 → COMMERCIAL / GOVERNMENT ROUTING
+    # -----------------------------
+    elif digit == "2":
+        response.say(
+            '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
+            voice="Polly.Matthew-Neural"
+        )
+        response.dial("+15555555555")  # Replace with your real direct number
+        return Response(str(response), mimetype="text/xml")
+
+    # -----------------------------
+    # INVALID INPUT → Replay Menu
+    # -----------------------------
+    else:
+        response.say(
+            '<speak><prosody rate="90%">Sorry, I didn’t understand that.</prosody></speak>',
+            voice="Polly.Matthew-Neural"
+        )
+        response.redirect("/incoming-call")
+        return Response(str(response), mimetype="text/xml")
+
+
+# ===================================================
+# Helper: Build Intent-Aware Kickoff Message
+# ===================================================
+def build_kickoff_message(intent, transcript):
+    """
+    Returns a customized kickoff SMS based on voicemail intent.
+    This is where we shape the first message the user receives
+    after leaving a voicemail.
+    """
+
+    category = intent.get("category")
+    appt = intent.get("appointment_type")
+
+    # --- CATEGORY-BASED INTRO LOGIC ---
+    if category == "panel_upgrade":
+        return "Got your message about the electrical panel upgrade. What town is the project in?"
+
+    if category == "outlet_switch":
+        return "Got your message about the outlet or switch problem — is this at your home address?"
+
+    if category == "ev_charger":
+        return "Got your message about installing an EV charger. What town should we head to?"
+
+    if category == "generator":
+        return "Got your generator message — when do you need the work completed?"
+
+    if appt == "TROUBLESHOOT_395":
+        return "Got your message — sounds like an electrical issue. What address should we come out to?"
+
+    # --- DEFAULT FALLBACK ---
+    if transcript:
+        trimmed = transcript.strip()
+        if len(trimmed) > 80:
+            trimmed = trimmed[:77] + "..."
+        return f'Got your message: "{trimmed}" — how can we help?'
+
+    return "Thanks for your message — what electrical work do you need help with?"
+
+
+# ---------------------------------------------------
 # Voice → Voicemail Completion (Recording + Transcription Safe)
 # ---------------------------------------------------
-@app.route("/voicemail-complete", methods=["POST"])
+@app.route("/This is Prevolt electric", methods=["POST"])
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse
     import re
@@ -7017,7 +7296,6 @@ def voicemail_complete():
 
     extracted_address = extract_address(cleaned_transcript.lower())
     intent = extract_intent(cleaned_transcript.lower())
-
     if detected_emergency:
         intent = "a possible electrical hazard"
 
@@ -7084,7 +7362,6 @@ def voicemail_complete():
     response.hangup()
 
     return Response(str(response), mimetype="text/xml")
-
 
 
 
