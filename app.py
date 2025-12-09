@@ -7101,89 +7101,228 @@ def build_kickoff_message(intent, transcript):
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse
+    import re
+    from difflib import get_close_matches
 
-    # -------------------------------------------
-    # Extract common fields (may vary by webhook type)
-    # -------------------------------------------
+    # ---------------------------------------------------
+    # UNIVERSAL ELECTRICAL-DOMAIN TRANSCRIPT CLEANER
+    # ---------------------------------------------------
+    def clean_transcript_text(t: str) -> str:
+        if not t:
+            return ""
+        t = t.lower()
+
+        replacements = {
+            "pre boost": "prevolt", "pre bolt": "prevolt", "pre vote": "prevolt",
+            "pre volt": "prevolt", "pree volt": "prevolt", "free volt": "prevolt",
+            "preavolt": "prevolt",
+
+            "easy charger": "ev charger", "easy char": "ev charger",
+            "evy charger": "ev charger", "e z charger": "ev charger",
+            "e v charger": "ev charger",
+
+            "pannel": "panel", "break her": "breaker", "breakor": "breaker",
+            "out lit": "outlet", "light fix sure": "light fixture",
+
+            "g f i": "gfci", "g f c i": "gfci", "gfi": "gfci",
+        }
+        for wrong, correct in replacements.items():
+            t = t.replace(wrong, correct)
+
+        vocab = [
+            "ev", "ev charger", "charger", "panel", "breaker", "outlet", "switch",
+            "gfci", "light", "lights", "smoke", "burning", "sparks",
+            "generator", "inspection", "service cable", "arc", "arcing",
+            "power", "no power"
+        ]
+
+        cleaned = []
+        for w in t.split():
+            if w in vocab:
+                cleaned.append(w)
+                continue
+            close = get_close_matches(w, vocab, n=1, cutoff=0.80)
+            cleaned.append(close[0] if close else w)
+
+        return " ".join(cleaned).capitalize()
+
+    # ---------------------------------------------------
+    # TIER-4 ADDRESS INTELLIGENCE EXTRACTOR
+    # ---------------------------------------------------
+    def extract_address(text):
+        if not text:
+            return None
+        t = text.lower()
+
+        street_pattern = (
+            r"\d{1,6}\s+[a-z0-9 .'-]+?"
+            r"\b(street|st|road|rd|lane|ln|drive|dr|ave|avenue|blvd|circle|cir|court|ct|way|highway|hwy)\b"
+        )
+        m = re.search(street_pattern, t)
+        if m:
+            return m.group(0).strip()
+
+        m2 = re.search(r"\d{1,6}\s+[a-z0-9 .'-]+", t)
+        partial_address = m2.group(0).strip() if m2 else None
+
+        towns = [
+            "windsor locks", "windsor", "enfield", "granby", "east granby",
+            "hartford", "bloomfield", "wethersfield", "west hartford",
+            "suffield", "somers", "ellington", "vernon", "east windsor",
+            "tolland", "farmington",
+            "springfield", "chicopee", "holyoke", "west springfield",
+            "agawam", "longmeadow", "east longmeadow", "ludlow"
+        ]
+
+        extracted_town = None
+        for town in towns:
+            if town in t:
+                extracted_town = town
+                break
+
+        if not extracted_town:
+            close = get_close_matches(t, towns, n=1, cutoff=0.80)
+            if close:
+                extracted_town = close[0]
+
+        state = None
+        if "connecticut" in t or "ct" in t:
+            state = "CT"
+        elif "massachusetts" in t or "ma" in t:
+            state = "MA"
+
+        merged = None
+        if partial_address and extracted_town:
+            merged = f"{partial_address}, {extracted_town}"
+        elif partial_address:
+            merged = partial_address
+        elif extracted_town:
+            merged = extracted_town
+
+        if merged and not state:
+            state = "CT"
+        if merged and state:
+            merged = f"{merged}, {state}"
+
+        return merged
+
+    # ---------------------------------------------------
+    # INTENT EXTRACTOR
+    # ---------------------------------------------------
+    def extract_intent(text):
+        if not text:
+            return "your electrical issue"
+
+        patterns = {
+            "ev charger installation": ["ev", "ev charger", "charger"],
+            "generator issue": ["generator", "gen"],
+            "panel upgrade": ["panel", "service upgrade"],
+            "outlet issue": ["outlet", "gfci", "plug"],
+            "switch issue": ["switch"],
+            "lighting issue": ["light", "lights", "fixture"],
+            "power outage": ["no power", "partial power", "power out"],
+            "burning smell": ["burning", "smoke", "sparks"],
+            "inspection": ["inspection"],
+        }
+
+        for intent, keys in patterns.items():
+            for k in keys:
+                if k in text:
+                    return intent
+        return "your electrical issue"
+
+    # ---------------------------------------------------
+    # Extract raw fields
+    # ---------------------------------------------------
     recording_url = request.form.get("RecordingUrl", "")
     from_number = request.form.get("From", "")
-    transcript = request.form.get("TranscriptionText") or ""
-    transcript_lower = transcript.lower().strip()
+    raw_transcript = request.form.get("TranscriptionText") or ""
+
+    cleaned_transcript = clean_transcript_text(raw_transcript.lower().strip())
 
     print("DEBUG → Voicemail recording:", recording_url)
-    print("DEBUG → Voicemail transcript:", repr(transcript))
+    print("DEBUG → Voicemail transcript (raw):", repr(raw_transcript))
+    print("DEBUG → Voicemail transcript (cleaned):", repr(cleaned_transcript))
 
-    # If this is ONLY the transcription callback
-    # and conversation already exists → update transcript and exit cleanly.
-    if from_number in conversations and transcript:
-        print("DEBUG → Updating transcript only (transcription callback).")
-        conversations[from_number]["initial_sms"] = transcript
-        conversations[from_number]["cleaned_transcript"] = transcript
+    # ---------------------------------------------------
+    # GOOGLE MAPS STRUCTURED + CONFIDENCE CHECK
+    # ---------------------------------------------------
+    def google_clean_address(raw_addr):
+        """
+        Returns (final_address, structured_address, needs_confirmation)
+        """
+        if not raw_addr:
+            return None, None, False
+
+        try:
+            status, struct = google_normalize_address(raw_addr)
+
+            if status != "ok" or not struct:
+                return raw_addr, None, False
+
+            google_addr = struct.get("full_address") or raw_addr
+            confidence = struct.get("confidence", 1.0)
+
+            if confidence < 0.80:
+                return google_addr, struct, True
+
+            return google_addr, struct, False
+
+        except Exception as e:
+            print("Google validation failed:", repr(e))
+            return raw_addr, None, False
+
+    # ---------------------------------------------------
+    # Handle transcription callback updates
+    # ---------------------------------------------------
+    if from_number in conversations and raw_transcript:
+        print("DEBUG → Updating transcript only (callback).")
+
+        conversations[from_number]["initial_sms"] = cleaned_transcript
+        conversations[from_number]["cleaned_transcript"] = cleaned_transcript
+
+        extracted = extract_address(cleaned_transcript)
+        final_addr, structured, needs_conf = google_clean_address(extracted)
+
+        conversations[from_number]["address"] = (
+            conversations[from_number]["address"] or final_addr
+        )
+        conversations[from_number]["normalized_address"] = (
+            conversations[from_number]["normalized_address"] or structured
+        )
+        conversations[from_number]["needs_address_confirmation"] = needs_conf
+
         return Response("OK", mimetype="text/plain")
 
     # ---------------------------------------------------
-    # Rule 1.43.9 — Emergency-intent auto-classification
+    # Emergency detection
     # ---------------------------------------------------
     emergency_keywords = [
-        "no power", "partial power", "power out",
-        "burning", "burning smell", "smoke", "smoke smell",
-        "sparks", "spark", "boom", "pop", "bang",
-        "hot outlet", "hot plug", "hot panel",
-        "tree ripped", "line down", "wire down",
-        "service cable", "arc", "arcing",
-        "water near", "leak", "flood", "flooding"
+        "no power", "partial power", "power out", "burning", "burning smell",
+        "smoke", "smoke smell", "sparks", "spark", "boom", "pop", "bang",
+        "hot outlet", "hot panel", "tree ripped", "line down", "wire down",
+        "service cable", "arc", "arcing", "water near", "leak", "flood"
     ]
-
-    detected_emergency = any(k in transcript_lower for k in emergency_keywords)
-
-    # ---------------------------------------------------
-    # Lightweight Address Extraction (best-effort)
-    # ---------------------------------------------------
-    import re
-    address_match = re.search(
-        r"\d{1,5} [A-Za-z0-9 .'-]+(?:street|st|road|rd|lane|ln|ave|avenue|blvd|drive|dr|circle|cir|ct)\b",
-        transcript_lower
-    )
-    extracted_address = address_match.group(0) if address_match else None
+    detected_emergency = any(k in cleaned_transcript.lower() for k in emergency_keywords)
 
     # ---------------------------------------------------
-    # Lightweight Intent Extraction
+    # Extract address + intent
     # ---------------------------------------------------
-    intent = "your electrical issue"
-
-    keywords = {
-        "outlet": "an outlet issue",
-        "switch": "a switch issue",
-        "lights": "a lighting issue",
-        "light": "a lighting issue",
-        "panel": "an electrical panel issue",
-        "breaker": "a breaker issue",
-        "no power": "a power-loss issue",
-        "power": "a power issue",
-        "ev": "an EV charger installation",
-        "charger": "an EV charger installation",
-        "generator": "a generator issue",
-        "inspection": "a home electrical inspection",
-        "smoke": "a burning or smoke smell",
-        "burning": "a burning smell",
-        "sparks": "a sparking hazard",
-    }
-
-    for key, value in keywords.items():
-        if key in transcript_lower:
-            intent = value
-            break
+    extracted_address = extract_address(cleaned_transcript.lower())
+    intent = extract_intent(cleaned_transcript.lower())
 
     if detected_emergency:
         intent = "a possible electrical hazard"
 
+    final_address, structured_addr, needs_confirmation = google_clean_address(extracted_address)
+
     # ---------------------------------------------------
-    # Initialize or overwrite conversation bucket
+    # Create conversation bucket
     # ---------------------------------------------------
     conversations[from_number] = {
         "voicemail_url": recording_url,
-        "initial_sms": transcript,
-        "cleaned_transcript": transcript,
+        "initial_sms": cleaned_transcript,
+        "cleaned_transcript": cleaned_transcript,
         "category": None,
         "appointment_type": "TROUBLESHOOT_395" if detected_emergency else None,
         "first_sms_time": time.time(),
@@ -7191,43 +7330,45 @@ def voicemail_complete():
         "followup_sent": False,
         "scheduled_date": None,
         "scheduled_time": None,
-        "address": extracted_address,
-        "normalized_address": None,
+        "address": final_address,
+        "normalized_address": structured_addr,
+        "needs_address_confirmation": needs_confirmation,
         "booking_created": False,
         "square_booking_id": None,
         "state_prompt_sent": False,
     }
 
     # ---------------------------------------------------
-    # Build premium kickoff SMS
+    # Build premium kickoff SMS (with confirmation logic)
     # ---------------------------------------------------
     try:
         if detected_emergency:
-            sms_message = (
+            sms = (
                 "This is Prevolt Electric — I saw your message about a possible electrical hazard. "
                 "Let’s get you taken care of. "
             )
         else:
-            sms_message = f"This is Prevolt Electric — I saw you called about {intent}. "
+            sms = f"This is Prevolt Electric — I saw you called about {intent}. "
 
-        # Address-awareness in first message
-        if extracted_address:
-            sms_message += f"I have your address as {extracted_address}. "
+        if final_address:
+            if needs_confirmation:
+                sms += (
+                    f"I found an address match as '{final_address}', but I need to confirm — "
+                    f"is this the correct address for your visit?"
+                )
+            else:
+                sms += f"I have your address as {final_address}. "
+                sms += "What’s the best time for the visit?"
+        else:
+            sms += "What’s the address and best time for the visit?"
 
-        # Missing field logic
-        sms_message += (
-            "What’s the best time for the visit?"
-            if extracted_address
-            else "What’s the address and best time for the visit?"
-        )
-
-        send_sms(from_number, sms_message)
+        send_sms(from_number, sms)
 
     except Exception as e:
-        print("Error sending SMS after voicemail:", repr(e))
+        print("Error sending kickoff SMS:", repr(e))
 
     # ---------------------------------------------------
-    # Voice response ending
+    # Voice goodbye
     # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
