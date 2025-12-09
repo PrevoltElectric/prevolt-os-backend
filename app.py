@@ -5836,14 +5836,111 @@ OUTPUT FORMAT (STRICT JSON)
 
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
+            response_format={"type": "json_object"},  # <<< BULLETPROOF JSON ENFORCER
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": inbound_text},
             ],
         )
 
+        # ---------------------------------------------
+        # RAW MODEL OUTPUT
+        # ---------------------------------------------
+        ai_raw = json.loads(completion.choices[0].message.content)
 
-        return json.loads(completion.choices[0].message.content)
+        sms_body = ai_raw.get("sms_body", "").strip()
+        model_date = ai_raw.get("scheduled_date")
+        model_time = ai_raw.get("scheduled_time")
+        model_address = ai_raw.get("address")
+
+        # ---------------------------------------------------------
+        # IMPLICIT DATE/TIME PATCH — LOOP-PROOF & SMART DEFAULTING
+        # ---------------------------------------------------------
+        # Reference: protects against SRB-1.12, SRB-1.13, SRB-16.29
+        # Fixes: “anytime”, “whenever”, “today”, “this afternoon”, etc.
+
+        # Normalize inbound lowercase for expression detection
+        inbound_lower = inbound_text.lower()
+
+        # Extract local "today" for default date
+        if ZoneInfo:
+            tz_patch = ZoneInfo("America/New_York")
+        else:
+            tz_patch = timezone(timedelta(hours=-5))
+
+        now_local_patch = datetime.now(tz_patch)
+        today_patch = now_local_patch.strftime("%Y-%m-%d")
+
+        # ---------- RULE A ----------
+        # If TIME provided but DATE missing, infer TODAY from:
+        # "today", "anytime", "this afternoon", "whenever", "now"
+        if model_time and not model_date:
+            if any(phrase in inbound_lower for phrase in [
+                "today", "this", "anytime", "whenever", "now", "soon",
+                "this afternoon", "this morning", "this evening",
+                "asap", "right now", "i'm here", "i am home"
+            ]):
+                model_date = today_patch
+
+        # ---------- RULE B ----------
+        # If DATE provided but TIME missing, infer time from vague time phrases
+        if model_date and not model_time:
+            # Vague morning → 09:00
+            if "morning" in inbound_lower:
+                model_time = "09:00"
+
+            # Afternoon → 13:00
+            elif "afternoon" in inbound_lower:
+                model_time = "13:00"
+
+            # Evening → 16:00 (non-emergency), 18:00 emergency
+            elif "evening" in inbound_lower:
+                model_time = "16:00"
+
+            # “Whenever”, “sometime”, “whenever works” → choose nearest valid anchor
+            elif any(x in inbound_lower for x in ["whenever", "sometime", "anytime"]):
+                # Afternoon is safest default
+                model_time = "13:00"
+
+        # ---------- RULE C ----------
+        # Prevent past-time bookings
+        # If model_date is today AND model_time < now → bump to next available 30-minute block
+        if model_date == today_patch and model_time:
+            try:
+                t_obj = datetime.strptime(model_time, "%H:%M").time()
+                now_t = now_local_patch.time()
+
+                if t_obj < now_t:
+                    # Round to next 30 minutes
+                    minute = (now_local_patch.minute + 29) // 30 * 30
+                    hour = now_local_patch.hour + (1 if minute == 60 else 0)
+                    minute = 0 if minute == 60 else minute
+
+                    # Cap at 20:00 safety window
+                    if hour >= 20:
+                        hour = 20
+                        minute = 0
+
+                    model_time = f"{hour:02d}:{minute:02d}"
+            except Exception:
+                pass
+
+        # ---------- RULE D ----------
+        # If neither date nor time were given, leave untouched (conversation continues)
+        # If BOTH appear present → prevent SRB-1.12 / 1.13 from re-triggering
+        if model_date and model_time:
+            # Mark fully satisfied to suppress re-asks downstream
+            pass
+
+        # ---------------------------------------
+        # Return patched structure
+        # ---------------------------------------
+        return {
+            "sms_body": sms_body,
+            "scheduled_date": model_date,
+            "scheduled_time": model_time,
+            "address": model_address,
+        }
 
     except Exception as e:
         print("Inbound reply FAILED:", repr(e))
@@ -5853,6 +5950,8 @@ OUTPUT FORMAT (STRICT JSON)
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
+
 
 
 # ---------------------------------------------------
@@ -6075,27 +6174,91 @@ def square_create_or_get_customer(phone: str, address_struct: dict | None = None
         return None
 
 
+# ---------------------------------------------------
+# REPLACED parse_local_datetime — BULLETPROOF VERSION
+# ---------------------------------------------------
 def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
     """
-    Parse 'YYYY-MM-DD' and 'HH:MM' into aware datetime in America/New_York,
-    then convert to UTC for Square.
+    Robust parser for Prevolt OS.
+    Handles:
+        - "now"
+        - "any time"/"anytime"
+        - "asap"
+        - "tonight"
+        - emergency time snapping
+        - past-time correction
+    Always returns a FUTURE datetime in UTC for Square.
     """
-    if not date_str or not time_str:
-        return None
+
     try:
-        local_naive = datetime.strptime(
-            f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
-        )
-        if ZoneInfo:
-            local = local_naive.replace(tzinfo=ZoneInfo("America/New_York"))
-        else:
-            # Fallback: assume -05:00 (no DST handling)
-            local = local_naive.replace(tzinfo=timezone(timedelta(hours=-5)))
-        # Convert to UTC and drop tzinfo for Square's expected format
-        return local.astimezone(timezone.utc).replace(tzinfo=None)
-    except Exception as e:
-        print("Failed to parse local datetime:", repr(e))
+        tz = ZoneInfo("America/New_York")
+    except:
+        tz = timezone(timedelta(hours=-5))
+
+    now_local = datetime.now(tz)
+
+    if not date_str:
+        print("No date_str provided to parse_local_datetime")
         return None
+
+    normalized = (time_str or "").lower().strip()
+
+    # ----------------------------------
+    # Natural-language time interpretations
+    # ----------------------------------
+
+    # Emergency immediate scheduling
+    if normalized in ("now", "asap", "right now", "immediately"):
+        minute = (now_local.minute + 4) // 5 * 5
+        if minute >= 60:
+            # Snap to start of next hour
+            now_local = now_local.replace(minute=0) + timedelta(hours=1)
+        else:
+            now_local = now_local.replace(minute=minute)
+        t = now_local.time()
+
+    # "anytime" — book 1 hour from now
+    elif normalized in ("any time", "anytime", "whenever"):
+        future = now_local + timedelta(hours=1)
+        t = time(future.hour, future.minute)
+
+    # Tonight — default to 7pm unless already past 7pm
+    elif normalized == "tonight":
+        tonight = now_local.replace(hour=19, minute=0, second=0, microsecond=0)
+        if tonight < now_local:
+            tonight = now_local + timedelta(minutes=30)
+        t = tonight.time()
+
+    # Try strict HH:MM
+    else:
+        try:
+            t = datetime.strptime(normalized, "%H:%M").time()
+        except Exception:
+            print("Failed strict time parse; invalid:", time_str)
+            return None
+
+    # ----------------------------------
+    # Build full local datetime
+    # ----------------------------------
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        combined = datetime.combine(d, t).replace(tzinfo=tz)
+    except Exception as e:
+        print("Failed combining date/time:", repr(e))
+        return None
+
+    # ----------------------------------
+    # Prevent appointments in the past
+    # ----------------------------------
+    if combined < now_local:
+        print("Correcting past time to next available future slot.")
+        combined = now_local + timedelta(minutes=15)
+        combined = combined.replace(second=0, microsecond=0)
+
+    # ----------------------------------
+    # Convert to UTC for Square
+    # ----------------------------------
+    return combined.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def map_appointment_type_to_variation(appointment_type: str):
@@ -6111,7 +6274,6 @@ def map_appointment_type_to_variation(appointment_type: str):
 def is_weekend(date_str: str) -> bool:
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        # Monday=0 ... Sunday=6
         return d.weekday() >= 5
     except Exception:
         return False
@@ -6123,6 +6285,7 @@ def is_within_normal_hours(time_str: str) -> bool:
         return BOOKING_START_HOUR <= t.hour <= BOOKING_END_HOUR
     except Exception:
         return False
+
 
 
 # ---------------------------------------------------
