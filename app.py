@@ -268,14 +268,16 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         # Hard-coded emergency script so pricing + type are ALWAYS correct
         return {
             "sms_body": (
-                "Hi, this is Prevolt Electric — we understand you have an urgent "
-                "electrical issue, likely related to a tree or power loss. "
-                "We can schedule a same-day troubleshooting visit to restore service. "
-                "Our emergency troubleshoot and repair visit is $395. "
-                "Please reply with your full service address and a good time today."
+                "Hi, this is Prevolt Electric — we understand you're dealing with an urgent electrical issue. "
+                "We can schedule a same-day troubleshooting and repair visit. "
+                "The emergency troubleshoot and repair visit is $395. "
+                "Please reply with your full service address and a good time for today."
             ),
             "category": "Active problems",
             "appointment_type": "TROUBLESHOOT_395",
+            "success": True,
+            "error": None,
+            "booking_id": None,
         }
 
     # ------------------------------------------------
@@ -284,7 +286,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
-            temperature=0,  # reduce randomness for classification
+            temperature=0,
             messages=[
                 {
                     "role": "system",
@@ -313,6 +315,9 @@ def generate_initial_sms(cleaned_text: str) -> dict:
             "sms_body": data["sms_body"].strip(),
             "category": data["category"],
             "appointment_type": data["appointment_type"],
+            "success": True,
+            "error": None,
+            "booking_id": None,
         }
 
     except Exception as e:
@@ -325,7 +330,11 @@ def generate_initial_sms(cleaned_text: str) -> dict:
             ),
             "category": "OTHER",
             "appointment_type": "EVAL_195",
+            "success": False,
+            "error": repr(e),
+            "booking_id": None,
         }
+
 
 
 
@@ -625,58 +634,6 @@ def normalize_address(raw: str, forced_state=None):
 
     except:
         return ("error", None)
-
-
-# ====================================================================
-# ADDRESS INTAKE ENGINE — LOOP PROOF
-# ====================================================================
-
-def handle_address_intake(conv, inbound_text, inbound_lower,
-                          scheduled_date, scheduled_time, address):
-
-    tokens = inbound_lower.replace(",", "").split()
-    if len(tokens) < 3:
-        return None
-    if not any(tok.isdigit() for tok in tokens):
-        return None
-
-    street_keywords = {
-        "st", "street", "rd", "road", "ave", "avenue", "blvd",
-        "ln", "lane", "dr", "drive", "way", "ct", "court"
-    }
-    if not any(tok in street_keywords for tok in tokens):
-        return None
-
-    m = re.search(r"\d{1,6}\s+[A-Za-z0-9\s\.\-]+", inbound_text)
-    raw_addr = m.group(0).strip() if m else inbound_text.strip()
-
-    conv["address"] = raw_addr
-
-    norm_status, parsed = normalize_address(raw_addr)
-
-    if norm_status == "ok" and parsed:
-        conv["normalized_address"] = parsed
-
-        if not conv.get("scheduled_date"):
-            return {
-                "sms_body": "Got it — what day would you like us to come out?",
-                "address": raw_addr,
-                "scheduled_date": None,
-                "scheduled_time": None,
-            }
-
-        if conv.get("scheduled_date") and not conv.get("scheduled_time"):
-            return {
-                "sms_body": f"What time works for your visit on {conv['scheduled_date']}?",
-                "address": raw_addr,
-                "scheduled_date": conv["scheduled_date"],
-                "scheduled_time": None,
-            }
-
-        return None
-
-    conv["normalized_address"] = None
-    return None
 
 
 # ====================================================================
@@ -7679,13 +7636,9 @@ def incoming_sms():
         convo["normalized_address"] = parsed
         convo["state_prompt_sent"] = False
 
-        try:
-            return incoming_sms()
-        except Exception as e:
-            print("Re-entry after CT/MA confirm failed:", repr(e))
-            resp = MessagingResponse()
-            resp.message("Thanks — we have the address confirmed.")
-            return Response(str(resp), mimetype="text/xml")
+        resp = MessagingResponse()
+        resp.message("Thanks — we have the address confirmed.")
+        return Response(str(resp), mimetype="text/xml")
 
     # ---------------------------------------------------
     # 4) NORMAL FLOW
@@ -7693,17 +7646,42 @@ def incoming_sms():
     convo["replied"] = True
     convo["phone"] = from_number
 
-    ai_reply = generate_reply_for_inbound(
-        conv=convo,
-        cleaned_transcript=convo.get("cleaned_transcript"),
-        category=convo.get("category"),
-        appointment_type=forced_type,
-        initial_sms=convo.get("initial_sms"),
-        inbound_text=body,
-        scheduled_date=convo.get("scheduled_date"),
-        scheduled_time=convo.get("scheduled_time"),
-        address=convo.get("address"),
-    )
+    raw_reply = None
+    try:
+        raw_reply = generate_reply_for_inbound(
+            conv=convo,
+            cleaned_transcript=convo.get("cleaned_transcript"),
+            category=convo.get("category"),
+            appointment_type=forced_type,
+            initial_sms=convo.get("initial_sms"),
+            inbound_text=body,
+            scheduled_date=convo.get("scheduled_date"),
+            scheduled_time=convo.get("scheduled_time"),
+            address=convo.get("address"),
+        )
+    except Exception as e:
+        print("generate_reply_for_inbound crashed:", repr(e))
+        raw_reply = {}
+
+    # ---------------------------------------------------
+    # 4B) REPLY SANITIZER — CRITICAL FIX
+    # ---------------------------------------------------
+    ai_reply = raw_reply if isinstance(raw_reply, dict) else {}
+
+    if "sms_body" not in ai_reply:
+        ai_reply["sms_body"] = ""
+
+    if "scheduled_date" not in ai_reply:
+        ai_reply["scheduled_date"] = convo.get("scheduled_date")
+
+    if "scheduled_time" not in ai_reply:
+        ai_reply["scheduled_time"] = convo.get("scheduled_time")
+
+    if "address" not in ai_reply:
+        ai_reply["address"] = convo.get("address")
+
+    if "appointment_type" not in ai_reply:
+        ai_reply["appointment_type"] = convo.get("appointment_type")
 
     # ---------------------------------------------------
     # 5) UPDATE STATE SAFELY
@@ -7718,7 +7696,7 @@ def incoming_sms():
         convo["address"] = ai_reply["address"]
 
     # ---------------------------------------------------
-    # 6) HARD APPT-TYPE PROTECTION
+    # 6) HARD APPT TYPE PROTECTION
     # ---------------------------------------------------
     incoming_apt = sanitize_appt_type(ai_reply.get("appointment_type"))
     convo["appointment_type"] = incoming_apt
@@ -7728,12 +7706,12 @@ def incoming_sms():
     # ---------------------------------------------------
     sms_body = (ai_reply.get("sms_body") or "").strip()
 
-    if sms_body == "":
-        return Response(str(MessagingResponse()), mimetype="text/xml")
-
     resp = MessagingResponse()
-    resp.message(sms_body)
+    if sms_body:
+        resp.message(sms_body)
+
     return Response(str(resp), mimetype="text/xml")
+
 
 
 
