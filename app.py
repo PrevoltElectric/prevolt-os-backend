@@ -6153,6 +6153,33 @@ OS must:
    - collecting address, or
    - final confirmation if address already collected.
 
+        # ---------------------------------------------------
+        # INSERTED OPTION A — VOICEMAIL INTENT/TOWN/PARTIAL ADDRESS INJECTION
+        # ---------------------------------------------------
+        voicemail_intent = convo.get("voicemail_intent")
+        voicemail_town = convo.get("voicemail_town")
+        voicemail_partial_address = convo.get("voicemail_partial_address")
+
+        voicemail_context_block = ""
+        if voicemail_intent or voicemail_town or voicemail_partial_address:
+            voicemail_context_block = (
+                "\n\n===================================================\n"
+                "VOICEMAIL INSIGHTS (PRE-EXTRACTED)\n"
+                "===================================================\n"
+            )
+            if voicemail_intent:
+                voicemail_context_block += f"Intent mentioned in voicemail: {voicemail_intent}\n"
+            if voicemail_town:
+                voicemail_context_block += f"Town detected: {voicemail_town}\n"
+            if voicemail_partial_address:
+                voicemail_context_block += f"Partial address detected: {voicemail_partial_address}\n"
+
+        system_prompt = system_prompt + voicemail_context_block
+
+        # ---------------------------------------------------
+        # CONTEXT SECTION
+        # ---------------------------------------------------
+        system_prompt += """
 ===================================================
 CONTEXT
 ===================================================
@@ -6165,19 +6192,19 @@ Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
 ===================================================
 OUTPUT FORMAT (STRICT JSON)
 ===================================================
-{{
+{
   "sms_body": "...",
   "scheduled_date": "YYYY-MM-DD or null",
   "scheduled_time": "HH:MM or null",
   "address": "string or null"
-}}
+}
 """
         system_prompt = system_prompt.replace("{today_date_str}", today_date_str)
         system_prompt = system_prompt.replace("{today_weekday}", today_weekday)
 
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
-            response_format={"type": "json_object"},  # <<< BULLETPROOF JSON ENFORCER
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": inbound_text},
@@ -6195,15 +6222,10 @@ OUTPUT FORMAT (STRICT JSON)
         model_address = ai_raw.get("address")
 
         # ---------------------------------------------------------
-        # IMPLICIT DATE/TIME PATCH — LOOP-PROOF & SMART DEFAULTING
+        # IMPLICIT DATE/TIME PATCH — LOOP-PROOF
         # ---------------------------------------------------------
-        # Reference: protects against SRB-1.12, SRB-1.13, SRB-16.29
-        # Fixes: “anytime”, “whenever”, “today”, “this afternoon”, etc.
-
-        # Normalize inbound lowercase for expression detection
         inbound_lower = inbound_text.lower()
 
-        # Extract local "today" for default date
         if ZoneInfo:
             tz_patch = ZoneInfo("America/New_York")
         else:
@@ -6213,7 +6235,6 @@ OUTPUT FORMAT (STRICT JSON)
         today_patch = now_local_patch.strftime("%Y-%m-%d")
 
         # ---------- RULE A ----------
-        # If TIME provided but DATE missing, infer TODAY
         if model_time and not model_date:
             if any(phrase in inbound_lower for phrase in [
                 "today", "this", "anytime", "whenever", "now", "soon",
@@ -6222,8 +6243,16 @@ OUTPUT FORMAT (STRICT JSON)
             ]):
                 model_date = today_patch
 
+        # ---------- OPTION A1 — EMERGENCY TIME W/ NO DATE FIX ----------
+        # Only applies to TROUBLESHOOT_395
+        # Only fires when LLM gave us a time but no date
+        # Zero override of time, zero emergency forcing
+        appointment_type_lower = str(appointment_type).lower()
+        if (model_time and not model_date and
+                appointment_type_lower == "troubleshoot_395"):
+            model_date = today_patch
+
         # ---------- RULE B ----------
-        # If DATE provided but TIME missing, infer time from vague time phrases
         if model_date and not model_time:
             if "morning" in inbound_lower:
                 model_time = "09:00"
@@ -6235,49 +6264,42 @@ OUTPUT FORMAT (STRICT JSON)
                 model_time = "13:00"
 
         # ---------- RULE C ----------
-        # Prevent past-time bookings
         if model_date == today_patch and model_time:
             try:
                 t_obj = datetime.strptime(model_time, "%H:%M").time()
                 now_t = now_local_patch.time()
-
                 if t_obj < now_t:
-                    # Round to next 30min block
                     minute = (now_local_patch.minute + 29) // 30 * 30
                     hour = now_local_patch.hour + (1 if minute == 60 else 0)
                     minute = 0 if minute == 60 else minute
-
-                    # Cap at 20:00 safety window
                     if hour >= 20:
                         hour = 20
                         minute = 0
-
                     model_time = f"{hour:02d}:{minute:02d}"
             except Exception:
                 pass
 
         # ---------- RULE D ----------
-        # If both present → suppress further date/time asks
         if model_date and model_time:
             pass
 
         # ---------------------------------------------------------
-        # ⭐ HUMAN AM/PM FORMATTING PATCH (NEW)
+        # HUMAN AM/PM PATCH
         # ---------------------------------------------------------
         human_time = None
         if model_time:
             try:
                 human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p")
             except:
-                human_time = model_time  # fallback (should never happen)
+                human_time = model_time
 
         # ---------------------------------------------------------
-        # Return patched structure
+        # RETURN FINAL STRUCTURE
         # ---------------------------------------------------------
         return {
             "sms_body": sms_body.replace(model_time, human_time) if (sms_body and human_time) else sms_body,
             "scheduled_date": model_date,
-            "scheduled_time": model_time,    # internal stays 24-hour for Square
+            "scheduled_time": model_time,
             "address": model_address,
         }
 
@@ -6899,195 +6921,169 @@ def handle_call_selection():
 
 
 # ---------------------------------------------------
-# Voice → Voicemail Completion
+# Voice → Voicemail Completion (FULL INTELLIGENT PIPELINE)
 # ---------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse
 
     recording_url = request.form.get("RecordingUrl", "")
-    from_number = request.form.get("From", "")
+    from_number = request.form.get("From", "").replace("whatsapp:", "")
 
-    # Store voicemail data + init conversation
-    conversations[from_number] = {
+    # ---------------------------------------------------
+    # 1. Retrieve or initialize conversation state
+    # ---------------------------------------------------
+    conv = conversations.get(from_number, {})
+
+    # Preserve existing AI brain state (never overwrite downstream values)
+    new_conv = {
         "voicemail_url": recording_url,
-        "initial_sms": "",
-        "cleaned_transcript": "",
-        "category": None,
-        "appointment_type": None,
+
+        # existing fields preserved
+        "initial_sms": conv.get("initial_sms", ""),
+        "cleaned_transcript": conv.get("cleaned_transcript", ""),
+        "category": conv.get("category"),
+        "appointment_type": conv.get("appointment_type"),
         "first_sms_time": time.time(),
-        "replied": False,
-        "followup_sent": False,
-        "scheduled_date": None,
-        "scheduled_time": None,
-        "address": None,
-        "normalized_address": None,
-        "booking_created": False,
-        "square_booking_id": None,
-        "state_prompt_sent": False,
+        "replied": conv.get("replied", False),
+        "followup_sent": conv.get("followup_sent", False),
+        "scheduled_date": conv.get("scheduled_date"),
+        "scheduled_time": conv.get("scheduled_time"),
+        "address": conv.get("address"),
+        "normalized_address": conv.get("normalized_address"),
+        "booking_created": conv.get("booking_created", False),
+        "square_booking_id": conv.get("square_booking_id"),
+        "state_prompt_sent": conv.get("state_prompt_sent", False),
+
+        # NEW AI extraction slots (never overwrite if exists)
+        "voicemail_intent": conv.get("voicemail_intent"),
+        "voicemail_town": conv.get("voicemail_town"),
+        "voicemail_partial_address": conv.get("voicemail_partial_address"),
     }
 
-    # Kick off SMS workflow
-    try:
-        send_sms(
-            from_number,
-            "Thanks for calling Prevolt Electric. Got your message — what electrical work do you need help with?"
-        )
-    except Exception as e:
-        print("Error sending SMS after voicemail:", repr(e))
+    conversations[from_number] = new_conv
 
+    # ---------------------------------------------------
+    # 2. TRANSCRIBE THE VOICEMAIL (Whisper)
+    # ---------------------------------------------------
+    try:
+        raw_transcript = transcribe_recording(recording_url)
+    except Exception as e:
+        print("Whisper transcription failed:", repr(e))
+        raw_transcript = ""
+
+    if not raw_transcript:
+        raw_transcript = ""
+
+    # ---------------------------------------------------
+    # 3. CLEAN TRANSCRIPT (LLM mild correction)
+    # ---------------------------------------------------
+    try:
+        cleaned = clean_transcript_text(raw_transcript)
+    except Exception as e:
+        print("Transcript cleanup failed:", repr(e))
+        cleaned = raw_transcript
+
+    new_conv["cleaned_transcript"] = cleaned
+
+    # ---------------------------------------------------
+    # 4. ADVANCED VOICEMAIL CONTENT EXTRACTION
+    #    (intent, town, partial address)
+    # ---------------------------------------------------
+    try:
+        extract = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract EXACTLY THREE fields from this voicemail:\n"
+                        "1. intent: what electrical work they want (short phrase)\n"
+                        "2. town: the town they say they are in (CT/MA region only)\n"
+                        "3. partial_address: any street number or street name mentioned\n\n"
+                        "If unknown, return null.\n"
+                        "Return STRICT JSON: {intent, town, partial_address}"
+                    )
+                },
+                {"role": "user", "content": cleaned}
+            ]
+        )
+        extracted = json.loads(extract.choices[0].message.content)
+    except Exception as e:
+        print("Voicemail extractor failed:", repr(e))
+        extracted = {"intent": None, "town": None, "partial_address": None}
+
+    # Save extraction values ONLY if not already set
+    if new_conv.get("voicemail_intent") is None:
+        new_conv["voicemail_intent"] = extracted.get("intent")
+    if new_conv.get("voicemail_town") is None:
+        new_conv["voicemail_town"] = extracted.get("town")
+    if new_conv.get("voicemail_partial_address") is None:
+        new_conv["voicemail_partial_address"] = extracted.get("partial_address")
+
+    # ---------------------------------------------------
+    # 5. APPOINTMENT CLASSIFICATION + INITIAL SMS
+    # ---------------------------------------------------
+    try:
+        initial = generate_initial_sms(cleaned)
+        sms_body = initial.get("sms_body", "")
+        category = initial.get("category")
+        appt_type = initial.get("appointment_type")
+    except Exception as e:
+        print("Initial SMS classification failed:", repr(e))
+        sms_body = "Hi, this is Prevolt Electric — I received your message. What day works for you?"
+        category = "OTHER"
+        appt_type = "EVAL_195"
+
+    # Update the conversation with classification results
+    new_conv["initial_sms"] = sms_body
+    new_conv["category"] = category
+    new_conv["appointment_type"] = appt_type
+
+    # ---------------------------------------------------
+    # 6. BUILD THE INTELLIGENT FIRST SMS
+    # ---------------------------------------------------
+    town = new_conv.get("voicemail_town")
+    intent = new_conv.get("voicemail_intent")
+    partial = new_conv.get("voicemail_partial_address")
+
+    intelligent_msg = "Hi, this is Prevolt Electric — "
+
+    # Mention intent if detected
+    if intent:
+        intelligent_msg += f"I saw your message about {intent}. "
+
+    # Mention town if detected
+    if town:
+        intelligent_msg += f"Looks like you're in {town}. "
+
+    # Ask for missing address
+    if partial:
+        intelligent_msg += (
+            f"I caught part of your address ({partial}). "
+            "What’s the full street address for the visit?"
+        )
+    else:
+        intelligent_msg += "What’s the full street address for the visit?"
+
+    # ---------------------------------------------------
+    # 7. SEND FIRST SMS
+    # ---------------------------------------------------
+    try:
+        send_sms(from_number, intelligent_msg)
+    except Exception as e:
+        print("Error sending intelligent voicemail SMS:", repr(e))
+
+    # ---------------------------------------------------
+    # 8. Voice response to caller
+    # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
         '<speak><prosody rate="90%">Thanks, we received your message.</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
     response.hangup()
-
-
-
-# ---------------------------------------------------
-# Incoming SMS / WhatsApp
-# ---------------------------------------------------
-@app.route("/incoming-sms", methods=["POST"])
-def incoming_sms():
-    from_number = request.form.get("From", "")
-    body = request.form.get("Body", "").strip()
-
-    # Normalize Twilio's WhatsApp prefix
-    if from_number.startswith("whatsapp:"):
-        from_number = from_number.replace("whatsapp:", "")
-
-    convo = conversations.get(from_number)
-
-    # Cold inbound with no voicemail history
-    if not convo:
-        resp = MessagingResponse()
-        resp.message(
-            "Hi, this is Prevolt Electric — thanks for reaching out. "
-            "What electrical work are you looking to have done?"
-        )
-        return Response(str(resp), mimetype="text/xml")
-
-    # Handle CT/MA reply after we asked specifically
-    if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
-        upper = body.upper()
-        if "CT" in upper or "CONNECTICUT" in upper:
-            chosen_state = "CT"
-        elif "MA" in upper or "MASS" in upper or "MASSACHUSETTS" in upper:
-            chosen_state = "MA"
-        else:
-            resp = MessagingResponse()
-            resp.message("Please reply with either CT or MA so we can confirm the address.")
-            return Response(str(resp), mimetype="text/xml")
-
-        raw_address = convo.get("address")
-        status, addr_struct = normalize_address(raw_address, forced_state=chosen_state)
-        if status != "ok" or not addr_struct:
-            resp = MessagingResponse()
-            resp.message(
-                "I still couldn't verify the address. "
-                "Please reply with the full street, town, state, and ZIP code."
-            )
-            convo["state_prompt_sent"] = False
-            return Response(str(resp), mimetype="text/xml")
-
-        convo["normalized_address"] = addr_struct
-        convo["state_prompt_sent"] = False
-
-        # Attempt booking now that we have a fully normalized address
-        try:
-            maybe_create_square_booking(from_number, convo)
-        except Exception as e:
-            print("maybe_create_square_booking after CT/MA reply failed:", repr(e))
-
-        # ------------------------------------------------------------
-        # FINAL BOOKING CONFIRMATION (SEND ONCE, NEVER AGAIN)
-        # ------------------------------------------------------------
-        if convo.get("booking_created") and not convo.get("booking_finalized"):
-
-            def convert_to_ampm(hhmm):
-                if not hhmm:
-                    return ""
-                t = datetime.strptime(hhmm, "%H:%M")
-                return t.strftime("%-I:%M %p")
-
-            appt_date = convo.get("scheduled_date")
-            appt_time = convert_to_ampm(convo.get("scheduled_time"))
-
-            final_msg = (
-                f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
-            )
-
-            convo["booking_finalized"] = True
-
-            resp = MessagingResponse()
-            resp.message(final_msg)
-            return Response(str(resp), mimetype="text/xml")
-
-        resp = MessagingResponse()
-        resp.message("Thanks — that helps. We have everything we need for your visit.")
-        return Response(str(resp), mimetype="text/xml")
-
-    # Normal conversational flow
-    convo["replied"] = True
-
-    ai_reply = generate_reply_for_inbound(
-        cleaned_transcript=convo["cleaned_transcript"],
-        category=convo["category"],
-        appointment_type=convo["appointment_type"],
-        initial_sms=convo["initial_sms"],
-        inbound_text=body,
-        scheduled_date=convo.get("scheduled_date"),
-        scheduled_time=convo.get("scheduled_time"),
-        address=convo.get("address"),
-    )
-
-    sms_body = ai_reply.get("sms_body", "").strip()
-
-    if ai_reply.get("scheduled_date"):
-        convo["scheduled_date"] = ai_reply["scheduled_date"]
-    if ai_reply.get("scheduled_time"):
-        convo["scheduled_time"] = ai_reply["scheduled_time"]
-    if ai_reply.get("address"):
-        convo["address"] = ai_reply["address"]
-
-    # Attempt booking once we have a complete date + time + address
-    try:
-        maybe_create_square_booking(from_number, convo)
-    except Exception as e:
-        print("maybe_create_square_booking failed:", repr(e))
-
-    # ------------------------------------------------------------
-    # FINAL BOOKING CONFIRMATION (SEND ONCE, NEVER AGAIN)
-    # ------------------------------------------------------------
-    if convo.get("booking_created") and not convo.get("booking_finalized"):
-
-        def convert_to_ampm(hhmm):
-            if not hhmm:
-                return ""
-            t = datetime.strptime(hhmm, "%H:%M")
-            return t.strftime("%-I:%M %p")
-
-        appt_date = convo.get("scheduled_date")
-        appt_time = convert_to_ampm(convo.get("scheduled_time"))
-
-        final_msg = (
-            f"All set! Your appointment is confirmed for {appt_date} at {appt_time}."
-        )
-
-        convo["booking_finalized"] = True
-
-        resp = MessagingResponse()
-        resp.message(final_msg)
-        return Response(str(resp), mimetype="text/xml")
-
-    # If final confirmation matched → stop responding
-    if sms_body == "":
-        return Response(str(MessagingResponse()), mimetype="text/xml")
-
-    resp = MessagingResponse()
-    resp.message(sms_body)
-    return Response(str(resp), mimetype="text/xml")
+    return str(response)
 
 
 # ---------------------------------------------------
