@@ -6803,6 +6803,8 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 # ---------------------------------------------------
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
+    from twilio.twiml.voice_response import Gather, VoiceResponse
+
     response = VoiceResponse()
 
     gather = Gather(
@@ -6811,7 +6813,7 @@ def incoming_call():
         method="POST"
     )
 
-    # Fully supported Matthew Neural voice everywhere
+    # 100% Matthew Neural for greeting + menu
     gather.say(
         "Thanks for calling Prevolt Electric. "
         "To help us direct your call, please choose an option. "
@@ -6822,7 +6824,7 @@ def incoming_call():
 
     response.append(gather)
 
-    # If caller does nothing → replay message
+    # If caller does nothing → replay message in Matthew
     response.say(
         "Sorry, I didn't get that.",
         voice="Polly.Matthew-Neural"
@@ -6837,11 +6839,13 @@ def incoming_call():
 # ---------------------------------------------------
 @app.route("/handle-call-selection", methods=["POST"])
 def handle_call_selection():
+    from twilio.twiml.voice_response import VoiceResponse
+
     digit = request.form.get("Digits", "")
     response = VoiceResponse()
 
     # -----------------------------
-    # Option 1 → Residential → Voicemail → OS SMS flow
+    # OPTION 1 → RESIDENTIAL
     # -----------------------------
     if digit == "1":
         response.say(
@@ -6850,28 +6854,32 @@ def handle_call_selection():
             "We will text you shortly.",
             voice="Polly.Matthew-Neural"
         )
+
         response.record(
             max_length=60,
             play_beep=True,
             trim="do-not-trim",
             action="/voicemail-complete",
         )
+
         response.hangup()
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
-    # Option 2 → Commercial / Government → Forward to Kyle directly
+    # OPTION 2 → COMMERCIAL / GOVERNMENT
     # -----------------------------
     elif digit == "2":
         response.say(
             "Connecting you now.",
             voice="Polly.Matthew-Neural"
         )
-        response.dial("+15555555555")  # Replace later
+
+        # Replace with your real direct number when ready
+        response.dial("+15555555555")
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
-    # Invalid input → retry
+    # INVALID INPUT → RESTART
     # -----------------------------
     else:
         response.say(
@@ -6882,47 +6890,53 @@ def handle_call_selection():
         return Response(str(response), mimetype="text/xml")
 
 
-
-
-
 # ---------------------------------------------------
-# Voicemail Complete → Transcribe → Initial SMS
+# Voice → Voicemail Completion
 # ---------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
-    recording_url = request.form.get("RecordingUrl")
-    caller = request.form.get("From")
+    from twilio.twiml.voice_response import VoiceResponse
 
+    recording_url = request.form.get("RecordingUrl", "")
+    from_number = request.form.get("From", "")
+
+    # Store voicemail URL + create conversation bucket
+    conversations[from_number] = {
+        "voicemail_url": recording_url,
+        "initial_sms": "",
+        "cleaned_transcript": "",
+        "category": None,
+        "appointment_type": None,
+        "first_sms_time": time.time(),
+        "replied": False,
+        "followup_sent": False,
+        "scheduled_date": None,
+        "scheduled_time": None,
+        "address": None,
+        "normalized_address": None,
+        "booking_created": False,
+        "square_booking_id": None,
+        "state_prompt_sent": False,
+    }
+
+    # Send SMS kickoff message after voicemail
     try:
-        raw = transcribe_recording(recording_url)
-        cleaned = clean_transcript_text(raw)
-        sms_info = generate_initial_sms(cleaned)
-
-        send_sms(caller, sms_info["sms_body"])
-
-        conversations[caller] = {
-            "cleaned_transcript": cleaned,
-            "category": sms_info["category"],
-            "appointment_type": sms_info["appointment_type"],
-            "initial_sms": sms_info["sms_body"],
-            "first_sms_time": datetime.now(ZoneInfo("America/New_York")),
-            "replied": False,
-            "followup_sent": False,
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": None,
-            "normalized_address": None,
-            "booking_created": False,
-            "square_booking_id": None,
-            "state_prompt_sent": False,
-        }
-
+        send_sms(
+            from_number,
+            "Thanks for calling Prevolt Electric. Got your message — what electrical work do you need help with?"
+        )
     except Exception as e:
-        print("Voicemail fail:", repr(e))
+        print("Error sending SMS after voicemail:", repr(e))
 
     response = VoiceResponse()
+    response.say(
+        "Thanks, we received your message.",
+        voice="Polly.Matthew-Neural"
+    )
     response.hangup()
+
     return Response(str(response), mimetype="text/xml")
+
 
 
 # ---------------------------------------------------
