@@ -7424,49 +7424,50 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict:
     }
 
 
-    # ---------------------------------------------------
-    # Send to Square
-    # ---------------------------------------------------
-    try:
-        resp = requests.post(
-            "https://connect.squareup.com/v2/bookings",
-            headers=square_headers(),
-            json=booking_payload,
-            timeout=10,
-        )
-    except Exception as e:
-        return fail(f"Square API exception: {repr(e)}")
-
-    if resp.status_code not in (200, 201):
-        return fail(f"Square booking failed [{resp.status_code}]: {resp.text}")
-
-    # Parse response JSON safely
-    try:
-        data = resp.json()
-    except Exception as e:
-        return fail(f"Invalid JSON in Square response: {repr(e)}")
-
-    booking = data.get("booking")
-    if not booking:
-        return fail(f"Square response missing 'booking': {data}")
-
-    booking_id = booking.get("id")
-
-    # Mark booking in conversation state
-    convo["booking_created"] = True
-    convo["square_booking_id"] = booking_id
-
-    print(
-        f"Square booking created for {phone}: {booking_id} "
-        f"{scheduled_date} {scheduled_time} ({appointment_type})"
+# ---------------------------------------------------
+# Send to Square
+# ---------------------------------------------------
+try:
+    resp = requests.post(
+        "https://connect.squareup.com/v2/bookings",
+        headers=square_headers(),
+        json=booking_payload,
+        timeout=10,
     )
+except Exception as e:
+    return fail(f"Square API exception: {repr(e)}")
 
-    # SUCCESS RETURN
-    return {
-        "success": True,
-        "error": None,
-        "booking_id": booking_id,
-    }
+if resp.status_code not in (200, 201):
+    return fail(f"Square booking failed [{resp.status_code}]: {resp.text}")
+
+# Parse response JSON safely
+try:
+    data = resp.json()
+except Exception as e:
+    return fail(f"Invalid JSON in Square response: {repr(e)}")
+
+booking = data.get("booking")
+if not booking:
+    return fail(f"Square response missing 'booking': {data}")
+
+booking_id = booking.get("id")
+
+# Mark booking in conversation state
+convo["booking_created"] = True
+convo["square_booking_id"] = booking_id
+
+print(
+    f"Square booking created for {phone}: {booking_id} "
+    f"{scheduled_date} {scheduled_time} ({appointment_type})"
+)
+
+# SUCCESS RETURN
+return {
+    "success": True,
+    "error": None,
+    "booking_id": booking_id,
+}
+
 
 # ---------------------------------------------------
 # Voice: Incoming Call
@@ -7524,7 +7525,6 @@ def voicemail_complete():
 
         send_sms(caller, sms_info["sms_body"])
 
-        # Initialize conversation state
         conversations[caller] = {
             "cleaned_transcript": cleaned,
             "category": sms_info["category"],
@@ -7540,6 +7540,7 @@ def voicemail_complete():
             "booking_created": False,
             "square_booking_id": None,
             "state_prompt_sent": False,
+            "phone": caller,
         }
 
     except Exception as e:
@@ -7555,6 +7556,7 @@ def voicemail_complete():
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
+
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
 
@@ -7564,34 +7566,50 @@ def incoming_sms():
     from_number = from_number.strip()
 
     convo = conversations.get(from_number)
+    inbound_lower = body.lower()
 
     # ---------------------------------------------------
     # INTERNAL FUNCTION — ALWAYS RETURNS VALID TYPE
     # ---------------------------------------------------
     def sanitize_appt_type(value):
-        """
-        Ensures appointment_type can NEVER be None/empty.
-        """
         if not value:
             return "TROUBLESHOOT_395"
-
         if isinstance(value, str):
             v = value.strip().upper()
             if v in ("", "NONE", "NULL"):
                 return "TROUBLESHOOT_395"
             return v
-
         return "TROUBLESHOOT_395"
 
-    # ===================================================
-    # 1) COLD INBOUND — NO PRIOR CONVO
-    # ===================================================
+    # ---------------------------------------------------
+    # EARLY ADDRESS CAPTURE (raw text) — SAFE PATCH
+    # ---------------------------------------------------
+    if convo is not None and is_customer_address_only(inbound_lower):
+        incoming_addr = body.strip()
+        if incoming_addr:
+            convo["address"] = incoming_addr
+
+    # ---------------------------------------------------
+    # EARLY NORMALIZATION PATCH (safe)
+    # ---------------------------------------------------
+    if convo and convo.get("address") and not convo.get("normalized_address"):
+        try:
+            status, parsed = normalize_address(convo["address"])
+            if status == "ok" and parsed:
+                convo["normalized_address"] = parsed
+        except Exception as e:
+            print("Early normalization failed:", repr(e))
+            pass
+
+
+    # ---------------------------------------------------
+    # 1) COLD INBOUND — INITIALIZE NEW CONVO
+    # ---------------------------------------------------
     if convo is None:
         resp = MessagingResponse()
         resp.message(
             "Hi, this is Prevolt Electric — what electrical work are you looking to have done?"
         )
-
         conversations[from_number] = {
             "cleaned_transcript": None,
             "category": None,
@@ -7611,23 +7629,24 @@ def incoming_sms():
         }
         return Response(str(resp), mimetype="text/xml")
 
-    # ===================================================
-    # 2) APPOINTMENT TYPE FIREWALL (IMMUTABLE PROTECTION)
-    # ===================================================
+
+    # ---------------------------------------------------
+    # 2) APPOINTMENT TYPE FIREWALL
+    # ---------------------------------------------------
     raw_appt = convo.get("appointment_type")
     raw_cat = convo.get("category")
-
     appt = sanitize_appt_type(raw_appt or raw_cat or "TROUBLESHOOT_395")
     convo["appointment_type"] = appt
     forced_type = appt
 
-    # ===================================================
-    # 3) ADDRESS STATE CONFIRMATION (CT/MA) — FULL PATCHED FIX
-    # ===================================================
+
+    # ---------------------------------------------------
+    # 3) ADDRESS STATE CONFIRMATION (CT/MA)
+    # ---------------------------------------------------
     if convo.get("state_prompt_sent") and not convo.get("normalized_address"):
+
         up = body.upper()
 
-        # Determine chosen state
         if "CT" in up or "CONNECTICUT" in up:
             chosen_state = "CT"
         elif "MA" in up or "MASS" in up or "MASSACHUSETTS" in up:
@@ -7637,12 +7656,9 @@ def incoming_sms():
             resp.message("Please reply with CT or MA so we can verify the address.")
             return Response(str(resp), mimetype="text/xml")
 
-        # Save it so normalization never re-prompts
         convo["forced_state"] = chosen_state
-
         raw_addr = convo.get("address")
 
-        # Patch missing state if not present
         if raw_addr and chosen_state not in raw_addr.upper():
             raw_addr = f"{raw_addr}, {chosen_state}"
             convo["address"] = raw_addr
@@ -7660,7 +7676,6 @@ def incoming_sms():
         convo["normalized_address"] = parsed
         convo["state_prompt_sent"] = False
 
-        # Re-enter flow instead of stalling
         try:
             return incoming_sms()
         except Exception as e:
@@ -7669,9 +7684,10 @@ def incoming_sms():
             resp.message("Thanks — we have the address confirmed.")
             return Response(str(resp), mimetype="text/xml")
 
-    # ===================================================
-    # 4) NORMAL FLOW — ALWAYS PRESERVE STATE
-    # ===================================================
+
+    # ---------------------------------------------------
+    # 4) NORMAL FLOW
+    # ---------------------------------------------------
     convo["replied"] = True
     convo["phone"] = from_number
 
@@ -7687,9 +7703,10 @@ def incoming_sms():
         address=convo.get("address"),
     )
 
-    # ===================================================
+
+    # ---------------------------------------------------
     # 5) UPDATE STATE SAFELY
-    # ===================================================
+    # ---------------------------------------------------
     if ai_reply.get("scheduled_date"):
         convo["scheduled_date"] = ai_reply["scheduled_date"]
 
@@ -7699,15 +7716,17 @@ def incoming_sms():
     if ai_reply.get("address"):
         convo["address"] = ai_reply["address"]
 
-    # ===================================================
+
+    # ---------------------------------------------------
     # 6) HARD APPT-TYPE PROTECTION
-    # ===================================================
+    # ---------------------------------------------------
     incoming_apt = sanitize_appt_type(ai_reply.get("appointment_type"))
     convo["appointment_type"] = incoming_apt
 
-    # ===================================================
-    # 7) SEND SMS OR NOT
-    # ===================================================
+
+    # ---------------------------------------------------
+    # 7) SEND SMS
+    # ---------------------------------------------------
     sms_body = (ai_reply.get("sms_body") or "").strip()
 
     if sms_body == "":
@@ -7716,6 +7735,7 @@ def incoming_sms():
     resp = MessagingResponse()
     resp.message(sms_body)
     return Response(str(resp), mimetype="text/xml")
+
 
 
 
