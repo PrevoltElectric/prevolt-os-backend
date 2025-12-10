@@ -231,12 +231,12 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         return {
             "sms_body": (
                 "Hi, this is Prevolt Electric — I received your message. "
-                "The next step is a $195 on-site consultation and quote visit. "
-                "What day works for you?"
+                "What day works for a visit?"
             ),
             "category": "OTHER",
             "appointment_type": "EVAL_195",
         }
+
 
 
 # ---------------------------------------------------
@@ -421,6 +421,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo  # REQUIRED for timezone logic
 
+
 # ---------------------------------------------------
 # REQUIRED STATE HELPERS (MINIMAL SAFE VERSIONS)
 # ---------------------------------------------------
@@ -449,10 +450,10 @@ def get_current_state(conv: dict) -> str:
 def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, scheduled_time):
     """
     TEMPORARY NON-BLOCKING VERSION.
-    MUST always return {} so Step 4 continues.
-    Prevents recursion, NameErrors, fallback loops.
+    Always returns {}, preventing recursion / NameErrors.
     """
     return {}
+
 
 
 # ---------------------------------------------------
@@ -497,12 +498,14 @@ def generate_reply_for_inbound(
             except Exception:
                 should_reset = True
 
-        if inbound_text.strip().lower() in [
-            "hi", "hello", "hey",
-            "new issue", "another issue",
-            "new problem", "i need help",
-            "i have a new problem",
-        ]:
+        trigger_resets = {
+            "hi","hello","hey",
+            "new issue","another issue",
+            "new problem","i need help",
+            "i have a new problem"
+        }
+
+        if inbound_text.strip().lower() in trigger_resets:
             should_reset = True
 
         if should_reset:
@@ -523,47 +526,57 @@ def generate_reply_for_inbound(
                 "state_prompt_sent": False,
             }
 
-        # Always ensure conv exists
         conv = conversations.setdefault(phone, {})
 
         # -------------------------------
-        # STATE LOCK ENFORCER (never blocks)
+        # STATE LOCK ENTRY (never blocks)
         # -------------------------------
         try:
             state = get_current_state(conv)
-        except NameError:
-            state = None
+        except Exception:
+            state = "unknown"
 
-        lock = enforce_state_lock(
+        enforce_state_lock(
             state,
             conv,
             inbound_text.lower(),
             address,
             scheduled_date,
-            scheduled_time,
+            scheduled_time
         )
 
-        if lock.get("interrupt"):
-            return lock["reply"]
+        # ===================================================
+        # ADDRESS DETECTION FIX (P1)
+        # When a valid address is detected → NEVER re-ask it.
+        # ===================================================
+        inbound_lower = inbound_text.lower()
+
+        if any(x in inbound_lower for x in [" st", " ave", " road", " rd", " ln", " lane", " dr", " drive"]) and len(inbound_text) > 6:
+            conv["address"] = inbound_text.strip()
+            conv["state_prompt_sent"] = False  # allow next state step
+            # Do NOT ask for time/date yet — let LLM respond naturally
+            # but block re-asking the address.
+            address = conv["address"]
+
 
         # -------------------------------
-        # BUILD SYSTEM PROMPT
+        # BUILD SYSTEM PROMPT (JSON RULES)
         # -------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
             appointment_type,
             initial_sms,
-            scheduled_date,
-            scheduled_time,
-            address,
+            conv.get("scheduled_date"),
+            conv.get("scheduled_time"),
+            conv.get("address"),
             today_date_str,
             today_weekday,
             conv
         )
 
         # -------------------------------
-        # LLM CALL
+        # LLM CALL FOR REPLY
         # -------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -581,7 +594,24 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_address = ai_raw.get("address")
 
-        inbound_lower = inbound_text.lower()
+
+        # -----------------------------------------------------
+        # PRICE INJECTION (P1 FIX #2) — based on appointment_type
+        # -----------------------------------------------------
+        price_phrase = ""
+
+        appt = str(appointment_type).lower()
+
+        if appt == "eval_195":
+            price_phrase = " The visit is a $195 consultation."
+        elif appt == "troubleshoot_395":
+            price_phrase = " The visit is a $395 troubleshoot and repair."
+        elif appt == "whole_home_inspection":
+            price_phrase = " Home inspections range from $375–$650 depending on square footage."
+
+        if price_phrase and price_phrase not in sms_body:
+            sms_body += price_phrase
+
 
         # -------------------------------
         # DATE/TIME PATCH LAYER
@@ -597,17 +627,17 @@ def generate_reply_for_inbound(
         # Time but no date → infer today
         if model_time and not model_date:
             if any(word in inbound_lower for word in [
-                "today", "this", "anytime", "whenever", "now", "soon",
-                "this afternoon", "this morning", "this evening",
-                "asap", "right now", "i'm here", "i am home"
+                "today","this","anytime","whenever","now","soon",
+                "this afternoon","this morning","this evening",
+                "asap","right now","i'm here","i am home"
             ]):
                 model_date = today_patch
 
-        # Troubleshoot override → today
-        if model_time and not model_date and str(appointment_type).lower() == "troubleshoot_395":
+        # Troubleshoot override → force today
+        if model_time and not model_date and appt == "troubleshoot_395":
             model_date = today_patch
 
-        # Date but no time
+        # Date but no time → infer from context
         if model_date and not model_time:
             if "morning" in inbound_lower:
                 model_time = "09:00"
@@ -615,7 +645,7 @@ def generate_reply_for_inbound(
                 model_time = "13:00"
             elif "evening" in inbound_lower:
                 model_time = "16:00"
-            elif any(x in inbound_lower for x in ["whenever", "sometime", "anytime"]):
+            elif any(k in inbound_lower for k in ["whenever","sometime","anytime"]):
                 model_time = "13:00"
 
         # Patch past times today
@@ -624,7 +654,7 @@ def generate_reply_for_inbound(
                 t_obj = datetime.strptime(model_time, "%H:%M").time()
                 now_t = now_local_patch.time()
                 if t_obj < now_t:
-                    minute = (now_local_patch.minute + 29) // 30 * 30
+                    minute = (now_local_patch.minute + 29)//30*30
                     hour = now_local_patch.hour + (1 if minute == 60 else 0)
                     minute = 0 if minute == 60 else minute
                     if hour >= 20:
@@ -633,18 +663,18 @@ def generate_reply_for_inbound(
             except:
                 pass
 
-        # Format AM/PM
+
+        # -------------------------------
+        # HUMAN FRIENDLY TIME
+        # -------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
             human_time = model_time
 
-        # -------------------------------
-        # FINAL RETURN
-        # -------------------------------
         final_sms = (
             sms_body.replace(model_time, human_time)
-            if (sms_body and human_time and model_time)
+            if (sms_body and model_time and human_time)
             else sms_body
         )
 
@@ -652,12 +682,11 @@ def generate_reply_for_inbound(
             "sms_body": final_sms,
             "scheduled_date": model_date,
             "scheduled_time": model_time,
-            "address": model_address,
+            "address": model_address or conv.get("address"),
         }
 
     except Exception as e:
         print("Inbound reply FAILED:", repr(e))
-
         return {
             "sms_body": "Sorry — can you say that again?",
             "scheduled_date": scheduled_date,
