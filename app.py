@@ -587,8 +587,33 @@ def generate_reply_for_inbound(
 
         inbound_lower = inbound_text.lower()
 
+        # =====================================================
+        #  APPOINTMENT TYPE (AUTO-DETECT + FALLBACK)
+        # =====================================================
+        # Default first
+        appt_type = sched.get("appointment_type")
+
+        # If still None, classify from text
+        if not appt_type:
+
+            if any(word in inbound_lower for word in [
+                "not working", "no power", "dead", "sparking", "burning",
+                "breaker keeps", "gfci", "outlet not", "troubleshoot"
+            ]):
+                appt_type = "TROUBLESHOOT_395"
+
+            elif any(word in inbound_lower for word in [
+                "inspection", "whole home inspection", "electrical inspection"
+            ]):
+                appt_type = "WHOLE_HOME_INSPECTION"
+
+            else:
+                appt_type = "EVAL_195"  # default
+
+            sched["appointment_type"] = appt_type
+
         # -----------------------------------------------------
-        # HARD ADDRESS CAPTURE  (FIXED — detects real addresses)
+        # HARD ADDRESS CAPTURE 
         # -----------------------------------------------------
         address_markers = [
             "st", "street",
@@ -610,7 +635,7 @@ def generate_reply_for_inbound(
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
-            sched.get("appointment_type"),
+            appt_type,
             initial_sms,
             sched.get("scheduled_date"),
             sched.get("scheduled_time"),
@@ -632,14 +657,13 @@ def generate_reply_for_inbound(
             ],
         )
 
-        # -------------------------------
-        # NEW FIX — sanitize invalid JSON
-        # -------------------------------
         raw_json = completion.choices[0].message.content.strip()
-        raw_json = raw_json.replace("None", "null")
-        raw_json = raw_json.replace("none", "null")
-        raw_json = raw_json.replace("Null", "null")
-        raw_json = raw_json.replace("NULL", "null")
+        raw_json = (
+            raw_json.replace("None", "null")
+                    .replace("none", "null")
+                    .replace("Null", "null")
+                    .replace("NULL", "null")
+        )
 
         ai_raw = json.loads(raw_json)
 
@@ -649,15 +673,14 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # -----------------------------------------------------
-        # PRICE INJECTION
+        # PRICE INJECTION BASED ON appt_type
         # -----------------------------------------------------
-        appt = str(sched.get("appointment_type")).lower()
         price_map = {
             "eval_195": " The visit is a $195 consultation.",
             "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
             "whole_home_inspection": " Home inspections range from $375–$650 depending on size."
         }
-        price_phrase = price_map.get(appt, "")
+        price_phrase = price_map.get(appt_type.lower(), "")
         if price_phrase and price_phrase not in sms_body:
             sms_body += price_phrase
 
