@@ -397,9 +397,6 @@ def generate_reply_for_inbound(
 ) -> dict:
 
     try:
-        # ---------------------------------------------------
-        # Local date/time for Option A date conversion
-        # ---------------------------------------------------
         if ZoneInfo:
             tz = ZoneInfo("America/New_York")
         else:
@@ -409,25 +406,18 @@ def generate_reply_for_inbound(
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday = now_local.strftime("%A")
 
-        # ---------------------------------------------------
-        # Session Reset Logic (prevents ghost-state)
-        # ---------------------------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         last_time = conversations.get(phone, {}).get("first_sms_time")
         should_reset = False
 
-        # Reset if conversation is older than 60 minutes
         if last_time:
             try:
-                # Ensure last_time is a datetime
                 elapsed_minutes = (now_local - last_time).total_seconds() / 60
                 if elapsed_minutes > 60:
                     should_reset = True
             except Exception:
-                # If corrupted/old format → force reset
                 should_reset = True
 
-        # Reset if user signals a brand-new issue
         if inbound_text.strip().lower() in [
             "hi", "hello", "hey",
             "new issue", "another issue",
@@ -436,7 +426,6 @@ def generate_reply_for_inbound(
         ]:
             should_reset = True
 
-        # Perform reset if needed
         if should_reset:
             conversations[phone] = {
                 "cleaned_transcript": cleaned_transcript,
@@ -454,6 +443,148 @@ def generate_reply_for_inbound(
                 "square_booking_id": None,
                 "state_prompt_sent": False,
             }
+
+        conv = conversations.setdefault(phone, {})
+        state = get_current_state(conv)
+
+        lock = enforce_state_lock(
+            state,
+            conv,
+            inbound_text.lower(),
+            address,
+            scheduled_date,
+            scheduled_time
+        )
+
+        if lock.get("interrupt"):
+            return lock["reply"]
+
+        system_prompt = build_system_prompt(
+            cleaned_transcript,
+            category,
+            appointment_type,
+            initial_sms,
+            scheduled_date,
+            scheduled_time,
+            address,
+            today_date_str,
+            today_weekday,
+            conv
+        )
+
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": inbound_text},
+            ],
+        )
+
+        ai_raw = json.loads(completion.choices[0].message.content)
+
+        sms_body = ai_raw.get("sms_body", "").strip()
+        model_date = ai_raw.get("scheduled_date")
+        model_time = ai_raw.get("scheduled_time")
+        model_address = ai_raw.get("address")
+
+        inbound_lower = inbound_text.lower()
+
+        if ZoneInfo:
+            tz_patch = ZoneInfo("America/New_York")
+        else:
+            tz_patch = timezone(timedelta(hours=-5))
+
+        now_local_patch = datetime.now(tz_patch)
+        today_patch = now_local_patch.strftime("%Y-%m-%d")
+
+        if model_time and not model_date:
+            if any(phrase in inbound_lower for phrase in [
+                "today", "this", "anytime", "whenever", "now", "soon",
+                "this afternoon", "this morning", "this evening",
+                "asap", "right now", "i'm here", "i am home"
+            ]):
+                model_date = today_patch
+
+        appointment_type_lower = str(appointment_type).lower()
+        if (model_time and not model_date and
+                appointment_type_lower == "troubleshoot_395"):
+            model_date = today_patch
+
+        if model_date and not model_time:
+            if "morning" in inbound_lower:
+                model_time = "09:00"
+            elif "afternoon" in inbound_lower:
+                model_time = "13:00"
+            elif "evening" in inbound_lower:
+                model_time = "16:00"
+            elif any(x in inbound_lower for x in ["whenever", "sometime", "anytime"]):
+                model_time = "13:00"
+
+        if model_date == today_patch and model_time:
+            try:
+                t_obj = datetime.strptime(model_time, "%H:%M").time()
+                now_t = now_local_patch.time()
+                if t_obj < now_t:
+                    minute = (now_local_patch.minute + 29) // 30 * 30
+                    hour = now_local_patch.hour + (1 if minute == 60 else 0)
+                    minute = 0 if minute == 60 else minute
+                    if hour >= 20:
+                        hour = 20
+                        minute = 0
+                    model_time = f"{hour:02d}:{minute:02d}"
+            except Exception:
+                pass
+
+        try:
+            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
+        except:
+            human_time = model_time
+
+        return {
+            "sms_body": sms_body.replace(model_time, human_time) if (sms_body and human_time) else sms_body,
+            "scheduled_date": model_date,
+            "scheduled_time": model_time,
+            "address": model_address,
+        }
+
+    except Exception as e:
+        print("Inbound reply FAILED:", repr(e))
+
+        # ---------------------------------------------------------
+        # SAFETY PATCH — Prevent "Got it." loop & preserve data
+        # ---------------------------------------------------------
+        try:
+            safe_body = (
+                sms_body
+                if isinstance(sms_body, str) and sms_body.strip()
+                else "Understood — what day and time works for you?"
+            )
+        except:
+            safe_body = "Understood — what day and time works for you?"
+
+        try:
+            final_date = model_date if model_date else scheduled_date
+        except:
+            final_date = scheduled_date
+
+        try:
+            final_time = model_time if model_time else scheduled_time
+        except:
+            final_time = scheduled_time
+
+        try:
+            final_address = model_address if model_address else address
+        except:
+            final_address = address
+
+        return {
+            "sms_body": safe_body,
+            "scheduled_date": final_date,
+            "scheduled_time": final_time,
+            "address": final_address,
+        }
+
 
         system_prompt = """
 You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
@@ -6224,6 +6355,240 @@ OS: “Great — what time on Thursday works for you?”
 
 User: “I’m free most mornings.”
 OS: “Got it — what time in the morning works best?”
+
+### Rule 20.31 — Explicit Day + Explicit Time Proposal
+If customer gives a specific day AND a specific time in the same message:
+Examples:
+• “What about this Thursday at 3pm?”
+• “Could you do Friday at 10?”
+• “Is tomorrow at noon okay?”
+• “Can you come Tuesday at 4?”
+• “Next Wednesday at 9am works.”
+
+OS must:
+• treat this as a firm scheduling request
+• extract the weekday or date expression and convert it into a real calendar date
+• extract the explicit time and convert it to HH:MM (24-hour)
+• lock both scheduled_date and scheduled_time
+• not reply with filler such as “Got it.”
+• give one short human confirmation AND move to the next missing step (usually address):
+  “That works — we can do Thursday at 3pm. What’s the address?”
+• if Square shows no availability for that exact time, apply Rule 20.30 (closest same-day alternative)
+• if the entire day is booked, apply Rule 20.29 (roll the same weekday forward)
+• never re-ask for the date or time unless the customer explicitly changes it
+
+
+### Rule 20.32 — Explicit Time + Vague Day Proposal
+If customer gives an explicit time but only a vague or relative day:
+Examples:
+• “Can you do 3pm tomorrow?”
+• “Is noon good sometime this week?”
+• “What about 4pm one day next week?”
+
+OS must:
+• extract and convert the time into HH:MM (24-hour)
+• interpret the vague day using SRB-1.12 and SRB-1.13 (natural language date handling)
+• lock scheduled_time immediately
+• lock scheduled_date once converted
+• confirm with one human line:
+  “We can do 3pm tomorrow — what’s the address?”
+• if Square rejects the proposed time, apply Rule 20.30 (same-day closest time)
+• if the whole day is unavailable, apply Rule 20.29 (roll same weekday next week)
+• never reset or re-ask for the day unless explicitly corrected by the customer
+
+
+### Rule 20.33 — Explicit Day + Time Window (Customer Chooses Time Range)
+If customer gives a specific day and a time window:
+Examples:
+• “I’m good Thursday afternoon.”
+• “Friday morning works best.”
+• “Anytime after 2pm on Tuesday.”
+• “Can you come Wednesday evening?”
+
+OS must:
+• convert the day into a real scheduled_date (per SRB-1.12 rules)
+• map the time window into a target block:
+  – “morning” → 9:00–12:00
+  – “afternoon” → 12:00–15:00
+  – “evening” → 15:00–18:00
+  – “after 2pm” → pick 14:00 as provisional start
+• if customer did not choose a specific time inside the window:
+  OS must ask once:
+  “What time Thursday afternoon works for you?”
+• if a time is implicitly clear (e.g., “anytime after 2pm”):
+  OS must select the earliest valid slot inside the window
+• apply Square availability:
+  – if conflict → offer closest time within window
+  – if whole window is booked → apply Rule 20.29 (same weekday next week)
+• never re-ask for the day or window once understood
+
+### Rule 20.34 — User States Exact Date First, Then Gives Time Later
+If customer sends:
+• an explicit date in one message  
+• the explicit time in a later message  
+
+Examples:
+Msg 1: “I can do March 14.”  
+Msg 2: “2pm works.”
+
+OS must:
+• merge both  
+• lock scheduled_date = March 14  
+• lock scheduled_time = 2pm  
+• NOT ask “what time works?” or “what day works?”  
+• move directly to the next missing step  
+
+Earlier hints or habitual availability must be ignored.
+
+---
+
+### Rule 20.35 — User States Exact Time First, Then Gives Date Later
+If customer sends the time before the date:
+Examples:
+Msg 1: “3pm is best.”  
+Msg 2: “I can do next Tuesday.”
+
+OS must:
+• treat the combination as complete scheduling info  
+• lock scheduled_time = 3pm  
+• lock scheduled_date = next Tuesday  
+• NOT re-ask for time or day  
+• proceed directly to the next missing step (usually address or final confirmation)
+
+This must never create a loop.
+
+### Rule 20.36 — Explicit Date + Time Always Override All Prior Inference
+If earlier messages included:
+• habitual days  
+• vague availability  
+• inferred dates  
+• time windows  
+• partial scheduling data  
+
+But the customer later gives:
+• a precise date AND  
+• a precise time  
+
+Then OS must:
+• discard all earlier inferred scheduling  
+• lock the explicit date and time as authoritative  
+• move forward without re-asking anything already provided  
+
+Example:
+Msg 1: “I’m usually home Thursdays.”  
+Msg 2: “Let’s do Monday at 9am.”  
+OS must lock Monday 9am — not Thursday.
+
+### Rule 20.37 — Ambiguous Date Clarification Without Looping
+If customer gives a date phrase that has two possible interpretations:
+Examples:
+• “This Tuesday?” (when today *is* Tuesday)
+• “Next Monday?” (ambiguous depending on local usage)
+• “Can you do Friday?” (near midnight)
+
+OS must:
+• choose the earliest reasonable interpretation  
+• ask *one* clarifying question ONLY if needed  
+• NEVER re-ask the same question twice  
+• NEVER reset scheduling  
+
+Allowed:
+“Do you mean this coming Monday or the following Monday?”
+
+Forbidden:
+“What day works for you?” (loop)
+
+---
+
+### Rule 20.38 — Double Dates in a Single Message
+If customer gives two potential dates:
+Examples:
+• “I can do Thursday or Friday”
+• “Either the 12th or the 14th works”
+
+OS must:
+• pick the **earliest** date  
+• confirm with a single question:  
+  “Thursday works — what time that day is good for you?”  
+• never present both options back to the user  
+• never ask “which one?” unless both dates are outside availability  
+
+---
+
+### Rule 20.39 — Double Times in a Single Message
+If customer gives two potential times:
+Examples:
+• “Around 1 or 3 works”
+• “Noon or 2pm is fine”
+
+OS must:
+• pick the **earliest** time  
+• move forward immediately if date is known  
+• ONLY ask a question if date is missing  
+
+Example:
+Customer: “1 or 3 works Thursday.”  
+OS: lock Thursday at 1pm → continue flow.
+
+---
+
+### Rule 20.40 — User Provides Date + Time + Question in One Message
+Examples:
+• “Can you do March 4 at 3pm? And do you charge extra?”
+• “Is 9am Tuesday OK? Also how long does it take?”
+
+OS must:
+• extract the date  
+• extract the time  
+• treat them as authoritative  
+• answer the question briefly  
+• continue the scheduling flow  
+• NEVER split this into two replies  
+
+---
+
+### Rule 20.41 — “Book It For That Time” Without Repeating the Time
+If customer says:
+• “Book it.”  
+• “That works — book me.”  
+• “Sounds good, lock it in.”  
+• “Perfect — schedule that.”  
+
+But the explicit date/time were provided in a previous message:
+
+OS must:
+• retrieve the already stored date/time  
+• send final confirmation  
+• complete booking  
+• NEVER ask: “What time?” or “What day?” again  
+
+---
+
+### Rule 20.42 — Detect Final Confirmation Phrases Even With Noise
+If customer includes any signal of acceptance:
+• “Yeah that’s fine”  
+• “Sure that works”  
+• “Ok perfect”  
+• “Let’s do it”  
+• “Yup that time is good”  
+
+Even if surrounded by noise:
+• emojis  
+• unrelated questions  
+• misspellings  
+• filler words  
+
+OS must:
+• treat acceptance as valid final confirmation  
+• proceed with booking  
+• then answer any remaining question AFTER booking (unless it alters date/time)
+
+Example:
+Customer: “Sounds good 👍 how long does it take?”
+OS must:
+• finalize booking  
+• then answer: “It’s usually about an hour.”
+
 
 
 ===================================================
