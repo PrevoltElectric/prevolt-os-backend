@@ -617,8 +617,8 @@ def generate_reply_for_inbound(
         # 1️⃣ CANCELATION HANDLER
         # =====================================================
         cancel_keywords = [
-            "cancel", "cancel appointment", "cancel it",
-            "i can't make it", "need to cancel",
+            "cancel", "cancel appointment", "cancel it", 
+            "i can't make it", "need to cancel", 
             "please cancel", "don't come"
         ]
 
@@ -656,11 +656,12 @@ def generate_reply_for_inbound(
                 "address": None,
             }
 
+
         # =====================================================
         # 2️⃣ ETA HANDLER
         # =====================================================
         eta_keywords = [
-            "eta", "how long", "how far", "on your way",
+            "eta", "how long", "how far", "on your way", 
             "when will you", "are you coming", "when are you"
         ]
 
@@ -669,16 +670,14 @@ def generate_reply_for_inbound(
             appt_time = conv.get("scheduled_time")
 
             if appt_date and appt_time:
-                try:
-                    human_time = datetime.strptime(appt_time, "%H:%M").strftime("%-I:%M %p")
-                except:
-                    human_time = appt_time
+                human_time = datetime.strptime(appt_time, "%H:%M").strftime("%-I:%M %p")
                 return {
                     "sms_body": f"Your visit is scheduled for {appt_date} at {human_time}. We'll send an arrival text when we're en route.",
                     "scheduled_date": appt_date,
                     "scheduled_time": appt_time,
                     "address": conv.get("address"),
                 }
+
 
         # =====================================================
         # 3️⃣ RESCHEDULE HANDLER
@@ -699,6 +698,7 @@ def generate_reply_for_inbound(
                 "scheduled_time": None,
                 "address": conv.get("address"),
             }
+
 
         # =====================================================
         # 4️⃣ ADDRESS CHANGE HANDLER
@@ -722,6 +722,7 @@ def generate_reply_for_inbound(
                 "address": conv["address"],
             }
 
+
         # =====================================================
         # 5️⃣ ADDITIONAL NOTES HANDLER
         # =====================================================
@@ -737,12 +738,14 @@ def generate_reply_for_inbound(
                 "address": conv.get("address"),
             }
 
+
         # -----------------------------------------------------
         # HARD ADDRESS CAPTURE (P1 FIX)
         # -----------------------------------------------------
         if any(x in inbound_lower for x in [" st", " ave", " rd", "road", " ln", " lane", "dr", "drive"]) and len(inbound_text) > 6:
             conv["address"] = inbound_text.strip()
             address = conv["address"]
+
 
         # -----------------------------------------------------
         # BUILD SYSTEM PROMPT
@@ -759,6 +762,7 @@ def generate_reply_for_inbound(
             today_weekday,
             conv
         )
+
 
         # -----------------------------------------------------
         # LLM CALL
@@ -778,6 +782,7 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
+
         # -----------------------------------------------------
         # PRICE INJECTION
         # -----------------------------------------------------
@@ -791,6 +796,7 @@ def generate_reply_for_inbound(
         if price_phrase and price_phrase not in sms_body:
             sms_body += price_phrase
 
+
         # -----------------------------------------------------
         # INHERIT KNOWN VALUES
         # -----------------------------------------------------
@@ -803,24 +809,28 @@ def generate_reply_for_inbound(
         if address and not model_addr:
             model_addr = address
 
+
         # -----------------------------------------------------
         # TIME INFERENCE
         # -----------------------------------------------------
         if model_time and not model_date:
             model_date = today_date_str
 
+
         # -----------------------------------------------------
         # HUMAN TIME
         # -----------------------------------------------------
         try:
-            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
+            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p")
         except:
             human_time = model_time
 
+
         final_sms = sms_body.replace(model_time, human_time) if (sms_body and model_time and human_time) else sms_body
 
+
         # =====================================================
-        # AUTO-BOOKING ENGINE (Option C + S2 fallback)
+        # AUTO-BOOKING ENGINE
         # =====================================================
         if model_date and model_time and model_addr and not conv.get("booking_created"):
             conv["scheduled_date"] = model_date
@@ -828,41 +838,21 @@ def generate_reply_for_inbound(
             conv["address"]        = model_addr
 
             try:
-                result = maybe_create_square_booking(phone, conv)
+                maybe_create_square_booking(phone, conv)
 
-                # If maybe_create_square_booking returned a dict with an sms_body,
-                # that's the S2 fallback: "We’re booked then, but I can do 2:30 PM or 4:30 PM — which works?"
-                if isinstance(result, dict):
-                    fallback_msg = result.get("sms_body")
-                    if fallback_msg:
-                        return {
-                            "sms_body": fallback_msg,
-                            "scheduled_date": result.get("scheduled_date"),
-                            "scheduled_time": result.get("scheduled_time"),
-                            "address": result.get("address"),
-                        }
-
-                # If booking was successfully created in Square, send confirmation
                 if conv.get("booking_created"):
                     booking_id = conv.get("square_booking_id")
-                    # human_time already computed above
-                    confirm_time = human_time or model_time or ""
                     return {
-                        "sms_body": (
-                            f"You're all set — your appointment is booked for "
-                            f"{model_date} at {confirm_time} at {model_addr}. "
-                            f"Your confirmation number is {booking_id}."
-                        ),
+                        "sms_body": f"You're all set — your appointment is booked for {model_date} at {human_time} at {model_addr}. Your confirmation number is {booking_id}.",
                         "scheduled_date": model_date,
                         "scheduled_time": model_time,
                         "address": model_addr,
                     }
 
-                # If no dict or no booking_created → fall through to normal return
-
             except Exception as e:
                 print("AUTO-BOOKING ERROR:", repr(e))
                 final_sms += " (Couldn't auto-book — we'll confirm manually.)"
+
 
         # -----------------------------------------------------
         # NORMAL RETURN
@@ -873,6 +863,7 @@ def generate_reply_for_inbound(
             "scheduled_time": model_time,
             "address": model_addr,
         }
+
 
     except Exception as e:
         print("Inbound reply FAILED:", repr(e))
@@ -1355,109 +1346,20 @@ def update_square_booking_notes(booking_id: str, note_text: str) -> bool:
         print("Square update-notes exception:", repr(e))
         return False
 
-# ---------------------------------------------------
-# Square Availability Check (for conflict detection)
-# ---------------------------------------------------
-def get_square_availability(date_str: str, time_str: str, duration_minutes: int) -> str:
-    """
-    Uses Square's SearchAvailability API to determine if the requested slot
-    is open or blocked.
-
-    RETURNS:
-        "open"    → You can book
-        "blocked" → Time is unavailable
-    """
-
-    try:
-        # ---------------------------------------------------
-        # Build RFC3339 timestamp (UTC expected by Square)
-        # ---------------------------------------------------
-        start_dt_utc = parse_local_datetime(date_str, time_str)
-        if not start_dt_utc:
-            print("get_square_availability: parse_local_datetime failed")
-            return "blocked"
-
-        start_rfc3339 = start_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # ---------------------------------------------------
-        # Time range for multi-hour appointments
-        # ---------------------------------------------------
-        end_dt_utc = start_dt_utc + timedelta(minutes=duration_minutes)
-        end_rfc3339 = end_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # ---------------------------------------------------
-        # Square Search Availabilities Request
-        # ---------------------------------------------------
-        payload = {
-            "query": {
-                "filter": {
-                    "start_at_range": {
-                        "start_at": start_rfc3339,
-                        "end_at": end_rfc3339
-                    },
-                    "location_ids": [SQUARE_LOCATION_ID],
-                    "segment_filters": [
-                        {
-                            "service_variation_id": None  # match any service variation
-                        }
-                    ]
-                }
-            }
-        }
-
-        resp = requests.post(
-            "https://connect.squareup.com/v2/availability/search",
-            headers=square_headers(),
-            json=payload,
-            timeout=10,
-        )
-
-        # --------------------------
-        # If the API request failed
-        # --------------------------
-        if resp.status_code not in (200, 201):
-            print("get_square_availability: API error", resp.status_code, resp.text)
-            return "blocked"
-
-        data = resp.json()
-
-        # ------------------------------------
-        # Square returns an array of openings
-        # If empty → time is NOT available
-        # ------------------------------------
-        availabilities = data.get("availabilities", [])
-
-        if not availabilities:
-            print(f"Square availability → BLOCKED ({date_str} {time_str})")
-            return "blocked"
-
-        print(f"Square availability → OPEN ({date_str} {time_str})")
-        return "open"
-
-    except Exception as e:
-        print("get_square_availability exception:", repr(e))
-        return "blocked"
 
 
 
 # ---------------------------------------------------
-# Create Square Booking (with address normalization + duration + conflict check)
+# Create Square Booking (with address normalization)
 # ---------------------------------------------------
-def maybe_create_square_booking(phone: str, convo: dict) -> dict | None:
+def maybe_create_square_booking(phone: str, convo: dict) -> None:
     """
-    Attempts to create a Square booking.
-
-    NOW INCLUDES:
-    • Option C duration logic (Eval 60 / Troubleshoot 120 / Inspection 120)
-    • Option S2 conflict fallback: "We're booked then, but I can do X or Y"
-    • Hard conflict detection BEFORE booking
-    • Safe return dict when booking cannot proceed
+    Create a Square booking once we have date, time, and address.
+    Square bookings CANNOT include the 'country' field inside booking.address.
+    Customer profiles CAN include country, but bookings cannot.
     """
-
-    # Prevent double-book
     if convo.get("booking_created"):
-        print("Booking already exists — skipping Square create.")
-        return None
+        return
 
     scheduled_date = convo.get("scheduled_date")
     scheduled_time = convo.get("scheduled_time")
@@ -1465,45 +1367,28 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict | None:
     appointment_type = convo.get("appointment_type")
 
     if not (scheduled_date and scheduled_time and raw_address):
-        print("Missing scheduling fields — cannot create booking.")
-        return None
-
-    # ---------------------------------------------------
-    # DURATION LOGIC — OPTION C
-    # ---------------------------------------------------
-    appt_type = (appointment_type or "").upper()
-
-    if appt_type == "EVAL_195":
-        duration_minutes = 60
-    elif appt_type == "TROUBLESHOOT_395":
-        duration_minutes = 120
-    elif appt_type == "WHOLE_HOME_INSPECTION":
-        duration_minutes = 120
-    else:
-        duration_minutes = 60  # fallback safeguard
+        return
 
     variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
     if not variation_id:
-        print("Appointment type missing mapping:", appointment_type)
-        return None
+        print("Unknown appointment_type; cannot map:", appointment_type)
+        return
 
-    # Weekend rules
+    # Weekend rule
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
-        print("Weekend blocked for non-emergency.")
-        return None
+        print("Weekend non-emergency booking blocked:", phone, scheduled_date)
+        return
 
     # Hours rule
     if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(scheduled_time):
-        print("Requested time outside normal hours.")
-        return None
+        print("Non-emergency time outside 9–4; booking not auto-created:", phone, scheduled_time)
+        return
 
     if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
-        print("Missing Square config — cannot book.")
-        return None
+        print("Square configuration incomplete; skipping booking creation.")
+        return
 
-    # ---------------------------------------------------
-    # Normalize Address
-    # ---------------------------------------------------
+    # Normalize or use stored
     addr_struct = convo.get("normalized_address")
     if not addr_struct:
         status, addr_struct = normalize_address(raw_address)
@@ -1515,16 +1400,14 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict | None:
             if not convo.get("state_prompt_sent"):
                 send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
                 convo["state_prompt_sent"] = True
-            print("Needs CT/MA clarification before booking.")
-            return None
+            print("Address needs CT/MA confirmation:", raw_address)
+            return
 
         else:
             print("Address normalization failed:", raw_address)
-            return None
+            return
 
-    # ---------------------------------------------------
-    # Travel time screening
-    # ---------------------------------------------------
+    # Travel time
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
     if origin:
         destination_for_travel = (
@@ -1533,56 +1416,37 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict | None:
             f"{addr_struct['administrative_district_level_1']} "
             f"{addr_struct['postal_code']}"
         )
+
         travel_minutes = compute_travel_time_minutes(origin, destination_for_travel)
 
         if travel_minutes is not None:
-            print(f"Travel estimate: {travel_minutes:.1f} minutes")
+            print(f"Estimated travel: {travel_minutes:.1f} min → {destination_for_travel}")
             if travel_minutes > MAX_TRAVEL_MINUTES:
-                print("Travel exceeds max — skip booking.")
-                return None
+                print("Travel exceeds limit; booking skipped.")
+                return
 
-    # ---------------------------------------------------
-    # Convert Local Time → UTC
-    # ---------------------------------------------------
+    # Customer create/fetch
+    customer_id = square_create_or_get_customer(phone, addr_struct)
+    if not customer_id:
+        print("No customer_id; cannot create booking.")
+        return
+
+    # Convert local → UTC
     start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
     if not start_at_utc:
-        print("Unable to convert datetime to UTC.")
-        return None
+        print("Unable to parse job datetime; skip booking.")
+        return
 
-    # ---------------------------------------------------
-    # PRE-CHECK AVAILABILITY — prevents double booking!
-    # ---------------------------------------------------
-    availability = get_square_availability(
-        scheduled_date,
-        scheduled_time,
-        duration_minutes
-    )
-
-    if availability == "blocked":
-        print("Requested time is unavailable — sending S2 fallback.")
-
-        return {
-            "sms_body": "We’re booked then, but I can do 2:30 PM or 4:30 PM — which works?",
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": raw_address,
-        }
-
-    if availability != "open":
-        print("Unknown availability response:", availability)
-        return None
-
-    # ---------------------------------------------------
-    # Build Square booking payload
-    # ---------------------------------------------------
     idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
 
+    # Square booking.address CANNOT include "country"
     booking_address = {
         "address_line_1": addr_struct["address_line_1"],
         "locality": addr_struct["locality"],
         "administrative_district_level_1": addr_struct["administrative_district_level_1"],
         "postal_code": addr_struct["postal_code"],
     }
+
     if addr_struct.get("address_line_2"):
         booking_address["address_line_2"] = addr_struct["address_line_2"]
 
@@ -1590,14 +1454,14 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict | None:
         "idempotency_key": idempotency_key,
         "booking": {
             "location_id": SQUARE_LOCATION_ID,
-            "customer_id": square_create_or_get_customer(phone, addr_struct),
+            "customer_id": customer_id,
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
             "address": booking_address,
             "customer_note": f"Auto-booked by Prevolt OS. Raw address: {raw_address}",
             "appointment_segments": [
                 {
-                    "duration_minutes": duration_minutes,
+                    "duration_minutes": 60,
                     "service_variation_id": variation_id,
                     "service_variation_version": variation_version,
                     "team_member_id": SQUARE_TEAM_MEMBER_ID,
@@ -1606,38 +1470,48 @@ def maybe_create_square_booking(phone: str, convo: dict) -> dict | None:
         },
     }
 
-    # ---------------------------------------------------
-    # POST to Square API
-    # ---------------------------------------------------
+    # POST → Square API
     try:
         resp = requests.post(
             "https://connect.squareup.com/v2/bookings",
             headers=square_headers(),
             json=booking_payload,
-            timeout=10,
+            timeout=10
         )
 
         if resp.status_code not in (200, 201):
-            print("Square create FAILED:", resp.status_code, resp.text)
-            return None
+            print("Square booking create FAILED:", resp.status_code, resp.text)
+            return
 
-        booking_id = resp.json().get("booking", {}).get("id")
+        booking = resp.json().get("booking", {})
+        booking_id = booking.get("id")
 
-        convo["booking_created"] = True
+        convo["booking_created"]   = True
         convo["square_booking_id"] = booking_id
 
-        print(f"Square booking created successfully → {booking_id}")
+        print(f"Square booking created for {phone}: {booking_id}")
 
-        return {
-            "sms_body": None,
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": raw_address,
+        # Reset convo AFTER booking
+        conversations[phone] = {
+            "cleaned_transcript": None,
+            "category": None,
+            "appointment_type": None,
+            "initial_sms": None,
+            "first_sms_time": None,
+            "replied": False,
+            "followup_sent": False,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "address": None,
+            "normalized_address": None,
+            "booking_created": True,
+            "square_booking_id": booking_id,
+            "state_prompt_sent": False,
         }
 
     except Exception as e:
         print("Square booking exception:", repr(e))
-        return None
+
 
 
 # ---------------------------------------------------
@@ -1655,6 +1529,7 @@ def incoming_call():
         method="POST"
     )
 
+    # FULL SSML — Slowed down + pauses + Matthew voice
     gather.say(
         '<speak>'
             '<prosody rate="95%">'
@@ -1669,6 +1544,7 @@ def incoming_call():
 
     response.append(gather)
 
+    # No input → replay menu
     response.say(
         '<speak><prosody rate="95%">Sorry, I did not get that. Let me repeat the options.</prosody></speak>',
         voice="Polly.Matthew-Neural"
@@ -1688,6 +1564,9 @@ def handle_call_selection():
     digit = request.form.get("Digits", "")
     response = VoiceResponse()
 
+    # -----------------------------
+    # OPTION 1 → RESIDENTIAL FLOW
+    # -----------------------------
     if digit == "1":
         response.say(
             '<speak>'
@@ -1712,14 +1591,20 @@ def handle_call_selection():
         response.hangup()
         return Response(str(response), mimetype="text/xml")
 
+    # -----------------------------
+    # OPTION 2 → COMMERCIAL / GOVERNMENT ROUTING
+    # -----------------------------
     elif digit == "2":
         response.say(
             '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
             voice="Polly.Matthew-Neural"
         )
-        response.dial("+15555555555")
+        response.dial("+15555555555")  # Replace with your real number
         return Response(str(response), mimetype="text/xml")
 
+    # -----------------------------
+    # INVALID INPUT → Replay Menu
+    # -----------------------------
     else:
         response.say(
             '<speak><prosody rate="90%">Sorry, I didn’t understand that.</prosody></speak>',
