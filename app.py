@@ -486,9 +486,19 @@ def generate_reply_for_inbound(
         inbound_lower = inbound_text.lower()
 
         # -----------------------------------------------------
-        # HARD ADDRESS CAPTURE
+        # HARD ADDRESS CAPTURE  (FIXED — detects real addresses)
         # -----------------------------------------------------
-        if any(x in inbound_lower for x in [" st", " ave", " rd", " road", " ln", " lane", " dr", " drive"]) and len(inbound_text) > 6:
+        address_markers = [
+            "st", "street",
+            "ave", "avenue",
+            "rd", "road",
+            "ln", "lane",
+            "dr", "drive",
+            "ct", "circle",
+            "blvd", "way"
+        ]
+
+        if any(marker in inbound_lower for marker in address_markers) and len(inbound_text) > 6:
             sched["normalized_address"] = inbound_text.strip()
             address = sched["normalized_address"]
 
@@ -638,6 +648,7 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
 
 
 
