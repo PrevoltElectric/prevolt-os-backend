@@ -397,6 +397,7 @@ def generate_reply_for_inbound(
 ) -> dict:
 
     try:
+        # Local timezone
         if ZoneInfo:
             tz = ZoneInfo("America/New_York")
         else:
@@ -406,6 +407,7 @@ def generate_reply_for_inbound(
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday = now_local.strftime("%A")
 
+        # Session Reset Logic
         phone = request.form.get("From", "").replace("whatsapp:", "")
         last_time = conversations.get(phone, {}).get("first_sms_time")
         should_reset = False
@@ -459,6 +461,7 @@ def generate_reply_for_inbound(
         if lock.get("interrupt"):
             return lock["reply"]
 
+        # Build system prompt for LLM
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
@@ -472,6 +475,7 @@ def generate_reply_for_inbound(
             conv
         )
 
+        # LLM Call
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             response_format={"type": "json_object"},
@@ -498,6 +502,7 @@ def generate_reply_for_inbound(
         now_local_patch = datetime.now(tz_patch)
         today_patch = now_local_patch.strftime("%Y-%m-%d")
 
+        # Time without date — infer today
         if model_time and not model_date:
             if any(phrase in inbound_lower for phrase in [
                 "today", "this", "anytime", "whenever", "now", "soon",
@@ -506,11 +511,11 @@ def generate_reply_for_inbound(
             ]):
                 model_date = today_patch
 
-        appointment_type_lower = str(appointment_type).lower()
-        if (model_time and not model_date and
-                appointment_type_lower == "troubleshoot_395"):
+        # Troubleshoot → assume today
+        if model_time and not model_date and str(appointment_type).lower() == "troubleshoot_395":
             model_date = today_patch
 
+        # Date without explicit time — infer window
         if model_date and not model_time:
             if "morning" in inbound_lower:
                 model_time = "09:00"
@@ -521,6 +526,7 @@ def generate_reply_for_inbound(
             elif any(x in inbound_lower for x in ["whenever", "sometime", "anytime"]):
                 model_time = "13:00"
 
+        # Prevent booking past times today
         if model_date == today_patch and model_time:
             try:
                 t_obj = datetime.strptime(model_time, "%H:%M").time()
@@ -536,6 +542,7 @@ def generate_reply_for_inbound(
             except Exception:
                 pass
 
+        # Human readable time
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
@@ -548,20 +555,16 @@ def generate_reply_for_inbound(
             "address": model_address,
         }
 
+    # ---------------------------------------------------------
+    # SAFE FALLBACK (NON-DESTRUCTIVE)
+    # ---------------------------------------------------------
     except Exception as e:
         print("Inbound reply FAILED:", repr(e))
 
-        # ---------------------------------------------------------
-        # SAFETY PATCH — Prevent "Got it." loop & preserve data
-        # ---------------------------------------------------------
         try:
-            safe_body = (
-                sms_body
-                if isinstance(sms_body, str) and sms_body.strip()
-                else "Understood — what day and time works for you?"
-            )
+            safe_body = sms_body if isinstance(sms_body, str) and sms_body.strip() else "Sorry — can you say that again?"
         except:
-            safe_body = "Understood — what day and time works for you?"
+            safe_body = "Sorry — can you say that again?"
 
         try:
             final_date = model_date if model_date else scheduled_date
