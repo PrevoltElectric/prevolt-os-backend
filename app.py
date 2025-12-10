@@ -590,12 +590,9 @@ def generate_reply_for_inbound(
         # =====================================================
         #  APPOINTMENT TYPE (AUTO-DETECT + FALLBACK)
         # =====================================================
-        # Default first
         appt_type = sched.get("appointment_type")
 
-        # If still None, classify from text
         if not appt_type:
-
             if any(word in inbound_lower for word in [
                 "not working", "no power", "dead", "sparking", "burning",
                 "breaker keeps", "gfci", "outlet not", "troubleshoot"
@@ -608,7 +605,7 @@ def generate_reply_for_inbound(
                 appt_type = "WHOLE_HOME_INSPECTION"
 
             else:
-                appt_type = "EVAL_195"  # default
+                appt_type = "EVAL_195"
 
             sched["appointment_type"] = appt_type
 
@@ -646,7 +643,7 @@ def generate_reply_for_inbound(
         )
 
         # -----------------------------------------------------
-        # LLM CALL (patched JSON-sanitization)
+        # LLM CALL + JSON SANITIZATION
         # -----------------------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -673,7 +670,7 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # -----------------------------------------------------
-        # PRICE INJECTION BASED ON appt_type
+        # PRICE INJECTION
         # -----------------------------------------------------
         price_map = {
             "eval_195": " The visit is a $195 consultation.",
@@ -685,28 +682,68 @@ def generate_reply_for_inbound(
             sms_body += price_phrase
 
         # -----------------------------------------------------
-        # INHERIT VALUES
+        # PATCH 1 — ADDRESS INHERITANCE
         # -----------------------------------------------------
-        if sched.get("scheduled_date") and not model_date:
-            model_date = sched["scheduled_date"]
-
-        if sched.get("scheduled_time") and not model_time:
-            model_time = sched["scheduled_time"]
-
         if sched.get("normalized_address") and not model_addr:
             model_addr = sched["normalized_address"]
 
+        if model_addr in ("", None, "null"):
+            if sched.get("normalized_address"):
+                model_addr = sched["normalized_address"]
+
+        if not model_addr and address:
+            model_addr = address
+
         # -----------------------------------------------------
-        # DATE/TIME INFERENCE
+        # DATE/TIME INHERITANCE
         # -----------------------------------------------------
+        existing_date = sched.get("scheduled_date")
+        existing_time = sched.get("scheduled_time")
+
+        if existing_date and not model_date:
+            model_date = existing_date
+
+        if existing_time and not model_time:
+            model_time = existing_time
+
         if model_time and not model_date:
             model_date = today_date_str
 
-        # Convert time → human format
+        # -----------------------------------------------------
+        # PATCH 3 — DAY/TIME LOCK (NO REPEATS)
+        # -----------------------------------------------------
+        lower_sms = sms_body.lower()
+
+        # Remove day request if day already known
+        if existing_date and any(q in lower_sms for q in [
+            "what day works", "what day is good", "what day works for the visit"
+        ]):
+            sms_body = sms_body.split("\n")[0]  # strip to first line
+
+        # Remove time request if time already known
+        if existing_time and any(q in lower_sms for q in [
+            "what time works", "what time is good", "what time works for you"
+        ]):
+            sms_body = sms_body.split("\n")[0]
+
+        # If BOTH date + time known -> NO QUESTIONS ALLOWED
+        if existing_date and existing_time:
+            if "?" in sms_body:
+                sms_body = sms_body.split("?")[0].strip() + "."
+
+        # -----------------------------------------------------
+        # Build readable time
+        # -----------------------------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
             human_time = model_time
+
+        # -----------------------------------------------------
+        # PATCH 2 — Address confirmation (keeps address anchored)
+        # -----------------------------------------------------
+        if model_addr and "address" not in sms_body.lower():
+            sms_body += f" Address on file: {model_addr}."
 
         final_sms = (
             sms_body.replace(model_time, human_time)
@@ -736,8 +773,8 @@ def generate_reply_for_inbound(
                     booking_id = sched.get("square_booking_id")
 
                     confirmation_sms = (
-                        f"You're all set — your appointment is booked for {model_date} at "
-                        f"{human_time} at {model_addr}. "
+                        f"You're all set — your appointment is booked for {model_date} "
+                        f"at {human_time} at {model_addr}. "
                         f"Your confirmation number is {booking_id}."
                     )
 
@@ -753,9 +790,6 @@ def generate_reply_for_inbound(
                 print("AUTO-BOOKING ERROR:", repr(e))
                 final_sms += " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
 
-        # =====================================================
-        # NORMAL RETURN
-        # =====================================================
         return {
             "sms_body": final_sms,
             "scheduled_date": model_date,
@@ -773,6 +807,8 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
+
 
 
 
