@@ -240,54 +240,76 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 
 # ---------------------------------------------------
-# NEW — Incoming SMS Webhook (Enables ALL Scheduling Logic)
-# SCANNING METADATA ATTACHED — SAFE, NON-EXECUTING
+# NEW — Incoming SMS Webhook (Rebuilt for 3-Layer Memory)
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
-    """
-    SCAN_TARGET: incoming_sms
-    SCAN_FIELDS:
-        - scheduled_date
-        - scheduled_time
-        - address
-        - normalized_address
-        - appointment_type
-        - category
-    SCAN_NOTES:
-        The scanner should analyze how state progresses AFTER the reply
-        and confirm nothing is overwritten incorrectly.
-    """
     from twilio.twiml.messaging_response import MessagingResponse
 
     inbound_text = request.form.get("Body", "")
     phone = request.form.get("From", "").replace("whatsapp:", "")
 
-    # Pull conversation state
+    # ==========================================================
+    # 3-LAYER MEMORY INITIALIZATION (NO OTHER FILES REQUIRED)
+    # ==========================================================
     conv = conversations.setdefault(phone, {})
 
+    # Create profile layer if missing
+    if "profile" not in conv:
+        conv["profile"] = {
+            "name": None,
+            "addresses": [],
+            "upcoming_appointment": None,
+            "past_jobs": []
+        }
+
+    # Create current job layer if missing
+    if "current_job" not in conv:
+        conv["current_job"] = {
+            "job_type": None,
+            "raw_description": None
+        }
+
+    # Create scheduler layer if missing
+    if "sched" not in conv:
+        conv["sched"] = {
+            "pending_step": None,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "appointment_type": None,
+            "normalized_address": None,
+            "booking_created": False
+        }
+
+    profile = conv["profile"]
+    current_job = conv["current_job"]
+    sched = conv["sched"]
+
+    # ==========================================================
+    # LEGACY VARIABLES (KEEPING THEM TO PREVENT BREAKING FLOW)
+    # ==========================================================
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
-    appointment_type = conv.get("appointment_type")
+    appointment_type = sched.get("appointment_type")
     initial_sms = conv.get("initial_sms")
-    scheduled_date = conv.get("scheduled_date")
-    scheduled_time = conv.get("scheduled_time")
-    address = conv.get("address")
+    scheduled_date = sched.get("scheduled_date")
+    scheduled_time = sched.get("scheduled_time")
+    address = sched.get("normalized_address")
 
-    # ---------------------------------------------------
-    # SCANNER_HOOK: PRE-REPLY STATE SNAPSHOT
-    # ---------------------------------------------------
+    # ==========================================================
+    # SNAPSHOT BEFORE REPLY (FOR DEBUG ONLY)
+    # ==========================================================
     conv["_scan_snapshot_before"] = {
         "scheduled_date": scheduled_date,
         "scheduled_time": scheduled_time,
         "address": address,
         "appointment_type": appointment_type,
-        "category": category,
+        "category": category
     }
 
-    # ---------------------------------------------------
-    # Generate AI reply (Step 4)
-    # ---------------------------------------------------
+    # ==========================================================
+    # GENERATE AI REPLY (NO STRUCTURE CHANGE TO DOWNSTREAM CODE)
+    # ==========================================================
     reply = generate_reply_for_inbound(
         cleaned_transcript,
         category,
@@ -299,25 +321,54 @@ def incoming_sms():
         address,
     )
 
-    # ---------------------------------------------------
-    # SAVE UPDATED STATE
-    # ---------------------------------------------------
-    conv["scheduled_date"] = reply.get("scheduled_date")
-    conv["scheduled_time"] = reply.get("scheduled_time")
-    conv["address"] = reply.get("address")
+    # ==========================================================
+    # APPLY REPLY FIELDS TO **SCHEDULER LAYER ONLY**
+    # ==========================================================
+    sched["scheduled_date"] = reply.get("scheduled_date")
+    sched["scheduled_time"] = reply.get("scheduled_time")
+    sched["normalized_address"] = reply.get("address")
 
-    # ---------------------------------------------------
-    # SCANNER_HOOK: POST-REPLY STATE SNAPSHOT
-    # ---------------------------------------------------
+    # ==========================================================
+    # IF BOOKING COMPLETED (DETECTED BY LLM), MOVE INTO PROFILE
+    # ==========================================================
+    if reply.get("booking_complete"):
+
+        # Store upcoming appointment in profile memory
+        profile["upcoming_appointment"] = {
+            "date": sched.get("scheduled_date"),
+            "time": sched.get("scheduled_time"),
+            "type": sched.get("appointment_type")
+        }
+
+        # Add to job history if job exists
+        if current_job.get("job_type"):
+            profile["past_jobs"].append({
+                "type": current_job["job_type"],
+                "date": sched.get("scheduled_date")
+            })
+
+        # FULL scheduler reset (core fix)
+        conv["sched"] = {
+            "pending_step": None,
+            "scheduled_date": None,
+            "scheduled_time": None,
+            "appointment_type": None,
+            "normalized_address": None,
+            "booking_created": True
+        }
+
+    # ==========================================================
+    # SNAPSHOT AFTER APPLYING REPLY
+    # ==========================================================
     conv["_scan_snapshot_after"] = {
-        "scheduled_date": conv["scheduled_date"],
-        "scheduled_time": conv["scheduled_time"],
-        "address": conv["address"],
+        "scheduled_date": conv["sched"]["scheduled_date"],
+        "scheduled_time": conv["sched"]["scheduled_time"],
+        "address": conv["sched"]["normalized_address"],
     }
 
-    # ---------------------------------------------------
-    # Build Twilio reply
-    # ---------------------------------------------------
+    # ==========================================================
+    # RETURN TWILIO REPLY
+    # ==========================================================
     twilio_reply = MessagingResponse()
     twilio_reply.message(reply["sms_body"])
 
@@ -487,19 +538,28 @@ def generate_reply_for_inbound(
         today_weekday  = now_local.strftime("%A")
 
         # -------------------------------
-        # Load conversation
+        # Load conversation + 3-layer memory
         # -------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         conv  = conversations.setdefault(phone, {})
 
+        # Ensure layers exist
+        conv.setdefault("profile", {})
+        conv.setdefault("current_job", {})
+        conv.setdefault("sched", {})
+
+        profile     = conv["profile"]
+        current_job = conv["current_job"]
+        sched       = conv["sched"]
+
         inbound_lower = inbound_text.lower()
 
         # -----------------------------------------------------
-        # HARD ADDRESS CAPTURE (P1 FIX)
+        # HARD ADDRESS CAPTURE
         # -----------------------------------------------------
         if any(x in inbound_lower for x in [" st", " ave", " rd", " road", " ln", " lane", " dr", " drive"]) and len(inbound_text) > 6:
-            conv["address"] = inbound_text.strip()
-            address = conv["address"]
+            sched["normalized_address"] = inbound_text.strip()
+            address = sched["normalized_address"]
 
         # -----------------------------------------------------
         # BUILD SYSTEM PROMPT
@@ -507,11 +567,11 @@ def generate_reply_for_inbound(
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
-            appointment_type,
+            sched.get("appointment_type"),
             initial_sms,
-            conv.get("scheduled_date"),
-            conv.get("scheduled_time"),
-            conv.get("address"),
+            sched.get("scheduled_date"),
+            sched.get("scheduled_time"),
+            sched.get("normalized_address"),
             today_date_str,
             today_weekday,
             conv
@@ -536,9 +596,9 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # -----------------------------------------------------
-        # PRICE INJECTION (P1 FIX #2)
+        # PRICE INJECTION
         # -----------------------------------------------------
-        appt = str(appointment_type).lower()
+        appt = str(sched.get("appointment_type")).lower()
         price_map = {
             "eval_195": " The visit is a $195 consultation.",
             "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
@@ -549,16 +609,16 @@ def generate_reply_for_inbound(
             sms_body += price_phrase
 
         # -----------------------------------------------------
-        # INHERIT KNOWN VALUES (P1 FIX #1)
+        # INHERIT VALUES
         # -----------------------------------------------------
-        if scheduled_date and not model_date:
-            model_date = scheduled_date
+        if sched.get("scheduled_date") and not model_date:
+            model_date = sched["scheduled_date"]
 
-        if scheduled_time and not model_time:
-            model_time = scheduled_time
+        if sched.get("scheduled_time") and not model_time:
+            model_time = sched["scheduled_time"]
 
-        if address and not model_addr:
-            model_addr = address
+        if sched.get("normalized_address") and not model_addr:
+            model_addr = sched["normalized_address"]
 
         # -----------------------------------------------------
         # DATE/TIME INFERENCE
@@ -566,9 +626,7 @@ def generate_reply_for_inbound(
         if model_time and not model_date:
             model_date = today_date_str
 
-        # -----------------------------------------------------
         # Convert time → human format
-        # -----------------------------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
@@ -581,27 +639,26 @@ def generate_reply_for_inbound(
         )
 
         # =====================================================
-        # AUTO-BOOKING ENGINE (calls maybe_create_square_booking)
+        # AUTO-BOOKING ENGINE
         # =====================================================
         ready_for_booking = (
             model_date
             and model_time
             and model_addr
-            and not conv.get("booking_created")
+            and not sched.get("booking_created")
         )
 
         if ready_for_booking:
-            # Square engine requires these stored in conv
-            conv["scheduled_date"] = model_date
-            conv["scheduled_time"] = model_time
-            conv["address"]        = model_addr
+            # Store into scheduler layer
+            sched["scheduled_date"] = model_date
+            sched["scheduled_time"] = model_time
+            sched["normalized_address"] = model_addr
 
             try:
                 maybe_create_square_booking(phone, conv)
 
-                # Only confirm booking if Square actually succeeded
-                if conv.get("booking_created"):
-                    booking_id = conv.get("square_booking_id")
+                if sched.get("booking_created"):
+                    booking_id = sched.get("square_booking_id")
 
                     confirmation_sms = (
                         f"You're all set — your appointment is booked for {model_date} at "
@@ -614,6 +671,7 @@ def generate_reply_for_inbound(
                         "scheduled_date": model_date,
                         "scheduled_time": model_time,
                         "address": model_addr,
+                        "booking_complete": True
                     }
 
             except Exception as e:
@@ -621,13 +679,14 @@ def generate_reply_for_inbound(
                 final_sms += " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
 
         # =====================================================
-        # NORMAL RETURN (no booking yet)
+        # NORMAL RETURN
         # =====================================================
         return {
             "sms_body": final_sms,
             "scheduled_date": model_date,
             "scheduled_time": model_time,
             "address": model_addr,
+            "booking_complete": False
         }
 
     except Exception as e:
@@ -637,6 +696,7 @@ def generate_reply_for_inbound(
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
             "address": address,
+            "booking_complete": False
         }
 
 
@@ -690,18 +750,18 @@ def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
 
 # ---------------------------------------------------
 # Google Maps — Address Normalization (CT/MA-aware)
+# 3-Layer Memory Compatible (NO direct writes to convo)
 # ---------------------------------------------------
 def normalize_address(raw_address: str, forced_state: str | None = None) -> tuple[str, dict | None]:
     """
-    Normalize a freeform address like:
-      '45 Dickerman Ave Windsor Locks'
-    into a Square-ready structure.
+    Normalize a freeform address into a Square-ready structure.
 
     Returns:
       ("ok", {address_struct})
-      ("needs_state", None)  -> ask customer CT or MA
-      ("error", None)        -> unable to normalize
+      ("needs_state", None)
+      ("error", None)
     """
+
     if not GOOGLE_MAPS_API_KEY or not raw_address:
         print("normalize_address: missing API key or raw address")
         return "error", None
@@ -712,7 +772,7 @@ def normalize_address(raw_address: str, forced_state: str | None = None) -> tupl
             "key": GOOGLE_MAPS_API_KEY,
         }
 
-        # Constrain to US; if forced_state is provided, bias to that state
+        # Constrain to US; bias if forced_state provided
         if forced_state:
             params["components"] = f"country:US|administrative_area:{forced_state}"
         else:
@@ -757,17 +817,16 @@ def normalize_address(raw_address: str, forced_state: str | None = None) -> tupl
             if "postal_code" in types:
                 zipcode = comp["long_name"]
 
-        # If we don't have a state at all (and no forced_state), we need to ask CT vs MA
+        # Missing state → prompt CT/MA
         if not state and not forced_state:
             print("normalize_address: missing state for", raw_address)
             return "needs_state", None
 
-        # If the geocoder picked a state that is NOT CT/MA and we didn't force it, ask CT vs MA
+        # Non-CT/MA → ask CT/MA
         if state and state not in ("CT", "MA") and not forced_state:
-            print("normalize_address: geocoded state is not CT/MA:", state, "for", raw_address)
+            print("normalize_address: geocoded state not CT/MA:", state, "for", raw_address)
             return "needs_state", None
 
-        # If we explicitly forced_state, trust that state if geocoder cooperates
         final_state = forced_state or state
 
         if not (line1 and city and final_state and zipcode):
@@ -782,12 +841,14 @@ def normalize_address(raw_address: str, forced_state: str | None = None) -> tupl
             "postal_code": zipcode,
             "country": "US",
         }
+
         print("normalize_address: success for", raw_address, "->", addr_struct)
         return "ok", addr_struct
 
     except Exception as e:
         print("normalize_address exception:", repr(e))
         return "error", None
+
 
 
 # ---------------------------------------------------
@@ -805,13 +866,17 @@ def square_headers() -> dict:
 
 def square_create_or_get_customer(phone: str, address_struct: dict | None = None) -> str | None:
     """
-    Very simple customer create-or-get by phone number.
+    Create or return an existing Square customer.
+    Stores NOTHING in scheduler state.
+    Profile layer is updated only by caller, not here.
     """
     if not SQUARE_ACCESS_TOKEN:
         print("Square not configured; skipping customer create.")
         return None
 
-    # Try search by phone
+    # ---------------------------------------------------
+    # SEARCH BY PHONE NUMBER
+    # ---------------------------------------------------
     try:
         search_payload = {
             "query": {
@@ -835,13 +900,16 @@ def square_create_or_get_customer(phone: str, address_struct: dict | None = None
     except Exception as e:
         print("Square search customer failed:", repr(e))
 
-    # Create new customer
+    # ---------------------------------------------------
+    # CREATE NEW CUSTOMER (address permitted)
+    # ---------------------------------------------------
     try:
         customer_payload = {
             "idempotency_key": str(uuid.uuid4()),
             "given_name": "Prevolt Lead",
             "phone_number": phone,
         }
+
         if address_struct:
             customer_payload["address"] = {
                 "address_line_1": address_struct.get("address_line_1"),
@@ -858,10 +926,13 @@ def square_create_or_get_customer(phone: str, address_struct: dict | None = None
             timeout=10,
         )
         resp.raise_for_status()
+
         data = resp.json()
         cid = data["customer"]["id"]
+
         print("square_create_or_get_customer: created", cid)
         return cid
+
     except Exception as e:
         print("Square create customer failed:", repr(e))
         return None
@@ -955,48 +1026,42 @@ def parse_local_datetime(date_str: str, time_str: str) -> datetime | None:
 
 
 def map_appointment_type_to_variation(appointment_type: str):
-    if appointment_type == "EVAL_195":
+    if not appointment_type:
+        return None, None
+
+    appt = appointment_type.upper().strip()
+
+    if appt in ("EVAL_195", "EVALUATION", "EVAL"):
         return SERVICE_VARIATION_EVAL_ID, SERVICE_VARIATION_EVAL_VERSION
-    if appointment_type == "WHOLE_HOME_INSPECTION":
+
+    if appt in ("WHOLE_HOME_INSPECTION", "INSPECTION", "HOME_INSPECTION"):
         return SERVICE_VARIATION_INSPECTION_ID, SERVICE_VARIATION_INSPECTION_VERSION
-    if appointment_type == "TROUBLESHOOT_395":
+
+    if appt in ("TROUBLESHOOT_395", "TROUBLESHOOT", "REPAIR"):
         return SERVICE_VARIATION_TROUBLESHOOT_ID, SERVICE_VARIATION_TROUBLESHOOT_VERSION
+
     return None, None
 
 
-def is_weekend(date_str: str) -> bool:
-    try:
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        return d.weekday() >= 5
-    except Exception:
-        return False
-
-
-def is_within_normal_hours(time_str: str) -> bool:
-    try:
-        t = datetime.strptime(time_str, "%H:%M").time()
-        return BOOKING_START_HOUR <= t.hour <= BOOKING_END_HOUR
-    except Exception:
-        return False
-
-
 
 # ---------------------------------------------------
-# Create Square Booking (with address normalization)
+# Create Square Booking (3-Layer Memory Compatible)
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict) -> None:
     """
-    Create a Square booking once we have date, time, and address.
-    Square bookings CANNOT include the 'country' field inside booking.address.
-    Customer profiles CAN include country, but bookings cannot.
+    Square bookings created only when scheduler layer has full info.
     """
-    if convo.get("booking_created"):
+    sched = convo.setdefault("sched", {})
+    profile = convo.setdefault("profile", {})
+    current_job = convo.setdefault("current_job", {})
+
+    if sched.get("booking_created"):
         return
 
-    scheduled_date = convo.get("scheduled_date")
-    scheduled_time = convo.get("scheduled_time")
-    raw_address = convo.get("address")
-    appointment_type = convo.get("appointment_type")
+    scheduled_date = sched.get("scheduled_date")
+    scheduled_time = sched.get("scheduled_time")
+    raw_address    = sched.get("normalized_address")
+    appointment_type = sched.get("appointment_type")
 
     if not (scheduled_date and scheduled_time and raw_address):
         return
@@ -1011,7 +1076,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Weekend non-emergency booking blocked:", phone, scheduled_date)
         return
 
-    # Time window rule (non-emergency)
+    # Time window rule
     if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(scheduled_time):
         print("Non-emergency time outside 9–4; booking not auto-created:", phone, scheduled_time)
         return
@@ -1021,25 +1086,22 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         return
 
     # Normalize or reuse
-    addr_struct = convo.get("normalized_address")
+    addr_struct = sched.get("normalized_address")
     if not addr_struct:
         status, addr_struct = normalize_address(raw_address)
         if status == "ok":
-            convo["normalized_address"] = addr_struct
+            sched["normalized_address"] = addr_struct
         elif status == "needs_state":
-            if not convo.get("state_prompt_sent"):
-                send_sms(
-                    phone,
-                    "Just to confirm, is this address in Connecticut or Massachusetts?"
-                )
-                convo["state_prompt_sent"] = True
-            print("Address needs CT/MA confirmation for:", raw_address)
+            if not sched.get("state_prompt_sent"):
+                send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
+                sched["state_prompt_sent"] = True
+            print("Address needs CT/MA confirmation:", raw_address)
             return
         else:
-            print("Address normalization failed; cannot create booking for:", raw_address)
+            print("Address normalization failed:", raw_address)
             return
 
-    # Travel time check
+    # Travel time
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
     if origin:
         destination_for_travel = (
@@ -1051,35 +1113,33 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         travel_minutes = compute_travel_time_minutes(origin, destination_for_travel)
         if travel_minutes is not None:
             print(
-                f"Estimated travel from origin to job: ~{travel_minutes:.1f} minutes "
-                f"for {phone} at {destination_for_travel}"
+                f"Estimated travel: {travel_minutes:.1f} minutes for {phone} "
+                f"→ {destination_for_travel}"
             )
             if travel_minutes > MAX_TRAVEL_MINUTES:
-                print("Travel exceeds max; skipping auto-book.")
+                print("Travel exceeds limit; skipping booking.")
                 return
 
-    # Create or find customer (customers CAN include country)
+    # Customer ID
     customer_id = square_create_or_get_customer(phone, addr_struct)
     if not customer_id:
         print("No customer_id; cannot create booking.")
         return
 
-    # Convert local → UTC
     start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
     if not start_at_utc:
-        print("Could not parse scheduled date/time; skipping booking.")
+        print("Time parse failed; skipping booking.")
         return
 
     idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
 
-    # Square booking.address MUST NOT include "country"
     booking_address = {
         "address_line_1": addr_struct["address_line_1"],
         "locality": addr_struct["locality"],
         "administrative_district_level_1": addr_struct["administrative_district_level_1"],
         "postal_code": addr_struct["postal_code"],
     }
-    if "address_line_2" in addr_struct and addr_struct["address_line_2"]:
+    if addr_struct.get("address_line_2"):
         booking_address["address_line_2"] = addr_struct["address_line_2"]
 
     booking_payload = {
@@ -1090,9 +1150,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
             "address": booking_address,
-            "customer_note": (
-                f"Auto-booked by Prevolt OS. Raw address from customer: {raw_address}"
-            ),
+            "customer_note": f"Auto-booked by Prevolt OS. Raw address: {raw_address}",
             "appointment_segments": [
                 {
                     "duration_minutes": 60,
@@ -1119,8 +1177,9 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         booking = data.get("booking")
         booking_id = booking.get("id") if booking else None
 
-        convo["booking_created"] = True
-        convo["square_booking_id"] = booking_id
+        # Update scheduler layer
+        sched["booking_created"] = True
+        sched["square_booking_id"] = booking_id
 
         print(
             f"Square booking created for {phone}: {booking_id} "
@@ -1128,24 +1187,23 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         )
 
         # ---------------------------------------------------
-        # Reset conversation AFTER successful booking
+        # Save upcoming appointment into PROFILE (not scheduler)
         # ---------------------------------------------------
-        conversations[phone] = {
-            "cleaned_transcript": None,
-            "category": None,
-            "appointment_type": None,
-            "initial_sms": None,
-            "first_sms_time": None,
-            "replied": False,
-            "followup_sent": False,
-            "scheduled_date": None,
-            "scheduled_time": None,
-            "address": None,
-            "normalized_address": None,
-            "booking_created": True,
-            "square_booking_id": booking_id,
-            "state_prompt_sent": False,
+        profile["upcoming_appointment"] = {
+            "date": scheduled_date,
+            "time": scheduled_time,
+            "type": appointment_type,
+            "square_id": booking_id
         }
+
+        # Save job history
+        if current_job.get("job_type"):
+            profile.setdefault("past_jobs", []).append({
+                "type": current_job["job_type"],
+                "date": scheduled_date
+            })
+
+        # Scheduler will be wiped by incoming_sms() after booking_complete return
 
     except Exception as e:
         print("Square booking exception:", repr(e))
