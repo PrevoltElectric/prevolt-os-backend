@@ -559,9 +559,6 @@ def generate_reply_for_inbound(
 ) -> dict:
 
     try:
-        # -------------------------------
-        # Timezone setup
-        # -------------------------------
         try:
             tz = ZoneInfo("America/New_York")
         except:
@@ -571,9 +568,6 @@ def generate_reply_for_inbound(
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday  = now_local.strftime("%A")
 
-        # -------------------------------
-        # Load conversation + 3-layer memory
-        # -------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         conv  = conversations.setdefault(phone, {})
 
@@ -587,31 +581,21 @@ def generate_reply_for_inbound(
 
         inbound_lower = inbound_text.lower()
 
-        # =====================================================
-        #  APPOINTMENT TYPE (AUTO-DETECT + FALLBACK)
-        # =====================================================
         appt_type = sched.get("appointment_type")
-
         if not appt_type:
             if any(word in inbound_lower for word in [
                 "not working", "no power", "dead", "sparking", "burning",
                 "breaker keeps", "gfci", "outlet not", "troubleshoot"
             ]):
                 appt_type = "TROUBLESHOOT_395"
-
             elif any(word in inbound_lower for word in [
                 "inspection", "whole home inspection", "electrical inspection"
             ]):
                 appt_type = "WHOLE_HOME_INSPECTION"
-
             else:
                 appt_type = "EVAL_195"
-
             sched["appointment_type"] = appt_type
 
-        # -----------------------------------------------------
-        # HARD ADDRESS CAPTURE 
-        # -----------------------------------------------------
         address_markers = [
             "st", "street",
             "ave", "avenue",
@@ -621,14 +605,10 @@ def generate_reply_for_inbound(
             "ct", "circle",
             "blvd", "way"
         ]
-
         if any(marker in inbound_lower for marker in address_markers) and len(inbound_text) > 6:
             sched["normalized_address"] = inbound_text.strip()
             address = sched["normalized_address"]
 
-        # -----------------------------------------------------
-        # BUILD SYSTEM PROMPT
-        # -----------------------------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
@@ -642,15 +622,12 @@ def generate_reply_for_inbound(
             conv
         )
 
-        # -----------------------------------------------------
-        # LLM CALL + JSON SANITIZATION
-        # -----------------------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user",     "content": inbound_text},
+                {"role": "user", "content": inbound_text},
             ],
         )
 
@@ -661,7 +638,6 @@ def generate_reply_for_inbound(
                     .replace("Null", "null")
                     .replace("NULL", "null")
         )
-
         ai_raw = json.loads(raw_json)
 
         sms_body   = ai_raw.get("sms_body", "").strip()
@@ -669,9 +645,6 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
-        # -----------------------------------------------------
-        # PRICE INJECTION
-        # -----------------------------------------------------
         price_map = {
             "eval_195": " The visit is a $195 consultation.",
             "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
@@ -681,69 +654,46 @@ def generate_reply_for_inbound(
         if price_phrase and price_phrase not in sms_body:
             sms_body += price_phrase
 
-        # -----------------------------------------------------
-        # PATCH 1 — ADDRESS INHERITANCE
-        # -----------------------------------------------------
-        if sched.get("normalized_address") and not model_addr:
-            model_addr = sched["normalized_address"]
-
-        if model_addr in ("", None, "null"):
+        # -----------------------------
+        # ADDRESS INHERITANCE (FIXED)
+        # -----------------------------
+        if not model_addr:
             if sched.get("normalized_address"):
                 model_addr = sched["normalized_address"]
+            elif address:
+                model_addr = address
 
-        if not model_addr and address:
-            model_addr = address
-
-        # -----------------------------------------------------
-        # DATE/TIME INHERITANCE
-        # -----------------------------------------------------
+        # -----------------------------
+        # DATE/TIME INHERITANCE (FIXED)
+        # -----------------------------
         existing_date = sched.get("scheduled_date")
         existing_time = sched.get("scheduled_time")
 
-        if existing_date and not model_date:
+        if not model_date and existing_date:
             model_date = existing_date
-
-        if existing_time and not model_time:
+        if not model_time and existing_time:
             model_time = existing_time
 
+        # If user gives only time → inherit date
         if model_time and not model_date:
-            model_date = today_date_str
+            model_date = existing_date or today_date_str
 
-        # -----------------------------------------------------
-        # PATCH 3 — DAY/TIME LOCK (NO REPEATS)
-        # -----------------------------------------------------
-        lower_sms = sms_body.lower()
+        # If user gives only date → inherit time
+        if model_date and not model_time:
+            model_time = existing_time
 
-        # Remove day request if day already known
-        if existing_date and any(q in lower_sms for q in [
-            "what day works", "what day is good", "what day works for the visit"
-        ]):
-            sms_body = sms_body.split("\n")[0]  # strip to first line
+        # -----------------------------
+        # NO ADDRESS INJECTION ANYMORE
+        # -----------------------------
+        # (Removed completely per your instruction)
 
-        # Remove time request if time already known
-        if existing_time and any(q in lower_sms for q in [
-            "what time works", "what time is good", "what time works for you"
-        ]):
-            sms_body = sms_body.split("\n")[0]
-
-        # If BOTH date + time known -> NO QUESTIONS ALLOWED
-        if existing_date and existing_time:
-            if "?" in sms_body:
-                sms_body = sms_body.split("?")[0].strip() + "."
-
-        # -----------------------------------------------------
-        # Build readable time
-        # -----------------------------------------------------
+        # -----------------------------
+        # TIME FORMAT CLEANING
+        # -----------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
             human_time = model_time
-
-        # -----------------------------------------------------
-        # PATCH 2 — Address confirmation (keeps address anchored)
-        # -----------------------------------------------------
-        if model_addr and "address" not in sms_body.lower():
-            sms_body += f" Address on file: {model_addr}."
 
         final_sms = (
             sms_body.replace(model_time, human_time)
@@ -751,13 +701,13 @@ def generate_reply_for_inbound(
             else sms_body
         )
 
-        # =====================================================
-        # AUTO-BOOKING ENGINE
-        # =====================================================
+        # -----------------------------
+        # AUTO-BOOKING ENGINE (FIXED)
+        # -----------------------------
         ready_for_booking = (
-            model_date
-            and model_time
-            and model_addr
+            bool(model_date)
+            and bool(model_time)
+            and bool(model_addr)
             and not sched.get("booking_created")
         )
 
@@ -771,13 +721,11 @@ def generate_reply_for_inbound(
 
                 if sched.get("booking_created"):
                     booking_id = sched.get("square_booking_id")
-
                     confirmation_sms = (
                         f"You're all set — your appointment is booked for {model_date} "
                         f"at {human_time} at {model_addr}. "
                         f"Your confirmation number is {booking_id}."
                     )
-
                     return {
                         "sms_body": confirmation_sms,
                         "scheduled_date": model_date,
