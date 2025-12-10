@@ -475,7 +475,6 @@ def generate_reply_for_inbound(
         phone = request.form.get("From", "").replace("whatsapp:", "")
         conv  = conversations.setdefault(phone, {})
 
-        # Ensure layers exist
         conv.setdefault("profile", {})
         conv.setdefault("current_job", {})
         conv.setdefault("sched", {})
@@ -510,18 +509,28 @@ def generate_reply_for_inbound(
         )
 
         # -----------------------------------------------------
-        # LLM CALL
+        # LLM CALL (patched JSON-sanitization)
         # -----------------------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": inbound_text},
+                {"role": "user",     "content": inbound_text},
             ],
         )
 
-        ai_raw     = json.loads(completion.choices[0].message.content)
+        # -------------------------------
+        # NEW FIX — sanitize invalid JSON
+        # -------------------------------
+        raw_json = completion.choices[0].message.content.strip()
+        raw_json = raw_json.replace("None", "null")
+        raw_json = raw_json.replace("none", "null")
+        raw_json = raw_json.replace("Null", "null")
+        raw_json = raw_json.replace("NULL", "null")
+
+        ai_raw = json.loads(raw_json)
+
         sms_body   = ai_raw.get("sms_body", "").strip()
         model_date = ai_raw.get("scheduled_date")
         model_time = ai_raw.get("scheduled_time")
@@ -581,7 +590,6 @@ def generate_reply_for_inbound(
         )
 
         if ready_for_booking:
-            # Store into scheduler layer
             sched["scheduled_date"] = model_date
             sched["scheduled_time"] = model_time
             sched["normalized_address"] = model_addr
