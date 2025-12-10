@@ -387,9 +387,40 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 import json
 
-# Cache the rules so we do not re-read the file on every SMS
+# Cache rules so we do not re-read the file every SMS
 PREVOLT_RULES_CACHE = None
 
+
+# ---------------------------------------------------
+# SAFETY: Minimal get_current_state implementation
+# (Prevents NameError + allows state machine to run)
+# ---------------------------------------------------
+def get_current_state(conv: dict) -> str:
+    """
+    Minimal but stable state detector.
+    Expand later if needed.
+    """
+    if conv.get("scheduled_date") and conv.get("scheduled_time") and conv.get("address"):
+        return "ready_for_confirmation"
+
+    if not conv.get("address"):
+        return "awaiting_address"
+
+    if not conv.get("scheduled_date") and not conv.get("scheduled_time"):
+        return "awaiting_date_or_time"
+
+    if conv.get("scheduled_date") and not conv.get("scheduled_time"):
+        return "awaiting_time"
+
+    if conv.get("scheduled_time") and not conv.get("scheduled_date"):
+        return "awaiting_date"
+
+    return "unknown"
+
+
+# ---------------------------------------------------
+# Build System Prompt (loads JSON rules dynamically)
+# ---------------------------------------------------
 def build_system_prompt(
     cleaned_transcript,
     category,
@@ -414,7 +445,7 @@ def build_system_prompt(
     rules_text = PREVOLT_RULES_CACHE.get("rules", "")
 
     # -------------------------------
-    # OPTIONAL CONTEXT (if exists)
+    # OPTIONAL CONTEXT (voicemail insights)
     # -------------------------------
     voicemail_intent = convo.get("voicemail_intent")
     voicemail_town = convo.get("voicemail_town")
@@ -435,14 +466,14 @@ def build_system_prompt(
             voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
 
     # -------------------------------
-    # Build Final Prompt
+    # Build final system prompt string
     # -------------------------------
     system_prompt = (
-        f"You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.\n\n"
+        f"You are Prevolt OS, the SMS assistant for Prevolt Electric. "
+        f"Continue the conversation naturally.\n\n"
         f"Today is {today_date_str}, a {today_weekday}, local time America/New_York.\n\n"
         f"{rules_text}"
-        f"{voicemail_context}"
-        "\n\n"
+        f"{voicemail_context}\n\n"
         "===================================================\n"
         "CONTEXT\n"
         "===================================================\n"
@@ -465,6 +496,35 @@ def build_system_prompt(
     return system_prompt
 
 
+# ---------------------------------------------------
+# STATE MACHINE HELPERS (REQUIRED FOR STEP 4)
+# ---------------------------------------------------
+
+def get_current_state(conv):
+    """
+    Minimal state extractor to prevent Step 4 crashes.
+    Step 4 only needs these fields to exist.
+    """
+    return {
+        "scheduled_date": conv.get("scheduled_date"),
+        "scheduled_time": conv.get("scheduled_time"),
+        "address": conv.get("address"),
+        "normalized_address": conv.get("normalized_address"),
+        "booking_created": conv.get("booking_created"),
+    }
+
+
+def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, scheduled_time):
+    """
+    TEMPORARY NON-BLOCKING VERSION.
+    MUST return {} so Step 4 always runs.
+    Prevents NameError, prevents infinite fallback loops.
+    """
+    return {}
+
+
+
+
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN)
@@ -481,7 +541,9 @@ def generate_reply_for_inbound(
 ) -> dict:
 
     try:
+        # -------------------------------
         # Local timezone
+        # -------------------------------
         if ZoneInfo:
             tz = ZoneInfo("America/New_York")
         else:
@@ -491,7 +553,9 @@ def generate_reply_for_inbound(
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday = now_local.strftime("%A")
 
-        # Session Reset Logic
+        # -------------------------------
+        # SESSION RESET LOGIC
+        # -------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         last_time = conversations.get(phone, {}).get("first_sms_time")
         should_reset = False
@@ -531,7 +595,14 @@ def generate_reply_for_inbound(
             }
 
         conv = conversations.setdefault(phone, {})
-        state = get_current_state(conv)
+
+        # -------------------------------
+        # STATE LOCK ENFORCER
+        # -------------------------------
+        try:
+            state = get_current_state(conv)
+        except NameError:
+            state = None  # Fail-safe if not yet defined
 
         lock = enforce_state_lock(
             state,
@@ -539,15 +610,15 @@ def generate_reply_for_inbound(
             inbound_text.lower(),
             address,
             scheduled_date,
-            scheduled_time
+            scheduled_time,
         )
 
         if lock.get("interrupt"):
             return lock["reply"]
 
-        # ---------------------------------------------------
-        # BUILD SYSTEM PROMPT — Using JSON rules file
-        # ---------------------------------------------------
+        # -------------------------------
+        # BUILD SYSTEM PROMPT FROM JSON RULES
+        # -------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
@@ -561,9 +632,9 @@ def generate_reply_for_inbound(
             conv
         )
 
-        # ---------------------------------------------------
-        # LLM Call
-        # ---------------------------------------------------
+        # -------------------------------
+        # LLM CALL
+        # -------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             response_format={"type": "json_object"},
@@ -582,7 +653,9 @@ def generate_reply_for_inbound(
 
         inbound_lower = inbound_text.lower()
 
-        # Timezone patch
+        # -------------------------------
+        # DATE/TIME PATCH LAYER
+        # -------------------------------
         if ZoneInfo:
             tz_patch = ZoneInfo("America/New_York")
         else:
@@ -591,20 +664,20 @@ def generate_reply_for_inbound(
         now_local_patch = datetime.now(tz_patch)
         today_patch = now_local_patch.strftime("%Y-%m-%d")
 
-        # Time without date — infer today
+        # Time but not date → infer today
         if model_time and not model_date:
-            if any(phrase in inbound_lower for phrase in [
+            if any(word in inbound_lower for word in [
                 "today", "this", "anytime", "whenever", "now", "soon",
                 "this afternoon", "this morning", "this evening",
                 "asap", "right now", "i'm here", "i am home"
             ]):
                 model_date = today_patch
 
-        # Troubleshoot_395 → assume today
+        # Troubleshoot override: assume today
         if model_time and not model_date and str(appointment_type).lower() == "troubleshoot_395":
             model_date = today_patch
 
-        # Date without explicit time
+        # Date but not explicit time
         if model_date and not model_time:
             if "morning" in inbound_lower:
                 model_time = "09:00"
@@ -615,7 +688,7 @@ def generate_reply_for_inbound(
             elif any(x in inbound_lower for x in ["whenever", "sometime", "anytime"]):
                 model_time = "13:00"
 
-        # Prevent past booking today
+        # Patch past times today
         if model_date == today_patch and model_time:
             try:
                 t_obj = datetime.strptime(model_time, "%H:%M").time()
@@ -628,15 +701,18 @@ def generate_reply_for_inbound(
                         hour = 20
                         minute = 0
                     model_time = f"{hour:02d}:{minute:02d}"
-            except Exception:
+            except:
                 pass
 
-        # Human readable AM/PM
+        # Format AM/PM
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
             human_time = model_time
 
+        # -------------------------------
+        # FINAL RETURN
+        # -------------------------------
         return {
             "sms_body": sms_body.replace(model_time, human_time) if (sms_body and human_time) else sms_body,
             "scheduled_date": model_date,
@@ -644,185 +720,19 @@ def generate_reply_for_inbound(
             "address": model_address,
         }
 
-    # ---------------------------------------------------------
-    # SAFE FALLBACK
-    # ---------------------------------------------------------
+    # -------------------------------
+    # SAFE FALLBACK (MINIMAL)
+    # -------------------------------
     except Exception as e:
         print("Inbound reply FAILED:", repr(e))
 
-        safe_body = "Sorry — can you say that again?"
-
         return {
-            "sms_body": safe_body,
+            "sms_body": "Sorry — can you say that again?",
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
             "address": address,
         }
 
-
-        system_prompt = """
-You are Prevolt OS, the SMS assistant for Prevolt Electric. Continue the conversation naturally.
-
-Today is {today_date_str}, a {today_weekday}, local time America/New_York.
-"""
-        # ---------------------------------------------------
-        # INSERTED OPTION A — VOICEMAIL INTENT/TOWN/PARTIAL ADDRESS INJECTION
-        # ---------------------------------------------------
-        voicemail_intent = convo.get("voicemail_intent")
-        voicemail_town = convo.get("voicemail_town")
-        voicemail_partial_address = convo.get("voicemail_partial_address")
-
-        voicemail_context_block = ""
-        if voicemail_intent or voicemail_town or voicemail_partial_address:
-            voicemail_context_block = (
-                "\n\n===================================================\n"
-                "VOICEMAIL INSIGHTS (PRE-EXTRACTED)\n"
-                "===================================================\n"
-            )
-            if voicemail_intent:
-                voicemail_context_block += f"Intent mentioned in voicemail: {voicemail_intent}\n"
-            if voicemail_town:
-                voicemail_context_block += f"Town detected: {voicemail_town}\n"
-            if voicemail_partial_address:
-                voicemail_context_block += f"Partial address detected: {voicemail_partial_address}\n"
-
-        system_prompt = system_prompt + voicemail_context_block
-
-        # ---------------------------------------------------
-        # CONTEXT SECTION
-        # ---------------------------------------------------
-        system_prompt += """
-===================================================
-CONTEXT
-===================================================
-Original voicemail: {cleaned_transcript}
-Category: {category}
-Appointment type: {appointment_type}
-Initial SMS: {initial_sms}
-Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}
-
-===================================================
-OUTPUT FORMAT (STRICT JSON)
-===================================================
-{
-  "sms_body": "...",
-  "scheduled_date": "YYYY-MM-DD or null",
-  "scheduled_time": "HH:MM or null",
-  "address": "string or null"
-}
-"""
-        system_prompt = system_prompt.replace("{today_date_str}", today_date_str)
-        system_prompt = system_prompt.replace("{today_weekday}", today_weekday)
-        system_prompt = system_prompt.replace("{cleaned_transcript}", cleaned_transcript)
-        system_prompt = system_prompt.replace("{category}", str(category))
-        system_prompt = system_prompt.replace("{appointment_type}", str(appointment_type))
-        system_prompt = system_prompt.replace("{initial_sms}", initial_sms or "")
-        system_prompt = system_prompt.replace("{scheduled_date}", str(scheduled_date))
-        system_prompt = system_prompt.replace("{scheduled_time}", str(scheduled_time))
-        system_prompt = system_prompt.replace("{address}", str(address))
-
-        completion = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": inbound_text},
-            ],
-        )
-
-        # ---------------------------------------------
-        # RAW MODEL OUTPUT
-        # ---------------------------------------------
-        ai_raw = json.loads(completion.choices[0].message.content)
-
-        sms_body = ai_raw.get("sms_body", "").strip()
-        model_date = ai_raw.get("scheduled_date")
-        model_time = ai_raw.get("scheduled_time")
-        model_address = ai_raw.get("address")
-
-        # ---------------------------------------------------------
-        # IMPLICIT DATE/TIME PATCH — LOOP-PROOF
-        # ---------------------------------------------------------
-        inbound_lower = inbound_text.lower()
-
-        if ZoneInfo:
-            tz_patch = ZoneInfo("America/New_York")
-        else:
-            tz_patch = timezone(timedelta(hours=-5))
-
-        now_local_patch = datetime.now(tz_patch)
-        today_patch = now_local_patch.strftime("%Y-%m-%d")
-
-        # ---------- RULE A ----------
-        if model_time and not model_date:
-            if any(phrase in inbound_lower for phrase in [
-                "today", "this", "anytime", "whenever", "now", "soon",
-                "this afternoon", "this morning", "this evening",
-                "asap", "right now", "i'm here", "i am home"
-            ]):
-                model_date = today_patch
-
-        # ---------- OPTION A1 — EMERGENCY TIME W/ NO DATE FIX ----------
-        appointment_type_lower = str(appointment_type).lower()
-        if (model_time and not model_date and
-                appointment_type_lower == "troubleshoot_395"):
-            model_date = today_patch
-
-        # ---------- RULE B ----------
-        if model_date and not model_time:
-            if "morning" in inbound_lower:
-                model_time = "09:00"
-            elif "afternoon" in inbound_lower:
-                model_time = "13:00"
-            elif "evening" in inbound_lower:
-                model_time = "16:00"
-            elif any(x in inbound_lower for x in ["whenever", "sometime", "anytime"]):
-                model_time = "13:00"
-
-        # ---------- RULE C ----------
-        if model_date == today_patch and model_time:
-            try:
-                t_obj = datetime.strptime(model_time, "%H:%M").time()
-                now_t = now_local_patch.time()
-                if t_obj < now_t:
-                    minute = (now_local_patch.minute + 29) // 30 * 30
-                    hour = now_local_patch.hour + (1 if minute == 60 else 0)
-                    minute = 0 if minute == 60 else minute
-                    if hour >= 20:
-                        hour = 20
-                        minute = 0
-                    model_time = f"{hour:02d}:{minute:02d}"
-            except Exception:
-                pass
-
-        # ---------------------------------------------------------
-        # HUMAN AM/PM PATCH
-        # ---------------------------------------------------------
-        human_time = None
-        if model_time:
-            try:
-                human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p")
-            except:
-                human_time = model_time
-
-        # ---------------------------------------------------------
-        # RETURN FINAL STRUCTURE
-        # ---------------------------------------------------------
-        return {
-            "sms_body": sms_body.replace(model_time, human_time) if (sms_body and human_time) else sms_body,
-            "scheduled_date": model_date,
-            "scheduled_time": model_time,
-            "address": model_address,
-        }
-
-    except Exception as e:
-        print("Inbound reply FAILED:", repr(e))
-        return {
-            "sms_body": "Got it.",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-        }
 
 
 
