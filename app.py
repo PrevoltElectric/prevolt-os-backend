@@ -250,6 +250,35 @@ def incoming_sms():
     phone = request.form.get("From", "").replace("whatsapp:", "")
 
     # ==========================================================
+    # SECRET MEMORY WIPE COMMAND (Tester Only)
+    # ==========================================================
+    if inbound_text.strip().lower() == "mobius1":
+        conversations[phone] = {
+            "profile": {
+                "name": None,
+                "addresses": [],
+                "upcoming_appointment": None,
+                "past_jobs": []
+            },
+            "current_job": {
+                "job_type": None,
+                "raw_description": None
+            },
+            "sched": {
+                "pending_step": None,
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "appointment_type": None,
+                "normalized_address": None,
+                "booking_created": False
+            }
+        }
+
+        resp = MessagingResponse()
+        resp.message("✔ Memory reset complete for this number.")
+        return Response(str(resp), mimetype="text/xml")
+
+    # ==========================================================
     # 3-LAYER MEMORY INITIALIZATION (NO OTHER FILES REQUIRED)
     # ==========================================================
     conv = conversations.setdefault(phone, {})
@@ -374,103 +403,6 @@ def incoming_sms():
 
     return Response(str(twilio_reply), mimetype="text/xml")
 
-
-
-
-# ---------------------------------------------------
-# Load + Build System Prompt (Prevolt Rules Engine)
-# ---------------------------------------------------
-
-import json
-
-# Cache rules so we do not re-read the file every SMS
-PREVOLT_RULES_CACHE = None
-
-
-# ---------------------------------------------------
-# Build System Prompt (loads JSON rules dynamically)
-# ---------------------------------------------------
-def build_system_prompt(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    scheduled_date,
-    scheduled_time,
-    address,
-    today_date_str,
-    today_weekday,
-    convo
-):
-    global PREVOLT_RULES_CACHE
-
-    # Load JSON rules once
-    if PREVOLT_RULES_CACHE is None:
-        with open("prevolt_rules.json", "r", encoding="utf-8") as f:
-            PREVOLT_RULES_CACHE = json.load(f)
-
-    rules_text = PREVOLT_RULES_CACHE.get("rules", "")
-
-    # Optional voicemail context
-    voicemail_intent = convo.get("voicemail_intent")
-    voicemail_town = convo.get("voicemail_town")
-    voicemail_partial_address = convo.get("voicemail_partial_address")
-
-    voicemail_context = ""
-    if voicemail_intent or voicemail_town or voicemail_partial_address:
-        voicemail_context += (
-            "\n\n===================================================\n"
-            "VOICEMAIL INSIGHTS (PRE-EXTRACTED)\n"
-            "===================================================\n"
-        )
-        if voicemail_intent:
-            voicemail_context += f"Intent mentioned in voicemail: {voicemail_intent}\n"
-        if voicemail_town:
-            voicemail_context += f"Town detected: {voicemail_town}\n"
-        if voicemail_partial_address:
-            voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
-
-    # SYSTEM PROMPT WITH STABILITY RULES
-    system_prompt = (
-        f"You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
-        f"Continue the conversation naturally. Do NOT repeat yourself.\n\n"
-        f"Today is {today_date_str}, a {today_weekday}, local time America/New_York.\n\n"
-        f"{rules_text}"
-        f"{voicemail_context}\n\n"
-
-        "===================================================\n"
-        "STATE HANDLING RULES\n"
-        "===================================================\n"
-        "• NEVER ask again for information the customer already provided.\n"
-        "• If customer provides ONLY a time → use the previously stored date.\n"
-        "• If customer provides ONLY a date → use the previously stored time.\n"
-        "• If customer provides an address → NEVER ask for address again.\n"
-        "• ALWAYS inherit previously known values unless customer changes them.\n"
-        "• NEVER return null for a field already known.\n"
-        "• Avoid phrases like 'Got it —'. Vary your confirmations.\n"
-        "• Include correct pricing once ONLY based on appointment type.\n\n"
-
-        "===================================================\n"
-        "CONTEXT\n"
-        "===================================================\n"
-        f"Original voicemail: {cleaned_transcript}\n"
-        f"Category: {category}\n"
-        f"Appointment type: {appointment_type}\n"
-        f"Initial SMS: {initial_sms}\n"
-        f"Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}\n\n"
-
-        "===================================================\n"
-        "OUTPUT FORMAT (STRICT JSON)\n"
-        "===================================================\n"
-        "{\n"
-        '  "sms_body": "...",\n'
-        '  "scheduled_date": "YYYY-MM-DD or null",\n'
-        '  "scheduled_time": "HH:MM or null",\n'
-        '  "address": "string or null"\n'
-        "}\n"
-    )
-
-    return system_prompt
 
 
 
