@@ -430,6 +430,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 
+
 # ---------------------------------------------------
 # STATE HELPERS (MINIMAL SAFE VERSIONS)
 # ---------------------------------------------------
@@ -457,128 +458,9 @@ def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, sche
     return {}
 
 
-# ---------------------------------------------------
-# SQUARE BOOKING CANCELLATION
-# ---------------------------------------------------
-def cancel_square_booking(booking_id: str):
-    """Cancel/delete a Square booking."""
-    try:
-        resp = requests.delete(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            timeout=10,
-        )
-        if resp.status_code in (200, 204):
-            print("Square booking cancelled:", booking_id)
-            return True
-
-        print("Square cancel failed:", resp.status_code, resp.text)
-        return False
-
-    except Exception as e:
-        print("Square cancel exception:", repr(e))
-        return False
-
 
 # ---------------------------------------------------
-# SQUARE BOOKING ADDRESS UPDATE (NEW)
-# ---------------------------------------------------
-def update_square_booking_address(booking_id: str, new_address: str):
-    """
-    Update the booking's address using Square PATCH.
-    Booking 'address' CANNOT include a country field.
-    """
-    try:
-        # Attempt to re-normalize
-        status, addr = normalize_address(new_address)
-        if status != "ok":
-            print("Address normalize failed for update:", new_address)
-            return False
-
-        booking_address = {
-            "address_line_1": addr["address_line_1"],
-            "locality": addr["locality"],
-            "administrative_district_level_1": addr["administrative_district_level_1"],
-            "postal_code": addr["postal_code"],
-        }
-        if addr.get("address_line_2"):
-            booking_address["address_line_2"] = addr["address_line_2"]
-
-        payload = {
-            "booking": {
-                "location_type": "CUSTOMER_LOCATION",
-                "address": booking_address,
-            }
-        }
-
-        resp = requests.patch(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            json=payload,
-            timeout=10,
-        )
-        if resp.status_code in (200, 201):
-            print("Square address updated:", booking_id)
-            return True
-
-        print("Square address update failed:", resp.status_code, resp.text)
-        return False
-
-    except Exception as e:
-        print("Square address update exception:", repr(e))
-        return False
-
-
-# ---------------------------------------------------
-# SQUARE BOOKING NOTES UPDATE (NEW)
-# ---------------------------------------------------
-def update_square_booking_notes(booking_id: str, append_text: str):
-    """
-    Adds text to the existing appointment notes.
-    """
-    try:
-        # Fetch existing booking (Square requires full booking object updates sometimes)
-        resp = requests.get(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            timeout=10,
-        )
-
-        if resp.status_code not in (200, 201):
-            print("Square fetch failed for notes:", resp.status_code, resp.text)
-            return False
-
-        data = resp.json().get("booking", {})
-        old_note = data.get("customer_note", "") or ""
-        new_note = (old_note + " | " + append_text).strip()
-
-        payload = {
-            "booking": {
-                "customer_note": new_note
-            }
-        }
-
-        resp2 = requests.patch(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            json=payload,
-            timeout=10,
-        )
-
-        if resp2.status_code in (200, 201):
-            print("Square notes updated:", booking_id)
-            return True
-
-        print("Square note update failed:", resp2.status_code, resp2.text)
-        return False
-
-    except Exception as e:
-        print("Square notes update exception:", repr(e))
-        return False
-
-
-# ---------------------------------------------------
-# Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING + HANDLERS
+# Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -609,143 +491,15 @@ def generate_reply_for_inbound(
         # -------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         conv  = conversations.setdefault(phone, {})
+
         inbound_lower = inbound_text.lower()
-
-        booking_id = conv.get("square_booking_id")
-
-        # =====================================================
-        # 1️⃣ CANCELATION HANDLER
-        # =====================================================
-        cancel_keywords = [
-            "cancel", "cancel appointment", "cancel it", 
-            "i can't make it", "need to cancel", 
-            "please cancel", "don't come"
-        ]
-
-        if booking_id and any(k in inbound_lower for k in cancel_keywords):
-            success = cancel_square_booking(booking_id)
-
-            conversations[phone] = {
-                "cleaned_transcript": None,
-                "category": None,
-                "appointment_type": None,
-                "initial_sms": None,
-                "first_sms_time": None,
-                "replied": False,
-                "followup_sent": False,
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": None,
-                "normalized_address": None,
-                "booking_created": False,
-                "square_booking_id": None,
-                "state_prompt_sent": False,
-            }
-
-            if success:
-                return {
-                    "sms_body": "Your appointment has been cancelled. If you'd like to reschedule, just let me know.",
-                    "scheduled_date": None,
-                    "scheduled_time": None,
-                    "address": None,
-                }
-            return {
-                "sms_body": "I wasn't able to cancel it in the system, but I flagged it for manual cancellation. Let me know if you'd like to reschedule.",
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": None,
-            }
-
-
-        # =====================================================
-        # 2️⃣ ETA HANDLER
-        # =====================================================
-        eta_keywords = [
-            "eta", "how long", "how far", "on your way", 
-            "when will you", "are you coming", "when are you"
-        ]
-
-        if booking_id and any(k in inbound_lower for k in eta_keywords):
-            appt_date = conv.get("scheduled_date")
-            appt_time = conv.get("scheduled_time")
-
-            if appt_date and appt_time:
-                human_time = datetime.strptime(appt_time, "%H:%M").strftime("%-I:%M %p")
-                return {
-                    "sms_body": f"Your visit is scheduled for {appt_date} at {human_time}. We'll send an arrival text when we're en route.",
-                    "scheduled_date": appt_date,
-                    "scheduled_time": appt_time,
-                    "address": conv.get("address"),
-                }
-
-
-        # =====================================================
-        # 3️⃣ RESCHEDULE HANDLER
-        # =====================================================
-        res_keywords = ["reschedule", "different time", "another time", "can we move"]
-
-        if booking_id and any(k in inbound_lower for k in res_keywords):
-            cancel_square_booking(booking_id)
-
-            conv["booking_created"] = False
-            conv["square_booking_id"] = None
-            conv["scheduled_time"] = None
-            conv["scheduled_date"] = None
-
-            return {
-                "sms_body": "No problem — what day works better for you?",
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": conv.get("address"),
-            }
-
-
-        # =====================================================
-        # 4️⃣ ADDRESS CHANGE HANDLER
-        # =====================================================
-        if booking_id and any(x in inbound_lower for x in [" st", " ave", " rd", " road", " ln", " lane", "dr", "drive"]):
-            conv["address"] = inbound_text.strip()
-
-            success = update_square_booking_address(booking_id, conv["address"])
-
-            if success:
-                return {
-                    "sms_body": f"Updated your appointment address to: {conv['address']}.",
-                    "scheduled_date": conv.get("scheduled_date"),
-                    "scheduled_time": conv.get("scheduled_time"),
-                    "address": conv["address"],
-                }
-            return {
-                "sms_body": "I couldn't update the address in the system, but I saved it internally.",
-                "scheduled_date": conv.get("scheduled_date"),
-                "scheduled_time": conv.get("scheduled_time"),
-                "address": conv["address"],
-            }
-
-
-        # =====================================================
-        # 5️⃣ ADDITIONAL NOTES HANDLER
-        # =====================================================
-        note_keywords = ["note", "code", "gate", "also", "by the way"]
-
-        if booking_id and any(k in inbound_lower for k in note_keywords):
-            update_square_booking_notes(booking_id, inbound_text.strip())
-
-            return {
-                "sms_body": "Got it — I added that to your appointment notes.",
-                "scheduled_date": conv.get("scheduled_date"),
-                "scheduled_time": conv.get("scheduled_time"),
-                "address": conv.get("address"),
-            }
-
 
         # -----------------------------------------------------
         # HARD ADDRESS CAPTURE (P1 FIX)
         # -----------------------------------------------------
-        if any(x in inbound_lower for x in [" st", " ave", " rd", "road", " ln", " lane", "dr", "drive"]) and len(inbound_text) > 6:
+        if any(x in inbound_lower for x in [" st", " ave", " rd", " road", " ln", " lane", " dr", " drive"]) and len(inbound_text) > 6:
             conv["address"] = inbound_text.strip()
             address = conv["address"]
-
 
         # -----------------------------------------------------
         # BUILD SYSTEM PROMPT
@@ -762,7 +516,6 @@ def generate_reply_for_inbound(
             today_weekday,
             conv
         )
-
 
         # -----------------------------------------------------
         # LLM CALL
@@ -782,9 +535,8 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
-
         # -----------------------------------------------------
-        # PRICE INJECTION
+        # PRICE INJECTION (P1 FIX #2)
         # -----------------------------------------------------
         appt = str(appointment_type).lower()
         price_map = {
@@ -796,9 +548,8 @@ def generate_reply_for_inbound(
         if price_phrase and price_phrase not in sms_body:
             sms_body += price_phrase
 
-
         # -----------------------------------------------------
-        # INHERIT KNOWN VALUES
+        # INHERIT KNOWN VALUES (P1 FIX #1)
         # -----------------------------------------------------
         if scheduled_date and not model_date:
             model_date = scheduled_date
@@ -809,30 +560,38 @@ def generate_reply_for_inbound(
         if address and not model_addr:
             model_addr = address
 
-
         # -----------------------------------------------------
-        # TIME INFERENCE
+        # DATE/TIME INFERENCE
         # -----------------------------------------------------
         if model_time and not model_date:
             model_date = today_date_str
 
-
         # -----------------------------------------------------
-        # HUMAN TIME
+        # Convert time → human format
         # -----------------------------------------------------
         try:
-            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p")
+            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
             human_time = model_time
 
-
-        final_sms = sms_body.replace(model_time, human_time) if (sms_body and model_time and human_time) else sms_body
-
+        final_sms = (
+            sms_body.replace(model_time, human_time)
+            if (sms_body and model_time and human_time)
+            else sms_body
+        )
 
         # =====================================================
-        # AUTO-BOOKING ENGINE
+        # AUTO-BOOKING ENGINE (calls maybe_create_square_booking)
         # =====================================================
-        if model_date and model_time and model_addr and not conv.get("booking_created"):
+        ready_for_booking = (
+            model_date
+            and model_time
+            and model_addr
+            and not conv.get("booking_created")
+        )
+
+        if ready_for_booking:
+            # Square engine requires these stored in conv
             conv["scheduled_date"] = model_date
             conv["scheduled_time"] = model_time
             conv["address"]        = model_addr
@@ -840,10 +599,18 @@ def generate_reply_for_inbound(
             try:
                 maybe_create_square_booking(phone, conv)
 
+                # Only confirm booking if Square actually succeeded
                 if conv.get("booking_created"):
                     booking_id = conv.get("square_booking_id")
+
+                    confirmation_sms = (
+                        f"You're all set — your appointment is booked for {model_date} at "
+                        f"{human_time} at {model_addr}. "
+                        f"Your confirmation number is {booking_id}."
+                    )
+
                     return {
-                        "sms_body": f"You're all set — your appointment is booked for {model_date} at {human_time} at {model_addr}. Your confirmation number is {booking_id}.",
+                        "sms_body": confirmation_sms,
                         "scheduled_date": model_date,
                         "scheduled_time": model_time,
                         "address": model_addr,
@@ -851,19 +618,17 @@ def generate_reply_for_inbound(
 
             except Exception as e:
                 print("AUTO-BOOKING ERROR:", repr(e))
-                final_sms += " (Couldn't auto-book — we'll confirm manually.)"
+                final_sms += " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
 
-
-        # -----------------------------------------------------
-        # NORMAL RETURN
-        # -----------------------------------------------------
+        # =====================================================
+        # NORMAL RETURN (no booking yet)
+        # =====================================================
         return {
             "sms_body": final_sms,
             "scheduled_date": model_date,
             "scheduled_time": model_time,
             "address": model_addr,
         }
-
 
     except Exception as e:
         print("Inbound reply FAILED:", repr(e))
@@ -1217,139 +982,6 @@ def is_within_normal_hours(time_str: str) -> bool:
 
 
 # ---------------------------------------------------
-# Cancel an existing Square booking
-# ---------------------------------------------------
-def cancel_square_booking(booking_id: str) -> bool:
-    """
-    Cancels a Square booking. Returns True if successful.
-    """
-    try:
-        url = f"https://connect.squareup.com/v2/bookings/{booking_id}/cancel"
-
-        payload = {
-            "idempotency_key": f"cancel-{booking_id}-{uuid.uuid4()}",
-        }
-
-        resp = requests.post(
-            url,
-            headers=square_headers(),
-            json=payload,
-            timeout=10
-        )
-
-        if resp.status_code in (200, 201):
-            print("Booking cancelled:", booking_id)
-            return True
-
-        print("Square cancel failed:", resp.status_code, resp.text)
-        return False
-
-    except Exception as e:
-        print("Square cancel exception:", repr(e))
-        return False
-
-
-
-# ---------------------------------------------------
-# Update a booking's address AFTER it has already been created
-# ---------------------------------------------------
-def update_square_booking_address(booking_id: str, new_address: str) -> bool:
-    """
-    Updates the booking.address field. Square booking objects CANNOT contain 'country'.
-    """
-    try:
-        status, addr_struct = normalize_address(new_address)
-
-        if status != "ok":
-            print("Address normalization failed; update aborted.")
-            return False
-
-        booking_address = {
-            "address_line_1": addr_struct["address_line_1"],
-            "locality": addr_struct["locality"],
-            "administrative_district_level_1": addr_struct["administrative_district_level_1"],
-            "postal_code": addr_struct["postal_code"],
-        }
-
-        if addr_struct.get("address_line_2"):
-            booking_address["address_line_2"] = addr_struct["address_line_2"]
-
-        payload = {
-            "idempotency_key": f"update-addr-{booking_id}-{uuid.uuid4()}",
-            "booking": { "address": booking_address },
-        }
-
-        resp = requests.put(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            json=payload,
-            timeout=10
-        )
-
-        if resp.status_code in (200, 201):
-            print("Booking address updated:", booking_id, booking_address)
-            return True
-
-        print("Square update-address failed:", resp.status_code, resp.text)
-        return False
-
-    except Exception as e:
-        print("Square update-address exception:", repr(e))
-        return False
-
-
-
-# ---------------------------------------------------
-# Append additional customer notes to an existing booking
-# ---------------------------------------------------
-def update_square_booking_notes(booking_id: str, note_text: str) -> bool:
-    """
-    Appends note_text to the booking.customer_note field.
-    """
-    try:
-        # Fetch current booking
-        resp = requests.get(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            timeout=10
-        )
-
-        if resp.status_code not in (200, 201):
-            print("Failed to fetch booking for note update:", resp.text)
-            return False
-
-        booking = resp.json().get("booking", {})
-        current_note = booking.get("customer_note") or ""
-
-        updated_note = (current_note + "\n" + note_text).strip()
-
-        payload = {
-            "idempotency_key": f"update-note-{booking_id}-{uuid.uuid4()}",
-            "booking": { "customer_note": updated_note },
-        }
-
-        resp2 = requests.put(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            json=payload,
-            timeout=10
-        )
-
-        if resp2.status_code in (200, 201):
-            print("Booking notes updated:", booking_id)
-            return True
-
-        print("Square update-notes failed:", resp2.status_code, resp2.text)
-        return False
-
-    except Exception as e:
-        print("Square update-notes exception:", repr(e))
-        return False
-
-
-
-
-# ---------------------------------------------------
 # Create Square Booking (with address normalization)
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict) -> None:
@@ -1363,7 +995,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
     scheduled_date = convo.get("scheduled_date")
     scheduled_time = convo.get("scheduled_time")
-    raw_address    = convo.get("address")
+    raw_address = convo.get("address")
     appointment_type = convo.get("appointment_type")
 
     if not (scheduled_date and scheduled_time and raw_address):
@@ -1379,7 +1011,7 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Weekend non-emergency booking blocked:", phone, scheduled_date)
         return
 
-    # Hours rule
+    # Time window rule (non-emergency)
     if appointment_type != "TROUBLESHOOT_395" and not is_within_normal_hours(scheduled_time):
         print("Non-emergency time outside 9–4; booking not auto-created:", phone, scheduled_time)
         return
@@ -1388,26 +1020,26 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         print("Square configuration incomplete; skipping booking creation.")
         return
 
-    # Normalize or use stored
+    # Normalize or reuse
     addr_struct = convo.get("normalized_address")
     if not addr_struct:
         status, addr_struct = normalize_address(raw_address)
-
         if status == "ok":
             convo["normalized_address"] = addr_struct
-
         elif status == "needs_state":
             if not convo.get("state_prompt_sent"):
-                send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
+                send_sms(
+                    phone,
+                    "Just to confirm, is this address in Connecticut or Massachusetts?"
+                )
                 convo["state_prompt_sent"] = True
-            print("Address needs CT/MA confirmation:", raw_address)
+            print("Address needs CT/MA confirmation for:", raw_address)
             return
-
         else:
-            print("Address normalization failed:", raw_address)
+            print("Address normalization failed; cannot create booking for:", raw_address)
             return
 
-    # Travel time
+    # Travel time check
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
     if origin:
         destination_for_travel = (
@@ -1416,16 +1048,17 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             f"{addr_struct['administrative_district_level_1']} "
             f"{addr_struct['postal_code']}"
         )
-
         travel_minutes = compute_travel_time_minutes(origin, destination_for_travel)
-
         if travel_minutes is not None:
-            print(f"Estimated travel: {travel_minutes:.1f} min → {destination_for_travel}")
+            print(
+                f"Estimated travel from origin to job: ~{travel_minutes:.1f} minutes "
+                f"for {phone} at {destination_for_travel}"
+            )
             if travel_minutes > MAX_TRAVEL_MINUTES:
-                print("Travel exceeds limit; booking skipped.")
+                print("Travel exceeds max; skipping auto-book.")
                 return
 
-    # Customer create/fetch
+    # Create or find customer (customers CAN include country)
     customer_id = square_create_or_get_customer(phone, addr_struct)
     if not customer_id:
         print("No customer_id; cannot create booking.")
@@ -1434,20 +1067,19 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
     # Convert local → UTC
     start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
     if not start_at_utc:
-        print("Unable to parse job datetime; skip booking.")
+        print("Could not parse scheduled date/time; skipping booking.")
         return
 
     idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
 
-    # Square booking.address CANNOT include "country"
+    # Square booking.address MUST NOT include "country"
     booking_address = {
         "address_line_1": addr_struct["address_line_1"],
         "locality": addr_struct["locality"],
         "administrative_district_level_1": addr_struct["administrative_district_level_1"],
         "postal_code": addr_struct["postal_code"],
     }
-
-    if addr_struct.get("address_line_2"):
+    if "address_line_2" in addr_struct and addr_struct["address_line_2"]:
         booking_address["address_line_2"] = addr_struct["address_line_2"]
 
     booking_payload = {
@@ -1458,7 +1090,9 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
             "address": booking_address,
-            "customer_note": f"Auto-booked by Prevolt OS. Raw address: {raw_address}",
+            "customer_note": (
+                f"Auto-booked by Prevolt OS. Raw address from customer: {raw_address}"
+            ),
             "appointment_segments": [
                 {
                     "duration_minutes": 60,
@@ -1470,28 +1104,32 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
         },
     }
 
-    # POST → Square API
     try:
         resp = requests.post(
             "https://connect.squareup.com/v2/bookings",
             headers=square_headers(),
             json=booking_payload,
-            timeout=10
+            timeout=10,
         )
-
         if resp.status_code not in (200, 201):
-            print("Square booking create FAILED:", resp.status_code, resp.text)
+            print("Square booking create failed:", resp.status_code, resp.text)
             return
 
-        booking = resp.json().get("booking", {})
-        booking_id = booking.get("id")
+        data = resp.json()
+        booking = data.get("booking")
+        booking_id = booking.get("id") if booking else None
 
-        convo["booking_created"]   = True
+        convo["booking_created"] = True
         convo["square_booking_id"] = booking_id
 
-        print(f"Square booking created for {phone}: {booking_id}")
+        print(
+            f"Square booking created for {phone}: {booking_id} "
+            f"{scheduled_date} {scheduled_time} ({appointment_type})"
+        )
 
-        # Reset convo AFTER booking
+        # ---------------------------------------------------
+        # Reset conversation AFTER successful booking
+        # ---------------------------------------------------
         conversations[phone] = {
             "cleaned_transcript": None,
             "category": None,
@@ -1511,7 +1149,6 @@ def maybe_create_square_booking(phone: str, convo: dict) -> None:
 
     except Exception as e:
         print("Square booking exception:", repr(e))
-
 
 
 # ---------------------------------------------------
