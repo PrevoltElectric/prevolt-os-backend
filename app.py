@@ -237,6 +237,52 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         }
 
 
+# ---------------------------------------------------
+# NEW — Incoming SMS Webhook (Enables ALL Scheduling Logic)
+# ---------------------------------------------------
+@app.route("/incoming-sms", methods=["POST"])
+def incoming_sms():
+    from twilio.twiml.messaging_response import MessagingResponse
+
+    inbound_text = request.form.get("Body", "")
+    phone = request.form.get("From", "").replace("whatsapp:", "")
+
+    # Pull conversation state
+    conv = conversations.setdefault(phone, {})
+
+    cleaned_transcript = conv.get("cleaned_transcript")
+    category = conv.get("category")
+    appointment_type = conv.get("appointment_type")
+    initial_sms = conv.get("initial_sms")
+    scheduled_date = conv.get("scheduled_date")
+    scheduled_time = conv.get("scheduled_time")
+    address = conv.get("address")
+
+    # Generate AI reply
+    reply = generate_reply_for_inbound(
+        cleaned_transcript,
+        category,
+        appointment_type,
+        initial_sms,
+        inbound_text,
+        scheduled_date,
+        scheduled_time,
+        address,
+    )
+
+    # Save updated state
+    conv["scheduled_date"] = reply.get("scheduled_date")
+    conv["scheduled_time"] = reply.get("scheduled_time")
+    conv["address"] = reply.get("address")
+
+    # Build Twilio reply
+    twilio_reply = MessagingResponse()
+    twilio_reply.message(reply["sms_body"])
+
+    return Response(str(twilio_reply), mimetype="text/xml")
+
+
+
     # ----------------------------------------
     # NON-EMERGENCY → Use LLM classification
     # ----------------------------------------
