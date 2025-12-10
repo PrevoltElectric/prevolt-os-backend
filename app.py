@@ -6979,13 +6979,12 @@ def voicemail_complete():
     # ---------------------------------------------------
     conv = conversations.get(from_number, {})
 
-    # Preserve existing AI brain state (never overwrite downstream values)
     new_conv = {
         "voicemail_url": recording_url,
 
-        # existing fields preserved
-        "initial_sms": conv.get("initial_sms", ""),
-        "cleaned_transcript": conv.get("cleaned_transcript", ""),
+        # Preserve existing values
+        "initial_sms": conv.get("initial_sms"),
+        "cleaned_transcript": conv.get("cleaned_transcript"),
         "category": conv.get("category"),
         "appointment_type": conv.get("appointment_type"),
         "first_sms_time": time.time(),
@@ -6999,7 +6998,7 @@ def voicemail_complete():
         "square_booking_id": conv.get("square_booking_id"),
         "state_prompt_sent": conv.get("state_prompt_sent", False),
 
-        # NEW AI extraction slots (never overwrite if exists)
+        # NEW extracted values
         "voicemail_intent": conv.get("voicemail_intent"),
         "voicemail_town": conv.get("voicemail_town"),
         "voicemail_partial_address": conv.get("voicemail_partial_address"),
@@ -7008,7 +7007,7 @@ def voicemail_complete():
     conversations[from_number] = new_conv
 
     # ---------------------------------------------------
-    # 2. TRANSCRIBE THE VOICEMAIL (Whisper)
+    # 2. TRANSCRIBE THE VOICEMAIL
     # ---------------------------------------------------
     try:
         raw_transcript = transcribe_recording(recording_url)
@@ -7020,7 +7019,7 @@ def voicemail_complete():
         raw_transcript = ""
 
     # ---------------------------------------------------
-    # 3. CLEAN TRANSCRIPT (LLM mild correction)
+    # 3. CLEAN IT (LLM minor correction)
     # ---------------------------------------------------
     try:
         cleaned = clean_transcript_text(raw_transcript)
@@ -7031,8 +7030,7 @@ def voicemail_complete():
     new_conv["cleaned_transcript"] = cleaned
 
     # ---------------------------------------------------
-    # 4. ADVANCED VOICEMAIL CONTENT EXTRACTION
-    #    (intent, town, partial address)
+    # 4. EXTRACT: intent, town, partial street
     # ---------------------------------------------------
     try:
         extract = openai_client.chat.completions.create(
@@ -7042,9 +7040,9 @@ def voicemail_complete():
                     "role": "system",
                     "content": (
                         "Extract EXACTLY THREE fields from this voicemail:\n"
-                        "1. intent: what electrical work they want (short phrase)\n"
-                        "2. town: the town they say they are in (CT/MA region only)\n"
-                        "3. partial_address: any street number or street name mentioned\n\n"
+                        "1. intent: short phrase of what work they want\n"
+                        "2. town: CT/MA town mentioned\n"
+                        "3. partial_address: any street number/name\n\n"
                         "If unknown, return null.\n"
                         "Return STRICT JSON: {intent, town, partial_address}"
                     )
@@ -7054,19 +7052,35 @@ def voicemail_complete():
         )
         extracted = json.loads(extract.choices[0].message.content)
     except Exception as e:
-        print("Voicemail extractor failed:", repr(e))
+        print("Extractor failed:", repr(e))
         extracted = {"intent": None, "town": None, "partial_address": None}
 
-    # Save extraction values ONLY if not already set
+    # Store extraction values (only if empty)
     if new_conv.get("voicemail_intent") is None:
         new_conv["voicemail_intent"] = extracted.get("intent")
+
     if new_conv.get("voicemail_town") is None:
         new_conv["voicemail_town"] = extracted.get("town")
+
     if new_conv.get("voicemail_partial_address") is None:
         new_conv["voicemail_partial_address"] = extracted.get("partial_address")
 
     # ---------------------------------------------------
-    # 5. APPOINTMENT CLASSIFICATION + INITIAL SMS
+    # 4B. *** NEW FIX *** — AUTO-STORE ADDRESS FROM VOICEMAIL
+    # ---------------------------------------------------
+    partial = new_conv.get("voicemail_partial_address")
+    town = new_conv.get("voicemail_town")
+
+    # Case 1 — full street + town present → store as full address
+    if partial and town and not new_conv.get("address"):
+        new_conv["address"] = f"{partial} {town}"
+
+    # Case 2 — full address already stored → nothing to override
+    # Case 3 — partial exists but no town → OS later asks: "What town is that in?"
+    # Case 4 — town exists but no street → OS asks for street name/number
+
+    # ---------------------------------------------------
+    # 5. CLASSIFY + BUILD INITIAL SMS BODY
     # ---------------------------------------------------
     try:
         initial = generate_initial_sms(cleaned)
@@ -7075,51 +7089,52 @@ def voicemail_complete():
         appt_type = initial.get("appointment_type")
     except Exception as e:
         print("Initial SMS classification failed:", repr(e))
-        sms_body = "Hi, this is Prevolt Electric — I received your message. What day works for you?"
+        sms_body = "Hi, this is Prevolt Electric — we received your message. What day works for you?"
         category = "OTHER"
         appt_type = "EVAL_195"
 
-    # Update the conversation with classification results
     new_conv["initial_sms"] = sms_body
     new_conv["category"] = category
     new_conv["appointment_type"] = appt_type
 
     # ---------------------------------------------------
-    # 6. BUILD THE INTELLIGENT FIRST SMS
+    # 6. BUILD INTELLIGENT FIRST SMS (Address-Aware)
     # ---------------------------------------------------
-    town = new_conv.get("voicemail_town")
     intent = new_conv.get("voicemail_intent")
-    partial = new_conv.get("voicemail_partial_address")
+    full_address = new_conv.get("address")
 
-    intelligent_msg = "Hi, this is Prevolt Electric — "
+    msg = "Hi, this is Prevolt Electric — "
 
-    # Mention intent if detected
     if intent:
-        intelligent_msg += f"I saw your message about {intent}. "
+        msg += f"I saw your message about {intent}. "
 
-    # Mention town if detected
     if town:
-        intelligent_msg += f"Looks like you're in {town}. "
+        msg += f"Looks like you're in {town}. "
 
-    # Ask for missing address
-    if partial:
-        intelligent_msg += (
-            f"I caught part of your address ({partial}). "
-            "What’s the full street address for the visit?"
-        )
+    # *** DO NOT ASK FOR ADDRESS AGAIN IF WE ALREADY HAVE ONE ***
+    if full_address:
+        msg += f"Thanks for confirming your address ({full_address}). "
+        msg += "What day works for the visit?"
     else:
-        intelligent_msg += "What’s the full street address for the visit?"
+        # Ask only for missing pieces
+        if partial and not town:
+            msg += f"I caught the street ({partial}). What town is that in?"
+        elif town and not partial:
+            msg += f"I heard {town}. What’s the street address?"
+        else:
+            # No usable address extracted
+            msg += "What’s the full street address for the visit?"
 
     # ---------------------------------------------------
     # 7. SEND FIRST SMS
     # ---------------------------------------------------
     try:
-        send_sms(from_number, intelligent_msg)
+        send_sms(from_number, msg)
     except Exception as e:
-        print("Error sending intelligent voicemail SMS:", repr(e))
+        print("Error sending SMS:", repr(e))
 
     # ---------------------------------------------------
-    # 8. Voice response to caller
+    # 8. Voice confirmation to caller
     # ---------------------------------------------------
     response = VoiceResponse()
     response.say(
@@ -7128,6 +7143,7 @@ def voicemail_complete():
     )
     response.hangup()
     return str(response)
+
 
 
 # ---------------------------------------------------
