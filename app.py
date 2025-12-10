@@ -6137,6 +6137,94 @@ OS must:
 Example:
 “We’ll take care of all of that — no stress. What day works for you?”
 
+### Rule 20.26 — GENERAL AVAILABILITY HINTS
+If customer indicates general availability without giving a specific date/time, such as:
+• “I’m usually home Thursdays”
+• “I’m free most Fridays”
+• “I’m around on weekends”
+• “I’m home afternoons”
+• “I’m available mornings”
+• “Thursdays work best”
+
+OS must:
+• treat this as a preference, not a final booking  
+• store the preferred weekday and/or time window  
+• still collect any missing specific date or time per SRB-1.12 and SRB-1.13  
+• never reply with “Got it.” only — scheduling must continue  
+
+### Rule 20.27 — Habitual Day → Next Date
+When a habitual phrase includes a specific weekday:
+Examples:
+• “I’m usually home Thursdays.”
+• “Fridays work best for me.”
+• “I’m generally free Mondays.”
+
+OS must:
+• convert that weekday into the next upcoming calendar date  
+• if the day is still ahead this week → use this week  
+• if the day has already passed this week → use the same day next week  
+• treat this as scheduled_date (provisional) and then ask for time if missing  
+
+Example:
+Customer (Tuesday): “I’m usually home Thursdays.”  
+OS: “Got it — this Thursday works. What time on Thursday works for you?”
+
+### Rule 20.28 — Habitual Day + Time Window
+If customer gives a habitual day plus a time window:
+Examples:
+• “I’m usually home Thursdays in the morning.”
+• “Fridays after 3pm work best.”
+• “Weekends in the afternoon are best for me.”
+
+OS must:
+• use Rule 20.27 to pick the correct date  
+• map the time window into a time block:  
+  – “morning” → treat as 9:00–12:00  
+  – “afternoon” → treat as 12:00–15:00  
+  – “evening” → treat as 15:00–18:00  
+• if no explicit time given, ask once:  
+  “Great — what time Thursday morning works for you?”  
+• then proceed with normal time rules and Square availability checks  
+
+### Rule 20.29 — Smart Square Availability Fallback (Same Weekday Rolling)
+If the OS has a preferred weekday from the customer (explicit or via Rule 20.27 / 20.28) and
+Square shows **no availability** on that date:
+
+OS must:
+• keep the same weekday (do NOT randomly change the day)  
+• move exactly 1 week forward on that weekday and check again  
+• repeat this process up to 4 weeks out  
+• when an available slot is found, offer that slot  
+
+Example:
+“We’re booked this Thursday, but next Thursday we have an opening at 2:00 PM. Would that work?”
+
+If all 4 weeks are booked on that weekday:
+• say: “We’re fully booked for Thursdays over the next month — would another day work for you?”  
+
+### Rule 20.30 — Explicit Time Rejected by Square
+If customer picks a specific date and time and Square returns no availability:
+
+OS must:
+• acknowledge the conflict: “We’re booked at that time.”  
+• first offer the closest available time **on the same day**  
+• if the entire day has no availability, apply Rule 20.29 (roll to the same weekday next week)  
+• respect any stated time window preference when choosing an alternative  
+• never reset the flow or re-ask for address/date already collected  
+
+
+OS must:
+1. Treat this as a scheduling preference (NOT a confirmed date).
+2. Identify the preferred day or time window.
+3. Ask the next required clarifying question.
+
+Examples:
+User: “I’m usually home Thursdays.”
+OS: “Great — what time on Thursday works for you?”
+
+User: “I’m free most mornings.”
+OS: “Got it — what time in the morning works best?”
+
 
 ===================================================
 DATE CONVERSION (OPTION A)
