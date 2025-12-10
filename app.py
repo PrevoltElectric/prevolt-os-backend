@@ -4,11 +4,13 @@ import time
 import uuid
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather, Dial
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from openai import OpenAI
+
 
 
 try:
@@ -239,9 +241,23 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 # ---------------------------------------------------
 # NEW — Incoming SMS Webhook (Enables ALL Scheduling Logic)
+# SCANNING METADATA ATTACHED — SAFE, NON-EXECUTING
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
+    """
+    SCAN_TARGET: incoming_sms
+    SCAN_FIELDS:
+        - scheduled_date
+        - scheduled_time
+        - address
+        - normalized_address
+        - appointment_type
+        - category
+    SCAN_NOTES:
+        The scanner should analyze how state progresses AFTER the reply
+        and confirm nothing is overwritten incorrectly.
+    """
     from twilio.twiml.messaging_response import MessagingResponse
 
     inbound_text = request.form.get("Body", "")
@@ -258,7 +274,20 @@ def incoming_sms():
     scheduled_time = conv.get("scheduled_time")
     address = conv.get("address")
 
-    # Generate AI reply
+    # ---------------------------------------------------
+    # SCANNER_HOOK: PRE-REPLY STATE SNAPSHOT
+    # ---------------------------------------------------
+    conv["_scan_snapshot_before"] = {
+        "scheduled_date": scheduled_date,
+        "scheduled_time": scheduled_time,
+        "address": address,
+        "appointment_type": appointment_type,
+        "category": category,
+    }
+
+    # ---------------------------------------------------
+    # Generate AI reply (Step 4)
+    # ---------------------------------------------------
     reply = generate_reply_for_inbound(
         cleaned_transcript,
         category,
@@ -270,12 +299,25 @@ def incoming_sms():
         address,
     )
 
-    # Save updated state
+    # ---------------------------------------------------
+    # SAVE UPDATED STATE
+    # ---------------------------------------------------
     conv["scheduled_date"] = reply.get("scheduled_date")
     conv["scheduled_time"] = reply.get("scheduled_time")
     conv["address"] = reply.get("address")
 
+    # ---------------------------------------------------
+    # SCANNER_HOOK: POST-REPLY STATE SNAPSHOT
+    # ---------------------------------------------------
+    conv["_scan_snapshot_after"] = {
+        "scheduled_date": conv["scheduled_date"],
+        "scheduled_time": conv["scheduled_time"],
+        "address": conv["address"],
+    }
+
+    # ---------------------------------------------------
     # Build Twilio reply
+    # ---------------------------------------------------
     twilio_reply = MessagingResponse()
     twilio_reply.message(reply["sms_body"])
 
@@ -283,103 +325,6 @@ def incoming_sms():
 
 
 
-    # ----------------------------------------
-    # NON-EMERGENCY → Use LLM classification
-    # ----------------------------------------
-    try:
-        completion = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
-                        "Generate ONLY the FIRST outbound SMS after reading voicemail.\n\n"
-                        "Rules:\n"
-                        "• MUST start with: 'Hi, this is Prevolt Electric —'\n"
-                        "• NEVER ask customer to repeat their voicemail.\n"
-                        "• Determine correct appointment type:\n"
-                        "   - Installs/quotes/upgrades → EVAL_195\n"
-                        "   - Active problems (non-emergency) → TROUBLESHOOT_395\n"
-                        "   - Whole home inspection → WHOLE_HOME_INSPECTION\n"
-                        "• Mention price once only.\n"
-                        "• No photos. No AI mentions. No Kyle.\n\n"
-                        "Return STRICT JSON with keys: sms_body, category, appointment_type."
-                    ),
-                },
-                {"role": "user", "content": cleaned_text},
-            ],
-        )
-
-        data = json.loads(completion.choices[0].message.content)
-
-        return {
-            "sms_body": data["sms_body"].strip(),
-            "category": data["category"],
-            "appointment_type": data["appointment_type"],
-        }
-
-    except Exception as e:
-        print("Initial SMS FAILED:", repr(e))
-        return {
-            "sms_body": (
-                "Hi, this is Prevolt Electric — I received your message. "
-                "The next step is a $195 on-site consultation and quote visit. "
-                "What day works for you?"
-            ),
-            "category": "OTHER",
-            "appointment_type": "EVAL_195",
-        }
-
-
-
-# ---------------------------------------------------
-# Step 3 — Generate Initial SMS
-# ---------------------------------------------------
-def generate_initial_sms(cleaned_text: str) -> dict:
-    try:
-        completion = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Prevolt OS, the SMS assistant for Prevolt Electric. "
-                        "Generate the FIRST outbound SMS after reading voicemail.\n\n"
-                        "Rules:\n"
-                        "• MUST start with: 'Hi, this is Prevolt Electric —'\n"
-                        "• NEVER ask them to repeat their voicemail.\n"
-                        "• Determine correct appointment type:\n"
-                        "   - Installs/quotes/upgrades → EVAL_195\n"
-                        "   - Active problems → TROUBLESHOOT_395\n"
-                        "   - Whole house inspection → WHOLE_HOME_INSPECTION\n"
-                        "• Mention price once only.\n"
-                        "• No photos. No AI mentions. No Kyle.\n\n"
-                        "Return STRICT JSON with keys: sms_body, category, appointment_type."
-                    ),
-                },
-                {"role": "user", "content": cleaned_text},
-            ],
-        )
-
-        data = json.loads(completion.choices[0].message.content)
-
-        return {
-            "sms_body": data["sms_body"].strip(),
-            "category": data["category"],
-            "appointment_type": data["appointment_type"],
-        }
-
-    except Exception as e:
-        print("Initial SMS FAILED:", repr(e))
-        return {
-            "sms_body": (
-                "Hi, this is Prevolt Electric — I received your message. "
-                "The next step is a $195 on-site consultation and quote visit. What day works for you?"
-            ),
-            "category": "OTHER",
-            "appointment_type": "EVAL_195",
-        }
 
 # ---------------------------------------------------
 # Load + Build System Prompt (Prevolt Rules Engine)
@@ -389,33 +334,6 @@ import json
 
 # Cache rules so we do not re-read the file every SMS
 PREVOLT_RULES_CACHE = None
-
-
-# ---------------------------------------------------
-# SAFETY: Minimal get_current_state implementation
-# (Prevents NameError + allows state machine to run)
-# ---------------------------------------------------
-def get_current_state(conv: dict) -> str:
-    """
-    Minimal but stable state detector.
-    Expand later if needed.
-    """
-    if conv.get("scheduled_date") and conv.get("scheduled_time") and conv.get("address"):
-        return "ready_for_confirmation"
-
-    if not conv.get("address"):
-        return "awaiting_address"
-
-    if not conv.get("scheduled_date") and not conv.get("scheduled_time"):
-        return "awaiting_date_or_time"
-
-    if conv.get("scheduled_date") and not conv.get("scheduled_time"):
-        return "awaiting_time"
-
-    if conv.get("scheduled_time") and not conv.get("scheduled_date"):
-        return "awaiting_date"
-
-    return "unknown"
 
 
 # ---------------------------------------------------
@@ -497,33 +415,44 @@ def build_system_prompt(
 
 
 # ---------------------------------------------------
-# STATE MACHINE HELPERS (REQUIRED FOR STEP 4)
+# REQUIRED IMPORTS FOR STEP 4
 # ---------------------------------------------------
+import json
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo  # REQUIRED for timezone logic
 
-def get_current_state(conv):
+# ---------------------------------------------------
+# REQUIRED STATE HELPERS (MINIMAL SAFE VERSIONS)
+# ---------------------------------------------------
+def get_current_state(conv: dict) -> str:
     """
-    Minimal state extractor to prevent Step 4 crashes.
-    Step 4 only needs these fields to exist.
+    Minimal stable state detector for Step 4.
     """
-    return {
-        "scheduled_date": conv.get("scheduled_date"),
-        "scheduled_time": conv.get("scheduled_time"),
-        "address": conv.get("address"),
-        "normalized_address": conv.get("normalized_address"),
-        "booking_created": conv.get("booking_created"),
-    }
+    if conv.get("scheduled_date") and conv.get("scheduled_time") and conv.get("address"):
+        return "ready_for_confirmation"
+
+    if not conv.get("address"):
+        return "awaiting_address"
+
+    if not conv.get("scheduled_date") and not conv.get("scheduled_time"):
+        return "awaiting_date_or_time"
+
+    if conv.get("scheduled_date") and not conv.get("scheduled_time"):
+        return "awaiting_time"
+
+    if conv.get("scheduled_time") and not conv.get("scheduled_date"):
+        return "awaiting_date"
+
+    return "unknown"
 
 
 def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, scheduled_time):
     """
     TEMPORARY NON-BLOCKING VERSION.
-    MUST return {} so Step 4 always runs.
-    Prevents NameError, prevents infinite fallback loops.
+    MUST always return {} so Step 4 continues.
+    Prevents recursion, NameErrors, fallback loops.
     """
     return {}
-
-
-
 
 
 # ---------------------------------------------------
@@ -544,9 +473,9 @@ def generate_reply_for_inbound(
         # -------------------------------
         # Local timezone
         # -------------------------------
-        if ZoneInfo:
+        try:
             tz = ZoneInfo("America/New_York")
-        else:
+        except Exception:
             tz = timezone(timedelta(hours=-5))
 
         now_local = datetime.now(tz)
@@ -594,15 +523,16 @@ def generate_reply_for_inbound(
                 "state_prompt_sent": False,
             }
 
+        # Always ensure conv exists
         conv = conversations.setdefault(phone, {})
 
         # -------------------------------
-        # STATE LOCK ENFORCER
+        # STATE LOCK ENFORCER (never blocks)
         # -------------------------------
         try:
             state = get_current_state(conv)
         except NameError:
-            state = None  # Fail-safe if not yet defined
+            state = None
 
         lock = enforce_state_lock(
             state,
@@ -617,7 +547,7 @@ def generate_reply_for_inbound(
             return lock["reply"]
 
         # -------------------------------
-        # BUILD SYSTEM PROMPT FROM JSON RULES
+        # BUILD SYSTEM PROMPT
         # -------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
@@ -656,15 +586,15 @@ def generate_reply_for_inbound(
         # -------------------------------
         # DATE/TIME PATCH LAYER
         # -------------------------------
-        if ZoneInfo:
+        try:
             tz_patch = ZoneInfo("America/New_York")
-        else:
+        except Exception:
             tz_patch = timezone(timedelta(hours=-5))
 
         now_local_patch = datetime.now(tz_patch)
         today_patch = now_local_patch.strftime("%Y-%m-%d")
 
-        # Time but not date → infer today
+        # Time but no date → infer today
         if model_time and not model_date:
             if any(word in inbound_lower for word in [
                 "today", "this", "anytime", "whenever", "now", "soon",
@@ -673,11 +603,11 @@ def generate_reply_for_inbound(
             ]):
                 model_date = today_patch
 
-        # Troubleshoot override: assume today
+        # Troubleshoot override → today
         if model_time and not model_date and str(appointment_type).lower() == "troubleshoot_395":
             model_date = today_patch
 
-        # Date but not explicit time
+        # Date but no time
         if model_date and not model_time:
             if "morning" in inbound_lower:
                 model_time = "09:00"
@@ -699,7 +629,6 @@ def generate_reply_for_inbound(
                     minute = 0 if minute == 60 else minute
                     if hour >= 20:
                         hour = 20
-                        minute = 0
                     model_time = f"{hour:02d}:{minute:02d}"
             except:
                 pass
@@ -713,16 +642,19 @@ def generate_reply_for_inbound(
         # -------------------------------
         # FINAL RETURN
         # -------------------------------
+        final_sms = (
+            sms_body.replace(model_time, human_time)
+            if (sms_body and human_time and model_time)
+            else sms_body
+        )
+
         return {
-            "sms_body": sms_body.replace(model_time, human_time) if (sms_body and human_time) else sms_body,
+            "sms_body": final_sms,
             "scheduled_date": model_date,
             "scheduled_time": model_time,
             "address": model_address,
         }
 
-    # -------------------------------
-    # SAFE FALLBACK (MINIMAL)
-    # -------------------------------
     except Exception as e:
         print("Inbound reply FAILED:", repr(e))
 
@@ -732,6 +664,7 @@ def generate_reply_for_inbound(
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
 
 
 
