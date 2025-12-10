@@ -440,6 +440,10 @@ def get_current_state(conv: dict) -> str:
 def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, scheduled_time):
     return {}
 
+# ---------------------------------------------------
+# GLOBAL RULES CACHE (Required for System Prompt Loader)
+# ---------------------------------------------------
+PREVOLT_RULES_CACHE = None
 
 # ---------------------------------------------------
 # Build System Prompt (Prevolt Rules Engine)
