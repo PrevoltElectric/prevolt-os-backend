@@ -353,18 +353,14 @@ def build_system_prompt(
 ):
     global PREVOLT_RULES_CACHE
 
-    # -------------------------------
-    # Load JSON rules once (cached)
-    # -------------------------------
+    # Load JSON rules once
     if PREVOLT_RULES_CACHE is None:
         with open("prevolt_rules.json", "r", encoding="utf-8") as f:
             PREVOLT_RULES_CACHE = json.load(f)
 
     rules_text = PREVOLT_RULES_CACHE.get("rules", "")
 
-    # -------------------------------
-    # OPTIONAL CONTEXT (voicemail insights)
-    # -------------------------------
+    # Optional voicemail context
     voicemail_intent = convo.get("voicemail_intent")
     voicemail_town = convo.get("voicemail_town")
     voicemail_partial_address = convo.get("voicemail_partial_address")
@@ -383,15 +379,26 @@ def build_system_prompt(
         if voicemail_partial_address:
             voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
 
-    # -------------------------------
-    # Build final system prompt string
-    # -------------------------------
+    # SYSTEM PROMPT WITH STABILITY RULES
     system_prompt = (
-        f"You are Prevolt OS, the SMS assistant for Prevolt Electric. "
-        f"Continue the conversation naturally.\n\n"
+        f"You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
+        f"Continue the conversation naturally. Do NOT repeat yourself.\n\n"
         f"Today is {today_date_str}, a {today_weekday}, local time America/New_York.\n\n"
         f"{rules_text}"
         f"{voicemail_context}\n\n"
+
+        "===================================================\n"
+        "STATE HANDLING RULES\n"
+        "===================================================\n"
+        "• NEVER ask again for information the customer already provided.\n"
+        "• If customer provides ONLY a time → use the previously stored date.\n"
+        "• If customer provides ONLY a date → use the previously stored time.\n"
+        "• If customer provides an address → NEVER ask for address again.\n"
+        "• ALWAYS inherit previously known values unless customer changes them.\n"
+        "• NEVER return null for a field already known.\n"
+        "• Avoid phrases like 'Got it —'. Vary your confirmations.\n"
+        "• Include correct pricing once ONLY based on appointment type.\n\n"
+
         "===================================================\n"
         "CONTEXT\n"
         "===================================================\n"
@@ -400,6 +407,7 @@ def build_system_prompt(
         f"Appointment type: {appointment_type}\n"
         f"Initial SMS: {initial_sms}\n"
         f"Stored date/time/address: {scheduled_date}, {scheduled_time}, {address}\n\n"
+
         "===================================================\n"
         "OUTPUT FORMAT (STRICT JSON)\n"
         "===================================================\n"
@@ -414,21 +422,20 @@ def build_system_prompt(
     return system_prompt
 
 
+
 # ---------------------------------------------------
 # REQUIRED IMPORTS FOR STEP 4
 # ---------------------------------------------------
-import json
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo  # REQUIRED for timezone logic
+from zoneinfo import ZoneInfo
+
 
 
 # ---------------------------------------------------
-# REQUIRED STATE HELPERS (MINIMAL SAFE VERSIONS)
+# STATE HELPERS (MINIMAL SAFE VERSIONS)
 # ---------------------------------------------------
 def get_current_state(conv: dict) -> str:
-    """
-    Minimal stable state detector for Step 4.
-    """
+
     if conv.get("scheduled_date") and conv.get("scheduled_time") and conv.get("address"):
         return "ready_for_confirmation"
 
@@ -448,16 +455,12 @@ def get_current_state(conv: dict) -> str:
 
 
 def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, scheduled_time):
-    """
-    TEMPORARY NON-BLOCKING VERSION.
-    Always returns {}, preventing recursion / NameErrors.
-    """
     return {}
 
 
 
 # ---------------------------------------------------
-# Step 4 — Generate Replies (THE BRAIN)
+# Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -472,96 +475,35 @@ def generate_reply_for_inbound(
 
     try:
         # -------------------------------
-        # Local timezone
+        # Timezone setup
         # -------------------------------
         try:
             tz = ZoneInfo("America/New_York")
-        except Exception:
+        except:
             tz = timezone(timedelta(hours=-5))
 
-        now_local = datetime.now(tz)
+        now_local      = datetime.now(tz)
         today_date_str = now_local.strftime("%Y-%m-%d")
-        today_weekday = now_local.strftime("%A")
+        today_weekday  = now_local.strftime("%A")
 
         # -------------------------------
-        # SESSION RESET LOGIC
+        # Load conversation
         # -------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
-        last_time = conversations.get(phone, {}).get("first_sms_time")
-        should_reset = False
+        conv  = conversations.setdefault(phone, {})
 
-        if last_time:
-            try:
-                elapsed_minutes = (now_local - last_time).total_seconds() / 60
-                if elapsed_minutes > 60:
-                    should_reset = True
-            except Exception:
-                should_reset = True
-
-        trigger_resets = {
-            "hi","hello","hey",
-            "new issue","another issue",
-            "new problem","i need help",
-            "i have a new problem"
-        }
-
-        if inbound_text.strip().lower() in trigger_resets:
-            should_reset = True
-
-        if should_reset:
-            conversations[phone] = {
-                "cleaned_transcript": cleaned_transcript,
-                "category": category,
-                "appointment_type": appointment_type,
-                "initial_sms": initial_sms,
-                "first_sms_time": now_local,
-                "replied": False,
-                "followup_sent": False,
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": None,
-                "normalized_address": None,
-                "booking_created": False,
-                "square_booking_id": None,
-                "state_prompt_sent": False,
-            }
-
-        conv = conversations.setdefault(phone, {})
-
-        # -------------------------------
-        # STATE LOCK ENTRY (never blocks)
-        # -------------------------------
-        try:
-            state = get_current_state(conv)
-        except Exception:
-            state = "unknown"
-
-        enforce_state_lock(
-            state,
-            conv,
-            inbound_text.lower(),
-            address,
-            scheduled_date,
-            scheduled_time
-        )
-
-        # ===================================================
-        # ADDRESS DETECTION FIX (P1)
-        # When a valid address is detected → NEVER re-ask it.
-        # ===================================================
         inbound_lower = inbound_text.lower()
 
-        if any(x in inbound_lower for x in [" st", " ave", " road", " rd", " ln", " lane", " dr", " drive"]) and len(inbound_text) > 6:
+        # -----------------------------------------------------
+        # HARD ADDRESS CAPTURE (P1 FIX)
+        # -----------------------------------------------------
+        if any(x in inbound_lower for x in [" st", " ave", " rd", " road", " ln", " lane", " dr", " drive"]) and len(inbound_text) > 6:
             conv["address"] = inbound_text.strip()
-            conv["state_prompt_sent"] = False  # allow next state step
-            # Do NOT ask for time/date yet — let LLM respond naturally
-            # but block re-asking the address.
             address = conv["address"]
 
-
-        # -------------------------------
-        # BUILD SYSTEM PROMPT (JSON RULES)
-        # -------------------------------
+        # -----------------------------------------------------
+        # BUILD SYSTEM PROMPT
+        # -----------------------------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
@@ -575,9 +517,9 @@ def generate_reply_for_inbound(
             conv
         )
 
-        # -------------------------------
-        # LLM CALL FOR REPLY
-        # -------------------------------
+        # -----------------------------------------------------
+        # LLM CALL
+        # -----------------------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             response_format={"type": "json_object"},
@@ -587,86 +529,46 @@ def generate_reply_for_inbound(
             ],
         )
 
-        ai_raw = json.loads(completion.choices[0].message.content)
-
-        sms_body = ai_raw.get("sms_body", "").strip()
+        ai_raw     = json.loads(completion.choices[0].message.content)
+        sms_body   = ai_raw.get("sms_body", "").strip()
         model_date = ai_raw.get("scheduled_date")
         model_time = ai_raw.get("scheduled_time")
-        model_address = ai_raw.get("address")
-
+        model_addr = ai_raw.get("address")
 
         # -----------------------------------------------------
-        # PRICE INJECTION (P1 FIX #2) — based on appointment_type
+        # PRICE INJECTION (P1 FIX #2)
         # -----------------------------------------------------
-        price_phrase = ""
-
         appt = str(appointment_type).lower()
-
-        if appt == "eval_195":
-            price_phrase = " The visit is a $195 consultation."
-        elif appt == "troubleshoot_395":
-            price_phrase = " The visit is a $395 troubleshoot and repair."
-        elif appt == "whole_home_inspection":
-            price_phrase = " Home inspections range from $375–$650 depending on square footage."
-
+        price_map = {
+            "eval_195": " The visit is a $195 consultation.",
+            "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
+            "whole_home_inspection": " Home inspections range from $375–$650 depending on size."
+        }
+        price_phrase = price_map.get(appt, "")
         if price_phrase and price_phrase not in sms_body:
             sms_body += price_phrase
 
+        # -----------------------------------------------------
+        # INHERIT KNOWN VALUES (P1 FIX #1)
+        # -----------------------------------------------------
+        if scheduled_date and not model_date:
+            model_date = scheduled_date
 
-        # -------------------------------
-        # DATE/TIME PATCH LAYER
-        # -------------------------------
-        try:
-            tz_patch = ZoneInfo("America/New_York")
-        except Exception:
-            tz_patch = timezone(timedelta(hours=-5))
+        if scheduled_time and not model_time:
+            model_time = scheduled_time
 
-        now_local_patch = datetime.now(tz_patch)
-        today_patch = now_local_patch.strftime("%Y-%m-%d")
+        if address and not model_addr:
+            model_addr = address
 
-        # Time but no date → infer today
+        # -----------------------------------------------------
+        # DATE/TIME INFERENCE
+        # -----------------------------------------------------
         if model_time and not model_date:
-            if any(word in inbound_lower for word in [
-                "today","this","anytime","whenever","now","soon",
-                "this afternoon","this morning","this evening",
-                "asap","right now","i'm here","i am home"
-            ]):
-                model_date = today_patch
+            model_date = today_date_str
 
-        # Troubleshoot override → force today
-        if model_time and not model_date and appt == "troubleshoot_395":
-            model_date = today_patch
-
-        # Date but no time → infer from context
-        if model_date and not model_time:
-            if "morning" in inbound_lower:
-                model_time = "09:00"
-            elif "afternoon" in inbound_lower:
-                model_time = "13:00"
-            elif "evening" in inbound_lower:
-                model_time = "16:00"
-            elif any(k in inbound_lower for k in ["whenever","sometime","anytime"]):
-                model_time = "13:00"
-
-        # Patch past times today
-        if model_date == today_patch and model_time:
-            try:
-                t_obj = datetime.strptime(model_time, "%H:%M").time()
-                now_t = now_local_patch.time()
-                if t_obj < now_t:
-                    minute = (now_local_patch.minute + 29)//30*30
-                    hour = now_local_patch.hour + (1 if minute == 60 else 0)
-                    minute = 0 if minute == 60 else minute
-                    if hour >= 20:
-                        hour = 20
-                    model_time = f"{hour:02d}:{minute:02d}"
-            except:
-                pass
-
-
-        # -------------------------------
-        # HUMAN FRIENDLY TIME
-        # -------------------------------
+        # -----------------------------------------------------
+        # Convert time → human format
+        # -----------------------------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
@@ -678,11 +580,54 @@ def generate_reply_for_inbound(
             else sms_body
         )
 
+        # =====================================================
+        # AUTO-BOOKING ENGINE (calls maybe_create_square_booking)
+        # =====================================================
+        ready_for_booking = (
+            model_date
+            and model_time
+            and model_addr
+            and not conv.get("booking_created")
+        )
+
+        if ready_for_booking:
+            # Square engine requires these stored in conv
+            conv["scheduled_date"] = model_date
+            conv["scheduled_time"] = model_time
+            conv["address"]        = model_addr
+
+            try:
+                maybe_create_square_booking(phone, conv)
+
+                # Only confirm booking if Square actually succeeded
+                if conv.get("booking_created"):
+                    booking_id = conv.get("square_booking_id")
+
+                    confirmation_sms = (
+                        f"You're all set — your appointment is booked for {model_date} at "
+                        f"{human_time} at {model_addr}. "
+                        f"Your confirmation number is {booking_id}."
+                    )
+
+                    return {
+                        "sms_body": confirmation_sms,
+                        "scheduled_date": model_date,
+                        "scheduled_time": model_time,
+                        "address": model_addr,
+                    }
+
+            except Exception as e:
+                print("AUTO-BOOKING ERROR:", repr(e))
+                final_sms += " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
+
+        # =====================================================
+        # NORMAL RETURN (no booking yet)
+        # =====================================================
         return {
             "sms_body": final_sms,
             "scheduled_date": model_date,
             "scheduled_time": model_time,
-            "address": model_address or conv.get("address"),
+            "address": model_addr,
         }
 
     except Exception as e:
@@ -693,6 +638,7 @@ def generate_reply_for_inbound(
             "scheduled_time": scheduled_time,
             "address": address,
         }
+
 
 
 
