@@ -699,7 +699,17 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # -------------------------------------------------
-        # *** INSERTED PATCH: ALWAYS CAPTURE RAW ADDRESS ***
+        # *** PATCH #1 — LOCK DATE/TIME IMMEDIATELY ***
+        # (Prevents re-asking for day/time)
+        # -------------------------------------------------
+        if sched.get("scheduled_date") and not model_date:
+            model_date = sched["scheduled_date"]
+
+        if sched.get("scheduled_time") and not model_time:
+            model_time = sched["scheduled_time"]
+
+        # -------------------------------------------------
+        # ALWAYS CAPTURE RAW ADDRESS
         # -------------------------------------------------
         if isinstance(model_addr, str) and len(model_addr) > 5:
             sched["raw_address"] = model_addr
@@ -743,7 +753,7 @@ def generate_reply_for_inbound(
             sms_body += phrase
 
         # --------------------------------------
-        # TIME FORMAT CLEANING
+        # TIME CLEANING
         # --------------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
@@ -755,6 +765,16 @@ def generate_reply_for_inbound(
             if (sms_body and model_time and human_time)
             else sms_body
         )
+
+        # -------------------------------------------------
+        # *** PATCH #2 — SAVE DATE/TIME BACK INTO STATE ***
+        # (Ensures future turns NEVER lose them)
+        # -------------------------------------------------
+        if model_date:
+            sched["scheduled_date"] = model_date
+
+        if model_time:
+            sched["scheduled_time"] = model_time
 
         # --------------------------------------
         # AUTO-BOOKING READINESS
