@@ -470,7 +470,91 @@ def incoming_sms():
 
     return Response(str(twilio_reply), mimetype="text/xml")
 
+# ---------------------------------------------------
+# Build System Prompt (Prevolt Rules Engine)
+# ---------------------------------------------------
+def build_system_prompt(
+    cleaned_transcript,
+    category,
+    appointment_type,
+    initial_sms,
+    scheduled_date,
+    scheduled_time,
+    address,
+    today_date_str,
+    today_weekday,
+    convo
+):
+    global PREVOLT_RULES_CACHE
 
+    # Load rules only once
+    if PREVOLT_RULES_CACHE is None:
+        with open("prevolt_rules.json", "r", encoding="utf-8") as f:
+            PREVOLT_RULES_CACHE = json.load(f)
+
+    rules_text = PREVOLT_RULES_CACHE.get("rules", "")
+
+    voicemail_intent = convo.get("voicemail_intent")
+    voicemail_town = convo.get("voicemail_town")
+    voicemail_partial_address = convo.get("voicemail_partial_address")
+
+    voicemail_context = ""
+    if voicemail_intent or voicemail_town or voicemail_partial_address:
+        voicemail_context += (
+            "\n\n===================================================\n"
+            "VOICEMAIL INSIGHTS (PRE-EXTRACTED)\n"
+            "===================================================\n"
+        )
+        if voicemail_intent:
+            voicemail_context += f"Intent mentioned in voicemail: {voicemail_intent}\n"
+        if voicemail_town:
+            voicemail_context += f"Town detected: {voicemail_town}\n"
+        if voicemail_partial_address:
+            voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
+
+    # STRICT JSON OUTPUT FORMAT FOR LLM
+    output_block = (
+        "{\n"
+        '  "sms_body": "string",\n'
+        '  "scheduled_date": "YYYY-MM-DD or null",\n'
+        '  "scheduled_time": "HH:MM or null",\n'
+        '  "address": "string or null"\n'
+        "}"
+    )
+
+    # Build the full prompt
+    system_prompt = (
+        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
+        "You MUST respond ONLY in strict JSON.\n\n"
+        f"Today is {today_date_str}, a {today_weekday}.\n\n"
+        f"{rules_text}"
+        f"{voicemail_context}\n\n"
+
+        "===================================================\n"
+        "STATE HANDLING RULES\n"
+        "===================================================\n"
+        "• NEVER ask again for information the customer already provided.\n"
+        "• ALWAYS inherit previously known values.\n"
+        "• NEVER output null if the value is already known.\n\n"
+
+        "===================================================\n"
+        "CURRENT CONTEXT\n"
+        "===================================================\n"
+        f"Original voicemail: {cleaned_transcript}\n"
+        f"Category: {category}\n"
+        f"Appointment type: {appointment_type}\n"
+        f"Initial SMS: {initial_sms}\n"
+        f"Stored date: {scheduled_date}\n"
+        f"Stored time: {scheduled_time}\n"
+        f"Stored address: {address}\n\n"
+
+        "===================================================\n"
+        "REQUIRED JSON OUTPUT FORMAT\n"
+        "===================================================\n"
+        f"{output_block}\n"
+    )
+
+    return system_prompt
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING
