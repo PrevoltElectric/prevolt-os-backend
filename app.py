@@ -455,130 +455,6 @@ def incoming_sms():
 
 
 # ---------------------------------------------------
-# REQUIRED IMPORTS FOR STEP 4
-# ---------------------------------------------------
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-
-
-
-# ---------------------------------------------------
-# STATE HELPERS (MINIMAL SAFE VERSIONS)
-# ---------------------------------------------------
-def get_current_state(conv: dict) -> str:
-
-    if conv.get("scheduled_date") and conv.get("scheduled_time") and conv.get("address"):
-        return "ready_for_confirmation"
-
-    if not conv.get("address"):
-        return "awaiting_address"
-
-    if not conv.get("scheduled_date") and not conv.get("scheduled_time"):
-        return "awaiting_date_or_time"
-
-    if conv.get("scheduled_date") and not conv.get("scheduled_time"):
-        return "awaiting_time"
-
-    if conv.get("scheduled_time") and not conv.get("scheduled_date"):
-        return "awaiting_date"
-
-    return "unknown"
-
-
-def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, scheduled_time):
-    return {}
-
-# ---------------------------------------------------
-# GLOBAL RULES CACHE (Required for System Prompt Loader)
-# ---------------------------------------------------
-PREVOLT_RULES_CACHE = None
-
-# ---------------------------------------------------
-# Build System Prompt (Prevolt Rules Engine)
-# ---------------------------------------------------
-def build_system_prompt(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    scheduled_date,
-    scheduled_time,
-    address,
-    today_date_str,
-    today_weekday,
-    convo
-):
-    global PREVOLT_RULES_CACHE
-
-    if PREVOLT_RULES_CACHE is None:
-        with open("prevolt_rules.json", "r", encoding="utf-8") as f:
-            PREVOLT_RULES_CACHE = json.load(f)
-
-    rules_text = PREVOLT_RULES_CACHE.get("rules", "")
-
-    voicemail_intent = convo.get("voicemail_intent")
-    voicemail_town = convo.get("voicemail_town")
-    voicemail_partial_address = convo.get("voicemail_partial_address")
-
-    voicemail_context = ""
-    if voicemail_intent or voicemail_town or voicemail_partial_address:
-        voicemail_context += (
-            "\n\n===================================================\n"
-            "VOICEMAIL INSIGHTS (PRE-EXTRACTED)\n"
-            "===================================================\n"
-        )
-        if voicemail_intent:
-            voicemail_context += f"Intent mentioned in voicemail: {voicemail_intent}\n"
-        if voicemail_town:
-            voicemail_context += f"Town detected: {voicemail_town}\n"
-        if voicemail_partial_address:
-            voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
-
-    output_block = (
-        "{\n"
-        '  "sms_body": "string",\n'
-        '  "scheduled_date": "YYYY-MM-DD or null",\n'
-        '  "scheduled_time": "HH:MM or null",\n'
-        '  "address": "string or null"\n'
-        "}"
-    )
-
-    system_prompt = (
-        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
-        "You MUST respond ONLY in strict JSON.\n\n"
-        f"Today is {today_date_str}, a {today_weekday}.\n\n"
-        f"{rules_text}"
-        f"{voicemail_context}\n\n"
-
-        "===================================================\n"
-        "STATE HANDLING RULES\n"
-        "===================================================\n"
-        "• NEVER ask again for information the customer already provided.\n"
-        "• ALWAYS inherit previously known values.\n"
-        "• NEVER output null if the value is already known.\n\n"
-
-        "===================================================\n"
-        "CURRENT CONTEXT\n"
-        "===================================================\n"
-        f"Original voicemail: {cleaned_transcript}\n"
-        f"Category: {category}\n"
-        f"Appointment type: {appointment_type}\n"
-        f"Initial SMS: {initial_sms}\n"
-        f"Stored date: {scheduled_date}\n"
-        f"Stored time: {scheduled_time}\n"
-        f"Stored address: {address}\n\n"
-
-        "===================================================\n"
-        "REQUIRED JSON OUTPUT FORMAT\n"
-        "===================================================\n"
-        f"{output_block}\n"
-    )
-
-    return system_prompt
-
-
-
-# ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING
 # ---------------------------------------------------
 def generate_reply_for_inbound(
@@ -651,7 +527,6 @@ def generate_reply_for_inbound(
         ]
 
         if any(marker in inbound_lower for marker in address_markers) and len(inbound_text) > 6:
-            # This is RAW text → store separately
             sched["raw_address"] = inbound_text.strip()
             address = sched["raw_address"]
 
@@ -665,7 +540,7 @@ def generate_reply_for_inbound(
             initial_sms,
             sched.get("scheduled_date"),
             sched.get("scheduled_time"),
-            sched.get("raw_address"),     # << important change
+            sched.get("raw_address"),
             today_date_str,
             today_weekday,
             conv
@@ -690,7 +565,16 @@ def generate_reply_for_inbound(
         sms_body   = ai_raw.get("sms_body", "").strip()
         model_date = ai_raw.get("scheduled_date")
         model_time = ai_raw.get("scheduled_time")
-        model_addr = ai_raw.get("address")   # May be string or null
+        model_addr = ai_raw.get("address")
+
+        # -------------------------------------------------
+        # HARD ADDRESS LOCK — FIXED
+        # -------------------------------------------------
+        # THE ADDRESS ALWAYS COMES FROM sched["raw_address"] FIRST
+        if sched.get("raw_address"):
+            model_addr = sched["raw_address"]
+        elif address:
+            model_addr = address
 
         # -------------------------------------------------
         # PATCH A — VOICEMAIL → SMS SYNC LOCK
@@ -699,21 +583,19 @@ def generate_reply_for_inbound(
             model_date = scheduled_date
         if not model_time and scheduled_time:
             model_time = scheduled_time
-        if not model_addr and address:
-            model_addr = address
 
         # State cannot regress
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
         if sched.get("scheduled_time") and not model_time:
             model_time = sched["scheduled_time"]
-        if sched.get("raw_address") and not model_addr:
+
+        # Address cannot regress
+        if not model_addr and sched.get("raw_address"):
             model_addr = sched["raw_address"]
 
         # -------------------------------------------------
-        # HARD ADDRESS RULE:
-        # raw string stays in raw_address
-        # normalized_address stays untouched unless Square updates it
+        # RAW ADDRESS ALWAYS STORED
         # -------------------------------------------------
         if isinstance(model_addr, str):
             sched["raw_address"] = model_addr
@@ -757,15 +639,16 @@ def generate_reply_for_inbound(
         if ready_for_booking:
             sched["scheduled_date"] = model_date
             sched["scheduled_time"] = model_time
-            # Pass raw text to booking system
-            sched["normalized_address"] = None  # ← real dict will appear after normalization
+
+            # NORMALIZATION WILL HAPPEN IN maybe_create_square_booking()
+            sched["normalized_address"] = None
             sched["raw_address"] = model_addr
 
             try:
                 maybe_create_square_booking(phone, conv)
+
                 if sched.get("booking_created"):
                     booking_id = sched.get("square_booking_id")
-
                     return {
                         "sms_body": (
                             f"You're all set — your appointment is booked for {model_date} "
@@ -777,11 +660,10 @@ def generate_reply_for_inbound(
                         "address": model_addr,
                         "booking_complete": True
                     }
+
             except Exception as e:
                 print("AUTO-BOOKING ERROR:", repr(e))
-                final_sms += (
-                    " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
-                )
+                final_sms += " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
 
         return {
             "sms_body": final_sms,
@@ -800,6 +682,7 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
 
 
 
