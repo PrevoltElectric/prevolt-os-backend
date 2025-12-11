@@ -462,14 +462,12 @@ def build_system_prompt(
 ):
     global PREVOLT_RULES_CACHE
 
-    # Load JSON rules once
     if PREVOLT_RULES_CACHE is None:
         with open("prevolt_rules.json", "r", encoding="utf-8") as f:
             PREVOLT_RULES_CACHE = json.load(f)
 
     rules_text = PREVOLT_RULES_CACHE.get("rules", "")
 
-    # Optional voicemail context
     voicemail_intent = convo.get("voicemail_intent")
     voicemail_town = convo.get("voicemail_town")
     voicemail_partial_address = convo.get("voicemail_partial_address")
@@ -488,9 +486,6 @@ def build_system_prompt(
         if voicemail_partial_address:
             voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
 
-    # ---------------------------------------------------
-    # OUTPUT FORMAT — NOW FULLY HARDENED FOR JSON SAFETY
-    # ---------------------------------------------------
     output_block = (
         "{\n"
         '  "sms_body": "string",\n'
@@ -500,15 +495,10 @@ def build_system_prompt(
         "}"
     )
 
-    # ---------------------------------------------------
-    # FULL SYSTEM PROMPT
-    # ---------------------------------------------------
     system_prompt = (
         "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
-        "You MUST respond ONLY in strict JSON. No comments. No trailing commas. No text outside JSON.\n"
-        "If a field is empty, ALWAYS return null (never None, never blank strings).\n"
-        "Never output 'None'. Always output null.\n\n"
-        f"Today is {today_date_str}, a {today_weekday}, local time America/New_York.\n\n"
+        "You MUST respond ONLY in strict JSON.\n\n"
+        f"Today is {today_date_str}, a {today_weekday}.\n\n"
         f"{rules_text}"
         f"{voicemail_context}\n\n"
 
@@ -516,13 +506,8 @@ def build_system_prompt(
         "STATE HANDLING RULES\n"
         "===================================================\n"
         "• NEVER ask again for information the customer already provided.\n"
-        "• If customer gives only a time → inherit date.\n"
-        "• If customer gives only a date → inherit time.\n"
-        "• If customer provides an address → never ask again.\n"
-        "• ALWAYS inherit previously known state values.\n"
-        "• NEVER output null if the value is already known.\n"
-        "• Avoid repeating acknowledgements.\n"
-        "• Include correct pricing exactly once if relevant.\n\n"
+        "• ALWAYS inherit previously known values.\n"
+        "• NEVER output null if the value is already known.\n\n"
 
         "===================================================\n"
         "CURRENT CONTEXT\n"
@@ -632,12 +617,8 @@ def generate_reply_for_inbound(
         )
 
         raw_json = completion.choices[0].message.content.strip()
-        raw_json = (
-            raw_json.replace("None", "null")
-                    .replace("none", "null")
-                    .replace("Null", "null")
-                    .replace("NULL", "null")
-        )
+        raw_json = raw_json.replace("None", "null").replace("none", "null")
+
         ai_raw = json.loads(raw_json)
 
         sms_body   = ai_raw.get("sms_body", "").strip()
@@ -645,51 +626,36 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
+        # -------------------------------------------------
+        # 🔒 HARD OVERRIDE: LLM CANNOT ERASE VALUES
+        # -------------------------------------------------
+        if not model_date and sched.get("scheduled_date"):
+            model_date = sched["scheduled_date"]
+
+        if not model_time and sched.get("scheduled_time"):
+            model_time = sched["scheduled_time"]
+
+        if not model_addr and sched.get("normalized_address"):
+            model_addr = sched["normalized_address"]
+
+        if not model_addr and address:
+            model_addr = address
+
+        # -------------------------------------------------
+        # PRICE INJECTION
+        # -------------------------------------------------
         price_map = {
             "eval_195": " The visit is a $195 consultation.",
             "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
             "whole_home_inspection": " Home inspections range from $375–$650 depending on size."
         }
-        price_phrase = price_map.get(appt_type.lower(), "")
-        if price_phrase and price_phrase not in sms_body:
-            sms_body += price_phrase
+        phrase = price_map.get(appt_type.lower(), "")
+        if phrase and phrase not in sms_body:
+            sms_body += phrase
 
-        # -----------------------------
-        # ADDRESS INHERITANCE (FIXED)
-        # -----------------------------
-        if not model_addr:
-            if sched.get("normalized_address"):
-                model_addr = sched["normalized_address"]
-            elif address:
-                model_addr = address
-
-        # -----------------------------
-        # DATE/TIME INHERITANCE (FIXED)
-        # -----------------------------
-        existing_date = sched.get("scheduled_date")
-        existing_time = sched.get("scheduled_time")
-
-        if not model_date and existing_date:
-            model_date = existing_date
-        if not model_time and existing_time:
-            model_time = existing_time
-
-        # If user gives only time → inherit date
-        if model_time and not model_date:
-            model_date = existing_date or today_date_str
-
-        # If user gives only date → inherit time
-        if model_date and not model_time:
-            model_time = existing_time
-
-        # -----------------------------
-        # NO ADDRESS INJECTION ANYMORE
-        # -----------------------------
-        # (Removed completely per your instruction)
-
-        # -----------------------------
+        # -------------------------------------------------
         # TIME FORMAT CLEANING
-        # -----------------------------
+        # -------------------------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except:
@@ -701,9 +667,9 @@ def generate_reply_for_inbound(
             else sms_body
         )
 
-        # -----------------------------
-        # AUTO-BOOKING ENGINE (FIXED)
-        # -----------------------------
+        # -------------------------------------------------
+        # AUTO-BOOKING LOGIC
+        # -------------------------------------------------
         ready_for_booking = (
             bool(model_date)
             and bool(model_time)
@@ -721,13 +687,12 @@ def generate_reply_for_inbound(
 
                 if sched.get("booking_created"):
                     booking_id = sched.get("square_booking_id")
-                    confirmation_sms = (
-                        f"You're all set — your appointment is booked for {model_date} "
-                        f"at {human_time} at {model_addr}. "
-                        f"Your confirmation number is {booking_id}."
-                    )
                     return {
-                        "sms_body": confirmation_sms,
+                        "sms_body": (
+                            f"You're all set — your appointment is booked for {model_date} "
+                            f"at {human_time} at {model_addr}. "
+                            f"Your confirmation number is {booking_id}."
+                        ),
                         "scheduled_date": model_date,
                         "scheduled_time": model_time,
                         "address": model_addr,
