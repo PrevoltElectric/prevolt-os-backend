@@ -671,18 +671,18 @@ def generate_reply_for_inbound(
         # --------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
-            response_format={"type":"json_object"},
+            response_format={"type": "json_object"},
             messages=[
-                {"role":"system","content":system_prompt},
-                {"role":"user","content":inbound_text},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": inbound_text},
             ],
         )
 
         raw_json = completion.choices[0].message.content.strip()
-        raw_json = raw_json.replace("None","null").replace("none","null")
+        raw_json = raw_json.replace("None", "null").replace("none", "null")
         ai_raw = json.loads(raw_json)
 
-        sms_body   = ai_raw.get("sms_body","").strip()
+        sms_body   = ai_raw.get("sms_body", "").strip()
         model_date = ai_raw.get("scheduled_date")
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
@@ -698,7 +698,7 @@ def generate_reply_for_inbound(
         # -------------------------------------------------
         # PATCH — Always capture raw address
         # -------------------------------------------------
-        if isinstance(model_addr,str) and len(model_addr)>5:
+        if isinstance(model_addr, str) and len(model_addr) > 5:
             sched["raw_address"] = model_addr
 
         # -------------------------------------------------
@@ -712,18 +712,18 @@ def generate_reply_for_inbound(
             model_addr = address
 
         # Finalize address memory
-        if isinstance(model_addr,str):
+        if isinstance(model_addr, str):
             sched["raw_address"] = model_addr
 
         # -------------------------------------------------
         # PRICE INJECTION
         # -------------------------------------------------
         price_map = {
-            "eval_195":" The visit is a $195 consultation.",
-            "troubleshoot_395":" The visit is a $395 troubleshoot and repair.",
-            "whole_home_inspection":" Home inspections range from $375–$650 depending on size."
+            "eval_195": " The visit is a $195 consultation.",
+            "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
+            "whole_home_inspection": " Home inspections range from $375–$650 depending on size."
         }
-        phrase = price_map.get(appt_type.lower(),"")
+        phrase = price_map.get(appt_type.lower(), "")
         if phrase and phrase not in sms_body:
             sms_body += phrase
 
@@ -731,23 +731,25 @@ def generate_reply_for_inbound(
         # Time formatting (12-hour conversion)
         # -------------------------------------------------
         try:
-            human_time = datetime.strptime(model_time,"%H:%M").strftime("%-I:%M %p") \
+            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") \
                 if model_time else None
         except:
             human_time = model_time
 
         final_sms = (
-            sms_body.replace(model_time,human_time)
+            sms_body.replace(model_time, human_time)
             if (sms_body and model_time and human_time)
             else sms_body
         )
 
         # -------------------------------------------------
-        # Save date/time back into memory
+        # PATCH — CORRECT DATE/TIME PRESERVATION
         # -------------------------------------------------
-        if model_date:
+        # Only update scheduler memory if the LLM actually provided a new value
+        if model_date is not None:
             sched["scheduled_date"] = model_date
-        if model_time:
+
+        if model_time is not None:
             sched["scheduled_time"] = model_time
 
         # -------------------------------------------------
@@ -767,7 +769,7 @@ def generate_reply_for_inbound(
             sched["raw_address"] = model_addr
 
             try:
-                maybe_create_square_booking(phone,conv)
+                maybe_create_square_booking(phone, conv)
 
                 if sched.get("booking_created"):
                     booking_id = sched.get("square_booking_id")
