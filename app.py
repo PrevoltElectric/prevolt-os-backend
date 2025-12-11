@@ -585,7 +585,7 @@ def build_system_prompt(
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING
-# COMPLETE + RESTORED + PATCHED
+# COMPLETE + RESTORED + PATCH 3 APPLIED
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -645,7 +645,6 @@ def generate_reply_for_inbound(
                 appt_type = "WHOLE_HOME_INSPECTION"
             else:
                 appt_type = "EVAL_195"
-
             sched["appointment_type"] = appt_type
 
         # --------------------------------------
@@ -662,7 +661,7 @@ def generate_reply_for_inbound(
             address = sched["raw_address"]
 
         # --------------------------------------
-        # Build LLM System Prompt (fixed & restored)
+        # Build LLM System Prompt
         # --------------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
@@ -699,8 +698,8 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # -------------------------------------------------
-        # *** PATCH #1 — LOCK DATE/TIME IMMEDIATELY ***
-        # (Prevents re-asking for day/time)
+        # PATCH 1 — DATE/TIME LOCK
+        # Ensures LLM cannot remove known date/time
         # -------------------------------------------------
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
@@ -709,40 +708,42 @@ def generate_reply_for_inbound(
             model_time = sched["scheduled_time"]
 
         # -------------------------------------------------
-        # ALWAYS CAPTURE RAW ADDRESS
+        # PATCH 3 — Always capture raw address
         # -------------------------------------------------
         if isinstance(model_addr, str) and len(model_addr) > 5:
             sched["raw_address"] = model_addr
 
-        # --------------------------------------
-        # SYNC LOCK: LLM cannot erase known values
-        # --------------------------------------
+        # -------------------------------------------------
+        # SYNC LOCK — Cannot erase known values
+        # -------------------------------------------------
         if not model_date and scheduled_date:
             model_date = scheduled_date
+
         if not model_time and scheduled_time:
             model_time = scheduled_time
+
         if not model_addr and address:
             model_addr = address
 
         # State cannot regress
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
+
         if sched.get("scheduled_time") and not model_time:
             model_time = sched["scheduled_time"]
 
-        # Address cannot regress
         if sched.get("raw_address") and not model_addr:
             model_addr = sched["raw_address"]
 
-        # --------------------------------------
+        # -------------------------------------------------
         # RAW ADDRESS FINALIZATION
-        # --------------------------------------
+        # -------------------------------------------------
         if isinstance(model_addr, str):
             sched["raw_address"] = model_addr
 
-        # --------------------------------------
+        # -------------------------------------------------
         # PRICE INJECTION
-        # --------------------------------------
+        # -------------------------------------------------
         price_map = {
             "eval_195": " The visit is a $195 consultation.",
             "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
@@ -752,11 +753,12 @@ def generate_reply_for_inbound(
         if phrase and phrase not in sms_body:
             sms_body += phrase
 
-        # --------------------------------------
-        # TIME CLEANING
-        # --------------------------------------
+        # -------------------------------------------------
+        # TIME FORMATTING (12-hour)
+        # -------------------------------------------------
         try:
-            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
+            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") \
+                if model_time else None
         except:
             human_time = model_time
 
@@ -767,8 +769,7 @@ def generate_reply_for_inbound(
         )
 
         # -------------------------------------------------
-        # *** PATCH #2 — SAVE DATE/TIME BACK INTO STATE ***
-        # (Ensures future turns NEVER lose them)
+        # PATCH 2 — SAVE DATE/TIME BACK INTO STATE
         # -------------------------------------------------
         if model_date:
             sched["scheduled_date"] = model_date
@@ -776,9 +777,9 @@ def generate_reply_for_inbound(
         if model_time:
             sched["scheduled_time"] = model_time
 
-        # --------------------------------------
-        # AUTO-BOOKING READINESS
-        # --------------------------------------
+        # -------------------------------------------------
+        # AUTO-BOOKING CHECK
+        # -------------------------------------------------
         ready_for_booking = (
             bool(model_date)
             and bool(model_time)
@@ -816,9 +817,9 @@ def generate_reply_for_inbound(
                     " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
                 )
 
-        # --------------------------------------
+        # -------------------------------------------------
         # NORMAL RETURN
-        # --------------------------------------
+        # -------------------------------------------------
         return {
             "sms_body": final_sms,
             "scheduled_date": model_date,
@@ -836,6 +837,7 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
 
 
 
