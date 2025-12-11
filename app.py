@@ -1133,6 +1133,33 @@ def map_appointment_type_to_variation(appointment_type: str):
     return None, None
 
 
+# ---------------------------------------------------
+# Time Window Helper — REQUIRED FOR BOOKING LOGIC
+# ---------------------------------------------------
+def is_within_normal_hours(time_str: str) -> bool:
+    """
+    Normal booking hours are 9:00–16:00 (4 PM). Input is 'HH:MM'.
+    """
+    try:
+        dt = datetime.strptime(time_str, "%H:%M")
+        return 9 <= dt.hour < 16
+    except:
+        return False
+
+
+# ---------------------------------------------------
+# Weekend Helper — REQUIRED FOR BOOKING LOGIC
+# ---------------------------------------------------
+def is_weekend(date_str: str) -> bool:
+    """
+    Returns True if the given YYYY-MM-DD date falls on a Saturday or Sunday.
+    """
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.weekday() >= 5  # 5 = Saturday, 6 = Sunday
+    except:
+        return False
+
 
 # ---------------------------------------------------
 # Create Square Booking (3-Layer Memory Compatible)
