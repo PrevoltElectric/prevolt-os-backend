@@ -371,7 +371,13 @@ def incoming_sms():
     initial_sms = conv.get("initial_sms")
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
-    address = sched.get("normalized_address")
+
+    # ********** CRITICAL FIX APPLIED HERE **********
+    # Always use raw_address FIRST (customer-typed)
+    # Fall back to normalized_address ONLY after Square creates it
+    address = sched.get("raw_address") or sched.get("normalized_address")
+    # ************************************************
+
 
     # ==========================================================
     # SNAPSHOT BEFORE REPLY (FOR DEBUG ONLY)
