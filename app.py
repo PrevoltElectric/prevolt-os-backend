@@ -585,7 +585,7 @@ def build_system_prompt(
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING
-# COMPLETE + RESTORED
+# COMPLETE + RESTORED + PATCHED
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -698,6 +698,12 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
+        # -------------------------------------------------
+        # *** INSERTED PATCH: ALWAYS CAPTURE RAW ADDRESS ***
+        # -------------------------------------------------
+        if isinstance(model_addr, str) and len(model_addr) > 5:
+            sched["raw_address"] = model_addr
+
         # --------------------------------------
         # SYNC LOCK: LLM cannot erase known values
         # --------------------------------------
@@ -713,6 +719,8 @@ def generate_reply_for_inbound(
             model_date = sched["scheduled_date"]
         if sched.get("scheduled_time") and not model_time:
             model_time = sched["scheduled_time"]
+
+        # Address cannot regress
         if sched.get("raw_address") and not model_addr:
             model_addr = sched["raw_address"]
 
@@ -761,7 +769,7 @@ def generate_reply_for_inbound(
         if ready_for_booking:
             sched["scheduled_date"] = model_date
             sched["scheduled_time"] = model_time
-            sched["normalized_address"] = None  # Square fills this
+            sched["normalized_address"] = None
             sched["raw_address"] = model_addr
 
             try:
