@@ -411,8 +411,13 @@ def incoming_sms():
         inbound_text,
         scheduled_date,
         scheduled_time,
-        address,
+
+        # ********** CRITICAL PATCH **********
+        # Always send the most current address memory
+        sched.get("raw_address") or sched.get("normalized_address")
+        # ************************************
     )
+
 
     # ==========================================================
     # APPLY REPLY TO SCHEDULER LAYER
