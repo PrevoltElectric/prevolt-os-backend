@@ -547,53 +547,7 @@ def build_system_prompt(
             voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
 
     # ---------------------------------------------------
-    # 🔐 HARD RESET-LOCK: MODEL MAY NOT REMOVE KNOWN VALUES
-    # ---------------------------------------------------
-    llm_reset_lock = f"""
-# ---------------------------------------------------
-# LLM RESET-LOCK RULESET (MANDATORY OVERRIDE)
-# ---------------------------------------------------
-def build_system_prompt(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    scheduled_date,
-    scheduled_time,
-    address,
-    today_date_str,
-    today_weekday,
-    convo
-):
-    global PREVOLT_RULES_CACHE
-
-    # Load rules only once
-    if PREVOLT_RULES_CACHE is None:
-        with open("prevolt_rules.json", "r", encoding="utf-8") as f:
-            PREVOLT_RULES_CACHE = json.load(f)
-
-    rules_text = PREVOLT_RULES_CACHE.get("rules", "")
-
-    voicemail_intent = convo.get("voicemail_intent")
-    voicemail_town = convo.get("voicemail_town")
-    voicemail_partial_address = convo.get("voicemail_partial_address")
-
-    voicemail_context = ""
-    if voicemail_intent or voicemail_town or voicemail_partial_address:
-        voicemail_context += (
-            "\n\n===================================================\n"
-            "VOICEMAIL INSIGHTS (PRE-EXTRACTED)\n"
-            "===================================================\n"
-        )
-        if voicemail_intent:
-            voicemail_context += f"Intent mentioned in voicemail: {voicemail_intent}\n"
-        if voicemail_town:
-            voicemail_context += f"Town detected: {voicemail_town}\n"
-        if voicemail_partial_address:
-            voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
-
-    # ---------------------------------------------------
-    # LLM RESET-LOCK RULE HEADER
+    # LLM RESET-LOCK — NOT nested, NOT duplicated
     # ---------------------------------------------------
     llm_reset_lock = f"""
 ===================================================
@@ -602,22 +556,20 @@ LLM RESET-LOCK RULES (MANDATORY)
 You MUST obey these rules with zero exceptions:
 
 1. If a value is already known, YOU MUST NOT change it:
-   • Scheduled date: {scheduled_date}
-   • Scheduled time: {scheduled_time}
-   • Address: {address}
+   - Scheduled date: {scheduled_date}
+   - Scheduled time: {scheduled_time}
+   - Address: {address}
 
-2. You MUST NOT output null for any of these fields if they already have a value.
+2. You MUST NOT output null for any field that already has a stored value.
 
-3. If the customer message does NOT provide a new date/time/address,
-   you MUST reuse the stored value above.
+3. If the customer did NOT provide a new date/time/address,
+   you MUST reuse the stored value exactly.
 
-4. If the stored value is present, you may NOT reinterpret or modify it.
-   You must return it exactly.
+4. If a stored value exists, you may NOT reinterpret, modify, or clear it.
 
-5. If the customer’s message contains a new address/date/time,
-   ONLY THEN are you allowed to update it — never otherwise.
+5. You may ONLY update date/time/address if the customer explicitly gives a new one.
 
-6. If uncertain, ALWAYS inherit the previous value.
+6. When uncertain, ALWAYS inherit the previous known value.
 
 7. NEVER re-ask for information that already exists in memory.
 
@@ -644,7 +596,7 @@ These rules override ALL other instructions.
         "STATE HANDLING RULES\n"
         "===================================================\n"
         "• NEVER ask again for information the customer already provided.\n"
-        "• ALWAYS inherit previously known values.\n"
+        "• ALWAYS inherit stored values.\n"
         "• NEVER output null if the value is already known.\n\n"
         "===================================================\n"
         "CURRENT CONTEXT\n"
@@ -665,11 +617,11 @@ These rules override ALL other instructions.
     return system_prompt
 
 
-
 # ---------------------------------------------------
 # PRICE INJECTION (PATCH D1 — inject only ONCE)
 # ---------------------------------------------------
 def apply_price_injection(appt_type, sms_body):
+
     price_map = {
         "eval_195": " The visit is a $195 consultation.",
         "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
@@ -678,7 +630,7 @@ def apply_price_injection(appt_type, sms_body):
 
     phrase = price_map.get(appt_type.lower(), "")
     if not phrase:
-        return sms_body  # no change
+        return sms_body
 
     lower_sms = sms_body.lower()
 
@@ -692,7 +644,7 @@ def apply_price_injection(appt_type, sms_body):
         "inspection" in lower_sms
     )
 
-    # Confirmation-style message?
+    # Confirmation-style messages should NOT inject pricing
     is_confirmation = (
         "sounds good" in lower_sms or
         "let's do" in lower_sms or
