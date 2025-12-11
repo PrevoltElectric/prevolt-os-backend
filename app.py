@@ -566,6 +566,9 @@ def generate_reply_for_inbound(
 
         inbound_lower = inbound_text.lower()
 
+        # -------------------------------------------------
+        # APPOINTMENT TYPE DETECTION
+        # -------------------------------------------------
         appt_type = sched.get("appointment_type")
         if not appt_type:
             if any(word in inbound_lower for word in [
@@ -581,6 +584,9 @@ def generate_reply_for_inbound(
                 appt_type = "EVAL_195"
             sched["appointment_type"] = appt_type
 
+        # -------------------------------------------------
+        # HARD ADDRESS CAPTURE
+        # -------------------------------------------------
         address_markers = [
             "st", "street",
             "ave", "avenue",
@@ -594,6 +600,9 @@ def generate_reply_for_inbound(
             sched["normalized_address"] = inbound_text.strip()
             address = sched["normalized_address"]
 
+        # -------------------------------------------------
+        # RUN AI MODEL
+        # -------------------------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
@@ -618,7 +627,6 @@ def generate_reply_for_inbound(
 
         raw_json = completion.choices[0].message.content.strip()
         raw_json = raw_json.replace("None", "null").replace("none", "null")
-
         ai_raw = json.loads(raw_json)
 
         sms_body   = ai_raw.get("sms_body", "").strip()
@@ -627,7 +635,7 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # -------------------------------------------------
-        # 🔒 HARD OVERRIDE: LLM CANNOT ERASE VALUES
+        # 🔒 HARD OVERRIDE — LLM CANNOT REMOVE SAVED VALUES
         # -------------------------------------------------
         if not model_date and sched.get("scheduled_date"):
             model_date = sched["scheduled_date"]
@@ -635,14 +643,24 @@ def generate_reply_for_inbound(
         if not model_time and sched.get("scheduled_time"):
             model_time = sched["scheduled_time"]
 
+        # address fallback #1 — scheduler layer
         if not model_addr and sched.get("normalized_address"):
             model_addr = sched["normalized_address"]
 
+        # address fallback #2 — Step 4 local variable
         if not model_addr and address:
             model_addr = address
 
         # -------------------------------------------------
-        # PRICE INJECTION
+        # ⭐ NEW FIX: address fallback #3 — profile memory
+        # -------------------------------------------------
+        if not model_addr:
+            profile_addrs = profile.get("addresses", [])
+            if profile_addrs:
+                model_addr = profile_addrs[-1]   # last known address
+
+        # -------------------------------------------------
+        # PRICE INJECTION — FIXED TO NEVER DUPLICATE
         # -------------------------------------------------
         price_map = {
             "eval_195": " The visit is a $195 consultation.",
@@ -650,11 +668,13 @@ def generate_reply_for_inbound(
             "whole_home_inspection": " Home inspections range from $375–$650 depending on size."
         }
         phrase = price_map.get(appt_type.lower(), "")
-        if phrase and phrase not in sms_body:
+
+        # FIX: Only add if "195" / "395" / "650" does NOT appear already
+        if phrase and all(x not in sms_body for x in ["195", "395", "650"]):
             sms_body += phrase
 
         # -------------------------------------------------
-        # TIME FORMAT CLEANING
+        # TIME NORMALIZATION
         # -------------------------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
@@ -668,7 +688,7 @@ def generate_reply_for_inbound(
         )
 
         # -------------------------------------------------
-        # AUTO-BOOKING LOGIC
+        # AUTO-BOOKING
         # -------------------------------------------------
         ready_for_booking = (
             bool(model_date)
@@ -720,6 +740,7 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
 
 
 
