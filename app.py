@@ -183,35 +183,78 @@ def clean_transcript_text(raw_text: str) -> str:
 
 
 # ---------------------------------------------------
-# Step 3 — Generate Initial SMS (Ultra-Deterministic Classifier)
+# Step 3 — Voicemail Classifier + Info Extraction (NO SMS GENERATION)
 # ---------------------------------------------------
 def generate_initial_sms(cleaned_text: str) -> dict:
+    """
+    NEW STEP 3 (Option C):
+    • Does NOT generate SMS.
+    • Only classifies voicemail + extracts address/date/time/intent.
+    • Step 4 will generate ALL outgoing text.
+    """
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
+            response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
-                        "Your job is to classify the voicemail into EXACTLY ONE appointment type.\n\n"
-                        "APPOINTMENT TYPE RULES (DO NOT GUESS):\n"
-                        "1. TROUBLESHOOT_395 = ANY active problem, urgent issue, outage, burning smell, fire, "
-                        "   wires down, tree damage, main wires pulled, breaker tripping, no power, partial power, "
-                        "   anything dangerous, anything affecting existing equipment.\n"
-                        "2. WHOLE_HOME_INSPECTION = ONLY when caller explicitly says: "
-                        "   'inspection', 'whole home inspection', 'electrical inspection', "
-                        "   or requests a safety inspection for insurance or buying a home.\n"
-                        "3. EVAL_195 = Quotes, upgrades, installs, adding circuits, panel upgrades, EV chargers, "
-                        "   generator installs, renovations, pricing requests, or non-emergency consultations.\n\n"
-                        "NEVER misclassify outages as inspections or evals. When in doubt between eval and troubleshoot → choose TROUBLESHOOT.\n"
-                        "NEVER soften or second-guess. Use hard classification logic ONLY based on the voicemail.\n\n"
-                        "SMS RULES:\n"
-                        "• Must begin with: 'Hi, this is Prevolt Electric —'\n"
-                        "• Mention the price ONCE.\n"
-                        "• No small talk, no emojis, no fluff.\n"
-                        "• Do NOT ask them to repeat the voicemail.\n\n"
-                        "Return STRICT JSON: {sms_body, category, appointment_type}."
+                        "You are Prevolt OS, the voicemail classifier for Prevolt Electric.\n"
+                        "You DO NOT write SMS messages.\n"
+                        "Your ONLY job is to extract structured data from the voicemail.\n\n"
+
+                        "========================================\n"
+                        "APPOINTMENT TYPE RULES\n"
+                        "========================================\n"
+                        "• TROUBLESHOOT_395 = ANY outage, burning smell, dangerous issue, "
+                        "  breaker problems, sparking, fire risk, wires down, tree damage, etc.\n"
+                        "• WHOLE_HOME_INSPECTION = ONLY if they explicitly say: "
+                        "  'inspection', 'whole home inspection', 'electrical inspection'.\n"
+                        "• EVAL_195 = Everything else: installs, upgrades, quotes, EV chargers, "
+                        "  generators, renovations, pricing questions, consultations.\n"
+                        "• When unsure between eval and troubleshoot → choose TROUBLESHOOT.\n\n"
+
+                        "========================================\n"
+                        "NATURAL LANGUAGE DATE/TIME EXTRACTION\n"
+                        "========================================\n"
+                        "Interpret natural language dates such as:\n"
+                        "• 'next Tuesday'\n"
+                        "• 'this Friday'\n"
+                        "• 'on the 21st'\n"
+                        "• 'tomorrow'\n"
+                        "• 'Sunday morning'\n\n"
+                        "Convert them into real calendar values:\n"
+                        "• scheduled_date = 'YYYY-MM-DD' or null\n"
+                        "• scheduled_time = 'HH:MM' in 24-hour time or null\n\n"
+
+                        "========================================\n"
+                        "ADDRESS EXTRACTION\n"
+                        "========================================\n"
+                        "If voicemail mentions a street, road, ave, lane, etc., extract it.\n"
+                        "Otherwise return null.\n\n"
+
+                        "========================================\n"
+                        "INTENT DETECTION\n"
+                        "========================================\n"
+                        "intent must be ONE of:\n"
+                        "• 'schedule' — caller clearly wants an appointment\n"
+                        "• 'quote' — caller is pricing or exploring options\n"
+                        "• 'emergency' — outage, burning smell, wires, tree damage, anything urgent\n"
+                        "• 'other' — cannot determine\n\n"
+
+                        "========================================\n"
+                        "REQUIRED STRICT JSON OUTPUT\n"
+                        "========================================\n"
+                        "{\n"
+                        "  'category': 'string',\n"
+                        "  'appointment_type': 'string',\n"
+                        "  'detected_address': 'string or null',\n"
+                        "  'detected_date': 'YYYY-MM-DD or null',\n"
+                        "  'detected_time': 'HH:MM or null',\n"
+                        "  'intent': 'schedule' | 'quote' | 'emergency' | 'other'\n"
+                        "}\n"
+                        "NO OTHER FIELDS. NO SMS BODY. NO FLUFF."
                     ),
                 },
                 {"role": "user", "content": cleaned_text},
@@ -220,21 +263,26 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
         data = json.loads(completion.choices[0].message.content)
 
+        # Return classification + extracted fields ONLY
         return {
-            "sms_body": data["sms_body"].strip(),
-            "category": data["category"],
-            "appointment_type": data["appointment_type"],
+            "category": data.get("category"),
+            "appointment_type": data.get("appointment_type"),
+            "detected_address": data.get("detected_address"),
+            "detected_date": data.get("detected_date"),
+            "detected_time": data.get("detected_time"),
+            "intent": data.get("intent")
         }
 
     except Exception as e:
-        print("Initial SMS FAILED:", repr(e))
+        print("Voicemail classifier FAILED:", repr(e))
+        # Fail-safe: still NO SMS — Step 4 will handle fallback messaging
         return {
-            "sms_body": (
-                "Hi, this is Prevolt Electric — I received your message. "
-                "What day works for a visit?"
-            ),
             "category": "OTHER",
             "appointment_type": "EVAL_195",
+            "detected_address": None,
+            "detected_date": None,
+            "detected_time": None,
+            "intent": "other"
         }
 
 
@@ -529,6 +577,7 @@ def build_system_prompt(
     return system_prompt
 
 
+
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING
 # ---------------------------------------------------
@@ -544,6 +593,9 @@ def generate_reply_for_inbound(
 ) -> dict:
 
     try:
+        # --------------------------------------
+        # Timezone and now()
+        # --------------------------------------
         try:
             tz = ZoneInfo("America/New_York")
         except:
@@ -553,6 +605,9 @@ def generate_reply_for_inbound(
         today_date_str = now_local.strftime("%Y-%m-%d")
         today_weekday  = now_local.strftime("%A")
 
+        # --------------------------------------
+        # Conversation load
+        # --------------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         conv  = conversations.setdefault(phone, {})
 
@@ -560,12 +615,12 @@ def generate_reply_for_inbound(
         conv.setdefault("current_job", {})
         conv.setdefault("sched", {})
 
-        profile     = conv["profile"]
-        current_job = conv["current_job"]
-        sched       = conv["sched"]
-
+        sched = conv["sched"]
         inbound_lower = inbound_text.lower()
 
+        # --------------------------------------
+        # APPOINTMENT TYPE (fallback)
+        # --------------------------------------
         appt_type = sched.get("appointment_type")
         if not appt_type:
             if any(word in inbound_lower for word in [
@@ -581,19 +636,21 @@ def generate_reply_for_inbound(
                 appt_type = "EVAL_195"
             sched["appointment_type"] = appt_type
 
+        # --------------------------------------
+        # HARD ADDRESS CAPTURE
+        # --------------------------------------
         address_markers = [
-            "st", "street",
-            "ave", "avenue",
-            "rd", "road",
-            "ln", "lane",
-            "dr", "drive",
-            "ct", "circle",
+            "st", "street", "ave", "avenue", "rd", "road",
+            "ln", "lane", "dr", "drive", "ct", "circle",
             "blvd", "way"
         ]
         if any(marker in inbound_lower for marker in address_markers) and len(inbound_text) > 6:
             sched["normalized_address"] = inbound_text.strip()
             address = sched["normalized_address"]
 
+        # --------------------------------------
+        # BUILD SYSTEM PROMPT
+        # --------------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
             category,
@@ -607,18 +664,20 @@ def generate_reply_for_inbound(
             conv
         )
 
+        # --------------------------------------
+        # LLM CALL
+        # --------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": inbound_text},
+                {"role": "user",   "content": inbound_text},
             ],
         )
 
         raw_json = completion.choices[0].message.content.strip()
         raw_json = raw_json.replace("None", "null").replace("none", "null")
-
         ai_raw = json.loads(raw_json)
 
         sms_body   = ai_raw.get("sms_body", "").strip()
@@ -627,19 +686,23 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # -------------------------------------------------
-        # 🔒 HARD OVERRIDE: LLM CANNOT ERASE VALUES
+        # PATCH A — VOICEMAIL → SMS SYNC LOCK
         # -------------------------------------------------
-        if not model_date and sched.get("scheduled_date"):
-            model_date = sched["scheduled_date"]
-
-        if not model_time and sched.get("scheduled_time"):
-            model_time = sched["scheduled_time"]
-
-        if not model_addr and sched.get("normalized_address"):
-            model_addr = sched["normalized_address"]
-
+        # 1. LLM cannot erase voicemail-derived date/time/address
+        if not model_date and scheduled_date:
+            model_date = scheduled_date
+        if not model_time and scheduled_time:
+            model_time = scheduled_time
         if not model_addr and address:
             model_addr = address
+
+        # 2. State cannot regress
+        if sched.get("scheduled_date") and not model_date:
+            model_date = sched["scheduled_date"]
+        if sched.get("scheduled_time") and not model_time:
+            model_time = sched["scheduled_time"]
+        if sched.get("normalized_address") and not model_addr:
+            model_addr = sched["normalized_address"]
 
         # -------------------------------------------------
         # PRICE INJECTION
@@ -654,7 +717,7 @@ def generate_reply_for_inbound(
             sms_body += phrase
 
         # -------------------------------------------------
-        # TIME FORMAT CLEANING
+        # TIME CLEANING
         # -------------------------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
@@ -668,7 +731,7 @@ def generate_reply_for_inbound(
         )
 
         # -------------------------------------------------
-        # AUTO-BOOKING LOGIC
+        # AUTO-BOOKING
         # -------------------------------------------------
         ready_for_booking = (
             bool(model_date)
@@ -684,9 +747,9 @@ def generate_reply_for_inbound(
 
             try:
                 maybe_create_square_booking(phone, conv)
-
                 if sched.get("booking_created"):
                     booking_id = sched.get("square_booking_id")
+
                     return {
                         "sms_body": (
                             f"You're all set — your appointment is booked for {model_date} "
@@ -698,10 +761,11 @@ def generate_reply_for_inbound(
                         "address": model_addr,
                         "booking_complete": True
                     }
-
             except Exception as e:
                 print("AUTO-BOOKING ERROR:", repr(e))
-                final_sms += " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
+                final_sms += (
+                    " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
+                )
 
         return {
             "sms_body": final_sms,
@@ -720,6 +784,7 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
 
 
 
