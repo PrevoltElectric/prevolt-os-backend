@@ -331,7 +331,6 @@ def incoming_sms():
     # ==========================================================
     conv = conversations.setdefault(phone, {})
 
-    # Create profile layer if missing
     if "profile" not in conv:
         conv["profile"] = {
             "name": None,
@@ -340,14 +339,12 @@ def incoming_sms():
             "past_jobs": []
         }
 
-    # Create current job layer if missing
     if "current_job" not in conv:
         conv["current_job"] = {
             "job_type": None,
             "raw_description": None
         }
 
-    # Create scheduler layer if missing
     if "sched" not in conv:
         conv["sched"] = {
             "pending_step": None,
@@ -373,8 +370,7 @@ def incoming_sms():
     scheduled_time = sched.get("scheduled_time")
 
     # ********** CRITICAL FIX APPLIED HERE **********
-    # Always use raw_address FIRST (customer-typed)
-    # Fall back to normalized_address ONLY after Square creates it
+    # Always use raw_address FIRST (the reliable, customer-typed one)
     address = sched.get("raw_address") or sched.get("normalized_address")
     # ************************************************
 
@@ -389,6 +385,26 @@ def incoming_sms():
         "appointment_type": appointment_type,
         "category": category
     }
+
+    # ==========================================================
+    # *************** INITIAL SMS ADDRESS PATCH ***************
+    # Pull address out of the FIRST outbound message if memory lost
+    # Example initial_sms format:
+    # "Thanks for confirming your address (45 Dickerman Ave Windsor Locks)."
+    # ==========================================================
+    try:
+        if initial_sms and "(" in initial_sms and ")" in initial_sms:
+            import re
+            m = re.search(r"\((.*?)\)", initial_sms)
+            if m:
+                extracted_addr = m.group(1).strip()
+                if extracted_addr and not sched.get("raw_address"):
+                    sched["raw_address"] = extracted_addr
+                    address = extracted_addr
+    except Exception as e:
+        print("Initial SMS extraction failed:", repr(e))
+    # ***********************************************************
+
 
     # ==========================================================
     # GENERATE AI REPLY (NO STRUCTURE CHANGE TO DOWNSTREAM CODE)
@@ -412,25 +428,22 @@ def incoming_sms():
     sched["normalized_address"] = reply.get("address")
 
     # ==========================================================
-    # IF BOOKING COMPLETED (DETECTED BY LLM), MOVE INTO PROFILE
+    # IF BOOKING COMPLETED, MOVE INTO PROFILE MEMORY
     # ==========================================================
     if reply.get("booking_complete"):
 
-        # Store upcoming appointment in profile memory
         profile["upcoming_appointment"] = {
             "date": sched.get("scheduled_date"),
             "time": sched.get("scheduled_time"),
             "type": sched.get("appointment_type")
         }
 
-        # Add to job history if job exists
         if current_job.get("job_type"):
             profile["past_jobs"].append({
                 "type": current_job["job_type"],
                 "date": sched.get("scheduled_date")
             })
 
-        # FULL scheduler reset (core fix)
         conv["sched"] = {
             "pending_step": None,
             "scheduled_date": None,
@@ -456,136 +469,6 @@ def incoming_sms():
     twilio_reply.message(reply["sms_body"])
 
     return Response(str(twilio_reply), mimetype="text/xml")
-
-
-
-
-# ---------------------------------------------------
-# REQUIRED IMPORTS FOR STEP 4
-# ---------------------------------------------------
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-import json
-
-
-# ---------------------------------------------------
-# STATE HELPERS (MINIMAL SAFE VERSIONS)
-# ---------------------------------------------------
-def get_current_state(conv: dict) -> str:
-
-    if conv.get("scheduled_date") and conv.get("scheduled_time") and conv.get("address"):
-        return "ready_for_confirmation"
-
-    if not conv.get("address"):
-        return "awaiting_address"
-
-    if not conv.get("scheduled_date") and not conv.get("scheduled_time"):
-        return "awaiting_date_or_time"
-
-    if conv.get("scheduled_date") and not conv.get("scheduled_time"):
-        return "awaiting_time"
-
-    if conv.get("scheduled_time") and not conv.get("scheduled_date"):
-        return "awaiting_date"
-
-    return "unknown"
-
-
-def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, scheduled_time):
-    return {}
-
-
-
-# ---------------------------------------------------
-# GLOBAL RULES CACHE (REQUIRED FOR SYSTEM PROMPT LOADER)
-# ---------------------------------------------------
-PREVOLT_RULES_CACHE = None
-
-
-
-# ---------------------------------------------------
-# Build System Prompt (Prevolt Rules Engine) — RESTORED
-# ---------------------------------------------------
-def build_system_prompt(
-    cleaned_transcript,
-    category,
-    appointment_type,
-    initial_sms,
-    scheduled_date,
-    scheduled_time,
-    address,
-    today_date_str,
-    today_weekday,
-    convo
-):
-    global PREVOLT_RULES_CACHE
-
-    # Load once
-    if PREVOLT_RULES_CACHE is None:
-        with open("prevolt_rules.json", "r", encoding="utf-8") as f:
-            PREVOLT_RULES_CACHE = json.load(f)
-
-    rules_text = PREVOLT_RULES_CACHE.get("rules", "")
-
-    voicemail_intent = convo.get("voicemail_intent")
-    voicemail_town = convo.get("voicemail_town")
-    voicemail_partial_address = convo.get("voicemail_partial_address")
-
-    voicemail_context = ""
-    if voicemail_intent or voicemail_town or voicemail_partial_address:
-        voicemail_context += (
-            "\n\n===================================================\n"
-            "VOICEMAIL INSIGHTS (PRE-EXTRACTED)\n"
-            "===================================================\n"
-        )
-        if voicemail_intent:
-            voicemail_context += f"Intent mentioned in voicemail: {voicemail_intent}\n"
-        if voicemail_town:
-            voicemail_context += f"Town detected: {voicemail_town}\n"
-        if voicemail_partial_address:
-            voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
-
-    output_block = (
-        "{\n"
-        '  "sms_body": "string",\n'
-        '  "scheduled_date": "YYYY-MM-DD or null",\n'
-        '  "scheduled_time": "HH:MM or null",\n'
-        '  "address": "string or null"\n'
-        "}"
-    )
-
-    system_prompt = (
-        "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
-        "You MUST respond ONLY in strict JSON.\n\n"
-        f"Today is {today_date_str}, a {today_weekday}.\n\n"
-        f"{rules_text}"
-        f"{voicemail_context}\n\n"
-
-        "===================================================\n"
-        "STATE HANDLING RULES\n"
-        "===================================================\n"
-        "• NEVER ask again for information the customer already provided.\n"
-        "• ALWAYS inherit previously known values.\n"
-        "• NEVER output null if the value is already known.\n\n"
-
-        "===================================================\n"
-        "CURRENT CONTEXT\n"
-        "===================================================\n"
-        f"Original voicemail: {cleaned_transcript}\n"
-        f"Category: {category}\n"
-        f"Appointment type: {appointment_type}\n"
-        f"Initial SMS: {initial_sms}\n"
-        f"Stored date: {scheduled_date}\n"
-        f"Stored time: {scheduled_time}\n"
-        f"Stored address: {address}\n\n"
-
-        "===================================================\n"
-        "REQUIRED JSON OUTPUT FORMAT\n"
-        "===================================================\n"
-        f"{output_block}\n"
-    )
-
-    return system_prompt
 
 
 
