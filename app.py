@@ -550,6 +550,52 @@ def build_system_prompt(
     # 🔐 HARD RESET-LOCK: MODEL MAY NOT REMOVE KNOWN VALUES
     # ---------------------------------------------------
     llm_reset_lock = f"""
+# ---------------------------------------------------
+# LLM RESET-LOCK RULESET (MANDATORY OVERRIDE)
+# ---------------------------------------------------
+def build_system_prompt(
+    cleaned_transcript,
+    category,
+    appointment_type,
+    initial_sms,
+    scheduled_date,
+    scheduled_time,
+    address,
+    today_date_str,
+    today_weekday,
+    convo
+):
+    global PREVOLT_RULES_CACHE
+
+    # Load rules only once
+    if PREVOLT_RULES_CACHE is None:
+        with open("prevolt_rules.json", "r", encoding="utf-8") as f:
+            PREVOLT_RULES_CACHE = json.load(f)
+
+    rules_text = PREVOLT_RULES_CACHE.get("rules", "")
+
+    voicemail_intent = convo.get("voicemail_intent")
+    voicemail_town = convo.get("voicemail_town")
+    voicemail_partial_address = convo.get("voicemail_partial_address")
+
+    voicemail_context = ""
+    if voicemail_intent or voicemail_town or voicemail_partial_address:
+        voicemail_context += (
+            "\n\n===================================================\n"
+            "VOICEMAIL INSIGHTS (PRE-EXTRACTED)\n"
+            "===================================================\n"
+        )
+        if voicemail_intent:
+            voicemail_context += f"Intent mentioned in voicemail: {voicemail_intent}\n"
+        if voicemail_town:
+            voicemail_context += f"Town detected: {voicemail_town}\n"
+        if voicemail_partial_address:
+            voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
+
+    # ---------------------------------------------------
+    # LLM RESET-LOCK RULE HEADER
+    # ---------------------------------------------------
+    llm_reset_lock = f"""
 ===================================================
 LLM RESET-LOCK RULES (MANDATORY)
 ===================================================
@@ -580,10 +626,10 @@ These rules override ALL other instructions.
 
     output_block = (
         "{\n"
-        '  \"sms_body\": \"string\",\n'
-        '  \"scheduled_date\": \"YYYY-MM-DD or null\",\n'
-        '  \"scheduled_time\": \"HH:MM or null\",\n'
-        '  \"address\": \"string or null\"\n'
+        '  "sms_body": "string",\n'
+        '  "scheduled_date": "YYYY-MM-DD or null",\n'
+        '  "scheduled_time": "HH:MM or null",\n'
+        '  "address": "string or null"\n'
         "}"
     )
 
@@ -618,138 +664,133 @@ These rules override ALL other instructions.
 
     return system_prompt
 
-        
-        # -------------------------------------------------
-        # PRICE INJECTION (PATCH D1 — Only inject ONCE)
-        # -------------------------------------------------
-        price_map = {
-            "eval_195": " The visit is a $195 consultation.",
-            "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
-            "whole_home_inspection": " Home inspections range from $375–$650 depending on size."
-        }
 
-        phrase = price_map.get(appt_type.lower(), "")
 
-        # Only inject price if:
-        #   • This is the FIRST substantive reply
-        #   • The SMS is not a confirmation message
-        #   • The customer hasn't already seen pricing
-        if phrase:
-            lower_sms = sms_body.lower()
-            already_contains_price = (
-                "$195" in lower_sms or
-                "$395" in lower_sms or
-                "$375" in lower_sms or
-                "consultation" in lower_sms or
-                "repair" in lower_sms or
-                "inspection" in lower_sms
-            )
+# ---------------------------------------------------
+# PRICE INJECTION (PATCH D1 — inject only ONCE)
+# ---------------------------------------------------
+def apply_price_injection(appt_type, sms_body):
+    price_map = {
+        "eval_195": " The visit is a $195 consultation.",
+        "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
+        "whole_home_inspection": " Home inspections range from $375–$650 depending on size."
+    }
 
-            is_confirmation = (
-                "sounds good" in lower_sms or
-                "let's do" in lower_sms or
-                "book" in lower_sms or
-                "that works" in lower_sms or
-                "perfect" in lower_sms
-            )
+    phrase = price_map.get(appt_type.lower(), "")
+    if not phrase:
+        return sms_body  # no change
 
-            if not already_contains_price and not is_confirmation:
-                sms_body += phrase
+    lower_sms = sms_body.lower()
 
-        # -------------------------------------------------
-        # Time formatting (12-hour conversion)
-        # -------------------------------------------------
-        try:
-            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") \
-                if model_time else None
-        except:
-            human_time = model_time
+    # Already contains pricing?
+    already_contains_price = (
+        "$195" in lower_sms or
+        "$395" in lower_sms or
+        "$375" in lower_sms or
+        "consultation" in lower_sms or
+        "repair" in lower_sms or
+        "inspection" in lower_sms
+    )
 
-        final_sms = (
-            sms_body.replace(model_time, human_time)
-            if (sms_body and model_time and human_time)
-            else sms_body
-        )
+    # Confirmation-style message?
+    is_confirmation = (
+        "sounds good" in lower_sms or
+        "let's do" in lower_sms or
+        "book" in lower_sms or
+        "that works" in lower_sms or
+        "perfect" in lower_sms
+    )
 
-        # -------------------------------------------------
-        # PATCH — CORRECT DATE/TIME PRESERVATION
-        # -------------------------------------------------
-        if model_date is not None:
-            sched["scheduled_date"] = model_date
+    if not already_contains_price and not is_confirmation:
+        sms_body += phrase
 
-        if model_time is not None:
-            sched["scheduled_time"] = model_time
+    return sms_body
 
-        # -------------------------------------------------
-        # AUTO-BOOKING LOGIC (PATCH E1 — HARD GATEKEEPING)
-        # -------------------------------------------------
-        # NEVER autobook unless:
-        #   • date is known
-        #   • time is known
-        #   • raw_address is locked in
-        #   • appointment_type is confirmed
-        #   • no pending_step exists
-        #   • conversation is NOT asking for anything else
-        ready_for_booking = (
-            bool(model_date)
-            and bool(model_time)
-            and bool(sched.get("raw_address"))
-            and bool(sched.get("appointment_type"))
-            and not sched.get("pending_step")
-            and not sched.get("booking_created")
-        )
 
-        if ready_for_booking:
-            # Freeze memory before Square call
-            sched["scheduled_date"] = model_date
-            sched["scheduled_time"] = model_time
-            sched["normalized_address"] = None
-            sched["raw_address"] = model_addr
 
-            try:
-                maybe_create_square_booking(phone, conv)
+# ---------------------------------------------------
+# AUTO-BOOKING GATEKEEPING (PATCH E1 — safety)
+# ---------------------------------------------------
+def ready_for_autobook(model_date, model_time, sched):
+    return (
+        bool(model_date)
+        and bool(model_time)
+        and bool(sched.get("raw_address"))
+        and bool(sched.get("appointment_type"))
+        and not sched.get("pending_step")
+        and not sched.get("booking_created")
+    )
 
-                if sched.get("booking_created"):
-                    booking_id = sched.get("square_booking_id")
-                    return {
-                        "sms_body": (
-                            f"You're all set — your appointment is booked for "
-                            f"{model_date} at {human_time} at {model_addr}. "
-                            f"Your confirmation number is {booking_id}."
-                        ),
-                        "scheduled_date": model_date,
-                        "scheduled_time": model_time,
-                        "address": model_addr,
-                        "booking_complete": True
-                    }
 
-            except Exception as e:
-                print("AUTO-BOOKING ERROR:", repr(e))
-                final_sms += (
-                    " (Auto-booking failed internally — but you're almost set. "
-                    "We'll confirm manually.)"
-                )
 
-        # -------------------------------------------------
-        # NORMAL RETURN
-        # -------------------------------------------------
-        return {
-            "sms_body": final_sms,
-            "scheduled_date": model_date,
-            "scheduled_time": model_time,
-            "address": model_addr,
-            "booking_complete": False
-        }
+# ---------------------------------------------------
+# INSERTED CORRECT PRICE INJECTION + AUTOBOOK BLOCK
+# ---------------------------------------------------
+# (Paste directly into Step 4 beneath model_addr handling)
+# ---------------------------------------------------
+# PRICE INJECTION (with D1 logic)
+sms_body = apply_price_injection(appt_type, sms_body)
+
+# Time formatting
+try:
+    human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") \
+        if model_time else None
+except:
+    human_time = model_time
+
+final_sms = (
+    sms_body.replace(model_time, human_time)
+    if (sms_body and model_time and human_time)
+    else sms_body
+)
+
+# CORRECT DATE/TIME PRESERVATION
+if model_date is not None:
+    sched["scheduled_date"] = model_date
+
+if model_time is not None:
+    sched["scheduled_time"] = model_time
+
+# AUTO-BOOKING LOGIC (E1)
+if ready_for_autobook(model_date, model_time, sched):
+    sched["scheduled_date"] = model_date
+    sched["scheduled_time"] = model_time
+    sched["normalized_address"] = None
+    sched["raw_address"] = model_addr
+
+    try:
+        maybe_create_square_booking(phone, conv)
+
+        if sched.get("booking_created"):
+            booking_id = sched.get("square_booking_id")
+            return {
+                "sms_body": (
+                    f"You're all set — your appointment is booked for "
+                    f"{model_date} at {human_time} at {model_addr}. "
+                    f"Your confirmation number is {booking_id}."
+                ),
+                "scheduled_date": model_date,
+                "scheduled_time": model_time,
+                "address": model_addr,
+                "booking_complete": True
+            }
 
     except Exception as e:
-        print("Inbound reply FAILED:", repr(e))
-        return {
-            "sms_body": "Sorry — can you say that again?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-            "booking_complete": False
-        }
+        print("AUTO-BOOKING ERROR:", repr(e))
+        final_sms += (
+            " (Auto-booking failed internally — but you're almost set. "
+            "We'll confirm manually.)"
+        )
+
+# NORMAL RETURN
+return {
+    "sms_body": final_sms,
+    "scheduled_date": model_date,
+    "scheduled_time": model_time,
+    "address": model_addr,
+    "booking_complete": False
+}
+
 
 
 
