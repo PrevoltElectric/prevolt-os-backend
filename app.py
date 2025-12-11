@@ -369,28 +369,13 @@ def incoming_sms():
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
 
-    # ********** CRITICAL FIX APPLIED HERE **********
-    # Always use raw_address FIRST (the reliable, customer-typed one)
+    # ==========================================================
+    # CRITICAL FIX — ALWAYS prefer raw_address first
+    # ==========================================================
     address = sched.get("raw_address") or sched.get("normalized_address")
-    # ************************************************
-
 
     # ==========================================================
-    # SNAPSHOT BEFORE REPLY (FOR DEBUG ONLY)
-    # ==========================================================
-    conv["_scan_snapshot_before"] = {
-        "scheduled_date": scheduled_date,
-        "scheduled_time": scheduled_time,
-        "address": address,
-        "appointment_type": appointment_type,
-        "category": category
-    }
-
-    # ==========================================================
-    # *************** INITIAL SMS ADDRESS PATCH ***************
-    # Pull address out of the FIRST outbound message if memory lost
-    # Example initial_sms format:
-    # "Thanks for confirming your address (45 Dickerman Ave Windsor Locks)."
+    # INITIAL SMS ADDRESS EXTRACTION (VOICEMAIL → FIRST OUTBOUND)
     # ==========================================================
     try:
         if initial_sms and "(" in initial_sms and ")" in initial_sms:
@@ -403,11 +388,20 @@ def incoming_sms():
                     address = extracted_addr
     except Exception as e:
         print("Initial SMS extraction failed:", repr(e))
-    # ***********************************************************
-
 
     # ==========================================================
-    # GENERATE AI REPLY (NO STRUCTURE CHANGE TO DOWNSTREAM CODE)
+    # SNAPSHOT BEFORE REPLY (DEBUG)
+    # ==========================================================
+    conv["_scan_snapshot_before"] = {
+        "scheduled_date": scheduled_date,
+        "scheduled_time": scheduled_time,
+        "address": address,
+        "appointment_type": appointment_type,
+        "category": category
+    }
+
+    # ==========================================================
+    # GENERATE AI REPLY
     # ==========================================================
     reply = generate_reply_for_inbound(
         cleaned_transcript,
@@ -421,14 +415,14 @@ def incoming_sms():
     )
 
     # ==========================================================
-    # APPLY REPLY FIELDS TO **SCHEDULER LAYER ONLY**
+    # APPLY REPLY TO SCHEDULER LAYER
     # ==========================================================
     sched["scheduled_date"] = reply.get("scheduled_date")
     sched["scheduled_time"] = reply.get("scheduled_time")
     sched["normalized_address"] = reply.get("address")
 
     # ==========================================================
-    # IF BOOKING COMPLETED, MOVE INTO PROFILE MEMORY
+    # BOOKING COMPLETE → MOVE TO PROFILE MEMORY
     # ==========================================================
     if reply.get("booking_complete"):
 
@@ -444,6 +438,7 @@ def incoming_sms():
                 "date": sched.get("scheduled_date")
             })
 
+        # FULL scheduler reset after booking
         conv["sched"] = {
             "pending_step": None,
             "scheduled_date": None,
@@ -454,7 +449,7 @@ def incoming_sms():
         }
 
     # ==========================================================
-    # SNAPSHOT AFTER APPLYING REPLY
+    # SNAPSHOT AFTER REPLY
     # ==========================================================
     conv["_scan_snapshot_after"] = {
         "scheduled_date": conv["sched"]["scheduled_date"],
@@ -471,6 +466,43 @@ def incoming_sms():
     return Response(str(twilio_reply), mimetype="text/xml")
 
 # ---------------------------------------------------
+# REQUIRED IMPORTS FOR STEP 4
+# ---------------------------------------------------
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+import json
+
+# ---------------------------------------------------
+# STATE HELPERS
+# ---------------------------------------------------
+def get_current_state(conv: dict) -> str:
+
+    if conv.get("scheduled_date") and conv.get("scheduled_time") and conv.get("address"):
+        return "ready_for_confirmation"
+
+    if not conv.get("address"):
+        return "awaiting_address"
+
+    if not conv.get("scheduled_date") and not conv.get("scheduled_time"):
+        return "awaiting_date_or_time"
+
+    if conv.get("scheduled_date") and not conv.get("scheduled_time"):
+        return "awaiting_time"
+
+    if conv.get("scheduled_time") and not conv.get("scheduled_date"):
+        return "awaiting_date"
+
+    return "unknown"
+
+def enforce_state_lock(state, conv, inbound_lower, address, scheduled_date, scheduled_time):
+    return {}
+
+# ---------------------------------------------------
+# GLOBAL RULES CACHE
+# ---------------------------------------------------
+PREVOLT_RULES_CACHE = None
+
+# ---------------------------------------------------
 # Build System Prompt (Prevolt Rules Engine)
 # ---------------------------------------------------
 def build_system_prompt(
@@ -485,6 +517,7 @@ def build_system_prompt(
     today_weekday,
     convo
 ):
+
     global PREVOLT_RULES_CACHE
 
     # Load rules only once
@@ -512,31 +545,27 @@ def build_system_prompt(
         if voicemail_partial_address:
             voicemail_context += f"Partial address detected: {voicemail_partial_address}\n"
 
-    # STRICT JSON OUTPUT FORMAT FOR LLM
     output_block = (
         "{\n"
-        '  "sms_body": "string",\n'
-        '  "scheduled_date": "YYYY-MM-DD or null",\n'
-        '  "scheduled_time": "HH:MM or null",\n'
-        '  "address": "string or null"\n'
+        '  \"sms_body\": \"string\",\n'
+        '  \"scheduled_date\": \"YYYY-MM-DD or null\",\n'
+        '  \"scheduled_time\": \"HH:MM or null\",\n'
+        '  \"address\": \"string or null\"\n'
         "}"
     )
 
-    # Build the full prompt
     system_prompt = (
         "You are Prevolt OS, the SMS assistant for Prevolt Electric.\n"
         "You MUST respond ONLY in strict JSON.\n\n"
         f"Today is {today_date_str}, a {today_weekday}.\n\n"
         f"{rules_text}"
         f"{voicemail_context}\n\n"
-
         "===================================================\n"
         "STATE HANDLING RULES\n"
         "===================================================\n"
         "• NEVER ask again for information the customer already provided.\n"
         "• ALWAYS inherit previously known values.\n"
         "• NEVER output null if the value is already known.\n\n"
-
         "===================================================\n"
         "CURRENT CONTEXT\n"
         "===================================================\n"
@@ -547,7 +576,6 @@ def build_system_prompt(
         f"Stored date: {scheduled_date}\n"
         f"Stored time: {scheduled_time}\n"
         f"Stored address: {address}\n\n"
-
         "===================================================\n"
         "REQUIRED JSON OUTPUT FORMAT\n"
         "===================================================\n"
@@ -558,7 +586,6 @@ def build_system_prompt(
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (THE BRAIN) + AUTO-BOOKING
-# COMPLETE + RESTORED + PATCH 3 APPLIED
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -585,22 +612,14 @@ def generate_reply_for_inbound(
         today_weekday  = now_local.strftime("%A")
 
         # --------------------------------------
-        # Load conversation
+        # Load conversation memory
         # --------------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         conv  = conversations.setdefault(phone, {})
-
-        conv.setdefault("profile", {})
-        conv.setdefault("current_job", {})
-        conv.setdefault("sched", {})
-        sched = conv["sched"]
+        sched = conv.setdefault("sched", {})
+        sched.setdefault("raw_address", None)
 
         inbound_lower = inbound_text.lower()
-
-        # -------------------------------------------------
-        # Ensure raw address bucket exists
-        # -------------------------------------------------
-        sched.setdefault("raw_address", None)
 
         # --------------------------------------
         # Appointment type fallback
@@ -608,12 +627,12 @@ def generate_reply_for_inbound(
         appt_type = sched.get("appointment_type")
         if not appt_type:
             if any(word in inbound_lower for word in [
-                "not working", "no power", "dead", "sparking", "burning",
-                "breaker keeps", "gfci", "outlet not", "troubleshoot"
+                "not working","no power","dead","sparking","burning",
+                "breaker keeps","gfci","outlet not","troubleshoot"
             ]):
                 appt_type = "TROUBLESHOOT_395"
             elif any(word in inbound_lower for word in [
-                "inspection", "whole home inspection", "electrical inspection"
+                "inspection","whole home inspection","electrical inspection"
             ]):
                 appt_type = "WHOLE_HOME_INSPECTION"
             else:
@@ -621,20 +640,18 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = appt_type
 
         # --------------------------------------
-        # HARD ADDRESS CAPTURE — raw only
+        # Direct raw address detection
         # --------------------------------------
         address_markers = [
-            "st", "street", "ave", "avenue", "rd", "road",
-            "ln", "lane", "dr", "drive", "ct", "circle",
-            "blvd", "way"
+            "st","street","ave","avenue","rd","road","ln","lane",
+            "dr","drive","ct","circle","blvd","way"
         ]
-
-        if any(marker in inbound_lower for marker in address_markers) and len(inbound_text) > 6:
+        if any(m in inbound_lower for m in address_markers) and len(inbound_text) > 6:
             sched["raw_address"] = inbound_text.strip()
             address = sched["raw_address"]
 
         # --------------------------------------
-        # Build LLM System Prompt
+        # Build System Prompt
         # --------------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
@@ -654,104 +671,87 @@ def generate_reply_for_inbound(
         # --------------------------------------
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
-            response_format={"type": "json_object"},
+            response_format={"type":"json_object"},
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": inbound_text},
+                {"role":"system","content":system_prompt},
+                {"role":"user","content":inbound_text},
             ],
         )
 
         raw_json = completion.choices[0].message.content.strip()
-        raw_json = raw_json.replace("None", "null").replace("none", "null")
+        raw_json = raw_json.replace("None","null").replace("none","null")
         ai_raw = json.loads(raw_json)
 
-        sms_body   = ai_raw.get("sms_body", "").strip()
+        sms_body   = ai_raw.get("sms_body","").strip()
         model_date = ai_raw.get("scheduled_date")
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
         # -------------------------------------------------
-        # PATCH 1 — DATE/TIME LOCK
-        # Ensures LLM cannot remove known date/time
+        # PATCH — Hard lock date/time if already known
         # -------------------------------------------------
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
-
         if sched.get("scheduled_time") and not model_time:
             model_time = sched["scheduled_time"]
 
         # -------------------------------------------------
-        # PATCH 3 — Always capture raw address
+        # PATCH — Always capture raw address
         # -------------------------------------------------
-        if isinstance(model_addr, str) and len(model_addr) > 5:
+        if isinstance(model_addr,str) and len(model_addr)>5:
             sched["raw_address"] = model_addr
 
         # -------------------------------------------------
-        # SYNC LOCK — Cannot erase known values
+        # SYNC LOCK — Prevent LLM resets
         # -------------------------------------------------
         if not model_date and scheduled_date:
             model_date = scheduled_date
-
         if not model_time and scheduled_time:
             model_time = scheduled_time
-
         if not model_addr and address:
             model_addr = address
 
-        # State cannot regress
-        if sched.get("scheduled_date") and not model_date:
-            model_date = sched["scheduled_date"]
-
-        if sched.get("scheduled_time") and not model_time:
-            model_time = sched["scheduled_time"]
-
-        if sched.get("raw_address") and not model_addr:
-            model_addr = sched["raw_address"]
-
-        # -------------------------------------------------
-        # RAW ADDRESS FINALIZATION
-        # -------------------------------------------------
-        if isinstance(model_addr, str):
+        # Finalize address memory
+        if isinstance(model_addr,str):
             sched["raw_address"] = model_addr
 
         # -------------------------------------------------
         # PRICE INJECTION
         # -------------------------------------------------
         price_map = {
-            "eval_195": " The visit is a $195 consultation.",
-            "troubleshoot_395": " The visit is a $395 troubleshoot and repair.",
-            "whole_home_inspection": " Home inspections range from $375–$650 depending on size."
+            "eval_195":" The visit is a $195 consultation.",
+            "troubleshoot_395":" The visit is a $395 troubleshoot and repair.",
+            "whole_home_inspection":" Home inspections range from $375–$650 depending on size."
         }
-        phrase = price_map.get(appt_type.lower(), "")
+        phrase = price_map.get(appt_type.lower(),"")
         if phrase and phrase not in sms_body:
             sms_body += phrase
 
         # -------------------------------------------------
-        # TIME FORMATTING (12-hour)
+        # Time formatting (12-hour conversion)
         # -------------------------------------------------
         try:
-            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") \
+            human_time = datetime.strptime(model_time,"%H:%M").strftime("%-I:%M %p") \
                 if model_time else None
         except:
             human_time = model_time
 
         final_sms = (
-            sms_body.replace(model_time, human_time)
+            sms_body.replace(model_time,human_time)
             if (sms_body and model_time and human_time)
             else sms_body
         )
 
         # -------------------------------------------------
-        # PATCH 2 — SAVE DATE/TIME BACK INTO STATE
+        # Save date/time back into memory
         # -------------------------------------------------
         if model_date:
             sched["scheduled_date"] = model_date
-
         if model_time:
             sched["scheduled_time"] = model_time
 
         # -------------------------------------------------
-        # AUTO-BOOKING CHECK
+        # AUTO-BOOKING LOGIC
         # -------------------------------------------------
         ready_for_booking = (
             bool(model_date)
@@ -767,15 +767,14 @@ def generate_reply_for_inbound(
             sched["raw_address"] = model_addr
 
             try:
-                maybe_create_square_booking(phone, conv)
+                maybe_create_square_booking(phone,conv)
 
                 if sched.get("booking_created"):
                     booking_id = sched.get("square_booking_id")
-
                     return {
                         "sms_body": (
-                            f"You're all set — your appointment is booked for {model_date} "
-                            f"at {human_time} at {model_addr}. "
+                            f"You're all set — your appointment is booked for "
+                            f"{model_date} at {human_time} at {model_addr}. "
                             f"Your confirmation number is {booking_id}."
                         ),
                         "scheduled_date": model_date,
@@ -786,9 +785,7 @@ def generate_reply_for_inbound(
 
             except Exception as e:
                 print("AUTO-BOOKING ERROR:", repr(e))
-                final_sms += (
-                    " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
-                )
+                final_sms += " (We couldn't auto-book, but you're almost set — we'll confirm manually.)"
 
         # -------------------------------------------------
         # NORMAL RETURN
