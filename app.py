@@ -618,6 +618,11 @@ def generate_reply_for_inbound(
         sched = conv["sched"]
         inbound_lower = inbound_text.lower()
 
+        # -------------------------------------------------
+        # Ensure raw address bucket exists
+        # -------------------------------------------------
+        sched.setdefault("raw_address", None)
+
         # --------------------------------------
         # APPOINTMENT TYPE (fallback)
         # --------------------------------------
@@ -637,16 +642,18 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = appt_type
 
         # --------------------------------------
-        # HARD ADDRESS CAPTURE
+        # HARD ADDRESS CAPTURE (STRING INPUT ONLY HERE)
         # --------------------------------------
         address_markers = [
             "st", "street", "ave", "avenue", "rd", "road",
             "ln", "lane", "dr", "drive", "ct", "circle",
             "blvd", "way"
         ]
+
         if any(marker in inbound_lower for marker in address_markers) and len(inbound_text) > 6:
-            sched["normalized_address"] = inbound_text.strip()
-            address = sched["normalized_address"]
+            # This is RAW text → store separately
+            sched["raw_address"] = inbound_text.strip()
+            address = sched["raw_address"]
 
         # --------------------------------------
         # BUILD SYSTEM PROMPT
@@ -658,7 +665,7 @@ def generate_reply_for_inbound(
             initial_sms,
             sched.get("scheduled_date"),
             sched.get("scheduled_time"),
-            sched.get("normalized_address"),
+            sched.get("raw_address"),     # << important change
             today_date_str,
             today_weekday,
             conv
@@ -683,12 +690,11 @@ def generate_reply_for_inbound(
         sms_body   = ai_raw.get("sms_body", "").strip()
         model_date = ai_raw.get("scheduled_date")
         model_time = ai_raw.get("scheduled_time")
-        model_addr = ai_raw.get("address")
+        model_addr = ai_raw.get("address")   # May be string or null
 
         # -------------------------------------------------
         # PATCH A — VOICEMAIL → SMS SYNC LOCK
         # -------------------------------------------------
-        # 1. LLM cannot erase voicemail-derived date/time/address
         if not model_date and scheduled_date:
             model_date = scheduled_date
         if not model_time and scheduled_time:
@@ -696,13 +702,21 @@ def generate_reply_for_inbound(
         if not model_addr and address:
             model_addr = address
 
-        # 2. State cannot regress
+        # State cannot regress
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
         if sched.get("scheduled_time") and not model_time:
             model_time = sched["scheduled_time"]
-        if sched.get("normalized_address") and not model_addr:
-            model_addr = sched["normalized_address"]
+        if sched.get("raw_address") and not model_addr:
+            model_addr = sched["raw_address"]
+
+        # -------------------------------------------------
+        # HARD ADDRESS RULE:
+        # raw string stays in raw_address
+        # normalized_address stays untouched unless Square updates it
+        # -------------------------------------------------
+        if isinstance(model_addr, str):
+            sched["raw_address"] = model_addr
 
         # -------------------------------------------------
         # PRICE INJECTION
@@ -731,19 +745,21 @@ def generate_reply_for_inbound(
         )
 
         # -------------------------------------------------
-        # AUTO-BOOKING
+        # AUTO-BOOKING READINESS
         # -------------------------------------------------
         ready_for_booking = (
             bool(model_date)
             and bool(model_time)
-            and bool(model_addr)
+            and bool(sched.get("raw_address"))
             and not sched.get("booking_created")
         )
 
         if ready_for_booking:
             sched["scheduled_date"] = model_date
             sched["scheduled_time"] = model_time
-            sched["normalized_address"] = model_addr
+            # Pass raw text to booking system
+            sched["normalized_address"] = None  # ← real dict will appear after normalization
+            sched["raw_address"] = model_addr
 
             try:
                 maybe_create_square_booking(phone, conv)
