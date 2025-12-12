@@ -619,9 +619,34 @@ def generate_reply_for_inbound(
             "service ripped", "burning", "sparking", "fire",
             "no power", "emergency", "urgent", "asap", "now"
         ])
-        
+
         if EMERGENCY:
+            # Force emergency appointment type
             sched["appointment_type"] = "TROUBLESHOOT_395"
+
+            # Ask for address if missing
+            if not sched.get("raw_address"):
+                return {
+                    "sms_body": "This is Prevolt Electric — we understand this may be an emergency. What is the full address?",
+                    "scheduled_date": None,
+                    "scheduled_time": None,
+                    "address": None,
+                    "booking_complete": False
+                }
+
+            # Emergency confirmation (NO evaluation wording, NO $195)
+            return {
+                "sms_body": (
+                    f"This is Prevolt Electric — we understand this is an emergency. "
+                    f"We will send someone out immediately to {sched['raw_address']}. "
+                    f"Emergency troubleshooting visits are $395."
+                ),
+                "scheduled_date": today_date_str,
+                "scheduled_time": now_local.strftime('%H:%M'),
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+       
                   
         # --------------------------------------
         # Weekday clarification (natural language)
@@ -776,7 +801,7 @@ def generate_reply_for_inbound(
             not sched.get("booking_created")
         )
 
-        if ready_for_booking:
+        if ready_for_booking or EMERGENCY:
             try:
                 maybe_create_square_booking(phone, conv)
                 if sched.get("booking_created"):
