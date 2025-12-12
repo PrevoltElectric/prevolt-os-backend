@@ -32,6 +32,21 @@ TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 SQUARE_ACCESS_TOKEN = os.environ.get("SQUARE_ACCESS_TOKEN")
 SQUARE_LOCATION_ID = os.environ.get("SQUARE_LOCATION_ID")
 SQUARE_TEAM_MEMBER_ID = os.environ.get("SQUARE_TEAM_MEMBER_ID")
+# ---------------------------------------------------
+# Square service variation data (final and verified)
+# ---------------------------------------------------
+SERVICE_VARIATION_EVAL_ID = "IPCUF6EPOYGWJUEFUZOXL2AZ"
+SERVICE_VARIATION_EVAL_VERSION = 1764725435505
+
+SERVICE_VARIATION_INSPECTION_ID = "LYK646AH4NAESCFUZL6PUTZ2"
+SERVICE_VARIATION_INSPECTION_VERSION = 1764725393938
+
+SERVICE_VARIATION_TROUBLESHOOT_ID = "64IQNJYO3H6XNTLPIHABDJOQ"
+SERVICE_VARIATION_TROUBLESHOOT_VERSION = 1762464315698
+
+BOOKING_START_HOUR = 9
+BOOKING_END_HOUR = 16
+MAX_TRAVEL_MINUTES = 60
 
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 DISPATCH_ORIGIN_ADDRESS = os.environ.get("DISPATCH_ORIGIN_ADDRESS")
@@ -590,6 +605,8 @@ def generate_reply_for_inbound(
         sched.setdefault("raw_address", None)
         sched.setdefault("normalized_address", None)
         sched.setdefault("pending_step", None)
+        sched.setdefault("intro_sent", False)
+        sched.setdefault("price_disclosed", False)
 
         inbound_text  = inbound_text or ""
         inbound_lower = inbound_text.lower()
@@ -613,7 +630,7 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = appt_type
 
         # --------------------------------------
-        # Hybrid Missing-Info Resolver
+        # Missing-info resolver
         # --------------------------------------
         missing_date = not (scheduled_date or sched.get("scheduled_date"))
         missing_time = not (scheduled_time or sched.get("scheduled_time"))
@@ -669,7 +686,7 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # --------------------------------------
-        # RESET-LOCK (Never wipe known values)
+        # RESET-LOCK
         # --------------------------------------
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
@@ -678,26 +695,26 @@ def generate_reply_for_inbound(
         if sched.get("raw_address") and not model_addr:
             model_addr = sched["raw_address"]
 
-        # --------------------------------------
-        # ADDRESS FINALIZATION
-        # --------------------------------------
         if isinstance(model_addr, str) and len(model_addr) > 5:
             sched["raw_address"] = model_addr
         model_addr = sched.get("raw_address")
 
         # --------------------------------------
-        # BRANDING LOCK (PATCH 1)
+        # ONE-TIME BRANDING
         # --------------------------------------
-        if not sms_body.lower().startswith("this is prevolt electric"):
+        if not sched["intro_sent"]:
             sms_body = f"This is Prevolt Electric — {sms_body}"
+            sched["intro_sent"] = True
 
         # --------------------------------------
-        # PRICE INJECTION (PATCH 2)
+        # ONE-TIME PRICE DISCLOSURE
         # --------------------------------------
-        sms_body = apply_price_injection(appt_type, sms_body)
+        if not sched["price_disclosed"]:
+            sms_body = apply_price_injection(appt_type, sms_body)
+            sched["price_disclosed"] = True
 
         # --------------------------------------
-        # Human-readable time replacement
+        # Human-readable time
         # --------------------------------------
         try:
             human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") \
@@ -709,7 +726,7 @@ def generate_reply_for_inbound(
             sms_body = sms_body.replace(model_time, human_time)
 
         # --------------------------------------
-        # Save updated values
+        # Save new values
         # --------------------------------------
         if model_date:
             sched["scheduled_date"] = model_date
@@ -717,7 +734,7 @@ def generate_reply_for_inbound(
             sched["scheduled_time"] = model_time
 
         # --------------------------------------
-        # AUTOBOOKING GATE
+        # AUTOBOOKING
         # --------------------------------------
         ready_for_booking = (
             bool(sched.get("scheduled_date")) and
@@ -757,7 +774,7 @@ def generate_reply_for_inbound(
     except Exception as e:
         print("[ERROR] generate_reply_for_inbound:", repr(e))
         return {
-            "sms_body": "This is Prevolt Electric — sorry, can you say that again?",
+            "sms_body": "Sorry — can you say that again?",
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
             "address": address,
