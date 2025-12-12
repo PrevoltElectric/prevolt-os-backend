@@ -610,7 +610,38 @@ def generate_reply_for_inbound(
 
         inbound_text  = inbound_text or ""
         inbound_lower = inbound_text.lower()
+        
+        # --------------------------------------
+        # EMERGENCY OVERRIDE (HARD RULE)
+        # --------------------------------------
+        EMERGENCY = any(k in inbound_lower for k in [
+            "tree fell", "tree down", "power line", "lines down",
+            "service ripped", "burning", "sparking", "fire",
+            "no power", "emergency", "urgent", "asap", "now"
+        ])
+        
+        if EMERGENCY:
+            sched["appointment_type"] = "TROUBLESHOOT_395"
+                  
+        # --------------------------------------
+        # Weekday clarification (natural language)
+        # --------------------------------------
+        weekdays = ["monday","tuesday","wednesday","thursday","friday"]
+        mentioned = [d for d in weekdays if d in inbound_lower]
+        
+        if mentioned and not sched.get("scheduled_date"):
+            day = mentioned[0].capitalize()
+            sched["pending_step"] = "need_date"
+        
+            return {
+                "sms_body": f"Got it — which {day} would work best for you?",
+                "scheduled_date": None,
+                "scheduled_time": sched.get("scheduled_time"),
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
 
+        
         # --------------------------------------
         # Appointment type fallback
         # --------------------------------------
