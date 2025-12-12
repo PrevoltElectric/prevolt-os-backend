@@ -519,17 +519,19 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] initial_sms address extraction failed:", repr(e))
 
-    # ---------------------------------------------------
-    # Pre-Step4 pending_step derivation
-    # ---------------------------------------------------
-    if not scheduled_date:
-        sched["pending_step"] = "need_date"
-    elif not scheduled_time:
-        sched["pending_step"] = "need_time"
-    elif not address:
-        sched["pending_step"] = "need_address"
-    else:
-        sched["pending_step"] = None
+        # --------------------------------------
+        # POST-Step4 pending_step (DO NOT OVERRIDE EMERGENCY STATE)
+        # --------------------------------------
+        if not sched.get("emergency_approved"):
+            if not sched.get("scheduled_date"):
+                sched["pending_step"] = "need_date"
+            elif not sched.get("scheduled_time"):
+                sched["pending_step"] = "need_time"
+            elif not sched.get("raw_address"):
+                sched["pending_step"] = "need_address"
+            else:
+                sched["pending_step"] = None
+           
 
     # ---------------------------------------------------
     # Run Step 4
@@ -691,7 +693,6 @@ def generate_reply_for_inbound(
         
             # Continue to downstream logic — DO NOT RETURN
        
-
         
         # --------------------------------------
         # Appointment type fallback
