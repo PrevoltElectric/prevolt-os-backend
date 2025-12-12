@@ -205,32 +205,110 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
 
 # ---------------------------------------------------
-# PRIMARY VOICE ENTRYPOINT
+# Voice: Incoming Call (IVR + Spam Filter)
 # ---------------------------------------------------
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
-    resp = VoiceResponse()
-    resp.say("Thanks for calling Prevolt Electric. One moment please.")
-    resp.redirect("/voicemail-start")
-    return Response(str(resp), mimetype="text/xml")
+    from twilio.twiml.voice_response import Gather, VoiceResponse
 
+    response = VoiceResponse()
 
-# ---------------------------------------------------
-# VOICEMAIL START ROUTE
-# ---------------------------------------------------
-@app.route("/voicemail-start", methods=["POST", "GET"])
-def voicemail_start():
-    resp = VoiceResponse()
-    resp.say("Please leave a message after the tone. When finished, you may hang up.")
-
-    resp.record(
-        action="/voicemail-complete",
+    gather = Gather(
+        num_digits=1,
+        action="/handle-call-selection",
         method="POST",
-        max_length=120,
-        play_beep=True
+        timeout=6
     )
 
-    return Response(str(resp), mimetype="text/xml")
+    gather.say(
+        '<speak>'
+            '<prosody rate="95%">'
+                'Thanks for calling PREE-volt Electric.<break time="0.7s"/>'
+                'To help us direct your call, please choose an option.<break time="0.6s"/>'
+                'If you are a residential customer, press 1.<break time="0.6s"/>'
+                'If you are a commercial, government, or facility customer, press 2.'
+            '</prosody>'
+        '</speak>',
+        voice="Polly.Matthew-Neural"
+    )
+
+    response.append(gather)
+
+    response.say(
+        '<speak><prosody rate="95%">Sorry, I did not get that. Let me repeat the options.</prosody></speak>',
+        voice="Polly.Matthew-Neural"
+    )
+    response.redirect("/incoming-call")
+
+    return Response(str(response), mimetype="text/xml")
+
+
+# ---------------------------------------------------
+# Handle Residential vs Commercial
+# ---------------------------------------------------
+@app.route("/handle-call-selection", methods=["POST"])
+def handle_call_selection():
+    from twilio.twiml.voice_response import VoiceResponse
+
+    digit = request.form.get("Digits", "")
+    phone = request.form.get("From", "")
+    response = VoiceResponse()
+
+    conv = conversations.setdefault(phone, {})
+    conv.setdefault("profile", {})
+    conv.setdefault("sched", {})
+
+    # -----------------------------
+    # OPTION 1 → RESIDENTIAL
+    # -----------------------------
+    if digit == "1":
+        conv["profile"]["customer_type"] = "residential"
+
+        response.say(
+            '<speak>'
+                '<prosody rate="95%">'
+                    'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
+                    'Please leave your name, address, and a brief description of what you need help with.<break time="0.6s"/>'
+                    'We will text you shortly.'
+                '</prosody>'
+            '</speak>',
+            voice="Polly.Matthew-Neural"
+        )
+
+        response.record(
+            max_length=60,
+            play_beep=True,
+            trim="do-not-trim",
+            action="/voicemail-complete",
+            method="POST"
+        )
+
+        response.hangup()
+        return Response(str(response), mimetype="text/xml")
+
+    # -----------------------------
+    # OPTION 2 → COMMERCIAL / GOV
+    # -----------------------------
+    elif digit == "2":
+        conv["profile"]["customer_type"] = "commercial"
+
+        response.say(
+            '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
+            voice="Polly.Matthew-Neural"
+        )
+        response.dial("+15555555555")  # replace with real number
+        return Response(str(response), mimetype="text/xml")
+
+    # -----------------------------
+    # INVALID INPUT
+    # -----------------------------
+    else:
+        response.say(
+            '<speak><prosody rate="90%">Sorry, I didn’t understand that.</prosody></speak>',
+            voice="Polly.Matthew-Neural"
+        )
+        response.redirect("/incoming-call")
+        return Response(str(response), mimetype="text/xml")
 
 
 # ---------------------------------------------------
@@ -535,37 +613,23 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = appt_type
 
         # --------------------------------------
-        # HARD ADDRESS EXTRACTION (A1)
-        # --------------------------------------
-        address_markers = [
-            " st", " street", " ave", " avenue", " rd", " road",
-            " ln", " lane", " dr", " drive", " ct", " circle",
-            " blvd", " way"
-        ]
-        if any(m in inbound_lower for m in address_markers) and len(inbound_text) > 6:
-            sched["raw_address"] = inbound_text.strip()
-            address = sched["raw_address"]
-
-        # --------------------------------------
-        # Hybrid Missing-Info Resolver (Option B)
+        # Hybrid Missing-Info Resolver
         # --------------------------------------
         missing_date = not (scheduled_date or sched.get("scheduled_date"))
         missing_time = not (scheduled_time or sched.get("scheduled_time"))
         missing_addr = not (address or sched.get("raw_address"))
 
         if missing_addr:
-            expected_next_step = "need_address"
+            sched["pending_step"] = "need_address"
         elif missing_date:
-            expected_next_step = "need_date"
+            sched["pending_step"] = "need_date"
         elif missing_time:
-            expected_next_step = "need_time"
+            sched["pending_step"] = "need_time"
         else:
-            expected_next_step = None
-
-        sched["pending_step"] = expected_next_step
+            sched["pending_step"] = None
 
         # --------------------------------------
-        # Build System Prompt (RESTORED)
+        # Build System Prompt
         # --------------------------------------
         system_prompt = build_system_prompt(
             cleaned_transcript,
@@ -605,14 +669,12 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # --------------------------------------
-        # RESET-LOCK (Never delete known values)
+        # RESET-LOCK (Never wipe known values)
         # --------------------------------------
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
-
         if sched.get("scheduled_time") and not model_time:
             model_time = sched["scheduled_time"]
-
         if sched.get("raw_address") and not model_addr:
             model_addr = sched["raw_address"]
 
@@ -624,7 +686,13 @@ def generate_reply_for_inbound(
         model_addr = sched.get("raw_address")
 
         # --------------------------------------
-        # PRICE INJECTION
+        # BRANDING LOCK (PATCH 1)
+        # --------------------------------------
+        if not sms_body.lower().startswith("this is prevolt electric"):
+            sms_body = f"This is Prevolt Electric — {sms_body}"
+
+        # --------------------------------------
+        # PRICE INJECTION (PATCH 2)
         # --------------------------------------
         sms_body = apply_price_injection(appt_type, sms_body)
 
@@ -641,7 +709,7 @@ def generate_reply_for_inbound(
             sms_body = sms_body.replace(model_time, human_time)
 
         # --------------------------------------
-        # Store new Step 4 values
+        # Save updated values
         # --------------------------------------
         if model_date:
             sched["scheduled_date"] = model_date
@@ -649,42 +717,35 @@ def generate_reply_for_inbound(
             sched["scheduled_time"] = model_time
 
         # --------------------------------------
-        # HARD-GATE AUTOBOOKING
+        # AUTOBOOKING GATE
         # --------------------------------------
         ready_for_booking = (
-            bool(sched.get("scheduled_date"))
-            and bool(sched.get("scheduled_time"))
-            and bool(sched.get("raw_address"))
-            and bool(sched.get("appointment_type"))
-            and not sched.get("pending_step")
-            and not sched.get("booking_created")
+            bool(sched.get("scheduled_date")) and
+            bool(sched.get("scheduled_time")) and
+            bool(sched.get("raw_address")) and
+            bool(sched.get("appointment_type")) and
+            not sched.get("pending_step") and
+            not sched.get("booking_created")
         )
 
         if ready_for_booking:
             try:
                 maybe_create_square_booking(phone, conv)
-
                 if sched.get("booking_created"):
-                    booking_id = sched.get("square_booking_id")
                     return {
                         "sms_body": (
                             f"You're all set — your appointment is booked for "
                             f"{sched['scheduled_date']} at {human_time} at {model_addr}. "
-                            f"Your confirmation number is {booking_id}."
+                            f"Your confirmation number is {sched.get('square_booking_id')}."
                         ),
                         "scheduled_date": sched["scheduled_date"],
                         "scheduled_time": sched["scheduled_time"],
                         "address": model_addr,
                         "booking_complete": True
                     }
-
             except Exception as e:
                 print("[ERROR] Autobooking:", repr(e))
-                sms_body += " (Auto-booking failed internally — but you're almost set.)"
 
-        # --------------------------------------
-        # NORMAL RETURN (Not booked yet)
-        # --------------------------------------
         return {
             "sms_body": sms_body,
             "scheduled_date": model_date,
@@ -696,7 +757,7 @@ def generate_reply_for_inbound(
     except Exception as e:
         print("[ERROR] generate_reply_for_inbound:", repr(e))
         return {
-            "sms_body": "Sorry — can you say that again?",
+            "sms_body": "This is Prevolt Electric — sorry, can you say that again?",
             "scheduled_date": scheduled_date,
             "scheduled_time": scheduled_time,
             "address": address,
@@ -705,58 +766,18 @@ def generate_reply_for_inbound(
 
 
 # ---------------------------------------------------
-# PRICE INJECTION HELPER
+# PRICE INJECTION HELPER (PATCH 2)
 # ---------------------------------------------------
 def apply_price_injection(appt_type: str, body: str) -> str:
-    """
-    Inserts the correct pricing phrasing into the message.
-    """
-    if not appt_type:
+    if "$" in body:
         return body
 
     if "TROUBLESHOOT" in appt_type:
-        return body.replace("{PRICE}", "$395")
+        return f"{body} Troubleshooting and repair visits are $395."
     if "INSPECTION" in appt_type:
-        return body.replace("{PRICE}", "$375–$650")
-    return body.replace("{PRICE}", "$195")
+        return f"{body} Whole-home electrical inspections range from $375–$650 depending on square footage."
+    return f"{body} Our evaluation visit is $195."
 
-
-# ---------------------------------------------------
-# Google Maps Travel Time Helper
-# ---------------------------------------------------
-def compute_travel_time_minutes(origin: str, destination: str) -> float | None:
-    if not GOOGLE_MAPS_API_KEY:
-        return None
-    if not origin or not destination:
-        return None
-
-    try:
-        params = {
-            "origins": origin,
-            "destinations": destination,
-            "key": GOOGLE_MAPS_API_KEY,
-        }
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/distancematrix/json",
-            params=params,
-            timeout=8,
-        )
-        data = resp.json()
-
-        rows = data.get("rows", [])
-        if not rows:
-            return None
-
-        elem = rows[0].get("elements", [{}])[0]
-        if elem.get("status") != "OK":
-            return None
-
-        seconds = elem["duration"]["value"]
-        return seconds / 60.0
-
-    except Exception as e:
-        print("[ERROR] compute_travel_time:", repr(e))
-        return None
 
 
 # ---------------------------------------------------
