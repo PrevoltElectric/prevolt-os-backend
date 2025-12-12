@@ -528,20 +528,6 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] initial_sms address extraction failed:", repr(e))
 
-        # --------------------------------------
-        # POST-Step4 pending_step (DO NOT OVERRIDE EMERGENCY STATE)
-        # --------------------------------------
-        if not sched.get("emergency_approved"):
-            if not sched.get("scheduled_date"):
-                sched["pending_step"] = "need_date"
-            elif not sched.get("scheduled_time"):
-                sched["pending_step"] = "need_time"
-            elif not sched.get("raw_address"):
-                sched["pending_step"] = "need_address"
-            else:
-                sched["pending_step"] = None
-           
-
     # ---------------------------------------------------
     # Run Step 4
     # ---------------------------------------------------
@@ -565,6 +551,13 @@ def incoming_sms():
         if reply["address"] not in profile["addresses"]:
             profile["addresses"].append(reply["address"])
 
+    # --------------------------------------
+    # HARD VALIDATION: Require full street address
+    # (Reject city-only like "Windsor Locks")
+    # --------------------------------------
+    if sched.get("raw_address") and not is_full_street_address(sched["raw_address"]):
+        sched["raw_address"] = None
+
     # POST-Step4 pending_step
     if not sched["scheduled_date"]:
         sched["pending_step"] = "need_date"
@@ -578,6 +571,27 @@ def incoming_sms():
     tw = MessagingResponse()
     tw.message(reply["sms_body"])
     return Response(str(tw), mimetype="text/xml")
+
+
+def is_full_street_address(addr: str | None) -> bool:
+    if not addr:
+        return False
+
+    addr = addr.lower().strip()
+
+    # must contain a street number
+    if not any(char.isdigit() for char in addr):
+        return False
+
+    # must contain a street-type word
+    STREET_WORDS = [
+        "street", "st", "avenue", "ave", "road", "rd",
+        "lane", "ln", "drive", "dr", "court", "ct",
+        "circle", "cir", "boulevard", "blvd", "way"
+    ]
+
+    return any(word in addr for word in STREET_WORDS)
+
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
@@ -627,30 +641,30 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # # 3) Save to memory (2-STEP CONFIRMATION FLOW)
         # --------------------------------------
-        
+
         # 🔒 Ensure flags always exist (prevents KeyError / NameError)
         sched.setdefault("awaiting_emergency_confirm", False)
         sched.setdefault("emergency_approved", False)
-        
+
         EMERGENCY_KEYWORDS = [
             "tree fell", "tree down", "power line", "lines down",
             "service ripped", "sparking", "burning", "fire",
             "smoke", "no power", "power outage",
             "urgent", "emergency"
         ]
-        
+
         IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
         EMERGENCY = IS_EMERGENCY  # 🔥 alias for downstream logic
-        
+
         # -------------------------------
         # STEP 1 — Emergency Detected
         # -------------------------------
         if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
-        
+
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["awaiting_emergency_confirm"] = True
             sched["pending_step"] = None  # halt normal flow
-        
+
             # Require address first
             if not sched.get("raw_address"):
                 return {
@@ -663,7 +677,7 @@ def generate_reply_for_inbound(
                     "address": None,
                     "booking_complete": False
                 }
-        
+
             # Ask customer to approve emergency pricing
             return {
                 "sms_body": (
@@ -676,7 +690,7 @@ def generate_reply_for_inbound(
                 "address": sched.get("raw_address"),
                 "booking_complete": False
             }
-        
+
         # -------------------------------
         # STEP 2 — Customer Approves Emergency
         # -------------------------------
@@ -684,23 +698,24 @@ def generate_reply_for_inbound(
             "yes", "yeah", "yup", "ok", "okay",
             "sure", "that works", "book", "send", "do it"
         ]
-        
+
         if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
-        
+
             sched["emergency_approved"] = True
             sched["awaiting_emergency_confirm"] = False
-        
+
             # Force immediate scheduling
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["scheduled_date"] = today_date_str
             sched["scheduled_time"] = now_local.strftime("%H:%M")
             sched["pending_step"] = None
-        
+
             # 🔥 CRITICAL: sync locals so autobooking sees them
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
-        
+
             # Continue to downstream logic — DO NOT RETURN
+
        
         
         # --------------------------------------
