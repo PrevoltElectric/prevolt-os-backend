@@ -607,43 +607,86 @@ def generate_reply_for_inbound(
         sched.setdefault("pending_step", None)
         sched.setdefault("intro_sent", False)
         sched.setdefault("price_disclosed", False)
+        sched.setdefault("awaiting_emergency_confirm", False)
+        sched.setdefault("emergency_approved", False)
 
         inbound_text  = inbound_text or ""
         inbound_lower = inbound_text.lower()
-        
+
         # --------------------------------------
-        # EMERGENCY OVERRIDE (HARD RULE)
+        # EMERGENCY OVERRIDE (2-STEP CONFIRMATION FLOW)
         # --------------------------------------
-        EMERGENCY = any(k in inbound_lower for k in [
+
+        EMERGENCY_KEYWORDS = [
             "tree fell", "tree down", "power line", "lines down",
-            "service ripped", "burning", "sparking", "fire",
-            "no power", "emergency", "urgent", "asap", "now"
-        ])
-        
-        if EMERGENCY:
-            # Force emergency appointment type + price lock
+            "service ripped", "sparking", "burning", "fire",
+            "smoke", "no power", "power outage",
+            "urgent", "emergency"
+        ]
+
+        IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
+
+        # -------------------------------
+        # STEP 1 — Emergency Detected
+        # -------------------------------
+        if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
+
             sched["appointment_type"] = "TROUBLESHOOT_395"
-            sched["price_disclosed"] = True
-            sched["intro_sent"] = True
-        
+            sched["awaiting_emergency_confirm"] = True
+            sched["pending_step"] = None  # halt normal flow
+
             # Require address first
             if not sched.get("raw_address"):
                 return {
-                    "sms_body": "This is Prevolt Electric — we understand this is an emergency. What is the full address?",
+                    "sms_body": (
+                        "This is Prevolt Electric — this sounds like an emergency. "
+                        "What is the full address for the dispatch?"
+                    ),
                     "scheduled_date": None,
                     "scheduled_time": None,
                     "address": None,
                     "booking_complete": False
                 }
-        
-            # Force same-day emergency scheduling
+
+            # Ask for emergency approval
+            return {
+                "sms_body": (
+                    f"This is Prevolt Electric — this appears to be an emergency at "
+                    f"{sched['raw_address']}. Emergency troubleshooting visits are $395. "
+                    "Would you like us to dispatch a technician immediately?"
+                ),
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+
+        # -------------------------------
+        # STEP 2 — Customer Approves
+        # -------------------------------
+        CONFIRM_PHRASES = [
+            "yes", "yeah", "yup", "ok", "okay",
+            "sure", "that works", "book", "send", "do it"
+        ]
+
+        if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
+
+            sched["emergency_approved"] = True
+            sched["awaiting_emergency_confirm"] = False
+
+            # Force immediate scheduling
+            sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["scheduled_date"] = today_date_str
             sched["scheduled_time"] = now_local.strftime("%H:%M")
             sched["pending_step"] = None
-        
-            # 🔥 IMPORTANT: DO NOT RETURN YET
-            # Let execution continue to autobooking
 
+            # 🔥 CRITICAL FIX: sync local vars so downstream logic sees them
+            scheduled_date = sched["scheduled_date"]
+            scheduled_time = sched["scheduled_time"]
+
+            # Continue to downstream logic — DO NOT RETURN
+
+      
        
                   
         # --------------------------------------
