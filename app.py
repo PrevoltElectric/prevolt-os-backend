@@ -616,25 +616,30 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # EMERGENCY OVERRIDE (2-STEP CONFIRMATION FLOW)
         # --------------------------------------
-
+        
+        # 🔒 Ensure flags always exist (prevents KeyError / NameError)
+        sched.setdefault("awaiting_emergency_confirm", False)
+        sched.setdefault("emergency_approved", False)
+        
         EMERGENCY_KEYWORDS = [
             "tree fell", "tree down", "power line", "lines down",
             "service ripped", "sparking", "burning", "fire",
             "smoke", "no power", "power outage",
             "urgent", "emergency"
         ]
-
+        
         IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
-
+        EMERGENCY = IS_EMERGENCY  # 🔥 alias for downstream logic
+        
         # -------------------------------
         # STEP 1 — Emergency Detected
         # -------------------------------
         if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
-
+        
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["awaiting_emergency_confirm"] = True
             sched["pending_step"] = None  # halt normal flow
-
+        
             # Require address first
             if not sched.get("raw_address"):
                 return {
@@ -647,8 +652,8 @@ def generate_reply_for_inbound(
                     "address": None,
                     "booking_complete": False
                 }
-
-            # Ask for emergency approval
+        
+            # Ask customer to approve emergency pricing
             return {
                 "sms_body": (
                     f"This is Prevolt Electric — this appears to be an emergency at "
@@ -660,52 +665,32 @@ def generate_reply_for_inbound(
                 "address": sched.get("raw_address"),
                 "booking_complete": False
             }
-
+        
         # -------------------------------
-        # STEP 2 — Customer Approves
+        # STEP 2 — Customer Approves Emergency
         # -------------------------------
         CONFIRM_PHRASES = [
             "yes", "yeah", "yup", "ok", "okay",
             "sure", "that works", "book", "send", "do it"
         ]
-
+        
         if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
-
+        
             sched["emergency_approved"] = True
             sched["awaiting_emergency_confirm"] = False
-
+        
             # Force immediate scheduling
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["scheduled_date"] = today_date_str
             sched["scheduled_time"] = now_local.strftime("%H:%M")
             sched["pending_step"] = None
-
-            # 🔥 CRITICAL FIX: sync local vars so downstream logic sees them
+        
+            # 🔥 CRITICAL: sync locals so autobooking sees them
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
-
+        
             # Continue to downstream logic — DO NOT RETURN
-
-      
        
-                  
-        # --------------------------------------
-        # Weekday clarification (natural language)
-        # --------------------------------------
-        weekdays = ["monday","tuesday","wednesday","thursday","friday"]
-        mentioned = [d for d in weekdays if d in inbound_lower]
-        
-        if mentioned and not sched.get("scheduled_date"):
-            day = mentioned[0].capitalize()
-            sched["pending_step"] = "need_date"
-        
-            return {
-                "sms_body": f"Got it — which {day} would work best for you?",
-                "scheduled_date": None,
-                "scheduled_time": sched.get("scheduled_time"),
-                "address": sched.get("raw_address"),
-                "booking_complete": False
-            }
 
         
         # --------------------------------------
