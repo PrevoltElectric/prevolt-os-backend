@@ -1079,6 +1079,12 @@ def maybe_create_square_booking(phone: str, convo: dict):
             return
         sched["normalized_address"] = addr_struct
 
+    # ---------------------------------------------------
+    # Square booking.address FIX (remove unsupported field)
+    # ---------------------------------------------------
+    booking_address = dict(addr_struct)
+    booking_address.pop("country", None)
+
     # travel check
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
     if origin:
@@ -1093,7 +1099,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
             print("[BLOCKED] Travel too long.")
             return
 
-    # Square customer
+    # Square customer (customer CAN include country)
     customer_id = square_create_or_get_customer(phone, addr_struct)
     if not customer_id:
         print("[ERROR] Can't create/fetch customer.")
@@ -1113,7 +1119,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
             "customer_id": customer_id,
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
-            "address": addr_struct,
+            "address": booking_address,  # ✅ FIXED
             "appointment_segments": [
                 {
                     "duration_minutes": 60,
