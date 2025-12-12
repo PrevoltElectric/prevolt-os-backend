@@ -367,6 +367,14 @@ def voicemail_complete():
     if classification.get("detected_address"):
         sched["raw_address"] = classification["detected_address"]
 
+    # --------------------------------------
+    # HARD OVERRIDE: Voicemail Emergency Pre-Flag
+    # --------------------------------------
+    if classification.get("intent") == "emergency":
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        sched["awaiting_emergency_confirm"] = True
+        sched["emergency_approved"] = False
+
     # 4) Trigger First SMS (Step 4 call)
     try:
         outbound = generate_reply_for_inbound(
@@ -388,6 +396,7 @@ def voicemail_complete():
     resp.say("Thank you. Your message has been recorded.")
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
+
 
 
 # ---------------------------------------------------
@@ -616,7 +625,7 @@ def generate_reply_for_inbound(
         inbound_lower = inbound_text.lower()
 
         # --------------------------------------
-        # EMERGENCY OVERRIDE (2-STEP CONFIRMATION FLOW)
+        # # 3) Save to memory (2-STEP CONFIRMATION FLOW)
         # --------------------------------------
         
         # 🔒 Ensure flags always exist (prevents KeyError / NameError)
