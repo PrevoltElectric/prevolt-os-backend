@@ -1189,15 +1189,15 @@ def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_creat
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
-# PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY)
-#   - Longer, more human intros + prompts (deterministic per conversation)
-#   - No em dash "—" and no " - " telltales
-#   - No "Got it", "Thanks" filler
-#   - No "one moment / securing" messages (ever)
-#   - House-number patch: handles
-#   - Re-check address state AFTER model output (prevents booking without house number)
-#   - If Square did NOT book, never "confirm"; always ask the next missing atom (or send a neutral line)
-#   - Adds acknowledgement memory so it doesn't repeat acknowledgements
+# PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY + SLOT SUGGESTIONS)
+#   ✅ Longer, more human intros + prompts (deterministic per conversation)
+#   ✅ No em dash "—" and no " - " telltales
+#   ✅ No "Got it", "Thanks" filler
+#   ✅ No "one moment / securing" messages (ever)
+#   ✅ House-number patch: merges "45" into stored street
+#   ✅ Re-check address state AFTER model output (prevents booking without house number)
+#   ✅ If Square did NOT book, never "confirm"; always ask next missing atom
+#   ✅ If Square slot is taken, offers available time slots same day; if none, next day
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -1266,11 +1266,15 @@ def generate_reply_for_inbound(
         # Human phrasing memory
         sched.setdefault("prompt_variants", {})
 
+        # Time suggestion memory (set by maybe_create_square_booking when slot is taken)
+        # Expected shape: {"date": "YYYY-MM-DD", "starts_utc": ["...Z", ...], "requested_start_utc": "...Z"}
+        sched.setdefault("time_suggestions", None)
+
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
 
         # --------------------------------------
-        # Local helpers (so this block is self-contained)
+        # Local helpers
         # --------------------------------------
         ACK_SET = {
             "ok", "okay", "k", "kk", "sure", "yep", "yeah", "yes",
@@ -1326,15 +1330,6 @@ def generate_reply_for_inbound(
                 flags=re.I
             )
 
-            # remove filler that appears right after the intro sentence
-            s = re.sub(
-                r"^(hi[, ]+)?(hey[, ]+)?(you(?:'|’)ve reached|this is)\s+prevolt electric\.\s*"
-                r"(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*",
-                r"this is prevolt electric. ",
-                s,
-                flags=re.I
-            )
-
             # remove wait-text (never allowed)
             s = re.sub(
                 r"\b(one moment|one sec|one second|give me a moment|please wait|hang tight|securing your appointment)\b[\s,.:;!-]*",
@@ -1347,7 +1342,6 @@ def generate_reply_for_inbound(
             s = re.sub(r"\s+\.", ".", s)
             s = re.sub(r"\.\.+", ".", s)
             s = _norm(s)
-
             return s
 
         def _shorten_texty(s: str, max_chars: int = 260) -> str:
@@ -1363,7 +1357,6 @@ def generate_reply_for_inbound(
             return _norm(s)
 
         def build_human_intro_line() -> str:
-            # One-time only. Two short sentences feels human without being chatty.
             options = [
                 "Hi, this is Prevolt Electric. I can help you right here by text.",
                 "Hey, this is Prevolt Electric. Quick question so I can get this lined up.",
@@ -1373,9 +1366,6 @@ def generate_reply_for_inbound(
 
         def humanize_question(core_question: str) -> str:
             core_question = _norm(core_question)
-
-            # Deterministic wrapper per question type so we do not sound random mid-thread.
-            # Keep it subtle, not salesy.
             options = [
                 core_question,
                 f"Perfect. {core_question}",
@@ -1400,6 +1390,32 @@ def generate_reply_for_inbound(
                 sched["price_disclosed"] = True
             return _norm(s)
 
+        def _format_time_suggestions_for_sms() -> str | None:
+            sugg = sched.get("time_suggestions")
+            if not isinstance(sugg, dict):
+                return None
+            starts = sugg.get("starts_utc")
+            if not isinstance(starts, list) or not starts:
+                return None
+
+            # Convert UTC strings into local human times
+            pretty = []
+            for s_utc in starts[:3]:
+                try:
+                    dt_utc = datetime.strptime(s_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    dt_local = dt_utc.astimezone(tz)
+                    pretty.append(dt_local.strftime("%I:%M %p").lstrip("0"))
+                except Exception:
+                    continue
+
+            if not pretty:
+                return None
+
+            day = (sugg.get("date") or "").strip()
+            if day:
+                return f"That time just got taken. I can do {', '.join(pretty)} on {day}. Which one works best?"
+            return f"That time just got taken. I can do {', '.join(pretty)}. Which one works best?"
+
         def _finalize_sms(s: str, appt_type_local: str, booking_created: bool) -> str:
             s = _apply_intro_once(s)
             s = _maybe_price_once(s, appt_type_local)
@@ -1411,7 +1427,6 @@ def generate_reply_for_inbound(
             if _is_ack_only(inbound_text):
                 low = s.lower()
                 looks_like_ack = (low in {"ok", "okay", "yep", "yeah", "yes"} or len(low) <= 6)
-
                 if looks_like_ack:
                     update_address_assembly_state(sched)
                     if not sched.get("address_verified"):
@@ -1423,16 +1438,16 @@ def generate_reply_for_inbound(
                         s = humanize_question("What day works best for you?")
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_time"):
-                        s = humanize_question("What time works best?")
+                        # If we have slot suggestions, use them
+                        sug_txt = _format_time_suggestions_for_sms()
+                        s = sug_txt if sug_txt else humanize_question("What time works best?")
                         s = _apply_intro_once(s)
                     else:
                         s = "Okay."
 
             # Extra safety: if not booked, strip any confirmation language
             if not booking_created:
-                conf_markers = [
-                    "confirmation number", "confirmed", "your appointment is", "booked for", "scheduled for"
-                ]
+                conf_markers = ["confirmation number", "confirmed", "your appointment is", "booked for", "scheduled for"]
                 if any(m in s.lower() for m in conf_markers):
                     update_address_assembly_state(sched)
                     if not sched.get("address_verified"):
@@ -1442,7 +1457,8 @@ def generate_reply_for_inbound(
                         s = humanize_question("What day works best for you?")
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_time"):
-                        s = humanize_question("What time works best?")
+                        sug_txt = _format_time_suggestions_for_sms()
+                        s = sug_txt if sug_txt else humanize_question("What time works best?")
                         s = _apply_intro_once(s)
                     else:
                         s = "Okay."
@@ -1452,11 +1468,10 @@ def generate_reply_for_inbound(
             except Exception:
                 pass
 
-            # Final cleanup: ensure no em dash / spaced hyphen survives
             s = s.replace("—", ".").replace("–", ".").replace(" - ", " ")
             s = _norm(s)
 
-            # Prevent repeating the exact same final ack text twice in a row
+            # Prevent repeating same ack text
             if _is_ack_only(inbound_text):
                 if sched.get("last_ack_text") and sched["last_ack_text"].lower() == s.lower():
                     s = "Okay."
@@ -1486,13 +1501,7 @@ def generate_reply_for_inbound(
             if not sched.get("raw_address"):
                 msg = "This sounds urgent. " + build_address_prompt(sched)
                 msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
-                return {
-                    "sms_body": msg,
-                    "scheduled_date": None,
-                    "scheduled_time": None,
-                    "address": None,
-                    "booking_complete": False
-                }
+                return {"sms_body": msg, "scheduled_date": None, "scheduled_time": None, "address": None, "booking_complete": False}
 
             msg = (
                 f"This looks urgent at {sched.get('raw_address')}. "
@@ -1500,13 +1509,7 @@ def generate_reply_for_inbound(
                 "Do you want us to dispatch someone now?"
             )
             msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
-            return {
-                "sms_body": msg,
-                "scheduled_date": None,
-                "scheduled_time": None,
-                "address": sched.get("raw_address"),
-                "booking_complete": False
-            }
+            return {"sms_body": msg, "scheduled_date": None, "scheduled_time": None, "address": sched.get("raw_address"), "booking_complete": False}
 
         CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
 
@@ -1526,10 +1529,7 @@ def generate_reply_for_inbound(
         # --------------------------------------
         appt_type = sched.get("appointment_type") or appointment_type
         if not appt_type:
-            if any(w in inbound_lower for w in [
-                "not working", "no power", "dead", "sparking", "burning",
-                "breaker keeps", "gfci", "outlet not", "troubleshoot"
-            ]):
+            if any(w in inbound_lower for w in ["not working", "no power", "dead", "sparking", "burning", "breaker keeps", "gfci", "outlet not", "troubleshoot"]):
                 appt_type = "TROUBLESHOOT_395"
             elif any(w in inbound_lower for w in ["inspection", "whole home inspection", "electrical inspection"]):
                 appt_type = "WHOLE_HOME_INSPECTION"
@@ -1542,7 +1542,7 @@ def generate_reply_for_inbound(
         # --------------------------------------
         update_address_assembly_state(sched)
 
-        # ✅ HOUSE NUMBER PATCH (pre-LLM) — IMPROVED
+        # ✅ HOUSE NUMBER PATCH (pre-LLM)
         try:
             update_address_assembly_state(sched)
             missing_atom = (sched.get("address_missing") or "").strip().lower()
@@ -1621,9 +1621,7 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
-        # --------------------------------------
-        # RESET-LOCK (never lose good stored values)
-        # --------------------------------------
+        # RESET-LOCK
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
         if sched.get("scheduled_time") and not model_time:
@@ -1634,9 +1632,7 @@ def generate_reply_for_inbound(
         if isinstance(model_addr, str) and len(model_addr.strip()) > 3:
             sched["raw_address"] = model_addr.strip()
 
-        # ---------------------------------------------------
-        # CRITICAL PATCH: re-run address state AFTER model changes
-        # ---------------------------------------------------
+        # Re-run address state AFTER model changes
         update_address_assembly_state(sched)
         try:
             try_early_address_normalize(sched)
@@ -1646,11 +1642,14 @@ def generate_reply_for_inbound(
 
         model_addr = sched.get("raw_address")
 
-        # Human-readable time
-        try:
-            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
-        except Exception:
-            human_time = model_time
+        # Human-readable time (cross-platform safe)
+        human_time = None
+        if model_time:
+            try:
+                dt = datetime.strptime(model_time, "%H:%M")
+                human_time = dt.strftime("%I:%M %p").lstrip("0")
+            except Exception:
+                human_time = model_time
 
         if model_time and human_time:
             sms_body = sms_body.replace(model_time, human_time)
@@ -1661,7 +1660,7 @@ def generate_reply_for_inbound(
         if model_time:
             sched["scheduled_time"] = model_time
 
-        # If address STILL not verified, override immediately (humanized prompt stays in builder)
+        # If address STILL not verified, override immediately
         if not sched.get("address_verified"):
             msg = build_address_prompt(sched)
             msg = _finalize_sms(msg, appt_type, booking_created=False)
@@ -1716,9 +1715,15 @@ def generate_reply_for_inbound(
             elif not sched.get("scheduled_date"):
                 sms_body = humanize_question("What day works best for you?")
             elif not sched.get("scheduled_time"):
-                sms_body = humanize_question("What time works best?")
+                # ✅ NEW: show slot suggestions if present
+                sug_txt = _format_time_suggestions_for_sms()
+                if sug_txt:
+                    sms_body = sug_txt
+                    # Clear after use so we don't repeat endlessly
+                    sched["time_suggestions"] = None
+                else:
+                    sms_body = humanize_question("What time works best?")
             else:
-                # Collected everything but booking not created. Neutral, human, not weird.
                 sms_body = pick_variant_once("neutral_no_book", [
                     "Okay. If anything changes, just text me here.",
                     "All set. If you need to adjust anything, just message me here.",
@@ -1745,6 +1750,7 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
 
 
 
@@ -1996,309 +2002,113 @@ def is_weekend(date_str: str) -> bool:
         return False
 
 
-# ---------------------------------------------------
-# Create Square Booking (Corrected + Step 5B Compatible) — PATCHED (requires house number)
-#   ✅ Creates booking
-#   ✅ Retrieves booking to confirm status/version
-#   ✅ Accepts booking if needed (often required to trigger notifications + calendar sync)
-#   ✅ Only sets booking_created / square_booking_id AFTER verify+accept succeeds
-#   ✅ Prevents stale booking flags from causing ghost confirmations
-# ---------------------------------------------------
-def maybe_create_square_booking(phone: str, convo: dict):
-    import re
-
-    sched = convo.setdefault("sched", {})
-    profile = convo.setdefault("profile", {})
-    current_job = convo.setdefault("current_job", {})
-
-    # Harden profile keys (prevents KeyError elsewhere)
-    profile.setdefault("addresses", [])
-    profile.setdefault("past_jobs", [])
-    profile.setdefault("upcoming_appointment", None)
-
-    # Never double-book
-    if sched.get("booking_created") and sched.get("square_booking_id"):
-        return
-
-    # Clear stale booking state before a fresh attempt
-    sched["booking_created"] = False
-    sched["square_booking_id"] = None
-
-    scheduled_date   = sched.get("scheduled_date")
-    scheduled_time   = sched.get("scheduled_time")
-    raw_address      = (sched.get("raw_address") or "").strip()
-    appointment_type = sched.get("appointment_type")
-
-    # ✅ Step 5 hard gate: do NOT attempt Square booking until address is VERIFIED
-    # (Verified now MUST mean "has a house number" per your patched address state helper.)
-    if not sched.get("address_verified"):
-        return
-
-    if not (scheduled_date and scheduled_time and appointment_type):
-        return
-
-    variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
-    if not variation_id:
-        print("[ERROR] Unknown appt_type:", appointment_type)
-        return
-
-    # weekend rule
-    if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
-        print("[BLOCKED] Weekend not allowed for non-emergency.")
-        return
-
-    # time-window rule
-    if appointment_type != "TROUBLESHOOT_395":
-        if not is_within_normal_hours(scheduled_time):
-            print("[BLOCKED] Time outside 9–4")
-            return
-
-    if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
-        print("[ERROR] Square not configured.")
-        return
-
     # ---------------------------------------------------
-    # Address normalization precedence (Step 5B)
-    # 1) Use sched["normalized_address"] if it is a dict and complete
-    # 2) Otherwise attempt normalize_address(raw_address)
+    # ✅ Availability + Suggestions
+    #   - If requested slot is free: proceed
+    #   - If not: store same-day suggestions; if none, store next-day suggestions
+    #   - Do NOT send SMS from here (Step 4 will message using sched["time_suggestions"])
     # ---------------------------------------------------
-    addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+    duration_minutes = 60
+    end_at_utc = start_at_utc + timedelta(minutes=duration_minutes)
 
-    def _is_complete_norm(a: dict) -> bool:
-        return bool(
-            isinstance(a, dict)
-            and (a.get("address_line_1") or "").strip()
-            and (a.get("locality") or "").strip()
-            and (a.get("administrative_district_level_1") or "").strip()
-            and (a.get("postal_code") or "").strip()
-        )
-
-    def _has_house_number(line1: str) -> bool:
-        line1 = (line1 or "").strip()
-        return bool(re.match(r"^\d{1,6}\b", line1))
-
-    if not _is_complete_norm(addr_struct):
-        # If we somehow reached here with address_verified True but no good normalized struct, re-normalize
-        if not raw_address:
-            # Nothing to normalize; bail safely
-            sched["address_verified"] = False
-            sched["address_missing"] = "street"
-            return
-
-        try:
-            status, fresh = normalize_address(raw_address)
-        except Exception as e:
-            print("[ERROR] normalize_address exception:", repr(e))
-            return
-
-        # Preserve your existing "needs_state" flow
-        if status == "needs_state":
-            send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
-            # Mark not verified until we have a full normalized address
-            sched["address_verified"] = False
-            sched["address_missing"] = "state"
-            return
-
-        # If normalization fails, do not book
-        if status != "ok" or not isinstance(fresh, dict):
-            print("[ERROR] Address normalization failed. status=", status)
-            sched["address_verified"] = False
-            sched["address_missing"] = "confirm"
-            return
-
-        addr_struct = fresh
-        sched["normalized_address"] = addr_struct
-
-    # Final check: must be complete
-    if not _is_complete_norm(addr_struct):
-        print("[ERROR] Normalized address missing required fields.")
-        sched["address_verified"] = False
-        sched["address_missing"] = "confirm"
-        return
-
-    # ---------------------------------------------------
-    # ✅ HARD BLOCK if no house number in normalized address_line_1
-    # ---------------------------------------------------
-    line1 = (addr_struct.get("address_line_1") or "").strip()
-    if not _has_house_number(line1):
-        sched["address_verified"] = False
-        sched["address_missing"] = "number"
-        return
-
-    # ---------------------------------------------------
-    # Square booking.address FIX (remove unsupported field)
-    # ---------------------------------------------------
-    booking_address = dict(addr_struct)
-    booking_address.pop("country", None)  # Square booking.address rejects country in some setups
-
-    # ---------------------------------------------------
-    # Travel check (uses normalized destination)
-    # ---------------------------------------------------
-    origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
-    if origin:
-        destination = (
-            f"{(addr_struct.get('address_line_1') or '').strip()}, "
-            f"{(addr_struct.get('locality') or '').strip()}, "
-            f"{(addr_struct.get('administrative_district_level_1') or '').strip()} "
-            f"{(addr_struct.get('postal_code') or '').strip()}"
-        ).strip()
-
-        travel_minutes = compute_travel_time_minutes(origin, destination)
-        if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES:
-            print("[BLOCKED] Travel too long.")
-            return
-
-    # ---------------------------------------------------
-    # Square customer (customer CAN include country)
-    # ---------------------------------------------------
-    customer_id = square_create_or_get_customer(phone, addr_struct)
-    if not customer_id:
-        print("[ERROR] Can't create/fetch customer.")
-        return
-
-    start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
-    if not start_at_utc:
-        print("[ERROR] Invalid start time.")
-        return
-
-    # Use normalized address in the idempotency key so partial text changes don't accidentally create dupes
-    idempotency_key = (
-        f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}-"
-        f"{(addr_struct.get('address_line_1') or '').strip()}-"
-        f"{(addr_struct.get('postal_code') or '').strip()}"
-    )
-
-    booking_payload = {
-        "idempotency_key": idempotency_key,
-        "booking": {
-            "location_id": SQUARE_LOCATION_ID,
-            "customer_id": customer_id,
-            "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "location_type": "CUSTOMER_LOCATION",
-            "address": booking_address,
-            "appointment_segments": [
-                {
-                    "duration_minutes": 60,
-                    "service_variation_id": variation_id,
-                    "service_variation_version": variation_version,
-                    "team_member_id": SQUARE_TEAM_MEMBER_ID
-                }
-            ],
-            "customer_note": (
-                "Auto-booked by Prevolt OS. "
-                f"Raw address: {raw_address or '[none]'} | "
-                f"Normalized: {addr_struct.get('address_line_1')}, {addr_struct.get('locality')}, "
-                f"{(addr_struct.get('administrative_district_level_1') or '').strip()} {(addr_struct.get('postal_code') or '').strip()}"
-            )
-        }
-    }
-
-    try:
-        # -----------------------------
-        # 1) Create booking
-        # -----------------------------
-        resp = requests.post(
-            "https://connect.squareup.com/v2/bookings",
-            headers=square_headers(),
-            json=booking_payload,
-            timeout=12,
-        )
-        if resp.status_code not in (200, 201):
-            print("[ERROR] Square booking failed:", resp.status_code, resp.text)
-            return
-
-        data = resp.json()
-        booking = data.get("booking") or {}
-        booking_id = booking.get("id")
-
-        if not booking_id:
-            print("[ERROR] booking_id missing. payload=", data)
-            return
-
-        # -----------------------------
-        # 2) Retrieve booking to confirm status/version
-        # -----------------------------
-        r2 = requests.get(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            timeout=12,
-        )
-        if r2.status_code not in (200, 201):
-            print("[ERROR] retrieve booking failed:", r2.status_code, r2.text)
-            return
-
-        b2 = (r2.json() or {}).get("booking") or {}
-        status = (b2.get("status") or "").upper()
-        version = b2.get("version")
-
-        try:
-            segs = b2.get("appointment_segments") or []
-            tm = segs[0].get("team_member_id") if segs and isinstance(segs, list) else None
-        except Exception:
-            tm = None
-
-        print("[DEBUG] booking retrieved:", {
-            "id": booking_id,
-            "status": status,
-            "version": version,
-            "location_id": b2.get("location_id"),
-            "team_member_id": tm
-        })
-
-        # -----------------------------
-        # 3) Accept booking if not already accepted/confirmed
-        # -----------------------------
-        if status not in ("ACCEPTED", "CONFIRMED"):
-            if version is None:
-                print("[ERROR] booking version missing; cannot accept.")
-                return
-
-            accept_payload = {
-                "booking": {
-                    "version": version,
-                    "status": "ACCEPTED",
+    def _availability_search(start_dt_utc, end_dt_utc):
+        payload = {
+            "query": {
+                "filter": {
+                    "start_at_range": {
+                        "start_at": start_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "end_at": end_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                    "location_id": SQUARE_LOCATION_ID,
+                    "segment_filters": [
+                        {
+                            "service_variation_id": variation_id,
+                            "team_member_id_filter": {"any": [SQUARE_TEAM_MEMBER_ID]},
+                        }
+                    ],
                 }
             }
-
-            r3 = requests.put(
-                f"https://connect.squareup.com/v2/bookings/{booking_id}",
-                headers=square_headers(),
-                json=accept_payload,
-                timeout=12,
-            )
-            if r3.status_code not in (200, 201):
-                print("[ERROR] accept booking failed:", r3.status_code, r3.text)
-                return
-
-            b3 = (r3.json() or {}).get("booking") or {}
-            status2 = (b3.get("status") or "").upper()
-            print("[DEBUG] booking accepted:", {"id": booking_id, "status": status2})
-
-            if status2 not in ("ACCEPTED", "CONFIRMED"):
-                print("[ERROR] booking did not end in ACCEPTED/CONFIRMED. status=", status2)
-                return
-
-        # ✅ Only mark booked AFTER create + retrieve + accept succeeds
-        sched["booking_created"] = True
-        sched["square_booking_id"] = booking_id
-
-        profile["upcoming_appointment"] = {
-            "date": scheduled_date,
-            "time": scheduled_time,
-            "type": appointment_type,
-            "square_id": booking_id
         }
+        r = requests.post(
+            "https://connect.squareup.com/v2/bookings/availability/search",
+            headers=square_headers(),
+            json=payload,
+            timeout=12,
+        )
+        if r.status_code not in (200, 201):
+            print("[ERROR] availability search failed:", r.status_code, r.text)
+            return None
+        return (r.json() or {}).get("availabilities") or []
 
-        if current_job.get("job_type"):
-            profile.setdefault("past_jobs", []).append({
-                "type": current_job["job_type"],
-                "date": scheduled_date
-            })
+    def _extract_start_times(av_list, limit=3):
+        starts = []
+        for a in (av_list or []):
+            sa = (a.get("start_at") or "").strip()
+            if sa:
+                starts.append(sa)
+            if len(starts) >= limit:
+                break
+        return starts
 
-        print("[SUCCESS] Booking created and accepted:", booking_id)
+    # 1) Check the exact requested slot
+    try:
+        availabilities = _availability_search(start_at_utc, end_at_utc)
+        if availabilities is None:
+            return
+
+        want_start = start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        slot_ok = any((a.get("start_at") or "") == want_start for a in availabilities)
+
+        if not slot_ok:
+            # 2) Suggestions same day: search a wider window after requested start
+            same_day_av = _availability_search(start_at_utc, start_at_utc + timedelta(hours=10))
+            if same_day_av is None:
+                return
+
+            suggestions_utc = _extract_start_times(same_day_av, limit=3)
+            suggestion_date = scheduled_date
+
+            # 3) If none same day: search next day
+            if not suggestions_utc:
+                next_day_start = start_at_utc + timedelta(days=1)
+                next_day_end = next_day_start + timedelta(hours=10)
+
+                next_day_av = _availability_search(next_day_start, next_day_end)
+                if next_day_av is None:
+                    return
+
+                suggestions_utc = _extract_start_times(next_day_av, limit=3)
+
+                # If we found next-day suggestions, set the suggested date
+                if suggestions_utc:
+                    try:
+                        d = datetime.strptime(scheduled_date, "%Y-%m-%d")
+                        suggestion_date = (d + timedelta(days=1)).strftime("%Y-%m-%d")
+                    except Exception:
+                        suggestion_date = scheduled_date
+
+            # Store for Step 4 to present
+            sched["time_suggestions"] = {
+                "date": suggestion_date,
+                "starts_utc": suggestions_utc,  # list[str] like "2025-12-22T14:00:00Z"
+                "requested_start_utc": want_start
+            }
+
+            print("[BLOCKED] Slot not available; saved suggestions:", sched["time_suggestions"])
+
+            # Force Step 4 to ask for a new time (and guide it toward suggestion_date)
+            sched["scheduled_time"] = None
+            sched["pending_step"] = "need_time"
+
+            # If we have next-day suggestions, move the date forward so Step 4 naturally stays aligned
+            if suggestion_date and suggestion_date != scheduled_date:
+                sched["scheduled_date"] = suggestion_date
+
+            return
 
     except Exception as e:
-        print("[ERROR] Square exception:", repr(e))
+        print("[ERROR] availability exception:", repr(e))
+        return
 
 
 
