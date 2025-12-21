@@ -470,7 +470,44 @@ def voicemail_complete():
 
 
 # ---------------------------------------------------
-# build_system_prompt (RESTORED)
+# SMS Sanitizer — prevents "one moment" / "hold on" lies
+# ---------------------------------------------------
+def sanitize_sms_body(s: str, *, booking_created: bool) -> str:
+    """
+    If we are NOT immediately sending a booking confirmation in this same reply,
+    we must NOT say 'one moment', 'securing', 'processing', etc.
+    """
+    if not s:
+        return s
+
+    low = s.lower()
+
+    banned_phrases = [
+        "one moment",
+        "one sec",
+        "one second",
+        "hold on",
+        "hang tight",
+        "please wait",
+        "i am finishing",
+        "i'm finishing",
+        "securing your appointment",
+        "processing",
+        "working on it",
+        "i'll book that now",
+        "i will book that now",
+        "let me book",
+        "let me secure",
+    ]
+
+    if any(p in low for p in banned_phrases) and not booking_created:
+        return "Thanks — got it."
+
+    return s
+
+
+# ---------------------------------------------------
+# build_system_prompt (RESTORED + PATCHED)
 # ---------------------------------------------------
 def build_system_prompt(
     cleaned_transcript,
@@ -512,17 +549,26 @@ Rules:
 - If only one field is missing, ask ONLY for that field.
 - If all fields are present, confirm appointment.
 - Use simple, direct language.
+- NEVER say “one moment”, “please wait”, “hold on”, “securing your appointment”, or anything implying background processing.
+- Only confirm a booking if it is ACTUALLY booked with Square (real booking id exists).
 """
 
 
 # ---------------------------------------------------
-# Address Assembly State Helper (Step 2)
+# Address Assembly State Helper (Step 2) — FIXED (requires house number)
 # ---------------------------------------------------
 def update_address_assembly_state(sched: dict) -> None:
     """
     Derives address state atoms from raw_address / normalized_address.
-    This does NOT change booking or messaging behavior yet.
+
+    FIX:
+      - Normalized addresses are ONLY considered "verified" if address_line_1
+        includes a leading street number (ex: "24 Dickerman Ave").
+      - Route-only normalization (ex: "Dickerman Ave, Windsor Locks CT 06096")
+        is NOT sufficient to book.
     """
+    import re
+
     # Defaults (never assume keys exist)
     sched.setdefault("address_candidate", None)
     sched.setdefault("address_verified", False)
@@ -532,28 +578,57 @@ def update_address_assembly_state(sched: dict) -> None:
     raw = (sched.get("raw_address") or "").strip()
     norm = sched.get("normalized_address")
 
-    # If we already have a normalized struct, we consider it bookable.
-    if (
-        isinstance(norm, dict)
-        and norm.get("address_line_1")
-        and norm.get("locality")
-        and norm.get("administrative_district_level_1")
-        and norm.get("postal_code")
-    ):
-        sched["address_verified"] = True
-        sched["address_missing"] = None
-        sched["address_candidate"] = raw or sched.get("address_candidate")
-        sched["address_parts"] = {
-            "street": True,
-            "number": True,
-            "city": True,
-            "state": True,
-            "zip": True,
-            "source": "normalized_address"
-        }
-        return
+    # Helper: does a line start with a street number?
+    def line_has_number(line: str) -> bool:
+        line = (line or "").strip()
+        return bool(re.match(r"^\d{1,6}\b", line))
 
-    # No normalized address yet → evaluate raw candidate quality
+    # -----------------------------
+    # 1) If we have normalized_address, validate it properly
+    # -----------------------------
+    if isinstance(norm, dict):
+        line1 = (norm.get("address_line_1") or "").strip()
+        city  = (norm.get("locality") or "").strip()
+        state = (norm.get("administrative_district_level_1") or "").strip()
+        zipc  = (norm.get("postal_code") or "").strip()
+
+        has_core_fields = bool(line1 and city and state and zipc)
+
+        # ✅ FIX: require street number in line1
+        has_number = line_has_number(line1)
+
+        if has_core_fields and has_number:
+            sched["address_verified"] = True
+            sched["address_missing"] = None
+            sched["address_candidate"] = raw or sched.get("address_candidate")
+            sched["address_parts"] = {
+                "street": True,
+                "number": True,
+                "city": True,
+                "state": True,
+                "zip": True,
+                "source": "normalized_address"
+            }
+            return
+
+        # If we have route-level normalization but no house number:
+        if has_core_fields and not has_number:
+            sched["address_verified"] = False
+            sched["address_missing"] = "number"
+            sched["address_candidate"] = raw or line1
+            sched["address_parts"] = {
+                "street": True,
+                "number": False,
+                "city": True,
+                "state": True,
+                "zip": True,
+                "source": "normalized_address_missing_number"
+            }
+            return
+
+    # -----------------------------
+    # 2) No normalized verified address → evaluate raw candidate quality
+    # -----------------------------
     sched["address_verified"] = False
     if raw:
         sched["address_candidate"] = raw
@@ -566,27 +641,27 @@ def update_address_assembly_state(sched: dict) -> None:
 
     low = raw.lower()
 
-    # Heuristic: detect street words (helps distinguish "Windsor Locks" vs "Dickerman Ave")
+    # Heuristic: detect street words
     street_suffixes = (
-        " st", " street", " ave", " avenue", " rd", " road", " ln", " lane", " dr", " drive",
-        " ct", " court", " cir", " circle", " blvd", " boulevard", " way", " pkwy", " parkway",
-        " ter", " terrace"
+        " st", " street", " ave", " avenue", " rd", " road", " ln", " lane",
+        " dr", " drive", " ct", " court", " cir", " circle", " blvd", " boulevard",
+        " way", " pkwy", " parkway", " ter", " terrace"
     )
     has_street_word = any(suf in low for suf in street_suffixes)
 
-    # Has a house number at the start? (leading digits)
+    # Has a house number at the start?
     starts_with_number = low[:1].isdigit()
 
     # Has explicit CT/MA?
     has_state = (" ct" in f" {low} ") or (" connecticut" in low) or (" ma" in f" {low} ") or (" massachusetts" in low)
 
-    # Very common case: "Dickerman Ave" (street, no number)
+    # Street, no number: "Dickerman Ave"
     if has_street_word and not starts_with_number:
         sched["address_missing"] = "number"
         sched["address_parts"] = {"street": True, "number": False, "city": False, "state": has_state, "zip": False, "source": "raw_address"}
         return
 
-    # Common case: "24 Main St" (number + street, likely needs town/state/zip via normalization/confirm)
+    # Number + street: "24 Main St" (needs town confirm possibly)
     if has_street_word and starts_with_number:
         sched["address_missing"] = "confirm"
         sched["address_parts"] = {"street": True, "number": True, "city": False, "state": has_state, "zip": False, "source": "raw_address"}
@@ -595,6 +670,7 @@ def update_address_assembly_state(sched: dict) -> None:
     # Town-only like "Windsor Locks"
     sched["address_missing"] = "street"
     sched["address_parts"] = {"street": False, "number": False, "city": True, "state": has_state, "zip": False, "source": "raw_address"}
+
 
 
 # ---------------------------------------------------
@@ -699,6 +775,7 @@ def try_early_address_normalize(sched: dict) -> None:
     if status == "ok" and isinstance(addr_struct, dict):
         sched["normalized_address"] = addr_struct
         update_address_assembly_state(sched)
+
 
 
 # ---------------------------------------------------
@@ -873,6 +950,11 @@ def incoming_sms():
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
+# PATCHED:
+#   - Never says "one moment" / wait-text when nothing happens.
+#   - Re-checks address state AFTER model output (fixes “booked with no house #”).
+#   - If Square did NOT book, it always asks for the NEXT missing atom instead of fake-confirming.
+#   - Uses sanitize_sms_body() helper (must exist above in your file).
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -1012,7 +1094,7 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = appt_type
 
         # --------------------------------------
-        # Missing-info resolver (Step 3 + Step 5B)
+        # Missing-info resolver (Pre-LLM)
         # --------------------------------------
         update_address_assembly_state(sched)
 
@@ -1027,8 +1109,6 @@ def generate_reply_for_inbound(
 
         missing_date = not (scheduled_date or sched.get("scheduled_date"))
         missing_time = not (scheduled_time or sched.get("scheduled_time"))
-
-        # raw_address ≠ complete address
         missing_addr = not bool(sched.get("address_verified"))
 
         if missing_addr:
@@ -1040,7 +1120,7 @@ def generate_reply_for_inbound(
         else:
             sched["pending_step"] = None
 
-        # Deterministic address ask (no loops, no "full service address" wording)
+        # Deterministic address ask (no loops, no "full service address")
         if sched.get("pending_step") == "need_address":
             return {
                 "sms_body": build_address_prompt(sched),
@@ -1091,7 +1171,7 @@ def generate_reply_for_inbound(
         model_addr = ai_raw.get("address")
 
         # --------------------------------------
-        # RESET-LOCK
+        # RESET-LOCK (never lose good stored values)
         # --------------------------------------
         if sched.get("scheduled_date") and not model_date:
             model_date = sched["scheduled_date"]
@@ -1100,8 +1180,23 @@ def generate_reply_for_inbound(
         if sched.get("raw_address") and not model_addr:
             model_addr = sched["raw_address"]
 
-        if isinstance(model_addr, str) and len(model_addr) > 5:
-            sched["raw_address"] = model_addr
+        # Save model address into sched raw_address
+        if isinstance(model_addr, str) and len(model_addr.strip()) > 3:
+            sched["raw_address"] = model_addr.strip()
+
+        # ---------------------------------------------------
+        # CRITICAL PATCH: Re-run address state AFTER model changes
+        #   This is where we stop "Dickerman Ave Windsor Locks CT 06096"
+        #   from being treated as bookable without a house number.
+        # ---------------------------------------------------
+        update_address_assembly_state(sched)
+        try:
+            try_early_address_normalize(sched)
+        except Exception as e:
+            print("[WARN] try_early_address_normalize post-LLM failed:", repr(e))
+        update_address_assembly_state(sched)
+
+        # Prefer stored raw_address after we updated it
         model_addr = sched.get("raw_address")
 
         # --------------------------------------
@@ -1138,6 +1233,21 @@ def generate_reply_for_inbound(
             sched["scheduled_time"] = model_time
 
         # --------------------------------------
+        # If address STILL not verified, override response immediately
+        # (this prevents Square booking + prevents misleading confirmations)
+        # --------------------------------------
+        if not sched.get("address_verified"):
+            sms_body = build_address_prompt(sched)
+            sms_body = sanitize_sms_body(sms_body, booking_created=False)
+            return {
+                "sms_body": sms_body,
+                "scheduled_date": sched.get("scheduled_date") or model_date,
+                "scheduled_time": sched.get("scheduled_time") or model_time,
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+
+        # --------------------------------------
         # AUTOBOOKING (Step 5)
         # Gate booking on address_verified, NOT raw_address.
         # --------------------------------------
@@ -1156,12 +1266,14 @@ def generate_reply_for_inbound(
 
                 # Never claim "booked" unless Square returned a booking id.
                 if sched.get("booking_created") and sched.get("square_booking_id"):
+                    booked_sms = (
+                        f"You're all set — your appointment is booked for "
+                        f"{sched['scheduled_date']} at {human_time} at {model_addr}. "
+                        f"Your confirmation number is {sched.get('square_booking_id')}."
+                    )
+                    booked_sms = sanitize_sms_body(booked_sms, booking_created=True)
                     return {
-                        "sms_body": (
-                            f"You're all set — your appointment is booked for "
-                            f"{sched['scheduled_date']} at {human_time} at {model_addr}. "
-                            f"Your confirmation number is {sched.get('square_booking_id')}."
-                        ),
+                        "sms_body": booked_sms,
                         "scheduled_date": sched["scheduled_date"],
                         "scheduled_time": sched["scheduled_time"],
                         "address": model_addr,
@@ -1171,28 +1283,25 @@ def generate_reply_for_inbound(
                 print("[ERROR] Autobooking:", repr(e))
 
         # ---------------------------------------------------
-        # HARD SAFETY: Never confirm appointment unless Square booked it
+        # HARD SAFETY PATCH:
+        # If Square didn't book, DO NOT confirm. Ask next missing atom instead.
         # ---------------------------------------------------
         if not (sched.get("booking_created") and sched.get("square_booking_id")):
-            confirmation_markers = [
-                "is scheduled",
-                "has been scheduled",
-                "scheduled for",
-                "booked for",
-                "confirmation number",
-                "you're all set",
-                "your appointment"
-            ]
-            lowered = sms_body.lower()
-            if any(m in lowered for m in confirmation_markers):
-                if not sched.get("address_verified"):
-                    sms_body = build_address_prompt(sched)
-                elif not sched.get("scheduled_date"):
-                    sms_body = "What date would you like to schedule the appointment?"
-                elif not sched.get("scheduled_time"):
-                    sms_body = "What time works best for you?"
-                else:
-                    sms_body = "One moment while I finish securing your appointment."
+            # Re-evaluate what we still need and ask for that.
+            update_address_assembly_state(sched)
+
+            if not sched.get("address_verified"):
+                sms_body = build_address_prompt(sched)
+            elif not sched.get("scheduled_date"):
+                sms_body = "What date would you like to schedule the appointment?"
+            elif not sched.get("scheduled_time"):
+                sms_body = "What time works best for you?"
+            else:
+                # We have all fields, but booking not created yet.
+                # Never lie — just acknowledge and keep moving.
+                sms_body = "Thanks — got it."
+
+        sms_body = sanitize_sms_body(sms_body, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
 
         return {
             "sms_body": sms_body,
@@ -1462,12 +1571,19 @@ def is_weekend(date_str: str) -> bool:
 
 
 # ---------------------------------------------------
-# Create Square Booking (Corrected + Step 5B Compatible)
+# Create Square Booking (Corrected + Step 5B Compatible) — PATCHED (requires house number)
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict):
+    import re
+
     sched = convo.setdefault("sched", {})
     profile = convo.setdefault("profile", {})
     current_job = convo.setdefault("current_job", {})
+
+    # Harden profile keys (prevents KeyError elsewhere)
+    profile.setdefault("addresses", [])
+    profile.setdefault("past_jobs", [])
+    profile.setdefault("upcoming_appointment", None)
 
     # Never double-book
     if sched.get("booking_created") and sched.get("square_booking_id"):
@@ -1479,7 +1595,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
     appointment_type = sched.get("appointment_type")
 
     # ✅ Step 5 hard gate: do NOT attempt Square booking until address is VERIFIED
-    # This prevents "it thinks it booked" when the address is partial.
+    # (Verified now MUST mean "has a house number" per your patched address state helper.)
     if not sched.get("address_verified"):
         return
 
@@ -1522,6 +1638,10 @@ def maybe_create_square_booking(phone: str, convo: dict):
             and (a.get("postal_code") or "").strip()
         )
 
+    def _has_house_number(line1: str) -> bool:
+        line1 = (line1 or "").strip()
+        return bool(re.match(r"^\d{1,6}\b", line1))
+
     if not _is_complete_norm(addr_struct):
         # If we somehow reached here with address_verified True but no good normalized struct, re-normalize
         if not raw_address:
@@ -1559,6 +1679,22 @@ def maybe_create_square_booking(phone: str, convo: dict):
         print("[ERROR] Normalized address missing required fields.")
         sched["address_verified"] = False
         sched["address_missing"] = "confirm"
+        return
+
+    # ---------------------------------------------------
+    # ✅ PATCH: HARD BLOCK if no house number in normalized address_line_1
+    # This prevents Square booking from route-only addresses like "Dickerman Ave".
+    # ---------------------------------------------------
+    line1 = (addr_struct.get("address_line_1") or "").strip()
+    if not _has_house_number(line1):
+        # Mark as not verified so Step 4 asks for the missing atom (house number)
+        sched["address_verified"] = False
+        sched["address_missing"] = "number"
+
+        # Optional: keep raw_address as-is; Step 4 will prompt for the number.
+        # If you want an immediate SMS from here, uncomment the next line:
+        # send_sms(phone, f"Got it — what’s the house number on {line1}?")
+
         return
 
     # ---------------------------------------------------
@@ -1669,6 +1805,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     except Exception as e:
         print("[ERROR] Square exception:", repr(e))
+
 
 
 # ---------------------------------------------------
