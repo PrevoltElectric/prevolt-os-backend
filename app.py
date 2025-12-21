@@ -671,15 +671,50 @@ def update_address_assembly_state(sched: dict) -> None:
     sched["address_missing"] = "street"
     sched["address_parts"] = {"street": False, "number": False, "city": True, "state": has_state, "zip": False, "source": "raw_address"}
 
+import hashlib
+
+def _stable_choice_key(sched: dict, label: str) -> str:
+    """
+    Generates a stable key for deterministic phrasing selection.
+    Prefer a per-conversation identifier if you have one.
+    """
+    # Use whatever you already store; these are safe fallbacks.
+    cid = (
+        str(sched.get("conversation_id") or "")
+        or str(sched.get("from_number") or "")
+        or str(sched.get("contact") or "")
+        or str(sched.get("raw_address") or "")
+    ).strip()
+
+    base = f"{cid}|{label}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+def pick_variant_once(sched: dict, label: str, options: list[str]) -> str:
+    """
+    Deterministically picks one option and stores it in sched so it never changes
+    mid-thread, even if the function runs multiple times.
+    """
+    if not options:
+        return ""
+
+    store = sched.setdefault("prompt_variants", {})
+    if label in store and store[label] in options:
+        return store[label]
+
+    h = _stable_choice_key(sched, label)
+    idx = int(h[:8], 16) % len(options)
+    chosen = options[idx]
+    store[label] = chosen
+    return chosen
 
 
 # ---------------------------------------------------
-# Address Prompt Builder (Step 4, improved)
+# Address Prompt Builder (Step 4) — HUMAN + DETERMINISTIC VARIATION
 # ---------------------------------------------------
 def build_address_prompt(sched: dict) -> str:
     """
-    Human-friendly prompts that ask for the missing address atom.
-    Avoids phrases like "full service address".
+    Human-sounding prompts that ask for the missing address atom.
+    Deterministic phrasing variation (no AI tells, no em dashes).
     """
     update_address_assembly_state(sched)
 
@@ -693,31 +728,78 @@ def build_address_prompt(sched: dict) -> str:
     norm_state = (norm.get("administrative_district_level_1") or "").strip() if norm else ""
     norm_zip   = (norm.get("postal_code") or "").strip() if norm else ""
 
+    # STREET
     if missing == "street":
-        # If user previously gave a town-only value, keep it contextual.
         if parts.get("city") and candidate and not parts.get("street"):
-            return f"Got it — what street is the job on in/near “{candidate}”? House number helps too."
-        return "What street is the job at? House number + street is perfect."
+            options = [
+                f"What street is it on in {candidate}?",
+                f"Which street in {candidate} is this on?",
+                f"What’s the street name in {candidate}?",
+            ]
+            return pick_variant_once(sched, "addr_missing_street_with_city", options)
 
+        options = [
+            "What street is it on?",
+            "What’s the street name?",
+            "Which street is this on?",
+        ]
+        return pick_variant_once(sched, "addr_missing_street", options)
+
+    # NUMBER
     if missing == "number":
-        # If we have route-level normalization (street + town/state/zip), ask ONLY for house number with context.
         if norm_line1 and norm_city and norm_state:
             tail = f"{norm_city}, {norm_state}"
             if norm_zip:
                 tail += f" {norm_zip}"
-            return f"Got it — what’s the house number on {norm_line1} in {tail}?"
-        if candidate:
-            return f"Got it — what’s the house number on {candidate}?"
-        return "Got it — what’s the house number?"
 
+            options = [
+                f"What’s the house number on {norm_line1} in {tail}?",
+                f"What number is the place on {norm_line1} in {tail}?",
+                f"What’s the street number on {norm_line1} in {tail}?",
+            ]
+            return pick_variant_once(sched, "addr_missing_number_with_norm", options)
+
+        if candidate:
+            options = [
+                f"What’s the house number on {candidate}?",
+                f"What number is it on {candidate}?",
+                f"What’s the street number on {candidate}?",
+            ]
+            return pick_variant_once(sched, "addr_missing_number_with_candidate", options)
+
+        options = [
+            "What’s the house number?",
+            "What number is it?",
+            "What’s the street number?",
+        ]
+        return pick_variant_once(sched, "addr_missing_number", options)
+
+    # CONFIRM TOWN/STATE
     if missing == "confirm":
-        # We have a street (and maybe a number). Ask town (and state if they didn’t say CT/MA).
         need_state = not bool(parts.get("state"))
         if need_state:
-            return "What town is that in — and is it in Connecticut or Massachusetts?"
-        return "What town is that in?"
+            options = [
+                "What town is it in, Connecticut or Massachusetts?",
+                "Which town is it in, and is that Connecticut or Massachusetts?",
+                "What town is this in, CT or MA?",
+            ]
+            return pick_variant_once(sched, "addr_missing_confirm_need_state", options)
 
-    return "What’s the street address for the job? House number + street is perfect."
+        options = [
+            "What town is it in?",
+            "Which town is this in?",
+            "What town is that in?",
+        ]
+        return pick_variant_once(sched, "addr_missing_confirm", options)
+
+    # FALLBACK
+    options = [
+        "What’s the address?",
+        "What address are we heading to?",
+        "What’s the address for the visit?",
+    ]
+    return pick_variant_once(sched, "addr_fallback", options)
+
 
 
 # ---------------------------------------------------
@@ -1400,60 +1482,55 @@ def generate_reply_for_inbound(
         # --------------------------------------
         update_address_assembly_state(sched)
 
-        # ✅ HOUSE NUMBER PATCH (pre-LLM):
-        # If we're missing ONLY the house number and user replies digits, merge it into stored street/route.
+        # ✅ HOUSE NUMBER PATCH (pre-LLM) — IMPROVED:
+        # Handles:
+        #   - "45"
+        #   - "it's 45"
+        #   - "45 dickerman ave"
+        # Also: when merging a number, prefer RAW (keeps city/state/zip) over norm_line1 (street-only).
         try:
             update_address_assembly_state(sched)
             missing_atom = (sched.get("address_missing") or "").strip().lower()
-
-            if missing_atom == "number" and re.fullmatch(r"\d{1,6}", inbound_text.strip()):
-                num = inbound_text.strip()
-
+        
+            if missing_atom == "number":
+                inbound_clean = inbound_text.strip()
+        
+                # Pull a number from messages like "45", "it's 45", "Its 45", "#45"
+                m_num = re.search(r"\b(\d{1,6})\b", inbound_clean)
+                num = m_num.group(1) if m_num else None
+        
+                # Heuristic: does inbound look like it contains a street name too?
+                low = inbound_clean.lower()
+                street_suffixes = (
+                    " st", " street", " ave", " avenue", " rd", " road", " ln", " lane",
+                    " dr", " drive", " ct", " court", " cir", " circle", " blvd", " boulevard",
+                    " way", " pkwy", " parkway", " ter", " terrace"
+                )
+                inbound_has_street_word = any(suf in f" {low} " for suf in street_suffixes)
+                inbound_starts_with_number = bool(re.match(r"^\s*\d{1,6}\b", inbound_clean))
+        
                 raw = (sched.get("raw_address") or "").strip()
                 norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
                 norm_line1 = (norm.get("address_line_1") or "").strip() if norm else ""
-
-                base = norm_line1 or raw
-                if base and not re.match(r"^\d{1,6}\b", base):
-                    sched["raw_address"] = f"{num} {base}".strip()
-                    sched["normalized_address"] = None  # force clean re-normalization
-                update_address_assembly_state(sched)
-
+        
+                # Case A: customer sent a full-ish address that begins with a number ("45 dickerman ave")
+                # Trust it as the new raw address and force re-normalization.
+                if inbound_starts_with_number and inbound_has_street_word:
+                    sched["raw_address"] = inbound_clean
+                    sched["normalized_address"] = None
+                    update_address_assembly_state(sched)
+        
+                # Case B: customer sent just the number (or number inside a short phrase)
+                # Merge it into EXISTING raw address (preferred: raw keeps town/state/zip).
+                elif num:
+                    base = raw or norm_line1  # ✅ raw first (keeps locality/zip if present)
+                    if base and not re.match(r"^\d{1,6}\b", base):
+                        sched["raw_address"] = f"{num} {base}".strip()
+                        sched["normalized_address"] = None  # force clean re-normalization
+                    update_address_assembly_state(sched)
+        
         except Exception as e:
             print("[WARN] house-number merge patch failed:", repr(e))
-
-        # Step 5B: early normalization
-        try:
-            try_early_address_normalize(sched)
-        except Exception as e:
-            print("[WARN] try_early_address_normalize failed:", repr(e))
-
-        update_address_assembly_state(sched)
-
-        missing_date = not (scheduled_date or sched.get("scheduled_date"))
-        missing_time = not (scheduled_time or sched.get("scheduled_time"))
-        missing_addr = not bool(sched.get("address_verified"))
-
-        if missing_addr:
-            sched["pending_step"] = "need_address"
-        elif missing_date:
-            sched["pending_step"] = "need_date"
-        elif missing_time:
-            sched["pending_step"] = "need_time"
-        else:
-            sched["pending_step"] = None
-
-        # Deterministic address ask
-        if sched.get("pending_step") == "need_address":
-            msg = build_address_prompt(sched)
-            msg = _finalize_sms(msg, appt_type, booking_created=False)
-            return {
-                "sms_body": msg,
-                "scheduled_date": sched.get("scheduled_date") or scheduled_date,
-                "scheduled_time": sched.get("scheduled_time") or scheduled_time,
-                "address": sched.get("raw_address"),
-                "booking_complete": False
-            }
 
         # --------------------------------------
         # Build System Prompt
