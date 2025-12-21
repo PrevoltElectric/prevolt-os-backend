@@ -331,6 +331,7 @@ def handle_call_selection():
 # ---------------------------------------------------
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
+    from twilio.twiml.voice_response import VoiceResponse  # ✅ avoid NameError
     recording_url = request.form.get("RecordingUrl")
     from_number   = request.form.get("From", "").replace("whatsapp:", "")
 
@@ -366,6 +367,12 @@ def voicemail_complete():
         sched["scheduled_time"] = classification["detected_time"]
     if classification.get("detected_address"):
         sched["raw_address"] = classification["detected_address"]
+
+    # Ensure address assembly keys exist for downstream logic
+    sched.setdefault("address_candidate", None)
+    sched.setdefault("address_verified", False)
+    sched.setdefault("address_missing", None)
+    sched.setdefault("address_parts", {})
 
     # --------------------------------------
     # HARD OVERRIDE: Voicemail Emergency Pre-Flag
@@ -446,6 +453,192 @@ Rules:
 
 
 # ---------------------------------------------------
+# Address Assembly State Helper (Step 2)
+# ---------------------------------------------------
+def update_address_assembly_state(sched: dict) -> None:
+    """
+    Derives address state atoms from raw_address / normalized_address.
+    This does NOT change booking or messaging behavior yet.
+    """
+    # Defaults (never assume keys exist)
+    sched.setdefault("address_candidate", None)
+    sched.setdefault("address_verified", False)
+    sched.setdefault("address_missing", None)
+    sched.setdefault("address_parts", {})
+
+    raw = (sched.get("raw_address") or "").strip()
+    norm = sched.get("normalized_address")
+
+    # If we already have a normalized struct, we consider it bookable.
+    if (
+        isinstance(norm, dict)
+        and norm.get("address_line_1")
+        and norm.get("locality")
+        and norm.get("administrative_district_level_1")
+        and norm.get("postal_code")
+    ):
+        sched["address_verified"] = True
+        sched["address_missing"] = None
+        sched["address_candidate"] = raw or sched.get("address_candidate")
+        sched["address_parts"] = {
+            "street": True,
+            "number": True,
+            "city": True,
+            "state": True,
+            "zip": True,
+            "source": "normalized_address"
+        }
+        return
+
+    # No normalized address yet → evaluate raw candidate quality
+    sched["address_verified"] = False
+    if raw:
+        sched["address_candidate"] = raw
+
+    # If nothing at all
+    if not raw:
+        sched["address_missing"] = "street"
+        sched["address_parts"] = {"street": False, "number": False, "city": False, "state": False, "zip": False, "source": "none"}
+        return
+
+    low = raw.lower()
+
+    # Heuristic: detect street words (helps distinguish "Windsor Locks" vs "Dickerman Ave")
+    street_suffixes = (
+        " st", " street", " ave", " avenue", " rd", " road", " ln", " lane", " dr", " drive",
+        " ct", " court", " cir", " circle", " blvd", " boulevard", " way", " pkwy", " parkway",
+        " ter", " terrace"
+    )
+    has_street_word = any(suf in low for suf in street_suffixes)
+
+    # Has a house number at the start? (leading digits)
+    starts_with_number = low[:1].isdigit()
+
+    # Has explicit CT/MA?
+    has_state = (" ct" in f" {low} ") or (" connecticut" in low) or (" ma" in f" {low} ") or (" massachusetts" in low)
+
+    # Very common case: "Dickerman Ave" (street, no number)
+    if has_street_word and not starts_with_number:
+        sched["address_missing"] = "number"
+        sched["address_parts"] = {"street": True, "number": False, "city": False, "state": has_state, "zip": False, "source": "raw_address"}
+        return
+
+    # Common case: "24 Main St" (number + street, likely needs town/state/zip via normalization/confirm)
+    if has_street_word and starts_with_number:
+        sched["address_missing"] = "confirm"
+        sched["address_parts"] = {"street": True, "number": True, "city": False, "state": has_state, "zip": False, "source": "raw_address"}
+        return
+
+    # Town-only like "Windsor Locks"
+    sched["address_missing"] = "street"
+    sched["address_parts"] = {"street": False, "number": False, "city": True, "state": has_state, "zip": False, "source": "raw_address"}
+
+
+# ---------------------------------------------------
+# Address Prompt Builder (Step 4, improved)
+# ---------------------------------------------------
+def build_address_prompt(sched: dict) -> str:
+    """
+    Human-friendly prompts that ask for the missing address atom.
+    Avoids phrases like "full service address".
+    """
+    update_address_assembly_state(sched)
+
+    missing = (sched.get("address_missing") or "").strip().lower()
+    candidate = (sched.get("address_candidate") or sched.get("raw_address") or "").strip()
+    parts = sched.get("address_parts") or {}
+
+    norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+    norm_line1 = (norm.get("address_line_1") or "").strip() if norm else ""
+    norm_city  = (norm.get("locality") or "").strip() if norm else ""
+    norm_state = (norm.get("administrative_district_level_1") or "").strip() if norm else ""
+    norm_zip   = (norm.get("postal_code") or "").strip() if norm else ""
+
+    if missing == "street":
+        # If user previously gave a town-only value, keep it contextual.
+        if parts.get("city") and candidate and not parts.get("street"):
+            return f"Got it — what street is the job on in/near “{candidate}”? House number helps too."
+        return "What street is the job at? House number + street is perfect."
+
+    if missing == "number":
+        # If we have route-level normalization (street + town/state/zip), ask ONLY for house number with context.
+        if norm_line1 and norm_city and norm_state:
+            tail = f"{norm_city}, {norm_state}"
+            if norm_zip:
+                tail += f" {norm_zip}"
+            return f"Got it — what’s the house number on {norm_line1} in {tail}?"
+        if candidate:
+            return f"Got it — what’s the house number on {candidate}?"
+        return "Got it — what’s the house number?"
+
+    if missing == "confirm":
+        # We have a street (and maybe a number). Ask town (and state if they didn’t say CT/MA).
+        need_state = not bool(parts.get("state"))
+        if need_state:
+            return "What town is that in — and is it in Connecticut or Massachusetts?"
+        return "What town is that in?"
+
+    return "What’s the street address for the job? House number + street is perfect."
+
+
+# ---------------------------------------------------
+# Step 5B — Early Google Maps normalization for partial addresses
+# NOTE: Works with normalize_address(raw) returning either:
+#   - (status, dict)  OR
+#   - dict (assumed ok)
+# ---------------------------------------------------
+def try_early_address_normalize(sched: dict) -> None:
+    """
+    Tries Google Maps normalization as soon as we have a plausible street.
+    Safe rules:
+      - Never clears data
+      - Only sets normalized_address if normalize_address() returns a dict-shaped address
+      - Recomputes address assembly state afterward
+    """
+    update_address_assembly_state(sched)
+
+    if sched.get("address_verified"):
+        return
+
+    raw = (sched.get("raw_address") or "").strip()
+    if not raw:
+        return
+
+    missing = (sched.get("address_missing") or "").strip().lower()
+
+    # If we only have town/city (missing street), do not normalize yet.
+    if missing == "street":
+        return
+
+    # Only normalize if it looks like a street input (avoid spamming maps on random text)
+    low = raw.lower()
+    street_suffixes = (" st", " street", " ave", " avenue", " rd", " road", " ln", " lane", " dr", " drive", " blvd", " boulevard", " way", " ct", " court", " cir", " circle", " ter", " terrace", " pkwy", " parkway")
+    if not any(suf in low for suf in street_suffixes):
+        return
+
+    try:
+        result = normalize_address(raw)
+    except Exception as e:
+        print("[WARN] try_early_address_normalize normalize_address failed:", repr(e))
+        return
+
+    status = None
+    addr_struct = None
+
+    # Support both signatures
+    if isinstance(result, tuple) and len(result) >= 2:
+        status, addr_struct = result[0], result[1]
+    elif isinstance(result, dict):
+        status, addr_struct = "ok", result
+    else:
+        return
+
+    if status == "ok" and isinstance(addr_struct, dict):
+        sched["normalized_address"] = addr_struct
+        update_address_assembly_state(sched)
+
+
+# ---------------------------------------------------
 # Incoming SMS (B-3 State Machine, Option A)
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
@@ -466,7 +659,13 @@ def incoming_sms():
                 "appointment_type": None,
                 "normalized_address": None,
                 "raw_address": None,
-                "booking_created": False
+                "booking_created": False,
+
+                # Address Assembly State
+                "address_candidate": None,
+                "address_verified": False,
+                "address_missing": None,
+                "address_parts": {}
             }
         }
         resp = MessagingResponse()
@@ -486,7 +685,13 @@ def incoming_sms():
         "appointment_type": None,
         "normalized_address": None,
         "raw_address": None,
-        "booking_created": False
+        "booking_created": False,
+
+        # Address Assembly State
+        "address_candidate": None,
+        "address_verified": False,
+        "address_missing": None,
+        "address_parts": {}
     })
 
     cleaned_transcript = conv.get("cleaned_transcript")
@@ -528,9 +733,6 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] initial_sms address extraction failed:", repr(e))
 
-        # --------------------------------------
-        # POST-Step4 pending_step (DO NOT OVERRIDE EMERGENCY STATE)
-        # --------------------------------------
         if not sched.get("emergency_approved"):
             if not sched.get("scheduled_date"):
                 sched["pending_step"] = "need_date"
@@ -540,7 +742,9 @@ def incoming_sms():
                 sched["pending_step"] = "need_address"
             else:
                 sched["pending_step"] = None
-           
+
+    # Keep address state fresh (pre-Step4)
+    update_address_assembly_state(sched)
 
     # ---------------------------------------------------
     # Run Step 4
@@ -565,12 +769,15 @@ def incoming_sms():
         if reply["address"] not in profile["addresses"]:
             profile["addresses"].append(reply["address"])
 
-    # POST-Step4 pending_step
-    if not sched["scheduled_date"]:
+    # Re-derive address assembly state after Step 4 updates
+    update_address_assembly_state(sched)
+
+    # POST-Step4 pending_step (Address complete only when verified)
+    if not sched.get("scheduled_date"):
         sched["pending_step"] = "need_date"
-    elif not sched["scheduled_time"]:
+    elif not sched.get("scheduled_time"):
         sched["pending_step"] = "need_time"
-    elif not sched["raw_address"]:
+    elif not sched.get("address_verified"):
         sched["pending_step"] = "need_address"
     else:
         sched["pending_step"] = None
@@ -578,6 +785,7 @@ def incoming_sms():
     tw = MessagingResponse()
     tw.message(reply["sms_body"])
     return Response(str(tw), mimetype="text/xml")
+
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
@@ -621,50 +829,48 @@ def generate_reply_for_inbound(
         sched.setdefault("awaiting_emergency_confirm", False)
         sched.setdefault("emergency_approved", False)
 
+        # Ensure address assembly keys always exist (safe for prompts)
+        sched.setdefault("address_candidate", None)
+        sched.setdefault("address_verified", False)
+        sched.setdefault("address_missing", None)
+        sched.setdefault("address_parts", {})
+
         inbound_text  = inbound_text or ""
         inbound_lower = inbound_text.lower()
 
         # --------------------------------------
-        # # 3) Save to memory (2-STEP CONFIRMATION FLOW)
+        # Emergency flow (2-step confirmation)
         # --------------------------------------
-        
-        # 🔒 Ensure flags always exist (prevents KeyError / NameError)
         sched.setdefault("awaiting_emergency_confirm", False)
         sched.setdefault("emergency_approved", False)
-        
+
         EMERGENCY_KEYWORDS = [
             "tree fell", "tree down", "power line", "lines down",
             "service ripped", "sparking", "burning", "fire",
             "smoke", "no power", "power outage",
             "urgent", "emergency"
         ]
-        
+
         IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
-        EMERGENCY = IS_EMERGENCY  # 🔥 alias for downstream logic
-        
-        # -------------------------------
-        # STEP 1 — Emergency Detected
-        # -------------------------------
+        EMERGENCY = IS_EMERGENCY
+
         if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
-        
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["awaiting_emergency_confirm"] = True
-            sched["pending_step"] = None  # halt normal flow
-        
-            # Require address first
+            sched["pending_step"] = None
+
             if not sched.get("raw_address"):
                 return {
                     "sms_body": (
                         "This is Prevolt Electric — this sounds like an emergency. "
-                        "What is the full address for the dispatch?"
+                        + build_address_prompt(sched)
                     ),
                     "scheduled_date": None,
                     "scheduled_time": None,
                     "address": None,
                     "booking_complete": False
                 }
-        
-            # Ask customer to approve emergency pricing
+
             return {
                 "sms_body": (
                     f"This is Prevolt Electric — this appears to be an emergency at "
@@ -676,33 +882,25 @@ def generate_reply_for_inbound(
                 "address": sched.get("raw_address"),
                 "booking_complete": False
             }
-        
-        # -------------------------------
-        # STEP 2 — Customer Approves Emergency
-        # -------------------------------
+
         CONFIRM_PHRASES = [
             "yes", "yeah", "yup", "ok", "okay",
             "sure", "that works", "book", "send", "do it"
         ]
-        
+
         if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
-        
             sched["emergency_approved"] = True
             sched["awaiting_emergency_confirm"] = False
-        
-            # Force immediate scheduling
+
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["scheduled_date"] = today_date_str
             sched["scheduled_time"] = now_local.strftime("%H:%M")
             sched["pending_step"] = None
-        
-            # 🔥 CRITICAL: sync locals so autobooking sees them
+
+            # Sync locals so downstream sees them
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
-        
-            # Continue to downstream logic — DO NOT RETURN
-       
-        
+
         # --------------------------------------
         # Appointment type fallback
         # --------------------------------------
@@ -722,11 +920,21 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = appt_type
 
         # --------------------------------------
-        # Missing-info resolver
+        # Missing-info resolver (Step 3 + Step 5B)
         # --------------------------------------
+        update_address_assembly_state(sched)
+
+        # Step 5B: attempt early normalization once we have a plausible street
+        try_early_address_normalize(sched)
+
+        # Refresh state after normalization attempt
+        update_address_assembly_state(sched)
+
         missing_date = not (scheduled_date or sched.get("scheduled_date"))
         missing_time = not (scheduled_time or sched.get("scheduled_time"))
-        missing_addr = not (address or sched.get("raw_address"))
+
+        # raw_address ≠ complete address
+        missing_addr = not bool(sched.get("address_verified"))
 
         if missing_addr:
             sched["pending_step"] = "need_address"
@@ -736,6 +944,16 @@ def generate_reply_for_inbound(
             sched["pending_step"] = "need_time"
         else:
             sched["pending_step"] = None
+
+        # Deterministic address ask (no loops, no "full service address" wording)
+        if sched.get("pending_step") == "need_address":
+            return {
+                "sms_body": build_address_prompt(sched),
+                "scheduled_date": sched.get("scheduled_date") or scheduled_date,
+                "scheduled_time": sched.get("scheduled_time") or scheduled_time,
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
 
         # --------------------------------------
         # Build System Prompt
@@ -809,8 +1027,7 @@ def generate_reply_for_inbound(
         # Human-readable time
         # --------------------------------------
         try:
-            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") \
-                if model_time else None
+            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
         except Exception:
             human_time = model_time
 
@@ -826,12 +1043,13 @@ def generate_reply_for_inbound(
             sched["scheduled_time"] = model_time
 
         # --------------------------------------
-        # AUTOBOOKING
+        # AUTOBOOKING (Step 5)
+        # Gate booking on address_verified, NOT raw_address.
         # --------------------------------------
         ready_for_booking = (
             bool(sched.get("scheduled_date")) and
             bool(sched.get("scheduled_time")) and
-            bool(sched.get("raw_address")) and
+            bool(sched.get("address_verified")) and
             bool(sched.get("appointment_type")) and
             not sched.get("pending_step") and
             not sched.get("booking_created")
@@ -840,7 +1058,9 @@ def generate_reply_for_inbound(
         if ready_for_booking or EMERGENCY:
             try:
                 maybe_create_square_booking(phone, conv)
-                if sched.get("booking_created"):
+
+                # Never claim "booked" unless Square returned a booking id.
+                if sched.get("booking_created") and sched.get("square_booking_id"):
                     return {
                         "sms_body": (
                             f"You're all set — your appointment is booked for "
@@ -872,6 +1092,7 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
 
 
 # ---------------------------------------------------
@@ -1121,22 +1342,28 @@ def is_weekend(date_str: str) -> bool:
 
 
 # ---------------------------------------------------
-# Create Square Booking (Corrected Version)
+# Create Square Booking (Corrected + Step 5B Compatible)
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict):
     sched = convo.setdefault("sched", {})
     profile = convo.setdefault("profile", {})
     current_job = convo.setdefault("current_job", {})
 
-    if sched.get("booking_created"):
+    # Never double-book
+    if sched.get("booking_created") and sched.get("square_booking_id"):
         return
 
-    scheduled_date = sched.get("scheduled_date")
-    scheduled_time = sched.get("scheduled_time")
-    raw_address    = sched.get("raw_address")
+    scheduled_date   = sched.get("scheduled_date")
+    scheduled_time   = sched.get("scheduled_time")
+    raw_address      = (sched.get("raw_address") or "").strip()
     appointment_type = sched.get("appointment_type")
 
-    if not (scheduled_date and scheduled_time and raw_address and appointment_type):
+    # ✅ Step 5 hard gate: do NOT attempt Square booking until address is VERIFIED
+    # This prevents "it thinks it booked" when the address is partial.
+    if not sched.get("address_verified"):
+        return
+
+    if not (scheduled_date and scheduled_time and appointment_type):
         return
 
     variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
@@ -1159,39 +1386,87 @@ def maybe_create_square_booking(phone: str, convo: dict):
         print("[ERROR] Square not configured.")
         return
 
-    # address normalization
-    addr_struct = sched.get("normalized_address")
-    if not addr_struct:
-        status, addr_struct = normalize_address(raw_address)
+    # ---------------------------------------------------
+    # Address normalization precedence (Step 5B)
+    # 1) Use sched["normalized_address"] if it is a dict and complete
+    # 2) Otherwise attempt normalize_address(raw_address)
+    # ---------------------------------------------------
+    addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+
+    def _is_complete_norm(a: dict) -> bool:
+        return bool(
+            isinstance(a, dict)
+            and (a.get("address_line_1") or "").strip()
+            and (a.get("locality") or "").strip()
+            and (a.get("administrative_district_level_1") or "").strip()
+            and (a.get("postal_code") or "").strip()
+        )
+
+    if not _is_complete_norm(addr_struct):
+        # If we somehow reached here with address_verified True but no good normalized struct, re-normalize
+        if not raw_address:
+            # Nothing to normalize; bail safely
+            sched["address_verified"] = False
+            sched["address_missing"] = "street"
+            return
+
+        try:
+            status, fresh = normalize_address(raw_address)
+        except Exception as e:
+            print("[ERROR] normalize_address exception:", repr(e))
+            return
+
+        # Preserve your existing "needs_state" flow
         if status == "needs_state":
             send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
+            # Mark not verified until we have a full normalized address
+            sched["address_verified"] = False
+            sched["address_missing"] = "state"
             return
-        if status != "ok":
-            print("[ERROR] Address normalization failed.")
+
+        # If normalization fails, do not book
+        if status != "ok" or not isinstance(fresh, dict):
+            print("[ERROR] Address normalization failed. status=", status)
+            sched["address_verified"] = False
+            sched["address_missing"] = "confirm"
             return
+
+        addr_struct = fresh
         sched["normalized_address"] = addr_struct
+
+    # Final check: must be complete
+    if not _is_complete_norm(addr_struct):
+        print("[ERROR] Normalized address missing required fields.")
+        sched["address_verified"] = False
+        sched["address_missing"] = "confirm"
+        return
 
     # ---------------------------------------------------
     # Square booking.address FIX (remove unsupported field)
     # ---------------------------------------------------
     booking_address = dict(addr_struct)
-    booking_address.pop("country", None)
+    booking_address.pop("country", None)  # Square booking.address rejects country in some setups
 
-    # travel check
+    # ---------------------------------------------------
+    # Travel check (uses normalized destination)
+    # ---------------------------------------------------
     origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
     if origin:
         destination = (
-            f"{addr_struct['address_line_1']}, "
-            f"{addr_struct['locality']}, "
-            f"{addr_struct['administrative_district_level_1']} "
-            f"{addr_struct['postal_code']}"
-        )
+            f"{(addr_struct.get('address_line_1') or '').strip()}, "
+            f"{(addr_struct.get('locality') or '').strip()}, "
+            f"{(addr_struct.get('administrative_district_level_1') or '').strip()} "
+            f"{(addr_struct.get('postal_code') or '').strip()}"
+        ).strip()
+
         travel_minutes = compute_travel_time_minutes(origin, destination)
         if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES:
             print("[BLOCKED] Travel too long.")
             return
 
+    # ---------------------------------------------------
     # Square customer (customer CAN include country)
+    # ---------------------------------------------------
     customer_id = square_create_or_get_customer(phone, addr_struct)
     if not customer_id:
         print("[ERROR] Can't create/fetch customer.")
@@ -1202,7 +1477,12 @@ def maybe_create_square_booking(phone: str, convo: dict):
         print("[ERROR] Invalid start time.")
         return
 
-    idempotency_key = f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}"
+    # Use normalized address in the idempotency key so partial text changes don't accidentally create dupes
+    idempotency_key = (
+        f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}-"
+        f"{(addr_struct.get('address_line_1') or '').strip()}-"
+        f"{(addr_struct.get('postal_code') or '').strip()}"
+    )
 
     booking_payload = {
         "idempotency_key": idempotency_key,
@@ -1211,7 +1491,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
             "customer_id": customer_id,
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
-            "address": booking_address,  # ✅ FIXED
+            "address": booking_address,
             "appointment_segments": [
                 {
                     "duration_minutes": 60,
@@ -1220,7 +1500,12 @@ def maybe_create_square_booking(phone: str, convo: dict):
                     "team_member_id": SQUARE_TEAM_MEMBER_ID
                 }
             ],
-            "customer_note": f"Auto-booked by Prevolt OS. Raw address: {raw_address}"
+            "customer_note": (
+                "Auto-booked by Prevolt OS. "
+                f"Raw address: {raw_address or '[none]'} | "
+                f"Normalized: {addr_struct.get('address_line_1')}, {addr_struct.get('locality')}, "
+                f"{addr_struct.get('administrative_district_level_1')} {addr_struct.get('postal_code')}"
+            )
         }
     }
 
@@ -1236,13 +1521,14 @@ def maybe_create_square_booking(phone: str, convo: dict):
             return
 
         data = resp.json()
-        booking = data.get("booking")
-        booking_id = booking.get("id") if booking else None
+        booking = data.get("booking") or {}
+        booking_id = booking.get("id")
 
         if not booking_id:
             print("[ERROR] booking_id missing.")
             return
 
+        # ✅ Only mark booked when we have a real Square booking id
         sched["booking_created"] = True
         sched["square_booking_id"] = booking_id
 
