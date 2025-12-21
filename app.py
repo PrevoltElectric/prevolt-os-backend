@@ -920,6 +920,10 @@ def generate_reply_for_inbound(
         sched.setdefault("awaiting_emergency_confirm", False)
         sched.setdefault("emergency_approved", False)
 
+        # Ensure booking flags exist
+        sched.setdefault("booking_created", False)
+        sched.setdefault("square_booking_id", None)
+
         # Ensure address assembly keys always exist (safe for prompts)
         sched.setdefault("address_candidate", None)
         sched.setdefault("address_verified", False)
@@ -995,12 +999,12 @@ def generate_reply_for_inbound(
         appt_type = sched.get("appointment_type") or appointment_type
         if not appt_type:
             if any(w in inbound_lower for w in [
-                "not working","no power","dead","sparking","burning",
-                "breaker keeps","gfci","outlet not","troubleshoot"
+                "not working", "no power", "dead", "sparking", "burning",
+                "breaker keeps", "gfci", "outlet not", "troubleshoot"
             ]):
                 appt_type = "TROUBLESHOOT_395"
             elif any(w in inbound_lower for w in [
-                "inspection","whole home inspection","electrical inspection"
+                "inspection", "whole home inspection", "electrical inspection"
             ]):
                 appt_type = "WHOLE_HOME_INSPECTION"
             else:
@@ -1166,6 +1170,30 @@ def generate_reply_for_inbound(
             except Exception as e:
                 print("[ERROR] Autobooking:", repr(e))
 
+        # ---------------------------------------------------
+        # HARD SAFETY: Never confirm appointment unless Square booked it
+        # ---------------------------------------------------
+        if not (sched.get("booking_created") and sched.get("square_booking_id")):
+            confirmation_markers = [
+                "is scheduled",
+                "has been scheduled",
+                "scheduled for",
+                "booked for",
+                "confirmation number",
+                "you're all set",
+                "your appointment"
+            ]
+            lowered = sms_body.lower()
+            if any(m in lowered for m in confirmation_markers):
+                if not sched.get("address_verified"):
+                    sms_body = build_address_prompt(sched)
+                elif not sched.get("scheduled_date"):
+                    sms_body = "What date would you like to schedule the appointment?"
+                elif not sched.get("scheduled_time"):
+                    sms_body = "What time works best for you?"
+                else:
+                    sms_body = "One moment while I finish securing your appointment."
+
         return {
             "sms_body": sms_body,
             "scheduled_date": model_date,
@@ -1183,6 +1211,7 @@ def generate_reply_for_inbound(
             "address": address,
             "booking_complete": False
         }
+
 
 
 
