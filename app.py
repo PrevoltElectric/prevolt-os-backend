@@ -950,11 +950,14 @@ def incoming_sms():
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
-# PATCHED:
-#   - Never says "one moment" / wait-text when nothing happens.
-#   - Re-checks address state AFTER model output (fixes “booked with no house #”).
-#   - If Square did NOT book, it always asks for the NEXT missing atom instead of fake-confirming.
-#   - Uses sanitize_sms_body() helper (must exist above in your file).
+# PATCHED (FULL):
+#   ✅ Intro + (optional) price injection applied EVEN on deterministic early-returns
+#   ✅ NO "one moment / securing" wait-text unless Square actually booked (prevents dead-end)
+#   ✅ House-number patch: if we are missing ONLY the house number and user replies "45",
+#      we automatically merge it into the stored street and continue (prevents infinite loop)
+#   ✅ Re-checks address state AFTER model output (prevents booking without house number)
+#   ✅ If Square did NOT book, it asks for the NEXT missing atom (never fake-confirms)
+#   ✅ Uses sanitize_sms_body() helper (must exist above in your file)
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -1012,8 +1015,28 @@ def generate_reply_for_inbound(
         sched.setdefault("address_missing", None)
         sched.setdefault("address_parts", {})
 
-        inbound_text  = inbound_text or ""
-        inbound_lower = inbound_text.lower()
+        inbound_text  = (inbound_text or "").strip()
+        inbound_lower = inbound_text.lower().strip()
+
+        # --------------------------------------
+        # Helper: apply intro + (optional) price injection on ALL returns
+        # --------------------------------------
+        def _finalize_sms(s: str, appt_type_local: str, booking_created: bool) -> str:
+            s = (s or "").strip()
+
+            # One-time intro
+            if not sched.get("intro_sent"):
+                s = f"This is Prevolt Electric — {s}"
+                sched["intro_sent"] = True
+
+            # One-time price disclosure (keep this ON if you want price shown early too)
+            if not sched.get("price_disclosed"):
+                s = apply_price_injection(appt_type_local, s)
+                sched["price_disclosed"] = True
+
+            # Final sanitize (also removes “one moment / securing” style text if not booked)
+            s = sanitize_sms_body(s, booking_created=bool(booking_created))
+            return s
 
         # --------------------------------------
         # Emergency flow (2-step confirmation)
@@ -1034,23 +1057,24 @@ def generate_reply_for_inbound(
             sched["pending_step"] = None
 
             if not sched.get("raw_address"):
+                msg = "This sounds like an emergency. " + build_address_prompt(sched)
+                msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
                 return {
-                    "sms_body": (
-                        "This is Prevolt Electric — this sounds like an emergency. "
-                        + build_address_prompt(sched)
-                    ),
+                    "sms_body": msg,
                     "scheduled_date": None,
                     "scheduled_time": None,
                     "address": None,
                     "booking_complete": False
                 }
 
+            msg = (
+                f"This appears to be an emergency at {sched.get('raw_address')}. "
+                "Emergency troubleshooting visits are $395. "
+                "Would you like us to dispatch a technician immediately?"
+            )
+            msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
             return {
-                "sms_body": (
-                    f"This is Prevolt Electric — this appears to be an emergency at "
-                    f"{sched['raw_address']}. Emergency troubleshooting visits are $395. "
-                    "Would you like us to dispatch a technician immediately?"
-                ),
+                "sms_body": msg,
                 "scheduled_date": None,
                 "scheduled_time": None,
                 "address": sched.get("raw_address"),
@@ -1098,6 +1122,41 @@ def generate_reply_for_inbound(
         # --------------------------------------
         update_address_assembly_state(sched)
 
+        # ✅ HOUSE NUMBER PATCH (pre-LLM):
+        # If we're missing ONLY the house number and user replies "45",
+        # merge that number into the stored street/route so we can proceed.
+        try:
+            import re
+
+            update_address_assembly_state(sched)
+            missing_atom = (sched.get("address_missing") or "").strip().lower()
+
+            # Accept "45" OR "45 " (just digits)
+            if missing_atom == "number" and re.fullmatch(r"\d{1,6}", inbound_text.strip()):
+                num = inbound_text.strip()
+
+                raw = (sched.get("raw_address") or "").strip()
+                norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+                norm_line1 = (norm.get("address_line_1") or "").strip() if norm else ""
+
+                # Prefer a known street line; else fall back to raw
+                base = norm_line1 or raw
+
+                # If base is like "Dickerman Ave, Windsor Locks, CT 06096", keep it;
+                # just prefix the number if it isn't already there.
+                if base and not re.match(r"^\d{1,6}\b", base):
+                    sched["raw_address"] = f"{num} {base}".strip()
+
+                    # Clear normalized_address so we re-normalize cleanly with the number
+                    # (prevents getting stuck on a route-only normalized result)
+                    sched["normalized_address"] = None
+
+                # Recompute address state after merge
+                update_address_assembly_state(sched)
+
+        except Exception as e:
+            print("[WARN] house-number merge patch failed:", repr(e))
+
         # Step 5B: attempt early normalization once we have a plausible street
         try:
             try_early_address_normalize(sched)
@@ -1122,8 +1181,10 @@ def generate_reply_for_inbound(
 
         # Deterministic address ask (no loops, no "full service address")
         if sched.get("pending_step") == "need_address":
+            msg = build_address_prompt(sched)
+            msg = _finalize_sms(msg, appt_type, booking_created=False)
             return {
-                "sms_body": build_address_prompt(sched),
+                "sms_body": msg,
                 "scheduled_date": sched.get("scheduled_date") or scheduled_date,
                 "scheduled_time": sched.get("scheduled_time") or scheduled_time,
                 "address": sched.get("raw_address"),
@@ -1186,8 +1247,6 @@ def generate_reply_for_inbound(
 
         # ---------------------------------------------------
         # CRITICAL PATCH: Re-run address state AFTER model changes
-        #   This is where we stop "Dickerman Ave Windsor Locks CT 06096"
-        #   from being treated as bookable without a house number.
         # ---------------------------------------------------
         update_address_assembly_state(sched)
         try:
@@ -1198,20 +1257,6 @@ def generate_reply_for_inbound(
 
         # Prefer stored raw_address after we updated it
         model_addr = sched.get("raw_address")
-
-        # --------------------------------------
-        # ONE-TIME BRANDING
-        # --------------------------------------
-        if not sched["intro_sent"]:
-            sms_body = f"This is Prevolt Electric — {sms_body}"
-            sched["intro_sent"] = True
-
-        # --------------------------------------
-        # ONE-TIME PRICE DISCLOSURE
-        # --------------------------------------
-        if not sched["price_disclosed"]:
-            sms_body = apply_price_injection(appt_type, sms_body)
-            sched["price_disclosed"] = True
 
         # --------------------------------------
         # Human-readable time
@@ -1234,13 +1279,12 @@ def generate_reply_for_inbound(
 
         # --------------------------------------
         # If address STILL not verified, override response immediately
-        # (this prevents Square booking + prevents misleading confirmations)
         # --------------------------------------
         if not sched.get("address_verified"):
-            sms_body = build_address_prompt(sched)
-            sms_body = sanitize_sms_body(sms_body, booking_created=False)
+            msg = build_address_prompt(sched)
+            msg = _finalize_sms(msg, appt_type, booking_created=False)
             return {
-                "sms_body": sms_body,
+                "sms_body": msg,
                 "scheduled_date": sched.get("scheduled_date") or model_date,
                 "scheduled_time": sched.get("scheduled_time") or model_time,
                 "address": sched.get("raw_address"),
@@ -1249,7 +1293,6 @@ def generate_reply_for_inbound(
 
         # --------------------------------------
         # AUTOBOOKING (Step 5)
-        # Gate booking on address_verified, NOT raw_address.
         # --------------------------------------
         ready_for_booking = (
             bool(sched.get("scheduled_date")) and
@@ -1271,7 +1314,7 @@ def generate_reply_for_inbound(
                         f"{sched['scheduled_date']} at {human_time} at {model_addr}. "
                         f"Your confirmation number is {sched.get('square_booking_id')}."
                     )
-                    booked_sms = sanitize_sms_body(booked_sms, booking_created=True)
+                    booked_sms = _finalize_sms(booked_sms, appt_type, booking_created=True)
                     return {
                         "sms_body": booked_sms,
                         "scheduled_date": sched["scheduled_date"],
@@ -1287,7 +1330,6 @@ def generate_reply_for_inbound(
         # If Square didn't book, DO NOT confirm. Ask next missing atom instead.
         # ---------------------------------------------------
         if not (sched.get("booking_created") and sched.get("square_booking_id")):
-            # Re-evaluate what we still need and ask for that.
             update_address_assembly_state(sched)
 
             if not sched.get("address_verified"):
@@ -1298,10 +1340,13 @@ def generate_reply_for_inbound(
                 sms_body = "What time works best for you?"
             else:
                 # We have all fields, but booking not created yet.
-                # Never lie — just acknowledge and keep moving.
                 sms_body = "Thanks — got it."
 
-        sms_body = sanitize_sms_body(sms_body, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
+        sms_body = _finalize_sms(
+            sms_body,
+            appt_type,
+            booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id"))
+        )
 
         return {
             "sms_body": sms_body,
