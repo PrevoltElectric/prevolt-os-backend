@@ -259,7 +259,7 @@ def incoming_call():
 
 
 # ---------------------------------------------------
-# Handle Residential vs Commercial
+# Handle Residential vs Commercial (FIXED: schema-hydrated profile/sched)
 # ---------------------------------------------------
 @app.route("/handle-call-selection", methods=["POST"])
 def handle_call_selection():
@@ -270,14 +270,44 @@ def handle_call_selection():
     response = VoiceResponse()
 
     conv = conversations.setdefault(phone, {})
-    conv.setdefault("profile", {})
-    conv.setdefault("sched", {})
+
+    # ---------------------------------------------------
+    # ✅ CRITICAL FIX:
+    # conv.setdefault("profile", {}) leaves profile as {} forever,
+    # which breaks /incoming-sms when it expects profile["addresses"].
+    # So we "hydrate" required keys even if profile already exists.
+    # ---------------------------------------------------
+    profile = conv.setdefault("profile", {})
+    profile.setdefault("name", None)
+    profile.setdefault("addresses", [])
+    profile.setdefault("upcoming_appointment", None)
+    profile.setdefault("past_jobs", [])
+
+    # Keep sched present (safe defaults; won't override existing values)
+    sched = conv.setdefault("sched", {})
+    sched.setdefault("pending_step", None)
+    sched.setdefault("scheduled_date", None)
+    sched.setdefault("scheduled_time", None)
+    sched.setdefault("appointment_type", None)
+    sched.setdefault("normalized_address", None)
+    sched.setdefault("raw_address", None)
+    sched.setdefault("booking_created", False)
+
+    # Address assembly state keys (so later helpers are safe)
+    sched.setdefault("address_candidate", None)
+    sched.setdefault("address_verified", False)
+    sched.setdefault("address_missing", None)
+    sched.setdefault("address_parts", {})
+
+    # Emergency flags (safe defaults)
+    sched.setdefault("awaiting_emergency_confirm", False)
+    sched.setdefault("emergency_approved", False)
 
     # -----------------------------
     # OPTION 1 → RESIDENTIAL
     # -----------------------------
     if digit == "1":
-        conv["profile"]["customer_type"] = "residential"
+        profile["customer_type"] = "residential"
 
         response.say(
             '<speak>'
@@ -305,7 +335,7 @@ def handle_call_selection():
     # OPTION 2 → COMMERCIAL / GOV
     # -----------------------------
     elif digit == "2":
-        conv["profile"]["customer_type"] = "commercial"
+        profile["customer_type"] = "commercial"
 
         response.say(
             '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
@@ -355,12 +385,47 @@ def voicemail_complete():
     # 3) Save to memory
     conv = conversations.setdefault(from_number, {})
 
+    # ---------------------------------------------------
+    # HYDRATE conversation schema (prevents KeyError later)
+    # ---------------------------------------------------
+    profile = conv.setdefault("profile", {})
+    profile.setdefault("name", None)
+    profile.setdefault("addresses", [])
+    profile.setdefault("upcoming_appointment", None)
+    profile.setdefault("past_jobs", [])
+    # Preserve any customer_type set earlier (residential/commercial)
+
+    current_job = conv.setdefault("current_job", {})
+    current_job.setdefault("job_type", None)
+    current_job.setdefault("raw_description", None)
+
+    sched = conv.setdefault("sched", {})
+    sched.setdefault("pending_step", None)
+    sched.setdefault("scheduled_date", None)
+    sched.setdefault("scheduled_time", None)
+    sched.setdefault("appointment_type", None)
+    sched.setdefault("normalized_address", None)
+    sched.setdefault("raw_address", None)
+    sched.setdefault("booking_created", False)
+
+    # Address assembly state
+    sched.setdefault("address_candidate", None)
+    sched.setdefault("address_verified", False)
+    sched.setdefault("address_missing", None)
+    sched.setdefault("address_parts", {})
+
+    # Emergency flags
+    sched.setdefault("awaiting_emergency_confirm", False)
+    sched.setdefault("emergency_approved", False)
+
+    # ---------------------------------------------------
+    # Store classification results
+    # ---------------------------------------------------
     conv["cleaned_transcript"] = cleaned
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
     conv.setdefault("initial_sms", cleaned)
 
-    sched = conv.setdefault("sched", {})
     if classification.get("detected_date"):
         sched["scheduled_date"] = classification["detected_date"]
     if classification.get("detected_time"):
@@ -368,11 +433,8 @@ def voicemail_complete():
     if classification.get("detected_address"):
         sched["raw_address"] = classification["detected_address"]
 
-    # Ensure address assembly keys exist for downstream logic
-    sched.setdefault("address_candidate", None)
-    sched.setdefault("address_verified", False)
-    sched.setdefault("address_missing", None)
-    sched.setdefault("address_parts", {})
+    # Refresh address assembly state (safe if normalized/raw changed)
+    update_address_assembly_state(sched)
 
     # --------------------------------------
     # HARD OVERRIDE: Voicemail Emergency Pre-Flag
@@ -403,6 +465,7 @@ def voicemail_complete():
     resp.say("Thank you. Your message has been recorded.")
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
+
 
 
 
@@ -665,7 +728,11 @@ def incoming_sms():
                 "address_candidate": None,
                 "address_verified": False,
                 "address_missing": None,
-                "address_parts": {}
+                "address_parts": {},
+
+                # Emergency state flags (safe defaults)
+                "awaiting_emergency_confirm": False,
+                "emergency_approved": False,
             }
         }
         resp = MessagingResponse()
@@ -673,26 +740,40 @@ def incoming_sms():
         return Response(str(resp), mimetype="text/xml")
 
     # ---------------------------------------------------
-    # Initialize layers
+    # Initialize layers (HARDENED: never assume dict shape)
     # ---------------------------------------------------
     conv = conversations.setdefault(phone, {})
-    profile = conv.setdefault("profile", {"name": None, "addresses": [], "upcoming_appointment": None, "past_jobs": []})
-    current_job = conv.setdefault("current_job", {"job_type": None, "raw_description": None})
-    sched = conv.setdefault("sched", {
-        "pending_step": None,
-        "scheduled_date": None,
-        "scheduled_time": None,
-        "appointment_type": None,
-        "normalized_address": None,
-        "raw_address": None,
-        "booking_created": False,
 
-        # Address Assembly State
-        "address_candidate": None,
-        "address_verified": False,
-        "address_missing": None,
-        "address_parts": {}
-    })
+    profile = conv.setdefault("profile", {})
+    profile.setdefault("name", None)
+    profile.setdefault("addresses", [])
+    profile.setdefault("upcoming_appointment", None)
+    profile.setdefault("past_jobs", [])
+    # keep customer_type if it exists (from call flow)
+    profile.setdefault("customer_type", profile.get("customer_type"))
+
+    current_job = conv.setdefault("current_job", {})
+    current_job.setdefault("job_type", None)
+    current_job.setdefault("raw_description", None)
+
+    sched = conv.setdefault("sched", {})
+    sched.setdefault("pending_step", None)
+    sched.setdefault("scheduled_date", None)
+    sched.setdefault("scheduled_time", None)
+    sched.setdefault("appointment_type", None)
+    sched.setdefault("normalized_address", None)
+    sched.setdefault("raw_address", None)
+    sched.setdefault("booking_created", False)
+
+    # Address Assembly State
+    sched.setdefault("address_candidate", None)
+    sched.setdefault("address_verified", False)
+    sched.setdefault("address_missing", None)
+    sched.setdefault("address_parts", {})
+
+    # Emergency flags (used by incoming_sms patch logic too)
+    sched.setdefault("awaiting_emergency_confirm", False)
+    sched.setdefault("emergency_approved", False)
 
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
@@ -715,7 +796,7 @@ def incoming_sms():
                 extracted = m.group(1).strip()
                 sched["raw_address"] = extracted
                 address = extracted
-                if extracted not in profile["addresses"]:
+                if extracted and extracted not in profile["addresses"]:
                     profile["addresses"].append(extracted)
 
             if not sched.get("raw_address"):
@@ -728,17 +809,19 @@ def incoming_sms():
                     extracted2 = m2.group(0).strip()
                     sched["raw_address"] = extracted2
                     address = extracted2
-                    if extracted2 not in profile["addresses"]:
+                    if extracted2 and extracted2 not in profile["addresses"]:
                         profile["addresses"].append(extracted2)
+
     except Exception as e:
         print("[WARN] initial_sms address extraction failed:", repr(e))
 
+        # Only set pending_step here as a fallback; Step 4 will recompute properly.
         if not sched.get("emergency_approved"):
             if not sched.get("scheduled_date"):
                 sched["pending_step"] = "need_date"
             elif not sched.get("scheduled_time"):
                 sched["pending_step"] = "need_time"
-            elif not sched.get("raw_address"):
+            elif not sched.get("raw_address") and not sched.get("address_verified"):
                 sched["pending_step"] = "need_address"
             else:
                 sched["pending_step"] = None
@@ -766,6 +849,7 @@ def incoming_sms():
 
     if reply.get("address"):
         sched["raw_address"] = reply["address"]
+        # addresses list is guaranteed above
         if reply["address"] not in profile["addresses"]:
             profile["addresses"].append(reply["address"])
 
@@ -815,10 +899,17 @@ def generate_reply_for_inbound(
         today_weekday  = now_local.strftime("%A")
 
         # --------------------------------------
-        # Conversation + scheduler layers
+        # Conversation + scheduler layers (HARDENED)
         # --------------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         conv  = conversations.setdefault(phone, {})
+
+        # Ensure profile never breaks downstream code that assumes addresses exists
+        profile = conv.setdefault("profile", {})
+        profile.setdefault("addresses", [])
+        profile.setdefault("past_jobs", [])
+        profile.setdefault("upcoming_appointment", None)
+
         sched = conv.setdefault("sched", {})
 
         sched.setdefault("raw_address", None)
@@ -841,9 +932,6 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # Emergency flow (2-step confirmation)
         # --------------------------------------
-        sched.setdefault("awaiting_emergency_confirm", False)
-        sched.setdefault("emergency_approved", False)
-
         EMERGENCY_KEYWORDS = [
             "tree fell", "tree down", "power line", "lines down",
             "service ripped", "sparking", "burning", "fire",
@@ -925,7 +1013,10 @@ def generate_reply_for_inbound(
         update_address_assembly_state(sched)
 
         # Step 5B: attempt early normalization once we have a plausible street
-        try_early_address_normalize(sched)
+        try:
+            try_early_address_normalize(sched)
+        except Exception as e:
+            print("[WARN] try_early_address_normalize failed:", repr(e))
 
         # Refresh state after normalization attempt
         update_address_assembly_state(sched)
