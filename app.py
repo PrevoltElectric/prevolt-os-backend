@@ -1998,6 +1998,11 @@ def is_weekend(date_str: str) -> bool:
 
 # ---------------------------------------------------
 # Create Square Booking (Corrected + Step 5B Compatible) — PATCHED (requires house number)
+#   ✅ Creates booking
+#   ✅ Retrieves booking to confirm status/version
+#   ✅ Accepts booking if needed (often required to trigger notifications + calendar sync)
+#   ✅ Only sets booking_created / square_booking_id AFTER verify+accept succeeds
+#   ✅ Prevents stale booking flags from causing ghost confirmations
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict):
     import re
@@ -2014,6 +2019,10 @@ def maybe_create_square_booking(phone: str, convo: dict):
     # Never double-book
     if sched.get("booking_created") and sched.get("square_booking_id"):
         return
+
+    # Clear stale booking state before a fresh attempt
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
 
     scheduled_date   = sched.get("scheduled_date")
     scheduled_time   = sched.get("scheduled_time")
@@ -2108,19 +2117,12 @@ def maybe_create_square_booking(phone: str, convo: dict):
         return
 
     # ---------------------------------------------------
-    # ✅ PATCH: HARD BLOCK if no house number in normalized address_line_1
-    # This prevents Square booking from route-only addresses like "Dickerman Ave".
+    # ✅ HARD BLOCK if no house number in normalized address_line_1
     # ---------------------------------------------------
     line1 = (addr_struct.get("address_line_1") or "").strip()
     if not _has_house_number(line1):
-        # Mark as not verified so Step 4 asks for the missing atom (house number)
         sched["address_verified"] = False
         sched["address_missing"] = "number"
-
-        # Optional: keep raw_address as-is; Step 4 will prompt for the number.
-        # If you want an immediate SMS from here, uncomment the next line:
-        # send_sms(phone, f"Got it — what’s the house number on {line1}?")
-
         return
 
     # ---------------------------------------------------
@@ -2186,12 +2188,15 @@ def maybe_create_square_booking(phone: str, convo: dict):
                 "Auto-booked by Prevolt OS. "
                 f"Raw address: {raw_address or '[none]'} | "
                 f"Normalized: {addr_struct.get('address_line_1')}, {addr_struct.get('locality')}, "
-                f"{addr_struct.get('administrative_district_level_1')} {addr_struct.get('postal_code')}"
+                f"{(addr_struct.get('administrative_district_level_1') or '').strip()} {(addr_struct.get('postal_code') or '').strip()}"
             )
         }
     }
 
     try:
+        # -----------------------------
+        # 1) Create booking
+        # -----------------------------
         resp = requests.post(
             "https://connect.squareup.com/v2/bookings",
             headers=square_headers(),
@@ -2207,10 +2212,73 @@ def maybe_create_square_booking(phone: str, convo: dict):
         booking_id = booking.get("id")
 
         if not booking_id:
-            print("[ERROR] booking_id missing.")
+            print("[ERROR] booking_id missing. payload=", data)
             return
 
-        # ✅ Only mark booked when we have a real Square booking id
+        # -----------------------------
+        # 2) Retrieve booking to confirm status/version
+        # -----------------------------
+        r2 = requests.get(
+            f"https://connect.squareup.com/v2/bookings/{booking_id}",
+            headers=square_headers(),
+            timeout=12,
+        )
+        if r2.status_code not in (200, 201):
+            print("[ERROR] retrieve booking failed:", r2.status_code, r2.text)
+            return
+
+        b2 = (r2.json() or {}).get("booking") or {}
+        status = (b2.get("status") or "").upper()
+        version = b2.get("version")
+
+        try:
+            segs = b2.get("appointment_segments") or []
+            tm = segs[0].get("team_member_id") if segs and isinstance(segs, list) else None
+        except Exception:
+            tm = None
+
+        print("[DEBUG] booking retrieved:", {
+            "id": booking_id,
+            "status": status,
+            "version": version,
+            "location_id": b2.get("location_id"),
+            "team_member_id": tm
+        })
+
+        # -----------------------------
+        # 3) Accept booking if not already accepted/confirmed
+        # -----------------------------
+        if status not in ("ACCEPTED", "CONFIRMED"):
+            if version is None:
+                print("[ERROR] booking version missing; cannot accept.")
+                return
+
+            accept_payload = {
+                "booking": {
+                    "version": version,
+                    "status": "ACCEPTED",
+                }
+            }
+
+            r3 = requests.put(
+                f"https://connect.squareup.com/v2/bookings/{booking_id}",
+                headers=square_headers(),
+                json=accept_payload,
+                timeout=12,
+            )
+            if r3.status_code not in (200, 201):
+                print("[ERROR] accept booking failed:", r3.status_code, r3.text)
+                return
+
+            b3 = (r3.json() or {}).get("booking") or {}
+            status2 = (b3.get("status") or "").upper()
+            print("[DEBUG] booking accepted:", {"id": booking_id, "status": status2})
+
+            if status2 not in ("ACCEPTED", "CONFIRMED"):
+                print("[ERROR] booking did not end in ACCEPTED/CONFIRMED. status=", status2)
+                return
+
+        # ✅ Only mark booked AFTER create + retrieve + accept succeeds
         sched["booking_created"] = True
         sched["square_booking_id"] = booking_id
 
@@ -2227,7 +2295,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
                 "date": scheduled_date
             })
 
-        print("[SUCCESS] Booking created:", booking_id)
+        print("[SUCCESS] Booking created and accepted:", booking_id)
 
     except Exception as e:
         print("[ERROR] Square exception:", repr(e))
