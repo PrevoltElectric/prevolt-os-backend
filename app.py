@@ -1190,12 +1190,13 @@ def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_creat
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
 # PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY)
-#   - Always applies intro on EVERY return (no missing intro)
-#   - No " — " or " - " telltales, no "Got it", no "Thanks" filler
+#   - Longer, more human intros + prompts (deterministic per conversation)
+#   - No em dash "—" and no " - " telltales
+#   - No "Got it", "Thanks" filler
 #   - No "one moment / securing" messages (ever)
-#   - House-number patch: if missing ONLY house number + user replies digits, merge and continue
+#   - House-number patch: handles
 #   - Re-check address state AFTER model output (prevents booking without house number)
-#   - If Square did NOT book, never "confirm"; always ask the next missing atom (or send a short neutral line)
+#   - If Square did NOT book, never "confirm"; always ask the next missing atom (or send a neutral line)
 #   - Adds acknowledgement memory so it doesn't repeat acknowledgements
 # ---------------------------------------------------
 def generate_reply_for_inbound(
@@ -1211,6 +1212,7 @@ def generate_reply_for_inbound(
 
     try:
         import re
+        import hashlib
         from datetime import datetime, timedelta
 
         # --------------------------------------
@@ -1261,6 +1263,9 @@ def generate_reply_for_inbound(
         sched.setdefault("last_ack_text", None)
         sched.setdefault("last_ack_ts", None)
 
+        # Human phrasing memory
+        sched.setdefault("prompt_variants", {})
+
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
 
@@ -1285,18 +1290,58 @@ def generate_reply_for_inbound(
                 return True
             return False
 
+        def _stable_choice_key(label: str) -> str:
+            cid = (
+                str(sched.get("conversation_id") or "")
+                or str(phone or "")
+                or str(sched.get("raw_address") or "")
+            ).strip()
+            base = f"{cid}|{label}"
+            return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+        def pick_variant_once(label: str, options: list[str]) -> str:
+            if not options:
+                return ""
+            store = sched.setdefault("prompt_variants", {})
+            if label in store and store[label] in options:
+                return store[label]
+            h = _stable_choice_key(label)
+            idx = int(h[:8], 16) % len(options)
+            chosen = options[idx]
+            store[label] = chosen
+            return chosen
+
         def _strip_ai_tells(s: str) -> str:
             s = _norm(s)
 
-            # remove em/en dashes + spaced hyphen tells
+            # normalize dashes and remove spaced hyphen tell
             s = s.replace("—", ".").replace("–", ".")
             s = s.replace(" - ", " ")
 
             # remove leading filler openers
-            s = re.sub(r"^(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*", "", s, flags=re.I)
+            s = re.sub(
+                r"^(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*",
+                "",
+                s,
+                flags=re.I
+            )
+
+            # remove filler that appears right after the intro sentence
+            s = re.sub(
+                r"^(hi[, ]+)?(hey[, ]+)?(you(?:'|’)ve reached|this is)\s+prevolt electric\.\s*"
+                r"(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*",
+                r"this is prevolt electric. ",
+                s,
+                flags=re.I
+            )
 
             # remove wait-text (never allowed)
-            s = re.sub(r"\b(one moment|one sec|one second|give me a moment|please wait|hang tight|securing your appointment)\b[\s,.:;!-]*", "", s, flags=re.I)
+            s = re.sub(
+                r"\b(one moment|one sec|one second|give me a moment|please wait|hang tight|securing your appointment)\b[\s,.:;!-]*",
+                "",
+                s,
+                flags=re.I
+            )
 
             # tighten punctuation spacing
             s = re.sub(r"\s+\.", ".", s)
@@ -1305,7 +1350,7 @@ def generate_reply_for_inbound(
 
             return s
 
-        def _shorten_texty(s: str, max_chars: int = 220) -> str:
+        def _shorten_texty(s: str, max_chars: int = 260) -> str:
             s = _norm(s)
             if len(s) <= max_chars:
                 return s
@@ -1317,17 +1362,36 @@ def generate_reply_for_inbound(
                 s += "."
             return _norm(s)
 
+        def build_human_intro_line() -> str:
+            # One-time only. Two short sentences feels human without being chatty.
+            options = [
+                "Hi, this is Prevolt Electric. I can help you right here by text.",
+                "Hey, this is Prevolt Electric. Quick question so I can get this lined up.",
+                "Hi, you’ve reached Prevolt Electric. I’ll get this set up for you here.",
+            ]
+            return pick_variant_once("intro_line", options)
+
+        def humanize_question(core_question: str) -> str:
+            core_question = _norm(core_question)
+
+            # Deterministic wrapper per question type so we do not sound random mid-thread.
+            # Keep it subtle, not salesy.
+            options = [
+                core_question,
+                f"Perfect. {core_question}",
+                f"Sounds good. {core_question}",
+                f"Alright. {core_question}",
+            ]
+            return pick_variant_once(f"qwrap::{core_question[:18].lower()}", options)
+
         def _apply_intro_once(s: str) -> str:
             s = _norm(s)
             if not sched.get("intro_sent"):
-                # IMPORTANT: no em dash, no " - "
-                s = f"This is Prevolt Electric. {s}".strip()
+                s = f"{build_human_intro_line()} {s}".strip()
                 sched["intro_sent"] = True
             return _norm(s)
 
         def _maybe_price_once(s: str, appt_type_local: str) -> str:
-            # If you want price injection early, keep this ON.
-            # If you ever want it OFF, just return s.
             if not sched.get("price_disclosed"):
                 try:
                     s = apply_price_injection(appt_type_local, s)
@@ -1345,7 +1409,6 @@ def generate_reply_for_inbound(
 
             # If user just sent ack-only, do NOT reply with ack-only again.
             if _is_ack_only(inbound_text):
-                # If our outgoing is also basically an ack, replace with next real step.
                 low = s.lower()
                 looks_like_ack = (low in {"ok", "okay", "yep", "yeah", "yes"} or len(low) <= 6)
 
@@ -1353,17 +1416,16 @@ def generate_reply_for_inbound(
                     update_address_assembly_state(sched)
                     if not sched.get("address_verified"):
                         s = build_address_prompt(sched)
-                        s = _apply_intro_once(s)  # intro might have already been sent; safe
+                        s = _apply_intro_once(s)
                         s = _strip_ai_tells(s)
                         s = _shorten_texty(s)
                     elif not sched.get("scheduled_date"):
-                        s = "What day works for you?"
+                        s = humanize_question("What day works best for you?")
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_time"):
-                        s = "What time works best?"
+                        s = humanize_question("What time works best?")
                         s = _apply_intro_once(s)
                     else:
-                        # Everything collected but Square didn't book (or nothing to do)
                         s = "Okay."
 
             # Extra safety: if not booked, strip any confirmation language
@@ -1377,21 +1439,20 @@ def generate_reply_for_inbound(
                         s = build_address_prompt(sched)
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_date"):
-                        s = "What day works for you?"
+                        s = humanize_question("What day works best for you?")
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_time"):
-                        s = "What time works best?"
+                        s = humanize_question("What time works best?")
                         s = _apply_intro_once(s)
                     else:
                         s = "Okay."
 
-            # If you still want your sanitize_sms_body(), call it safely at the end.
             try:
                 s = sanitize_sms_body(s, booking_created=bool(booking_created))
             except Exception:
                 pass
 
-            # Final cleanup: ensure no " - " or "—" survives
+            # Final cleanup: ensure no em dash / spaced hyphen survives
             s = s.replace("—", ".").replace("–", ".").replace(" - ", " ")
             s = _norm(s)
 
@@ -1423,7 +1484,7 @@ def generate_reply_for_inbound(
             sched["pending_step"] = None
 
             if not sched.get("raw_address"):
-                msg = "This sounds like an emergency. " + build_address_prompt(sched)
+                msg = "This sounds urgent. " + build_address_prompt(sched)
                 msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
                 return {
                     "sms_body": msg,
@@ -1434,8 +1495,8 @@ def generate_reply_for_inbound(
                 }
 
             msg = (
-                f"This looks like an emergency at {sched.get('raw_address')}. "
-                "Emergency troubleshooting visits are $395. "
+                f"This looks urgent at {sched.get('raw_address')}. "
+                "Troubleshoot and repair visits are $395. "
                 "Do you want us to dispatch someone now?"
             )
             msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
@@ -1457,7 +1518,6 @@ def generate_reply_for_inbound(
             sched["scheduled_time"] = now_local.strftime("%H:%M")
             sched["pending_step"] = None
 
-            # Sync locals so downstream sees them
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
 
@@ -1482,24 +1542,17 @@ def generate_reply_for_inbound(
         # --------------------------------------
         update_address_assembly_state(sched)
 
-        # ✅ HOUSE NUMBER PATCH (pre-LLM) — IMPROVED:
-        # Handles:
-        #   - "45"
-        #   - "it's 45"
-        #   - "45 dickerman ave"
-        # Also: when merging a number, prefer RAW (keeps city/state/zip) over norm_line1 (street-only).
+        # ✅ HOUSE NUMBER PATCH (pre-LLM) — IMPROVED
         try:
             update_address_assembly_state(sched)
             missing_atom = (sched.get("address_missing") or "").strip().lower()
-        
+
             if missing_atom == "number":
                 inbound_clean = inbound_text.strip()
-        
-                # Pull a number from messages like "45", "it's 45", "Its 45", "#45"
+
                 m_num = re.search(r"\b(\d{1,6})\b", inbound_clean)
                 num = m_num.group(1) if m_num else None
-        
-                # Heuristic: does inbound look like it contains a street name too?
+
                 low = inbound_clean.lower()
                 street_suffixes = (
                     " st", " street", " ave", " avenue", " rd", " road", " ln", " lane",
@@ -1508,27 +1561,23 @@ def generate_reply_for_inbound(
                 )
                 inbound_has_street_word = any(suf in f" {low} " for suf in street_suffixes)
                 inbound_starts_with_number = bool(re.match(r"^\s*\d{1,6}\b", inbound_clean))
-        
+
                 raw = (sched.get("raw_address") or "").strip()
                 norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
                 norm_line1 = (norm.get("address_line_1") or "").strip() if norm else ""
-        
-                # Case A: customer sent a full-ish address that begins with a number ("45 dickerman ave")
-                # Trust it as the new raw address and force re-normalization.
+
                 if inbound_starts_with_number and inbound_has_street_word:
                     sched["raw_address"] = inbound_clean
                     sched["normalized_address"] = None
                     update_address_assembly_state(sched)
-        
-                # Case B: customer sent just the number (or number inside a short phrase)
-                # Merge it into EXISTING raw address (preferred: raw keeps town/state/zip).
+
                 elif num:
-                    base = raw or norm_line1  # ✅ raw first (keeps locality/zip if present)
+                    base = raw or norm_line1
                     if base and not re.match(r"^\d{1,6}\b", base):
                         sched["raw_address"] = f"{num} {base}".strip()
-                        sched["normalized_address"] = None  # force clean re-normalization
+                        sched["normalized_address"] = None
                     update_address_assembly_state(sched)
-        
+
         except Exception as e:
             print("[WARN] house-number merge patch failed:", repr(e))
 
@@ -1612,7 +1661,7 @@ def generate_reply_for_inbound(
         if model_time:
             sched["scheduled_time"] = model_time
 
-        # If address STILL not verified, override immediately
+        # If address STILL not verified, override immediately (humanized prompt stays in builder)
         if not sched.get("address_verified"):
             msg = build_address_prompt(sched)
             msg = _finalize_sms(msg, appt_type, booking_created=False)
@@ -1665,12 +1714,16 @@ def generate_reply_for_inbound(
             if not sched.get("address_verified"):
                 sms_body = build_address_prompt(sched)
             elif not sched.get("scheduled_date"):
-                sms_body = "What day works for you?"
+                sms_body = humanize_question("What day works best for you?")
             elif not sched.get("scheduled_time"):
-                sms_body = "What time works best?"
+                sms_body = humanize_question("What time works best?")
             else:
-                # Collected everything but booking not created. Say something neutral.
-                sms_body = "Okay."
+                # Collected everything but booking not created. Neutral, human, not weird.
+                sms_body = pick_variant_once("neutral_no_book", [
+                    "Okay. If anything changes, just text me here.",
+                    "All set. If you need to adjust anything, just message me here.",
+                    "Okay. Want to keep that same day and time?",
+                ])
 
         booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
         sms_body = _finalize_sms(sms_body, appt_type, booking_created=booking_created)
