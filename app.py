@@ -282,11 +282,6 @@ def handle_call_selection():
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
-    profile.setdefault("first_name", None)
-    profile.setdefault("last_name", None)
-    profile.setdefault("email", None)
-    profile.setdefault("square_customer_id", None)
-
 
     # Keep sched present (safe defaults; won't override existing values)
     sched = conv.setdefault("sched", {})
@@ -398,11 +393,6 @@ def voicemail_complete():
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
-    profile.setdefault("first_name", None)
-    profile.setdefault("last_name", None)
-    profile.setdefault("email", None)
-    profile.setdefault("square_customer_id", None)
-
     # Preserve any customer_type set earlier (residential/commercial)
 
     current_job = conv.setdefault("current_job", {})
@@ -920,11 +910,6 @@ def incoming_sms():
     profile.setdefault("past_jobs", [])
     # keep customer_type if it exists (from call flow)
     profile.setdefault("customer_type", profile.get("customer_type"))
-    profile.setdefault("first_name", None)
-    profile.setdefault("last_name", None)
-    profile.setdefault("email", None)
-    profile.setdefault("square_customer_id", None)
-
 
     current_job = conv.setdefault("current_job", {})
     current_job.setdefault("job_type", None)
@@ -1205,6 +1190,14 @@ def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_creat
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
 # PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY)
+#   - Longer, more human intros + prompts (deterministic per conversation)
+#   - No em dash "—" and no " - " telltales
+#   - No "Got it", "Thanks" filler
+#   - No "one moment / securing" messages (ever)
+#   - House-number patch: handles
+#   - Re-check address state AFTER model output (prevents booking without house number)
+#   - If Square did NOT book, never "confirm"; always ask the next missing atom (or send a neutral line)
+#   - Adds acknowledgement memory so it doesn't repeat acknowledgements
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -1244,10 +1237,6 @@ def generate_reply_for_inbound(
         profile.setdefault("addresses", [])
         profile.setdefault("past_jobs", [])
         profile.setdefault("upcoming_appointment", None)
-        profile.setdefault("first_name", None)
-        profile.setdefault("last_name", None)
-        profile.setdefault("email", None)
-        profile.setdefault("square_customer_id", None)
 
         sched = conv.setdefault("sched", {})
 
@@ -1280,28 +1269,8 @@ def generate_reply_for_inbound(
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
 
-        # ---------------------------------------------------
-        # IDENTITY SIGNAL EXTRACTION (SRB-14.7 / SRB-18)
-        # ---------------------------------------------------
-        EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-        # Email capture (once, anywhere)
-        if not profile.get("email"):
-            m = EMAIL_RE.search(inbound_text)
-            if m:
-                profile["email"] = m.group(0)
-
-        # First + last name capture (conservative)
-        if not profile.get("first_name") or not profile.get("last_name"):
-            parts = inbound_text.split()
-            if len(parts) == 2 and all(p.isalpha() for p in parts):
-                if not profile.get("first_name"):
-                    profile["first_name"] = parts[0].title()
-                if not profile.get("last_name"):
-                    profile["last_name"] = parts[1].title()
-
         # --------------------------------------
-        # Local helpers (self-contained)
+        # Local helpers (so this block is self-contained)
         # --------------------------------------
         ACK_SET = {
             "ok", "okay", "k", "kk", "sure", "yep", "yeah", "yes",
@@ -1344,23 +1313,42 @@ def generate_reply_for_inbound(
 
         def _strip_ai_tells(s: str) -> str:
             s = _norm(s)
+
+            # normalize dashes and remove spaced hyphen tell
             s = s.replace("—", ".").replace("–", ".")
             s = s.replace(" - ", " ")
+
+            # remove leading filler openers
             s = re.sub(
                 r"^(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*",
                 "",
                 s,
                 flags=re.I
             )
+
+            # remove filler that appears right after the intro sentence
+            s = re.sub(
+                r"^(hi[, ]+)?(hey[, ]+)?(you(?:'|’)ve reached|this is)\s+prevolt electric\.\s*"
+                r"(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*",
+                r"this is prevolt electric. ",
+                s,
+                flags=re.I
+            )
+
+            # remove wait-text (never allowed)
             s = re.sub(
                 r"\b(one moment|one sec|one second|give me a moment|please wait|hang tight|securing your appointment)\b[\s,.:;!-]*",
                 "",
                 s,
                 flags=re.I
             )
+
+            # tighten punctuation spacing
             s = re.sub(r"\s+\.", ".", s)
             s = re.sub(r"\.\.+", ".", s)
-            return _norm(s)
+            s = _norm(s)
+
+            return s
 
         def _shorten_texty(s: str, max_chars: int = 260) -> str:
             s = _norm(s)
@@ -1375,6 +1363,7 @@ def generate_reply_for_inbound(
             return _norm(s)
 
         def build_human_intro_line() -> str:
+            # One-time only. Two short sentences feels human without being chatty.
             options = [
                 "Hi, this is Prevolt Electric. I can help you right here by text.",
                 "Hey, this is Prevolt Electric. Quick question so I can get this lined up.",
@@ -1384,6 +1373,9 @@ def generate_reply_for_inbound(
 
         def humanize_question(core_question: str) -> str:
             core_question = _norm(core_question)
+
+            # Deterministic wrapper per question type so we do not sound random mid-thread.
+            # Keep it subtle, not salesy.
             options = [
                 core_question,
                 f"Perfect. {core_question}",
@@ -1411,9 +1403,60 @@ def generate_reply_for_inbound(
         def _finalize_sms(s: str, appt_type_local: str, booking_created: bool) -> str:
             s = _apply_intro_once(s)
             s = _maybe_price_once(s, appt_type_local)
+
             s = _strip_ai_tells(s)
             s = _shorten_texty(s)
 
+            # If user just sent ack-only, do NOT reply with ack-only again.
+            if _is_ack_only(inbound_text):
+                low = s.lower()
+                looks_like_ack = (low in {"ok", "okay", "yep", "yeah", "yes"} or len(low) <= 6)
+
+                if looks_like_ack:
+                    update_address_assembly_state(sched)
+                    if not sched.get("address_verified"):
+                        s = build_address_prompt(sched)
+                        s = _apply_intro_once(s)
+                        s = _strip_ai_tells(s)
+                        s = _shorten_texty(s)
+                    elif not sched.get("scheduled_date"):
+                        s = humanize_question("What day works best for you?")
+                        s = _apply_intro_once(s)
+                    elif not sched.get("scheduled_time"):
+                        s = humanize_question("What time works best?")
+                        s = _apply_intro_once(s)
+                    else:
+                        s = "Okay."
+
+            # Extra safety: if not booked, strip any confirmation language
+            if not booking_created:
+                conf_markers = [
+                    "confirmation number", "confirmed", "your appointment is", "booked for", "scheduled for"
+                ]
+                if any(m in s.lower() for m in conf_markers):
+                    update_address_assembly_state(sched)
+                    if not sched.get("address_verified"):
+                        s = build_address_prompt(sched)
+                        s = _apply_intro_once(s)
+                    elif not sched.get("scheduled_date"):
+                        s = humanize_question("What day works best for you?")
+                        s = _apply_intro_once(s)
+                    elif not sched.get("scheduled_time"):
+                        s = humanize_question("What time works best?")
+                        s = _apply_intro_once(s)
+                    else:
+                        s = "Okay."
+
+            try:
+                s = sanitize_sms_body(s, booking_created=bool(booking_created))
+            except Exception:
+                pass
+
+            # Final cleanup: ensure no em dash / spaced hyphen survives
+            s = s.replace("—", ".").replace("–", ".").replace(" - ", " ")
+            s = _norm(s)
+
+            # Prevent repeating the exact same final ack text twice in a row
             if _is_ack_only(inbound_text):
                 if sched.get("last_ack_text") and sched["last_ack_text"].lower() == s.lower():
                     s = "Okay."
@@ -1421,22 +1464,6 @@ def generate_reply_for_inbound(
                 sched["last_ack_ts"] = datetime.utcnow().isoformat()
 
             return s
-
-        # ⬇⬇⬇
-        # EVERYTHING BELOW REMAINS UNCHANGED IN YOUR FILE
-        # (address handling, emergency flow, LLM, autobooking, etc.)
-        # ⬆⬆⬆
-
-    except Exception as e:
-        print("[ERROR] generate_reply_for_inbound:", repr(e))
-        return {
-            "sms_body": "Sorry, can you say that again?",
-            "scheduled_date": scheduled_date,
-            "scheduled_time": scheduled_time,
-            "address": address,
-            "booking_complete": False
-        }
-
 
         # --------------------------------------
         # Emergency flow (2-step confirmation)
@@ -1835,11 +1862,8 @@ def square_headers() -> dict:
 def square_create_or_get_customer(phone: str, addr_struct: dict | None = None):
     """
     Searches by phone, else creates new.
-    Enriches customer with name/email if known.
     """
-    # --------------------------------------
-    # Search by phone
-    # --------------------------------------
+    # Search
     try:
         payload = {
             "query": {"filter": {"phone_number": {"exact": phone}}}
@@ -1857,28 +1881,13 @@ def square_create_or_get_customer(phone: str, addr_struct: dict | None = None):
     except Exception as e:
         print("[WARN] customer search failed:", repr(e))
 
-    # --------------------------------------
-    # Create new customer
-    # --------------------------------------
+    # Create
     try:
-        # Pull profile identity if available
-        profile = conversations.get(phone, {}).get("profile", {})
-
         payload = {
             "idempotency_key": str(uuid.uuid4()),
+            "given_name": "Prevolt Lead",
             "phone_number": phone,
         }
-
-        # Enrich identity if known (SRB-14.7 / SRB-18)
-        if profile.get("first_name"):
-            payload["given_name"] = profile["first_name"]
-
-        if profile.get("last_name"):
-            payload["family_name"] = profile["last_name"]
-
-        if profile.get("email"):
-            payload["email_address"] = profile["email"]
-
         if addr_struct:
             payload["address"] = addr_struct
 
@@ -2006,10 +2015,6 @@ def maybe_create_square_booking(phone: str, convo: dict):
     profile.setdefault("addresses", [])
     profile.setdefault("past_jobs", [])
     profile.setdefault("upcoming_appointment", None)
-    profile.setdefault("first_name", None)
-    profile.setdefault("last_name", None)
-    profile.setdefault("email", None)
-    profile.setdefault("square_customer_id", None)
 
     # Never double-book
     if sched.get("booking_created") and sched.get("square_booking_id"):
