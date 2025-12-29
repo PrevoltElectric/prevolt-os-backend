@@ -362,37 +362,16 @@ def handle_call_selection():
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse  # ✅ avoid NameError
-
     recording_url = request.form.get("RecordingUrl")
-    raw_from      = request.form.get("From")
+    from_number   = request.form.get("From", "").replace("whatsapp:", "")
 
     resp = VoiceResponse()
 
-    # ---------------------------------------------------
-    # HARD GUARD: voicemail MUST have a From number
-    # ---------------------------------------------------
-    if not raw_from:
-        print("[ERROR] voicemail_complete: missing From number")
-        resp.say("We did not receive caller information. Goodbye.")
-        resp.hangup()
-        return Response(str(resp), mimetype="text/xml")
-
-    from_number = raw_from.replace("whatsapp:", "").strip()
-
-    if not from_number:
-        print("[ERROR] voicemail_complete: empty normalized From number")
-        resp.say("We did not receive caller information. Goodbye.")
-        resp.hangup()
-        return Response(str(resp), mimetype="text/xml")
-
     if not recording_url:
         resp.say("We did not receive a recording. Goodbye.")
-        resp.hangup()
         return Response(str(resp), mimetype="text/xml")
 
-    # ---------------------------------------------------
     # 1) Transcribe
-    # ---------------------------------------------------
     try:
         transcript = transcribe_recording(recording_url)
         cleaned    = clean_transcript_text(transcript)
@@ -400,14 +379,10 @@ def voicemail_complete():
         print("[ERROR] voicemail_complete transcription:", repr(e))
         cleaned = ""
 
-    # ---------------------------------------------------
     # 2) Classification
-    # ---------------------------------------------------
     classification = generate_initial_sms(cleaned)
 
-    # ---------------------------------------------------
-    # 3) Save to memory (conversation is now SAFE)
-    # ---------------------------------------------------
+    # 3) Save to memory
     conv = conversations.setdefault(from_number, {})
 
     # ---------------------------------------------------
@@ -418,6 +393,7 @@ def voicemail_complete():
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
+    # Preserve any customer_type set earlier (residential/commercial)
 
     current_job = conv.setdefault("current_job", {})
     current_job.setdefault("job_type", None)
@@ -457,42 +433,38 @@ def voicemail_complete():
     if classification.get("detected_address"):
         sched["raw_address"] = classification["detected_address"]
 
-    # Refresh address assembly state
+    # Refresh address assembly state (safe if normalized/raw changed)
     update_address_assembly_state(sched)
 
-    # ---------------------------------------------------
+    # --------------------------------------
     # HARD OVERRIDE: Voicemail Emergency Pre-Flag
-    # ---------------------------------------------------
+    # --------------------------------------
     if classification.get("intent") == "emergency":
         sched["appointment_type"] = "TROUBLESHOOT_395"
         sched["awaiting_emergency_confirm"] = True
         sched["emergency_approved"] = False
 
-    # ---------------------------------------------------
-    # 4) Trigger First SMS (Step 4)
-    # ---------------------------------------------------
+    # 4) Trigger First SMS (Step 4 call)
     try:
         outbound = generate_reply_for_inbound(
             cleaned,
             conv.get("category"),
             conv.get("appointment_type"),
             conv.get("initial_sms"),
-            "",  # no inbound SMS yet
+            "",  # no user inbound yet
             sched.get("scheduled_date"),
             sched.get("scheduled_time"),
             sched.get("raw_address")
         )
 
-        initial_msg = outbound.get("sms_body") or "Thanks for your voicemail. I can help you right here by text."
+        initial_msg = outbound.get("sms_body") or "Thanks for your voicemail — how can we help?"
         send_sms(from_number, initial_msg)
-
     except Exception as e:
         print("[ERROR] voicemail_complete → Step4:", repr(e))
 
     resp.say("Thank you. Your message has been recorded.")
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
-
 
 
 
@@ -1218,6 +1190,14 @@ def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_creat
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
 # PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY)
+#   - Longer, more human intros + prompts (deterministic per conversation)
+#   - No em dash "—" and no " - " telltales
+#   - No "Got it", "Thanks" filler
+#   - No "one moment / securing" messages (ever)
+#   - House-number patch: handles
+#   - Re-check address state AFTER model output (prevents booking without house number)
+#   - If Square did NOT book, never "confirm"; always ask the next missing atom (or send a neutral line)
+#   - Adds acknowledgement memory so it doesn't repeat acknowledgements
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -1248,40 +1228,19 @@ def generate_reply_for_inbound(
         today_weekday  = now_local.strftime("%A")
 
         # --------------------------------------
-        # SAFE PHONE RESOLUTION (CRITICAL FIX)
+        # Conversation + scheduler layers (HARDENED)
         # --------------------------------------
-        phone = None
-        try:
-            raw_from = request.form.get("From")
-            if raw_from:
-                phone = raw_from.replace("whatsapp:", "").strip()
-        except Exception:
-            phone = None
+        phone = request.form.get("From", "").replace("whatsapp:", "")
+        conv  = conversations.setdefault(phone, {})
 
-        if not phone:
-            # Fallback for voicemail / non-request contexts
-            phone = "__voicemail__"
-
-        conv = conversations.setdefault(phone, {})
-
-        # --------------------------------------
-        # Profile (SAFE)
-        # --------------------------------------
         profile = conv.setdefault("profile", {})
         profile.setdefault("addresses", [])
         profile.setdefault("past_jobs", [])
         profile.setdefault("upcoming_appointment", None)
 
-        # Identity atoms
-        profile.setdefault("first_name", None)
-        profile.setdefault("last_name", None)
-        profile.setdefault("email", None)
-
-        # --------------------------------------
-        # Scheduler
-        # --------------------------------------
         sched = conv.setdefault("sched", {})
 
+        # Core state
         sched.setdefault("raw_address", None)
         sched.setdefault("normalized_address", None)
         sched.setdefault("pending_step", None)
@@ -1290,39 +1249,28 @@ def generate_reply_for_inbound(
         sched.setdefault("awaiting_emergency_confirm", False)
         sched.setdefault("emergency_approved", False)
 
+        # Booking flags
         sched.setdefault("booking_created", False)
         sched.setdefault("square_booking_id", None)
 
+        # Address atoms
         sched.setdefault("address_candidate", None)
         sched.setdefault("address_verified", False)
         sched.setdefault("address_missing", None)
         sched.setdefault("address_parts", {})
 
+        # Ack memory
         sched.setdefault("last_ack_text", None)
         sched.setdefault("last_ack_ts", None)
+
+        # Human phrasing memory
         sched.setdefault("prompt_variants", {})
 
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
 
-        # ---------------------------------------------------
-        # IDENTITY SIGNAL EXTRACTION (PASSIVE)
-        # ---------------------------------------------------
-        EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-        if profile.get("email") is None:
-            m = EMAIL_RE.search(inbound_text)
-            if m:
-                profile["email"] = m.group(0)
-
-        if profile.get("first_name") is None or profile.get("last_name") is None:
-            parts = inbound_text.split()
-            if len(parts) == 2 and all(p.isalpha() for p in parts):
-                profile.setdefault("first_name", parts[0].title())
-                profile.setdefault("last_name", parts[1].title())
-
         # --------------------------------------
-        # Helpers
+        # Local helpers (so this block is self-contained)
         # --------------------------------------
         ACK_SET = {
             "ok", "okay", "k", "kk", "sure", "yep", "yeah", "yes",
@@ -1334,51 +1282,459 @@ def generate_reply_for_inbound(
 
         def _is_ack_only(msg: str) -> bool:
             t = _norm(msg).lower()
-            return t in ACK_SET
+            if not t:
+                return False
+            if t in ACK_SET:
+                return True
+            if len(t) <= 20 and any(w in t for w in ["ok", "okay", "thanks", "thank", "thx", "got it"]):
+                return True
+            return False
 
         def _stable_choice_key(label: str) -> str:
-            base = f"{phone}|{label}"
+            cid = (
+                str(sched.get("conversation_id") or "")
+                or str(phone or "")
+                or str(sched.get("raw_address") or "")
+            ).strip()
+            base = f"{cid}|{label}"
             return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
         def pick_variant_once(label: str, options: list[str]) -> str:
+            if not options:
+                return ""
             store = sched.setdefault("prompt_variants", {})
-            if label in store:
+            if label in store and store[label] in options:
                 return store[label]
-            idx = int(_stable_choice_key(label)[:8], 16) % len(options)
-            store[label] = options[idx]
-            return store[label]
+            h = _stable_choice_key(label)
+            idx = int(h[:8], 16) % len(options)
+            chosen = options[idx]
+            store[label] = chosen
+            return chosen
+
+        def _strip_ai_tells(s: str) -> str:
+            s = _norm(s)
+
+            # normalize dashes and remove spaced hyphen tell
+            s = s.replace("—", ".").replace("–", ".")
+            s = s.replace(" - ", " ")
+
+            # remove leading filler openers
+            s = re.sub(
+                r"^(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*",
+                "",
+                s,
+                flags=re.I
+            )
+
+            # remove filler that appears right after the intro sentence
+            s = re.sub(
+                r"^(hi[, ]+)?(hey[, ]+)?(you(?:'|’)ve reached|this is)\s+prevolt electric\.\s*"
+                r"(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*",
+                r"this is prevolt electric. ",
+                s,
+                flags=re.I
+            )
+
+            # remove wait-text (never allowed)
+            s = re.sub(
+                r"\b(one moment|one sec|one second|give me a moment|please wait|hang tight|securing your appointment)\b[\s,.:;!-]*",
+                "",
+                s,
+                flags=re.I
+            )
+
+            # tighten punctuation spacing
+            s = re.sub(r"\s+\.", ".", s)
+            s = re.sub(r"\.\.+", ".", s)
+            s = _norm(s)
+
+            return s
+
+        def _shorten_texty(s: str, max_chars: int = 260) -> str:
+            s = _norm(s)
+            if len(s) <= max_chars:
+                return s
+            parts = re.split(r"(?<=[.!?])\s+", s)
+            s = " ".join(parts[:2]).strip()
+            if len(s) > max_chars:
+                s = s[:max_chars].rstrip()
+                s = re.sub(r"[\s,;:]+$", "", s)
+                s += "."
+            return _norm(s)
 
         def build_human_intro_line() -> str:
-            return pick_variant_once("intro", [
+            # One-time only. Two short sentences feels human without being chatty.
+            options = [
                 "Hi, this is Prevolt Electric. I can help you right here by text.",
                 "Hey, this is Prevolt Electric. Quick question so I can get this lined up.",
                 "Hi, you’ve reached Prevolt Electric. I’ll get this set up for you here.",
-            ])
+            ]
+            return pick_variant_once("intro_line", options)
+
+        def humanize_question(core_question: str) -> str:
+            core_question = _norm(core_question)
+
+            # Deterministic wrapper per question type so we do not sound random mid-thread.
+            # Keep it subtle, not salesy.
+            options = [
+                core_question,
+                f"Perfect. {core_question}",
+                f"Sounds good. {core_question}",
+                f"Alright. {core_question}",
+            ]
+            return pick_variant_once(f"qwrap::{core_question[:18].lower()}", options)
 
         def _apply_intro_once(s: str) -> str:
-            if not sched["intro_sent"]:
+            s = _norm(s)
+            if not sched.get("intro_sent"):
+                s = f"{build_human_intro_line()} {s}".strip()
                 sched["intro_sent"] = True
-                return f"{build_human_intro_line()} {s}"
-            return s
+            return _norm(s)
 
         def _maybe_price_once(s: str, appt_type_local: str) -> str:
-            if not sched["price_disclosed"]:
+            if not sched.get("price_disclosed"):
                 try:
                     s = apply_price_injection(appt_type_local, s)
                 except Exception:
                     pass
                 sched["price_disclosed"] = True
-            return s
+            return _norm(s)
 
         def _finalize_sms(s: str, appt_type_local: str, booking_created: bool) -> str:
             s = _apply_intro_once(s)
             s = _maybe_price_once(s, appt_type_local)
+
+            s = _strip_ai_tells(s)
+            s = _shorten_texty(s)
+
+            # If user just sent ack-only, do NOT reply with ack-only again.
+            if _is_ack_only(inbound_text):
+                low = s.lower()
+                looks_like_ack = (low in {"ok", "okay", "yep", "yeah", "yes"} or len(low) <= 6)
+
+                if looks_like_ack:
+                    update_address_assembly_state(sched)
+                    if not sched.get("address_verified"):
+                        s = build_address_prompt(sched)
+                        s = _apply_intro_once(s)
+                        s = _strip_ai_tells(s)
+                        s = _shorten_texty(s)
+                    elif not sched.get("scheduled_date"):
+                        s = humanize_question("What day works best for you?")
+                        s = _apply_intro_once(s)
+                    elif not sched.get("scheduled_time"):
+                        s = humanize_question("What time works best?")
+                        s = _apply_intro_once(s)
+                    else:
+                        s = "Okay."
+
+            # Extra safety: if not booked, strip any confirmation language
+            if not booking_created:
+                conf_markers = [
+                    "confirmation number", "confirmed", "your appointment is", "booked for", "scheduled for"
+                ]
+                if any(m in s.lower() for m in conf_markers):
+                    update_address_assembly_state(sched)
+                    if not sched.get("address_verified"):
+                        s = build_address_prompt(sched)
+                        s = _apply_intro_once(s)
+                    elif not sched.get("scheduled_date"):
+                        s = humanize_question("What day works best for you?")
+                        s = _apply_intro_once(s)
+                    elif not sched.get("scheduled_time"):
+                        s = humanize_question("What time works best?")
+                        s = _apply_intro_once(s)
+                    else:
+                        s = "Okay."
+
+            try:
+                s = sanitize_sms_body(s, booking_created=bool(booking_created))
+            except Exception:
+                pass
+
+            # Final cleanup: ensure no em dash / spaced hyphen survives
+            s = s.replace("—", ".").replace("–", ".").replace(" - ", " ")
             s = _norm(s)
+
+            # Prevent repeating the exact same final ack text twice in a row
+            if _is_ack_only(inbound_text):
+                if sched.get("last_ack_text") and sched["last_ack_text"].lower() == s.lower():
+                    s = "Okay."
+                sched["last_ack_text"] = s
+                sched["last_ack_ts"] = datetime.utcnow().isoformat()
+
             return s
 
-        # ⬇⬇⬇
-        # REST OF STEP 4 CONTINUES UNCHANGED
-        # ⬆⬆⬆
+        # --------------------------------------
+        # Emergency flow (2-step confirmation)
+        # --------------------------------------
+        EMERGENCY_KEYWORDS = [
+            "tree fell", "tree down", "power line", "lines down",
+            "service ripped", "sparking", "burning", "fire",
+            "smoke", "no power", "power outage",
+            "urgent", "emergency"
+        ]
+
+        IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
+        EMERGENCY = IS_EMERGENCY
+
+        if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
+            sched["appointment_type"] = "TROUBLESHOOT_395"
+            sched["awaiting_emergency_confirm"] = True
+            sched["pending_step"] = None
+
+            if not sched.get("raw_address"):
+                msg = "This sounds urgent. " + build_address_prompt(sched)
+                msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
+                return {
+                    "sms_body": msg,
+                    "scheduled_date": None,
+                    "scheduled_time": None,
+                    "address": None,
+                    "booking_complete": False
+                }
+
+            msg = (
+                f"This looks urgent at {sched.get('raw_address')}. "
+                "Troubleshoot and repair visits are $395. "
+                "Do you want us to dispatch someone now?"
+            )
+            msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
+            return {
+                "sms_body": msg,
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+
+        CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
+
+        if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
+            sched["emergency_approved"] = True
+            sched["awaiting_emergency_confirm"] = False
+            sched["appointment_type"] = "TROUBLESHOOT_395"
+            sched["scheduled_date"] = today_date_str
+            sched["scheduled_time"] = now_local.strftime("%H:%M")
+            sched["pending_step"] = None
+
+            scheduled_date = sched["scheduled_date"]
+            scheduled_time = sched["scheduled_time"]
+
+        # --------------------------------------
+        # Appointment type fallback
+        # --------------------------------------
+        appt_type = sched.get("appointment_type") or appointment_type
+        if not appt_type:
+            if any(w in inbound_lower for w in [
+                "not working", "no power", "dead", "sparking", "burning",
+                "breaker keeps", "gfci", "outlet not", "troubleshoot"
+            ]):
+                appt_type = "TROUBLESHOOT_395"
+            elif any(w in inbound_lower for w in ["inspection", "whole home inspection", "electrical inspection"]):
+                appt_type = "WHOLE_HOME_INSPECTION"
+            else:
+                appt_type = "EVAL_195"
+            sched["appointment_type"] = appt_type
+
+        # --------------------------------------
+        # Missing-info resolver (Pre-LLM)
+        # --------------------------------------
+        update_address_assembly_state(sched)
+
+        # ✅ HOUSE NUMBER PATCH (pre-LLM) — IMPROVED
+        try:
+            update_address_assembly_state(sched)
+            missing_atom = (sched.get("address_missing") or "").strip().lower()
+
+            if missing_atom == "number":
+                inbound_clean = inbound_text.strip()
+
+                m_num = re.search(r"\b(\d{1,6})\b", inbound_clean)
+                num = m_num.group(1) if m_num else None
+
+                low = inbound_clean.lower()
+                street_suffixes = (
+                    " st", " street", " ave", " avenue", " rd", " road", " ln", " lane",
+                    " dr", " drive", " ct", " court", " cir", " circle", " blvd", " boulevard",
+                    " way", " pkwy", " parkway", " ter", " terrace"
+                )
+                inbound_has_street_word = any(suf in f" {low} " for suf in street_suffixes)
+                inbound_starts_with_number = bool(re.match(r"^\s*\d{1,6}\b", inbound_clean))
+
+                raw = (sched.get("raw_address") or "").strip()
+                norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+                norm_line1 = (norm.get("address_line_1") or "").strip() if norm else ""
+
+                if inbound_starts_with_number and inbound_has_street_word:
+                    sched["raw_address"] = inbound_clean
+                    sched["normalized_address"] = None
+                    update_address_assembly_state(sched)
+
+                elif num:
+                    base = raw or norm_line1
+                    if base and not re.match(r"^\d{1,6}\b", base):
+                        sched["raw_address"] = f"{num} {base}".strip()
+                        sched["normalized_address"] = None
+                    update_address_assembly_state(sched)
+
+        except Exception as e:
+            print("[WARN] house-number merge patch failed:", repr(e))
+
+        # --------------------------------------
+        # Build System Prompt
+        # --------------------------------------
+        system_prompt = build_system_prompt(
+            cleaned_transcript,
+            category,
+            appt_type,
+            initial_sms,
+            sched.get("scheduled_date") or scheduled_date,
+            sched.get("scheduled_time") or scheduled_time,
+            sched.get("raw_address") or address,
+            today_date_str,
+            today_weekday,
+            conv
+        )
+
+        # --------------------------------------
+        # LLM CALL (STRICT JSON)
+        # --------------------------------------
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": inbound_text},
+            ],
+        )
+
+        ai_raw = json.loads(
+            completion.choices[0].message.content
+            .strip()
+            .replace("None", "null")
+            .replace("none", "null")
+        )
+
+        sms_body   = (ai_raw.get("sms_body") or "").strip()
+        model_date = ai_raw.get("scheduled_date")
+        model_time = ai_raw.get("scheduled_time")
+        model_addr = ai_raw.get("address")
+
+        # --------------------------------------
+        # RESET-LOCK (never lose good stored values)
+        # --------------------------------------
+        if sched.get("scheduled_date") and not model_date:
+            model_date = sched["scheduled_date"]
+        if sched.get("scheduled_time") and not model_time:
+            model_time = sched["scheduled_time"]
+        if sched.get("raw_address") and not model_addr:
+            model_addr = sched["raw_address"]
+
+        if isinstance(model_addr, str) and len(model_addr.strip()) > 3:
+            sched["raw_address"] = model_addr.strip()
+
+        # ---------------------------------------------------
+        # CRITICAL PATCH: re-run address state AFTER model changes
+        # ---------------------------------------------------
+        update_address_assembly_state(sched)
+        try:
+            try_early_address_normalize(sched)
+        except Exception as e:
+            print("[WARN] try_early_address_normalize post-LLM failed:", repr(e))
+        update_address_assembly_state(sched)
+
+        model_addr = sched.get("raw_address")
+
+        # Human-readable time
+        try:
+            human_time = datetime.strptime(model_time, "%H:%M").strftime("%-I:%M %p") if model_time else None
+        except Exception:
+            human_time = model_time
+
+        if model_time and human_time:
+            sms_body = sms_body.replace(model_time, human_time)
+
+        # Save new values
+        if model_date:
+            sched["scheduled_date"] = model_date
+        if model_time:
+            sched["scheduled_time"] = model_time
+
+        # If address STILL not verified, override immediately (humanized prompt stays in builder)
+        if not sched.get("address_verified"):
+            msg = build_address_prompt(sched)
+            msg = _finalize_sms(msg, appt_type, booking_created=False)
+            return {
+                "sms_body": msg,
+                "scheduled_date": sched.get("scheduled_date") or model_date,
+                "scheduled_time": sched.get("scheduled_time") or model_time,
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+
+        # --------------------------------------
+        # AUTOBOOKING (Step 5)
+        # --------------------------------------
+        ready_for_booking = (
+            bool(sched.get("scheduled_date")) and
+            bool(sched.get("scheduled_time")) and
+            bool(sched.get("address_verified")) and
+            bool(sched.get("appointment_type")) and
+            not sched.get("pending_step") and
+            not sched.get("booking_created")
+        )
+
+        if ready_for_booking or EMERGENCY:
+            try:
+                maybe_create_square_booking(phone, conv)
+
+                if sched.get("booking_created") and sched.get("square_booking_id"):
+                    booked_sms = (
+                        f"Booked for {sched['scheduled_date']} at {human_time} "
+                        f"at {model_addr}. Confirmation {sched.get('square_booking_id')}."
+                    )
+                    booked_sms = _finalize_sms(booked_sms, appt_type, booking_created=True)
+                    return {
+                        "sms_body": booked_sms,
+                        "scheduled_date": sched["scheduled_date"],
+                        "scheduled_time": sched["scheduled_time"],
+                        "address": model_addr,
+                        "booking_complete": True
+                    }
+            except Exception as e:
+                print("[ERROR] Autobooking:", repr(e))
+
+        # --------------------------------------
+        # HARD SAFETY: If Square didn't book, never confirm. Ask next missing atom.
+        # --------------------------------------
+        if not (sched.get("booking_created") and sched.get("square_booking_id")):
+            update_address_assembly_state(sched)
+
+            if not sched.get("address_verified"):
+                sms_body = build_address_prompt(sched)
+            elif not sched.get("scheduled_date"):
+                sms_body = humanize_question("What day works best for you?")
+            elif not sched.get("scheduled_time"):
+                sms_body = humanize_question("What time works best?")
+            else:
+                # Collected everything but booking not created. Neutral, human, not weird.
+                sms_body = pick_variant_once("neutral_no_book", [
+                    "Okay. If anything changes, just text me here.",
+                    "All set. If you need to adjust anything, just message me here.",
+                    "Okay. Want to keep that same day and time?",
+                ])
+
+        booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+        sms_body = _finalize_sms(sms_body, appt_type, booking_created=booking_created)
+
+        return {
+            "sms_body": sms_body,
+            "scheduled_date": model_date,
+            "scheduled_time": model_time,
+            "address": model_addr,
+            "booking_complete": False
+        }
 
     except Exception as e:
         print("[ERROR] generate_reply_for_inbound:", repr(e))
@@ -1506,11 +1862,8 @@ def square_headers() -> dict:
 def square_create_or_get_customer(phone: str, addr_struct: dict | None = None):
     """
     Searches by phone, else creates new.
-    Enriches customer with name/email if available.
     """
-    # --------------------------------------
-    # Search by phone
-    # --------------------------------------
+    # Search
     try:
         payload = {
             "query": {"filter": {"phone_number": {"exact": phone}}}
@@ -1528,27 +1881,13 @@ def square_create_or_get_customer(phone: str, addr_struct: dict | None = None):
     except Exception as e:
         print("[WARN] customer search failed:", repr(e))
 
-    # --------------------------------------
-    # Create new customer
-    # --------------------------------------
+    # Create
     try:
-        profile = conversations.get(phone, {}).get("profile", {})
-
         payload = {
             "idempotency_key": str(uuid.uuid4()),
+            "given_name": "Prevolt Lead",
             "phone_number": phone,
         }
-
-        # Identity enrichment (from Step 4 capture)
-        if profile.get("first_name"):
-            payload["given_name"] = profile["first_name"]
-
-        if profile.get("last_name"):
-            payload["family_name"] = profile["last_name"]
-
-        if profile.get("email"):
-            payload["email_address"] = profile["email"]
-
         if addr_struct:
             payload["address"] = addr_struct
 
