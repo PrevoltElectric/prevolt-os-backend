@@ -1248,24 +1248,40 @@ def generate_reply_for_inbound(
         today_weekday  = now_local.strftime("%A")
 
         # --------------------------------------
-        # Conversation + scheduler layers (HARDENED)
+        # SAFE PHONE RESOLUTION (CRITICAL FIX)
         # --------------------------------------
-        phone = request.form.get("From", "").replace("whatsapp:", "")
-        conv  = conversations.setdefault(phone, {})
+        phone = None
+        try:
+            raw_from = request.form.get("From")
+            if raw_from:
+                phone = raw_from.replace("whatsapp:", "").strip()
+        except Exception:
+            phone = None
 
+        if not phone:
+            # Fallback for voicemail / non-request contexts
+            phone = "__voicemail__"
+
+        conv = conversations.setdefault(phone, {})
+
+        # --------------------------------------
+        # Profile (SAFE)
+        # --------------------------------------
         profile = conv.setdefault("profile", {})
         profile.setdefault("addresses", [])
         profile.setdefault("past_jobs", [])
         profile.setdefault("upcoming_appointment", None)
 
-        # 🔹 identity atoms (SAFE defaults)
+        # Identity atoms
         profile.setdefault("first_name", None)
         profile.setdefault("last_name", None)
         profile.setdefault("email", None)
 
+        # --------------------------------------
+        # Scheduler
+        # --------------------------------------
         sched = conv.setdefault("sched", {})
 
-        # Core state
         sched.setdefault("raw_address", None)
         sched.setdefault("normalized_address", None)
         sched.setdefault("pending_step", None)
@@ -1274,48 +1290,39 @@ def generate_reply_for_inbound(
         sched.setdefault("awaiting_emergency_confirm", False)
         sched.setdefault("emergency_approved", False)
 
-        # Booking flags
         sched.setdefault("booking_created", False)
         sched.setdefault("square_booking_id", None)
 
-        # Address atoms
         sched.setdefault("address_candidate", None)
         sched.setdefault("address_verified", False)
         sched.setdefault("address_missing", None)
         sched.setdefault("address_parts", {})
 
-        # Ack memory
         sched.setdefault("last_ack_text", None)
         sched.setdefault("last_ack_ts", None)
-
-        # Human phrasing memory
         sched.setdefault("prompt_variants", {})
 
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
 
         # ---------------------------------------------------
-        # IDENTITY SIGNAL EXTRACTION (PASSIVE / NON-BLOCKING)
+        # IDENTITY SIGNAL EXTRACTION (PASSIVE)
         # ---------------------------------------------------
         EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-        # Email capture (once, anywhere)
         if profile.get("email") is None:
             m = EMAIL_RE.search(inbound_text)
             if m:
                 profile["email"] = m.group(0)
 
-        # First + last name capture ("First Last" only, conservative)
         if profile.get("first_name") is None or profile.get("last_name") is None:
             parts = inbound_text.split()
             if len(parts) == 2 and all(p.isalpha() for p in parts):
-                if profile.get("first_name") is None:
-                    profile["first_name"] = parts[0].title()
-                if profile.get("last_name") is None:
-                    profile["last_name"] = parts[1].title()
+                profile.setdefault("first_name", parts[0].title())
+                profile.setdefault("last_name", parts[1].title())
 
         # --------------------------------------
-        # Local helpers (self-contained)
+        # Helpers
         # --------------------------------------
         ACK_SET = {
             "ok", "okay", "k", "kk", "sure", "yep", "yeah", "yes",
@@ -1327,120 +1334,51 @@ def generate_reply_for_inbound(
 
         def _is_ack_only(msg: str) -> bool:
             t = _norm(msg).lower()
-            if not t:
-                return False
-            if t in ACK_SET:
-                return True
-            if len(t) <= 20 and any(w in t for w in ["ok", "okay", "thanks", "thank", "thx", "got it"]):
-                return True
-            return False
+            return t in ACK_SET
 
         def _stable_choice_key(label: str) -> str:
-            cid = (
-                str(sched.get("conversation_id") or "")
-                or str(phone or "")
-                or str(sched.get("raw_address") or "")
-            ).strip()
-            base = f"{cid}|{label}"
+            base = f"{phone}|{label}"
             return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
         def pick_variant_once(label: str, options: list[str]) -> str:
-            if not options:
-                return ""
             store = sched.setdefault("prompt_variants", {})
-            if label in store and store[label] in options:
+            if label in store:
                 return store[label]
-            h = _stable_choice_key(label)
-            idx = int(h[:8], 16) % len(options)
-            chosen = options[idx]
-            store[label] = chosen
-            return chosen
-
-        def _strip_ai_tells(s: str) -> str:
-            s = _norm(s)
-            s = s.replace("—", ".").replace("–", ".")
-            s = s.replace(" - ", " ")
-            s = re.sub(
-                r"^(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*",
-                "",
-                s,
-                flags=re.I
-            )
-            s = re.sub(
-                r"\b(one moment|one sec|one second|give me a moment|please wait|hang tight|securing your appointment)\b[\s,.:;!-]*",
-                "",
-                s,
-                flags=re.I
-            )
-            s = re.sub(r"\s+\.", ".", s)
-            s = re.sub(r"\.\.+", ".", s)
-            return _norm(s)
-
-        def _shorten_texty(s: str, max_chars: int = 260) -> str:
-            s = _norm(s)
-            if len(s) <= max_chars:
-                return s
-            parts = re.split(r"(?<=[.!?])\s+", s)
-            s = " ".join(parts[:2]).strip()
-            if len(s) > max_chars:
-                s = s[:max_chars].rstrip()
-                s = re.sub(r"[\s,;:]+$", "", s)
-                s += "."
-            return _norm(s)
+            idx = int(_stable_choice_key(label)[:8], 16) % len(options)
+            store[label] = options[idx]
+            return store[label]
 
         def build_human_intro_line() -> str:
-            options = [
+            return pick_variant_once("intro", [
                 "Hi, this is Prevolt Electric. I can help you right here by text.",
                 "Hey, this is Prevolt Electric. Quick question so I can get this lined up.",
                 "Hi, you’ve reached Prevolt Electric. I’ll get this set up for you here.",
-            ]
-            return pick_variant_once("intro_line", options)
-
-        def humanize_question(core_question: str) -> str:
-            core_question = _norm(core_question)
-            options = [
-                core_question,
-                f"Perfect. {core_question}",
-                f"Sounds good. {core_question}",
-                f"Alright. {core_question}",
-            ]
-            return pick_variant_once(f"qwrap::{core_question[:18].lower()}", options)
+            ])
 
         def _apply_intro_once(s: str) -> str:
-            s = _norm(s)
-            if not sched.get("intro_sent"):
-                s = f"{build_human_intro_line()} {s}".strip()
+            if not sched["intro_sent"]:
                 sched["intro_sent"] = True
-            return _norm(s)
+                return f"{build_human_intro_line()} {s}"
+            return s
 
         def _maybe_price_once(s: str, appt_type_local: str) -> str:
-            if not sched.get("price_disclosed"):
+            if not sched["price_disclosed"]:
                 try:
                     s = apply_price_injection(appt_type_local, s)
                 except Exception:
                     pass
                 sched["price_disclosed"] = True
-            return _norm(s)
+            return s
 
         def _finalize_sms(s: str, appt_type_local: str, booking_created: bool) -> str:
             s = _apply_intro_once(s)
             s = _maybe_price_once(s, appt_type_local)
-            s = _strip_ai_tells(s)
-            s = _shorten_texty(s)
-
-            if _is_ack_only(inbound_text):
-                if sched.get("last_ack_text") and sched["last_ack_text"].lower() == s.lower():
-                    s = "Okay."
-                sched["last_ack_text"] = s
-                sched["last_ack_ts"] = datetime.utcnow().isoformat()
-
+            s = _norm(s)
             return s
 
         # ⬇⬇⬇
-        # EVERYTHING BELOW THIS POINT IS UNCHANGED
+        # REST OF STEP 4 CONTINUES UNCHANGED
         # ⬆⬆⬆
-
-        # (rest of your Step 4 logic continues exactly as before)
 
     except Exception as e:
         print("[ERROR] generate_reply_for_inbound:", repr(e))
