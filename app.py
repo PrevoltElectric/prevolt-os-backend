@@ -362,16 +362,37 @@ def handle_call_selection():
 @app.route("/voicemail-complete", methods=["POST"])
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse  # ✅ avoid NameError
+
     recording_url = request.form.get("RecordingUrl")
-    from_number   = request.form.get("From", "").replace("whatsapp:", "")
+    raw_from      = request.form.get("From")
 
     resp = VoiceResponse()
 
-    if not recording_url:
-        resp.say("We did not receive a recording. Goodbye.")
+    # ---------------------------------------------------
+    # HARD GUARD: voicemail MUST have a From number
+    # ---------------------------------------------------
+    if not raw_from:
+        print("[ERROR] voicemail_complete: missing From number")
+        resp.say("We did not receive caller information. Goodbye.")
+        resp.hangup()
         return Response(str(resp), mimetype="text/xml")
 
+    from_number = raw_from.replace("whatsapp:", "").strip()
+
+    if not from_number:
+        print("[ERROR] voicemail_complete: empty normalized From number")
+        resp.say("We did not receive caller information. Goodbye.")
+        resp.hangup()
+        return Response(str(resp), mimetype="text/xml")
+
+    if not recording_url:
+        resp.say("We did not receive a recording. Goodbye.")
+        resp.hangup()
+        return Response(str(resp), mimetype="text/xml")
+
+    # ---------------------------------------------------
     # 1) Transcribe
+    # ---------------------------------------------------
     try:
         transcript = transcribe_recording(recording_url)
         cleaned    = clean_transcript_text(transcript)
@@ -379,10 +400,14 @@ def voicemail_complete():
         print("[ERROR] voicemail_complete transcription:", repr(e))
         cleaned = ""
 
+    # ---------------------------------------------------
     # 2) Classification
+    # ---------------------------------------------------
     classification = generate_initial_sms(cleaned)
 
-    # 3) Save to memory
+    # ---------------------------------------------------
+    # 3) Save to memory (conversation is now SAFE)
+    # ---------------------------------------------------
     conv = conversations.setdefault(from_number, {})
 
     # ---------------------------------------------------
@@ -393,7 +418,6 @@ def voicemail_complete():
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
-    # Preserve any customer_type set earlier (residential/commercial)
 
     current_job = conv.setdefault("current_job", {})
     current_job.setdefault("job_type", None)
@@ -433,38 +457,42 @@ def voicemail_complete():
     if classification.get("detected_address"):
         sched["raw_address"] = classification["detected_address"]
 
-    # Refresh address assembly state (safe if normalized/raw changed)
+    # Refresh address assembly state
     update_address_assembly_state(sched)
 
-    # --------------------------------------
+    # ---------------------------------------------------
     # HARD OVERRIDE: Voicemail Emergency Pre-Flag
-    # --------------------------------------
+    # ---------------------------------------------------
     if classification.get("intent") == "emergency":
         sched["appointment_type"] = "TROUBLESHOOT_395"
         sched["awaiting_emergency_confirm"] = True
         sched["emergency_approved"] = False
 
-    # 4) Trigger First SMS (Step 4 call)
+    # ---------------------------------------------------
+    # 4) Trigger First SMS (Step 4)
+    # ---------------------------------------------------
     try:
         outbound = generate_reply_for_inbound(
             cleaned,
             conv.get("category"),
             conv.get("appointment_type"),
             conv.get("initial_sms"),
-            "",  # no user inbound yet
+            "",  # no inbound SMS yet
             sched.get("scheduled_date"),
             sched.get("scheduled_time"),
             sched.get("raw_address")
         )
 
-        initial_msg = outbound.get("sms_body") or "Thanks for your voicemail — how can we help?"
+        initial_msg = outbound.get("sms_body") or "Thanks for your voicemail. I can help you right here by text."
         send_sms(from_number, initial_msg)
+
     except Exception as e:
         print("[ERROR] voicemail_complete → Step4:", repr(e))
 
     resp.say("Thank you. Your message has been recorded.")
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
+
 
 
 
