@@ -279,6 +279,12 @@ def handle_call_selection():
     # ---------------------------------------------------
     profile = conv.setdefault("profile", {})
     profile.setdefault("name", None)
+
+    # ✅ PATCH: identity atoms (for calendar + invoices)
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
@@ -390,6 +396,12 @@ def voicemail_complete():
     # ---------------------------------------------------
     profile = conv.setdefault("profile", {})
     profile.setdefault("name", None)
+
+    # ✅ PATCH: identity atoms (for calendar + invoices)
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
@@ -465,6 +477,7 @@ def voicemail_complete():
     resp.say("Thank you. Your message has been recorded.")
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
+
 
 
 
@@ -872,7 +885,18 @@ def incoming_sms():
     # SECRET RESET COMMAND
     if inbound_low == "mobius1":
         conversations[phone] = {
-            "profile": {"name": None, "addresses": [], "upcoming_appointment": None, "past_jobs": []},
+            "profile": {
+                "name": None,
+
+                # ✅ PATCH: identity atoms
+                "first_name": None,
+                "last_name": None,
+                "email": None,
+
+                "addresses": [],
+                "upcoming_appointment": None,
+                "past_jobs": []
+            },
             "current_job": {"job_type": None, "raw_description": None},
             "sched": {
                 "pending_step": None,
@@ -905,6 +929,12 @@ def incoming_sms():
 
     profile = conv.setdefault("profile", {})
     profile.setdefault("name", None)
+
+    # ✅ PATCH: identity atoms (safe defaults; won't overwrite)
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
@@ -933,6 +963,37 @@ def incoming_sms():
     # Emergency flags (used by incoming_sms patch logic too)
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
+
+    # ---------------------------------------------------
+    # ✅ PATCH: Capture identity atoms from inbound SMS (safe + conservative)
+    # - Captures email anywhere in message
+    # - Captures "First Last" only when message looks like a name
+    # - Never overwrites existing fields
+    # ---------------------------------------------------
+    def _maybe_capture_identity_from_inbound(msg: str) -> None:
+        import re
+        t = (msg or "").strip()
+        if not t:
+            return
+
+        # Email capture (anywhere)
+        if not profile.get("email"):
+            m = re.search(r"\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b", t, flags=re.I)
+            if m:
+                profile["email"] = m.group(1).strip()
+
+        # Name capture (conservative): "John Smith" only
+        # Avoid grabbing address/date/time style replies.
+        if (not profile.get("first_name") or not profile.get("last_name")):
+            if 0 < len(t) <= 40 and re.match(r"^[A-Za-z]+(?:\s+[A-Za-z]+)+$", t):
+                parts = [p for p in t.split() if p.strip()]
+                if len(parts) >= 2:
+                    if not profile.get("first_name"):
+                        profile["first_name"] = parts[0].strip()
+                    if not profile.get("last_name"):
+                        profile["last_name"] = parts[-1].strip()
+
+    _maybe_capture_identity_from_inbound(inbound_text)
 
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
@@ -1029,175 +1090,19 @@ def incoming_sms():
     tw.message(reply["sms_body"])
     return Response(str(tw), mimetype="text/xml")
 
-import re
-from datetime import datetime, timedelta
-
-# ---------------------------------------------------
-# Human SMS polish + anti-AI telltales + ack memory
-# ---------------------------------------------------
-
-ACK_PHRASES = {
-    "ok", "okay", "k", "kk", "sure", "sounds good", "that works", "works", "yep", "yeah", "yes",
-    "thanks", "thank you", "thx", "got it", "done", "perfect"
-}
-
-def _norm_text(s: str) -> str:
-    return " ".join((s or "").strip().split())
-
-def is_ack_message(inbound_text: str) -> bool:
-    t = _norm_text(inbound_text).lower()
-    if not t:
-        return False
-    # short ack-only replies
-    if t in ACK_PHRASES:
-        return True
-    # "ok thanks" style
-    if len(t) <= 20 and any(p in t for p in ["ok", "okay", "thanks", "thank you", "thx", "got it"]):
-        return True
-    return False
-
-def remove_ai_punctuation(text: str) -> str:
-    if not text:
-        return text
-    # em dash / en dash / spaced hyphen patterns
-    text = text.replace("—", ".").replace("–", ".")
-    text = text.replace(" - ", " ")
-    return text
-
-def strip_ai_telltales(text: str) -> str:
-    """
-    Removes common bot openers and filler that scream "assistant".
-    Keeps the message meaning intact.
-    """
-    if not text:
-        return text
-
-    t = _norm_text(text)
-
-    # Kill leading filler openers
-    # Examples: "Got it." "Thanks." "Sure." "Absolutely."
-    t = re.sub(r"^(got it|thanks|thank you|sure|absolutely|no problem|ok|okay)\b[\s,.:;!-]*", "", t, flags=re.I)
-
-    # Kill "one moment" / wait-text (you said never do this)
-    t = re.sub(r"\b(one moment|one sec|one second|give me a moment|please wait|hang tight)\b[\s,.:;!-]*", "", t, flags=re.I)
-
-    # Kill "you're all set" if not actually booked (you also gate this elsewhere, but belt + suspenders)
-    # We'll let booking-confirm strings happen only when booking_created True upstream.
-    # Here we just remove the phrase if it appears alone at the start.
-    t = re.sub(r"^(you'?re all set)\b[\s,.:;!-]*", "", t, flags=re.I)
-
-    return _norm_text(t)
-
-def shorten_for_texting(text: str, max_chars: int = 220) -> str:
-    """
-    Makes messages feel like a human text:
-    - fewer clauses
-    - fewer stacked sentences
-    - keeps it under a reasonable length
-    """
-    if not text:
-        return text
-
-    t = _norm_text(text)
-
-    # Replace overly formal connectors
-    t = re.sub(r"\b(perfect|certainly|additionally|therefore|however)\b", "", t, flags=re.I)
-    t = _norm_text(t)
-
-    # If it's long, split into 2 sentences max by punctuation
-    if len(t) > max_chars:
-        parts = re.split(r"(?<=[.!?])\s+", t)
-        t = " ".join(parts[:2]).strip()
-
-    # If still long, hard-trim but keep clean end
-    if len(t) > max_chars:
-        t = t[:max_chars].rstrip()
-        t = re.sub(r"[\s,;:]+$", "", t)
-        t += "."
-
-    return _norm_text(t)
-
-def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_created: bool = False) -> str:
-    """
-    Final pass: removes AI tells, avoids repeated acknowledgements, and keeps it human.
-    """
-    sms = sms_body or ""
-    sms = remove_ai_punctuation(sms)
-    sms = strip_ai_telltales(sms)
-
-    # -----------------------------
-    # Acknowledgement memory
-    # -----------------------------
-    # If user just sent an acknowledgement ("ok", "thanks"), do NOT reply with another acknowledgement.
-    if is_ack_message(inbound_text):
-        # If our message is now empty (because it was only "Thanks."), replace with a useful next step.
-        # Prefer next missing atom if present.
-        update_address_assembly_state(sched)
-
-        if not sched.get("address_verified"):
-            sms = build_address_prompt(sched)
-        elif not sched.get("scheduled_date"):
-            sms = "What day works for you?"
-        elif not sched.get("scheduled_time"):
-            sms = "What time works best?"
-        else:
-            # If everything is present and booking is not created, just keep it simple.
-            sms = "Got it."
-
-        # Even here, avoid "Got it." repeats:
-        # If we said "Got it." recently, say nothing new or ask a clarifier.
-        last_ack = sched.get("last_ack_text")
-        last_ack_ts = sched.get("last_ack_ts")
-        if last_ack and last_ack.lower() == sms.lower():
-            sms = "Okay."
-        sched["last_ack_text"] = sms
-        sched["last_ack_ts"] = datetime.utcnow().isoformat()
-
-    # If booking is not actually created, remove any "confirmation" talk (extra safety)
-    if not booking_created:
-        confirmation_markers = [
-            "confirmation number", "confirming", "confirmed", "your appointment is", "booked for", "scheduled for"
-        ]
-        low = sms.lower()
-        if any(m in low for m in confirmation_markers):
-            update_address_assembly_state(sched)
-            if not sched.get("address_verified"):
-                sms = build_address_prompt(sched)
-            elif not sched.get("scheduled_date"):
-                sms = "What day works for you?"
-            elif not sched.get("scheduled_time"):
-                sms = "What time works best?"
-            else:
-                sms = "Okay."
-
-    sms = shorten_for_texting(sms)
-
-    # If empty after stripping, never send empty: pick a safe next line
-    if not sms:
-        update_address_assembly_state(sched)
-        if not sched.get("address_verified"):
-            sms = build_address_prompt(sched)
-        elif not sched.get("scheduled_date"):
-            sms = "What day works for you?"
-        elif not sched.get("scheduled_time"):
-            sms = "What time works best?"
-        else:
-            sms = "Okay."
-
-    return sms
-
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
-# PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY)
+# PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY + IDENTITY CAPTURE)
 #   - Longer, more human intros + prompts (deterministic per conversation)
 #   - No em dash "—" and no " - " telltales
 #   - No "Got it", "Thanks" filler
 #   - No "one moment / securing" messages (ever)
-#   - House-number patch: handles
+#   - House-number patch
 #   - Re-check address state AFTER model output (prevents booking without house number)
 #   - If Square did NOT book, never "confirm"; always ask the next missing atom (or send a neutral line)
 #   - Adds acknowledgement memory so it doesn't repeat acknowledgements
+#   - ✅ Patch B: capture first/last name + email from inbound when possible
 # ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
@@ -1238,6 +1143,11 @@ def generate_reply_for_inbound(
         profile.setdefault("past_jobs", [])
         profile.setdefault("upcoming_appointment", None)
 
+        # ✅ Patch B hydration: identity atoms (safe defaults; won't overwrite)
+        profile.setdefault("first_name", None)
+        profile.setdefault("last_name", None)
+        profile.setdefault("email", None)
+
         sched = conv.setdefault("sched", {})
 
         # Core state
@@ -1268,6 +1178,34 @@ def generate_reply_for_inbound(
 
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
+
+        # --------------------------------------
+        # ✅ Patch B: Lightweight identity capture from inbound
+        #  - Captures email anywhere in inbound
+        #  - Captures "First Last" only when the message looks like a name (very conservative)
+        #  - Never overwrites existing profile fields
+        # --------------------------------------
+        def _maybe_capture_email_and_name(inbound: str) -> None:
+            t = (inbound or "").strip()
+
+            # Email capture
+            if not profile.get("email"):
+                m = re.search(r"\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b", t, flags=re.I)
+                if m:
+                    profile["email"] = m.group(1).strip()
+
+            # Name capture (conservative): "John Smith" style
+            # Avoid capturing scheduling/address-ish content
+            if (not profile.get("first_name") or not profile.get("last_name")):
+                if 0 < len(t) <= 40 and re.match(r"^[A-Za-z]+(?:\s+[A-Za-z]+)+$", t):
+                    parts = [p for p in t.split() if p.strip()]
+                    if len(parts) >= 2:
+                        if not profile.get("first_name"):
+                            profile["first_name"] = parts[0].strip()
+                        if not profile.get("last_name"):
+                            profile["last_name"] = parts[-1].strip()
+
+        _maybe_capture_email_and_name(inbound_text)
 
         # --------------------------------------
         # Local helpers (so this block is self-contained)
@@ -1464,6 +1402,7 @@ def generate_reply_for_inbound(
                 sched["last_ack_ts"] = datetime.utcnow().isoformat()
 
             return s
+
 
         # --------------------------------------
         # Emergency flow (2-step confirmation)
@@ -1672,7 +1611,7 @@ def generate_reply_for_inbound(
                 "address": sched.get("raw_address"),
                 "booking_complete": False
             }
-
+        
         # --------------------------------------
         # AUTOBOOKING (Step 5)
         # --------------------------------------
@@ -1685,6 +1624,54 @@ def generate_reply_for_inbound(
             not sched.get("booking_created")
         )
 
+        # --------------------------------------
+        # PATCH B: Identity gate (name + email) BEFORE Square booking attempt
+        # Only triggers after date/time/address are already locked.
+        # --------------------------------------
+        profile.setdefault("first_name", None)
+        profile.setdefault("last_name", None)
+        profile.setdefault("email", None)
+
+        if ready_for_booking and not sched.get("booking_created"):
+            # Ask last name if we have first name but not last name
+            if profile.get("first_name") and not profile.get("last_name"):
+                sms_body = humanize_question(
+                    f"I have your first name as {profile.get('first_name')}. What is your last name?"
+                )
+                sms_body = _finalize_sms(sms_body, appt_type, booking_created=False)
+                return {
+                    "sms_body": sms_body,
+                    "scheduled_date": model_date,
+                    "scheduled_time": model_time,
+                    "address": model_addr,
+                    "booking_complete": False
+                }
+
+            # Ask full name if neither first nor last is present
+            if not profile.get("first_name") and not profile.get("last_name"):
+                sms_body = humanize_question("What is your first and last name?")
+                sms_body = _finalize_sms(sms_body, appt_type, booking_created=False)
+                return {
+                    "sms_body": sms_body,
+                    "scheduled_date": model_date,
+                    "scheduled_time": model_time,
+                    "address": model_addr,
+                    "booking_complete": False
+                }
+
+            # Ask email last (only if missing)
+            if not profile.get("email"):
+                sms_body = humanize_question("What is the best email address for your quote and invoices?")
+                sms_body = _finalize_sms(sms_body, appt_type, booking_created=False)
+                return {
+                    "sms_body": sms_body,
+                    "scheduled_date": model_date,
+                    "scheduled_time": model_time,
+                    "address": model_addr,
+                    "booking_complete": False
+                }
+
+        # If we have identity OR it's an emergency, proceed to Square booking
         if ready_for_booking or EMERGENCY:
             try:
                 maybe_create_square_booking(phone, conv)
@@ -1705,6 +1692,7 @@ def generate_reply_for_inbound(
             except Exception as e:
                 print("[ERROR] Autobooking:", repr(e))
 
+
         # --------------------------------------
         # HARD SAFETY: If Square didn't book, never confirm. Ask next missing atom.
         # --------------------------------------
@@ -1722,7 +1710,7 @@ def generate_reply_for_inbound(
                 sms_body = pick_variant_once("neutral_no_book", [
                     "Okay. If anything changes, just text me here.",
                     "All set. If you need to adjust anything, just message me here.",
-                    "Okay. Want to keep that same day and time?",
+                    "Want me to go ahead and book that day and time for you?",
                 ])
 
         booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
@@ -1753,15 +1741,36 @@ def generate_reply_for_inbound(
 # ---------------------------------------------------
 # PRICE INJECTION HELPER (PATCH 2)
 # ---------------------------------------------------
-def apply_price_injection(appt_type: str, body: str) -> str:
-    if "$" in body:
-        return body
+def apply_price_injection(body: str, appointment_type: str) -> str:
+    """
+    Inject pricing ONCE (first outbound only), but make it warm + action-oriented.
+    """
+    body = (body or "").strip()
 
-    if "TROUBLESHOOT" in appt_type:
-        return f"{body} Troubleshooting and repair visits are $395."
-    if "INSPECTION" in appt_type:
-        return f"{body} Whole-home electrical inspections range from $375–$650 depending on square footage."
-    return f"{body} Our evaluation visit is $195."
+    if appointment_type == "EVAL_195":
+        addon = (
+            " Standard service visit is $195. "
+            "That covers a licensed electrician coming out, diagnosing the issue, and giving you a clear plan to fix it. "
+            "Want me to check the next available appointments?"
+        )
+        return (body + addon).strip()
+
+    if appointment_type == "TROUBLESHOOT_395":
+        addon = (
+            " Troubleshoot and repair is $395. "
+            "That includes a licensed electrician coming out, diagnosing the problem, and completing the repair when it is safe and straightforward. "
+            "Want me to check the next available appointments?"
+        )
+        return (body + addon).strip()
+
+    if appointment_type == "INSPECTION":
+        addon = (
+            " Full-home electrical inspections run $375–$650 depending on house size. "
+            "Want me to check the next available appointments?"
+        )
+        return (body + addon).strip()
+
+    return body
 
 
 
