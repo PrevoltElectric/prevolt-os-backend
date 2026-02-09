@@ -282,6 +282,16 @@ def handle_call_selection():
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+    profile.setdefault("square_customer_id", None)
+    profile.setdefault("square_lookup_done", False)
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+    profile.setdefault("square_customer_id", None)
+    profile.setdefault("square_lookup_done", False)
 
     # Keep sched present (safe defaults; won't override existing values)
     sched = conv.setdefault("sched", {})
@@ -872,7 +882,7 @@ def incoming_sms():
     # SECRET RESET COMMAND
     if inbound_low == "mobius1":
         conversations[phone] = {
-            "profile": {"name": None, "addresses": [], "upcoming_appointment": None, "past_jobs": []},
+            "profile": {"name": None, "first_name": None, "last_name": None, "email": None, "square_customer_id": None, "square_lookup_done": False, "addresses": [], "upcoming_appointment": None, "past_jobs": []},
             "current_job": {"job_type": None, "raw_description": None},
             "sched": {
                 "pending_step": None,
@@ -908,6 +918,11 @@ def incoming_sms():
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+    profile.setdefault("square_customer_id", None)
+    profile.setdefault("square_lookup_done", False)
     # keep customer_type if it exists (from call flow)
     profile.setdefault("customer_type", profile.get("customer_type"))
 
@@ -2172,6 +2187,13 @@ def maybe_create_square_booking(phone: str, convo: dict):
     profile.setdefault("addresses", [])
     profile.setdefault("past_jobs", [])
     profile.setdefault("upcoming_appointment", None)
+    # Identity required for booking + Square customer (never create placeholders)
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+    if not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip() and (profile.get("email") or "").strip()):
+        return
+
 
     # Never double-book
     if sched.get("booking_created") and sched.get("square_booking_id"):
