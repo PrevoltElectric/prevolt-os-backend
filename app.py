@@ -982,6 +982,10 @@ def incoming_sms():
                 sched["pending_step"] = "need_time"
             elif not sched.get("raw_address") and not sched.get("address_verified"):
                 sched["pending_step"] = "need_address"
+            elif not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip()):
+                sched["pending_step"] = "need_name"
+            elif not (profile.get("email") or "").strip():
+                sched["pending_step"] = "need_email"
             else:
                 sched["pending_step"] = None
 
@@ -1022,6 +1026,10 @@ def incoming_sms():
         sched["pending_step"] = "need_time"
     elif not sched.get("address_verified"):
         sched["pending_step"] = "need_address"
+    elif not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip()):
+        sched["pending_step"] = "need_name"
+    elif not (profile.get("email") or "").strip():
+        sched["pending_step"] = "need_email"
     else:
         sched["pending_step"] = None
 
@@ -1237,6 +1245,62 @@ def generate_reply_for_inbound(
         profile.setdefault("addresses", [])
         profile.setdefault("past_jobs", [])
         profile.setdefault("upcoming_appointment", None)
+        # Identity / repeat-customer memory (never overwrite once set)
+        profile.setdefault("first_name", None)
+        profile.setdefault("last_name", None)
+        profile.setdefault("email", None)
+        profile.setdefault("square_customer_id", None)
+        profile.setdefault("square_lookup_done", False)
+
+        # One-time repeat-customer hydrate from Square (by phone)
+        if not profile.get("square_lookup_done"):
+            try:
+                cust = square_lookup_customer_by_phone(phone)
+                if cust and cust.get("id"):
+                    profile["square_customer_id"] = cust.get("id")
+                    profile["first_name"] = profile.get("first_name") or cust.get("given_name")
+                    profile["last_name"] = profile.get("last_name") or cust.get("family_name")
+                    profile["email"] = profile.get("email") or cust.get("email_address")
+                    # pull address to local memory if present
+                    caddr = cust.get("address") or {}
+                    line1 = (caddr.get("address_line_1") or "").strip()
+                    city  = (caddr.get("locality") or "").strip()
+                    state = (caddr.get("administrative_district_level_1") or "").strip()
+                    zipc  = (caddr.get("postal_code") or "").strip()
+                    if line1 and city and state:
+                        pretty = f"{line1}, {city}, {state} {zipc}".strip()
+                        if pretty and pretty not in profile["addresses"]:
+                            profile["addresses"].append(pretty)
+            except Exception as e:
+                print("[WARN] Square lookup hydrate failed:", repr(e))
+            finally:
+                profile["square_lookup_done"] = True
+
+        # Helpers to capture name/email from inbound text
+        def _extract_email(txt: str) -> str | None:
+            txt = (txt or "").strip()
+            m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", txt, flags=re.I)
+            return m.group(1).strip() if m else None
+
+        def _extract_first_last(txt: str) -> tuple[str | None, str | None]:
+            txt = (txt or "").strip()
+            # avoid treating address/phone/email as a name
+            if any(ch.isdigit() for ch in txt):
+                return None, None
+            if "@" in txt:
+                return None, None
+            cleaned = re.sub(r"[^A-Za-z\-\'\s]", " ", txt)
+            cleaned = " ".join(cleaned.split()).strip()
+            if not cleaned:
+                return None, None
+            parts = cleaned.split(" ")
+            if len(parts) < 2:
+                return None, None
+            first = parts[0]
+            last = " ".join(parts[1:])
+            return first, last
+
+
 
         sched = conv.setdefault("sched", {})
 
@@ -1268,6 +1332,20 @@ def generate_reply_for_inbound(
 
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
+        # Opportunistic capture (only when relevant)
+        if not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip()):
+            if sched.get("pending_step") == "need_name" or "my name" in inbound_lower or inbound_lower.startswith("name is"):
+                fn, ln = _extract_first_last(inbound_text)
+                if fn and ln:
+                    profile["first_name"] = profile.get("first_name") or fn
+                    profile["last_name"]  = profile.get("last_name") or ln
+
+        if not (profile.get("email") or "").strip():
+            if sched.get("pending_step") == "need_email" or "@" in inbound_text:
+                em = _extract_email(inbound_text)
+                if em:
+                    profile["email"] = profile.get("email") or em
+
 
         # --------------------------------------
         # Local helpers (so this block is self-contained)
@@ -1681,11 +1759,14 @@ def generate_reply_for_inbound(
             bool(sched.get("scheduled_time")) and
             bool(sched.get("address_verified")) and
             bool(sched.get("appointment_type")) and
+            bool((profile.get("first_name") or "").strip()) and
+            bool((profile.get("last_name") or "").strip()) and
+            bool((profile.get("email") or "").strip()) and
             not sched.get("pending_step") and
             not sched.get("booking_created")
         )
 
-        if ready_for_booking or EMERGENCY:
+        if ready_for_booking or (EMERGENCY and bool((profile.get("first_name") or "").strip()) and bool((profile.get("last_name") or "").strip()) and bool((profile.get("email") or "").strip())):
             try:
                 maybe_create_square_booking(phone, conv)
 
@@ -1717,6 +1798,10 @@ def generate_reply_for_inbound(
                 sms_body = humanize_question("What day works best for you?")
             elif not sched.get("scheduled_time"):
                 sms_body = humanize_question("What time works best?")
+            elif not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip()):
+                sms_body = humanize_question("What is your first and last name?")
+            elif not (profile.get("email") or "").strip():
+                sms_body = humanize_question("What is the best email address for the appointment?")
             else:
                 # Collected everything but booking not created. Neutral, human, not weird.
                 sms_body = pick_variant_once("neutral_no_book", [
@@ -1859,35 +1944,98 @@ def square_headers() -> dict:
     }
 
 
-def square_create_or_get_customer(phone: str, addr_struct: dict | None = None):
-    """
-    Searches by phone, else creates new.
-    """
-    # Search
+def square_lookup_customer_by_phone(phone: str) -> dict | None:
+    """Return the first Square customer match for this phone, or None."""
     try:
-        payload = {
-            "query": {"filter": {"phone_number": {"exact": phone}}}
-        }
+        payload = {"query": {"filter": {"phone_number": {"exact": phone}}}}
         resp = requests.post(
             "https://connect.squareup.com/v2/customers/search",
             json=payload,
             headers=square_headers(),
             timeout=10,
         )
-        data = resp.json()
-        custs = data.get("customers", [])
+        if resp.status_code not in (200, 201):
+            return None
+        data = resp.json() or {}
+        custs = data.get("customers") or []
         if custs:
-            return custs[0]["id"]
+            return custs[0]
     except Exception as e:
         print("[WARN] customer search failed:", repr(e))
+    return None
 
-    # Create
+
+def square_create_or_get_customer(
+    phone: str,
+    profile: dict | None = None,
+    addr_struct: dict | None = None,
+):
+    """
+    Repeat-customer optimization:
+      - Search by phone first.
+      - If found: return id and hydrate profile with name/email/address when missing.
+      - If not found: create customer using first/last + email (if available) + address.
+    """
+    profile = profile or {}
+
+    # 1) Search
+    cust = square_lookup_customer_by_phone(phone)
+    if cust and cust.get("id"):
+        cid = cust["id"]
+
+        # Hydrate profile only if empty (never overwrite user-provided)
+        profile.setdefault("square_customer_id", cid)
+
+        # Square fields
+        if not profile.get("first_name"):
+            profile["first_name"] = cust.get("given_name") or profile.get("first_name")
+        if not profile.get("last_name"):
+            profile["last_name"] = cust.get("family_name") or profile.get("last_name")
+        if not profile.get("email"):
+            profile["email"] = cust.get("email_address") or profile.get("email")
+
+        # Best-effort: pull address into our address memory if we don't already have one
+        try:
+            caddr = cust.get("address") or {}
+            line1 = (caddr.get("address_line_1") or "").strip()
+            city  = (caddr.get("locality") or "").strip()
+            state = (caddr.get("administrative_district_level_1") or "").strip()
+            zipc  = (caddr.get("postal_code") or "").strip()
+            if line1 and city and state:
+                pretty = f"{line1}, {city}, {state} {zipc}".strip()
+                addrs = profile.setdefault("addresses", [])
+                if pretty and pretty not in addrs:
+                    addrs.append(pretty)
+        except Exception:
+            pass
+
+        return cid
+
+    # 2) Create
     try:
         payload = {
             "idempotency_key": str(uuid.uuid4()),
-            "given_name": "Prevolt Lead",
             "phone_number": phone,
         }
+
+        # Name (preferred)
+        fn = (profile.get("first_name") or "").strip()
+        ln = (profile.get("last_name") or "").strip()
+        if fn:
+            payload["given_name"] = fn
+        if ln:
+            payload["family_name"] = ln
+
+        # Email (preferred)
+        em = (profile.get("email") or "").strip()
+        if em:
+            payload["email_address"] = em
+
+        # Fallback label if truly blank
+        if not payload.get("given_name") and not payload.get("family_name"):
+            payload["given_name"] = "Prevolt Lead"
+
+        # Address allowed on customer object
         if addr_struct:
             payload["address"] = addr_struct
 
@@ -1897,8 +2045,17 @@ def square_create_or_get_customer(phone: str, addr_struct: dict | None = None):
             headers=square_headers(),
             timeout=10,
         )
-        data = resp.json()
-        return data.get("customer", {}).get("id")
+        if resp.status_code not in (200, 201):
+            print("[ERROR] customer create failed:", resp.status_code, resp.text)
+            return None
+
+        data = resp.json() or {}
+        cid = (data.get("customer") or {}).get("id")
+
+        if cid:
+            profile.setdefault("square_customer_id", cid)
+
+        return cid
 
     except Exception as e:
         print("[ERROR] customer create failed:", repr(e))
@@ -2151,7 +2308,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
     # ---------------------------------------------------
     # Square customer (customer CAN include country)
     # ---------------------------------------------------
-    customer_id = square_create_or_get_customer(phone, addr_struct)
+    customer_id = square_create_or_get_customer(phone, profile, addr_struct)
     if not customer_id:
         print("[ERROR] Can't create/fetch customer.")
         return
