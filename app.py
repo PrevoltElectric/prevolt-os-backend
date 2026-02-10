@@ -66,6 +66,31 @@ app = Flask(__name__)
 # ---------------------------------------------------
 conversations = {}
 
+# ---------------------------------------------------
+# Phone Normalization + WhatsApp Sandbox Routing
+# ---------------------------------------------------
+# In production, inbound SMS 'From' matches the caller.
+# In WhatsApp sandbox testing, inbound SMS always comes from your personal WhatsApp number,
+# so we map that sandbox sender back to the last voice caller.
+TEST_WHATSAPP_TO = "whatsapp:+18609701727"  # your cell (testing only)
+_last_voice_caller_for_whatsapp_sender = {}  # key: normalized whatsapp sender -> normalized voice caller
+
+def normalize_phone(raw: str) -> str:
+    raw = (raw or "").strip()
+    if raw.startswith("whatsapp:"):
+        raw = raw.replace("whatsapp:", "", 1)
+    return raw.strip()
+
+def resolve_conversation_key_for_inbound(raw_from: str) -> str:
+    """Return the conversation key we should use for inbound messages."""
+    norm = normalize_phone(raw_from)
+    if (raw_from or "").startswith("whatsapp:") and (raw_from or "") == TEST_WHATSAPP_TO:
+        mapped = _last_voice_caller_for_whatsapp_sender.get(norm)
+        if mapped:
+            return mapped
+    return norm
+
+
 
 # ---------------------------------------------------
 # WhatsApp SMS Helper (Testing Path Only)
@@ -83,7 +108,13 @@ def send_sms(to_number: str, body: str) -> None:
         whatsapp_from = "whatsapp:+14155238886"
         whatsapp_to   = "whatsapp:+18609701727"  # your cell
 
-        msg = twilio_client.messages.create(
+        
+        # Sandbox routing: map this WhatsApp sender back to the caller we are texting
+        try:
+            _last_voice_caller_for_whatsapp_sender[normalize_phone(whatsapp_to)] = normalize_phone(to_number)
+        except Exception:
+            pass
+msg = twilio_client.messages.create(
             body=body,
             from_=whatsapp_from,
             to=whatsapp_to
@@ -266,44 +297,29 @@ def handle_call_selection():
     from twilio.twiml.voice_response import VoiceResponse
 
     digit = request.form.get("Digits", "")
-    phone = request.form.get("From", "")
+    raw_from = request.form.get("From", "")
+    phone = resolve_conversation_key_for_inbound(raw_from)
     response = VoiceResponse()
 
-    
+    conv = conversations.setdefault(phone, {})
+
     # ---------------------------------------------------
     # ✅ CRITICAL FIX:
     # conv.setdefault("profile", {}) leaves profile as {} forever,
     # which breaks /incoming-sms when it expects profile["addresses"].
     # So we "hydrate" required keys even if profile already exists.
     # ---------------------------------------------------
-    # Establish conversation context (fix NameError: conv undefined)
-    call_sid = request.form.get("CallSid", "") or ""
-    convo_key = phone.strip() if phone.strip() else (f"call:{call_sid}" if call_sid else "call:unknown")
-    conv = conversations.setdefault(convo_key, {})
-
-    # Hydrate schema so later flows never KeyError
     profile = conv.setdefault("profile", {})
     profile.setdefault("name", None)
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
-    profile.setdefault("past_jobs", [])
-    profile.setdefault("first_name", None)
-    profile.setdefault("last_name", None)
-    profile.setdefault("email", None)
-    profile.setdefault("square_customer_id", None)
-    profile.setdefault("square_lookup_done", False)
+        # Identity required for booking + Square customer creation
+        profile.setdefault("first_name", None)
+        profile.setdefault("last_name", None)
+        profile.setdefault("email", None)
+        if not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip() and (profile.get("email") or "").strip()):
+            return
 
-    sched = conv.setdefault("sched", {})
-    sched.setdefault("pending_step", None)
-    sched.setdefault("scheduled_date", None)
-    sched.setdefault("scheduled_time", None)
-    sched.setdefault("raw_address", None)
-    sched.setdefault("address_verified", False)
-    sched.setdefault("appointment_type", None)
-    sched.setdefault("booking_created", False)
-    profile.setdefault("name", None)
-    profile.setdefault("addresses", [])
-    profile.setdefault("upcoming_appointment", None)
     profile.setdefault("past_jobs", [])
     profile.setdefault("first_name", None)
     profile.setdefault("last_name", None)
@@ -396,7 +412,7 @@ def handle_call_selection():
 def voicemail_complete():
     from twilio.twiml.voice_response import VoiceResponse  # ✅ avoid NameError
     recording_url = request.form.get("RecordingUrl")
-    from_number   = request.form.get("From", "").replace("whatsapp:", "")
+    from_number   = normalize_phone(request.form.get("From", ""))
 
     resp = VoiceResponse()
 
@@ -899,14 +915,12 @@ def try_early_address_normalize(sched: dict) -> None:
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
     inbound_text = request.form.get("Body", "") or ""
-    phone_raw   = request.form.get("From", "")
-    phone       = (phone_raw or "").replace("whatsapp:", "")
-    convo_key   = phone or request.form.get("MessageSid") or request.form.get("SmsSid") or request.form.get("CallSid") or "unknown"
+    phone        = request.form.get("From", "").replace("whatsapp:", "")
     inbound_low  = inbound_text.lower().strip()
 
     # SECRET RESET COMMAND
     if inbound_low == "mobius1":
-        conversations[convo_key] = {
+        conversations[phone] = {
             "profile": {"name": None, "first_name": None, "last_name": None, "email": None, "square_customer_id": None, "square_lookup_done": False, "addresses": [], "upcoming_appointment": None, "past_jobs": []},
             "current_job": {"job_type": None, "raw_description": None},
             "sched": {
@@ -1279,11 +1293,21 @@ def generate_reply_for_inbound(
         # Conversation + scheduler layers (HARDENED)
         # --------------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
-        convo_key = phone or request.form.get("MessageSid") or request.form.get("SmsSid") or request.form.get("CallSid") or "unknown"
-        conv  = conversations.setdefault(convo_key, {})
-        conv  = conversations.setdefault(convo_key, {})
+        conv  = conversations.setdefault(phone, {})
 
         profile = conv.setdefault("profile", {})
+        # Identity / repeat-customer memory (never overwrite once set)
+        profile.setdefault("first_name", None)
+        profile.setdefault("last_name", None)
+        profile.setdefault("email", None)
+        profile.setdefault("square_customer_id", None)
+        profile.setdefault("square_lookup_done", False)
+
+        def _has_name(p: dict) -> bool:
+            return bool((p.get("first_name") or "").strip()) and bool((p.get("last_name") or "").strip())
+
+        def _has_email(p: dict) -> bool:
+            return bool((p.get("email") or "").strip())
         profile.setdefault("addresses", [])
         profile.setdefault("past_jobs", [])
         profile.setdefault("upcoming_appointment", None)
@@ -1374,37 +1398,6 @@ def generate_reply_for_inbound(
 
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
-
-        # --------------------------------------
-        # Repeat booking safety: allow restart/reschedule
-        # If an appointment is already booked for this phone, but the user sends
-        # a different address or a new date/time intent, treat it as a new thread
-        # and clear ONLY the scheduling layer (keep identity memory).
-        # --------------------------------------
-        if sched.get("booking_created") and sched.get("square_booking_id"):
-            restart_keywords = [
-                "reschedule", "change", "different", "another", "new appointment",
-                "move it", "push it", "cancel", "need a new time", "need a new day"
-            ]
-            looks_like_address = bool(re.search(r"\b\d{1,6}\b", inbound_text)) and bool(re.search(
-                r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b",
-                inbound_lower,
-                flags=re.I
-            ))
-            looks_like_date_time = any(w in inbound_lower for w in ["tomorrow", "today", "next", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]) or bool(re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", inbound_lower))
-            if any(k in inbound_lower for k in restart_keywords) or looks_like_address or looks_like_date_time:
-                # Clear scheduling atoms so the user can book a new visit.
-                sched["booking_created"] = False
-                sched["square_booking_id"] = None
-                sched["scheduled_date"] = None
-                sched["scheduled_time"] = None
-                sched["raw_address"] = None
-                sched["normalized_address"] = None
-                sched["address_candidate"] = None
-                sched["address_verified"] = False
-                sched["address_missing"] = None
-                sched["address_parts"] = {}
-                sched["pending_step"] = None
         # Opportunistic capture (only when relevant)
         if not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip()):
             if sched.get("pending_step") == "need_name" or "my name" in inbound_lower or inbound_lower.startswith("name is"):
@@ -1450,34 +1443,13 @@ def generate_reply_for_inbound(
             base = f"{cid}|{label}"
             return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-        def pick_variant_once(*args) -> str:
-            """
-            Deterministically pick and persist a prompt variant.
-
-            Supports both call styles:
-              - pick_variant_once(label, options)              (uses outer 'sched')
-              - pick_variant_once(sched_dict, label, options)  (uses provided dict)
-            """
-            if len(args) == 2:
-                _sched = sched
-                label, options = args
-            elif len(args) == 3:
-                _sched, label, options = args
-            else:
-                return ""
-
+        def pick_variant_once(label: str, options: list[str]) -> str:
             if not options:
                 return ""
-
-            if not isinstance(_sched, dict):
-                _sched = sched
-
-            store = _sched.setdefault("prompt_variants", {})
-            # If we've already chosen a variant for this label, reuse it (but only if still valid).
+            store = sched.setdefault("prompt_variants", {})
             if label in store and store[label] in options:
                 return store[label]
-
-            h = _stable_choice_key(str(label))
+            h = _stable_choice_key(label)
             idx = int(h[:8], 16) % len(options)
             chosen = options[idx]
             store[label] = chosen
@@ -1541,7 +1513,7 @@ def generate_reply_for_inbound(
                 "Hey, this is Prevolt Electric. Quick question so I can get this lined up.",
                 "Hi, you’ve reached Prevolt Electric. I’ll get this set up for you here.",
             ]
-            return pick_variant_once(sched, "intro_line", options)
+            return pick_variant_once("intro_line", options)
 
         def humanize_question(core_question: str) -> str:
             core_question = _norm(core_question)
@@ -1597,6 +1569,12 @@ def generate_reply_for_inbound(
                     elif not sched.get("scheduled_time"):
                         s = humanize_question("What time works best?")
                         s = _apply_intro_once(s)
+                    elif not _has_name(profile):
+                        s = humanize_question("What is your first and last name?")
+                        s = _apply_intro_once(s)
+                    elif not _has_email(profile):
+                        s = humanize_question("What is the best email address for the appointment?")
+                        s = _apply_intro_once(s)
                     else:
                         s = "Okay."
 
@@ -1615,6 +1593,12 @@ def generate_reply_for_inbound(
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_time"):
                         s = humanize_question("What time works best?")
+                        s = _apply_intro_once(s)
+                    elif not _has_name(profile):
+                        s = humanize_question("What is your first and last name?")
+                        s = _apply_intro_once(s)
+                    elif not _has_email(profile):
+                        s = humanize_question("What is the best email address for the appointment?")
                         s = _apply_intro_once(s)
                     else:
                         s = "Okay."
@@ -1898,27 +1882,10 @@ def generate_reply_for_inbound(
                 sms_body = humanize_question("What is the best email address for the appointment?")
             else:
                 # Collected everything but booking not created. Neutral, human, not weird.
-                friendly_dt = None
-                try:
-                    # Use stored date + time if present
-                    if sched.get("scheduled_date") and sched.get("scheduled_time"):
-                        d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
-                        human_d = d.strftime("%A, %B %d").replace(" 0", " ")
-                        human_t = humanize_time(sched["scheduled_time"])
-                        friendly_dt = f"{human_d} at {human_t}"
-                except Exception:
-                    friendly_dt = None
-
-                keep_line = (
-                    f"You are currently scheduled for {friendly_dt}. Is that still good?"
-                    if friendly_dt else
-                    "You are currently scheduled for that day and time. Is that still good?"
-                )
-
-                sms_body = pick_variant_once(sched, "neutral_no_book", [
+                sms_body = pick_variant_once("neutral_no_book", [
                     "Okay. If anything changes, just text me here.",
                     "All set. If you need to adjust anything, just message me here.",
-                    keep_line,
+                    "Okay. Want to keep that same day and time?",
                 ])
 
         booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
