@@ -1097,8 +1097,29 @@ def incoming_sms():
     else:
         sched["pending_step"] = None
 
+    # Deterministic next-question override:
+    # Step4 can occasionally return an acknowledgement even though we still
+    # need identity fields before we can create a Square booking.
+    sms_body = (reply.get("sms_body") or "").strip()
+
+    if sched.get("pending_step") == "need_name":
+        sms_body = humanize_question("What is your first and last name?")
+    elif sched.get("pending_step") == "need_email":
+        sms_body = humanize_question("What is the best email address for the appointment?")
+    elif sched.get("pending_step") is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
+        # We have date/time/address, but booking is not created yet. Confirm like a human.
+        try:
+            from datetime import datetime
+            d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d") if sched.get("scheduled_date") else None
+            human_d = d.strftime("%A, %B %d").replace(" 0", " ") if d else None
+            human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else None
+            if human_d and human_t:
+                sms_body = f"You are currently scheduled for {human_d} at {human_t}. Is that still good?"
+        except Exception:
+            pass
+
     tw = MessagingResponse()
-    tw.message(reply["sms_body"])
+    tw.message(sms_body)
     return Response(str(tw), mimetype="text/xml")
 
 import re
@@ -1304,7 +1325,6 @@ def generate_reply_for_inbound(
         # --------------------------------------
         phone = request.form.get("From", "").replace("whatsapp:", "")
         convo_key = phone or request.form.get("MessageSid") or request.form.get("SmsSid") or request.form.get("CallSid") or "unknown"
-        conv  = conversations.setdefault(convo_key, {})
         conv  = conversations.setdefault(convo_key, {})
 
         profile = conv.setdefault("profile", {})
