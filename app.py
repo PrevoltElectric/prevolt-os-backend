@@ -87,6 +87,44 @@ conversations = {}
 # ---------------------------------------------------
 # WhatsApp SMS Helper (Testing Path Only)
 # ---------------------------------------------------
+
+def humanize_time(t: str) -> str:
+    """
+    Convert a stored time string into a friendly 12-hour display.
+    Accepts formats like "15:00", "15:00:00", "1500", "3pm", "3 pm", "3:00 PM".
+    """
+    t = (t or "").strip()
+    if not t:
+        return ""
+    # Already contains am/pm -> normalize spacing/case
+    m = re.match(r"^\s*(\d{1,2})(?::(\d{2}))?\s*([aApP])[mM]\s*$", t)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2) or "00")
+        ap = "AM" if m.group(3).lower() == "a" else "PM"
+        if hh == 0:
+            hh = 12
+        if hh > 12:
+            hh = ((hh - 1) % 12) + 1
+        return f"{hh}:{mm:02d} {ap}"
+    # HHMM (e.g., 1500)
+    if re.fullmatch(r"\d{3,4}", t):
+        t = t.zfill(4)
+        hh = int(t[:2])
+        mm = int(t[2:])
+    else:
+        # HH:MM(:SS)
+        m2 = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", t)
+        if not m2:
+            return t  # fallback: return as-is
+        hh = int(m2.group(1))
+        mm = int(m2.group(2))
+    ap = "AM" if hh < 12 else "PM"
+    hh12 = hh % 12
+    if hh12 == 0:
+        hh12 = 12
+    return f"{hh12}:{mm:02d} {ap}"
+
 def send_sms(to_number: str, body: str) -> None:
     """
     Outbound always routes to WhatsApp sandbox for safe testing.
