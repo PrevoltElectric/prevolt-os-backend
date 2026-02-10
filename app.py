@@ -276,7 +276,31 @@ def handle_call_selection():
     # which breaks /incoming-sms when it expects profile["addresses"].
     # So we "hydrate" required keys even if profile already exists.
     # ---------------------------------------------------
+    # Establish conversation context (fix NameError: conv undefined)
+    call_sid = request.form.get("CallSid", "") or ""
+    convo_key = phone.strip() if phone.strip() else (f"call:{call_sid}" if call_sid else "call:unknown")
+    conv = conversations.setdefault(convo_key, {})
+
+    # Hydrate schema so later flows never KeyError
     profile = conv.setdefault("profile", {})
+    profile.setdefault("name", None)
+    profile.setdefault("addresses", [])
+    profile.setdefault("upcoming_appointment", None)
+    profile.setdefault("past_jobs", [])
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+    profile.setdefault("square_customer_id", None)
+    profile.setdefault("square_lookup_done", False)
+
+    sched = conv.setdefault("sched", {})
+    sched.setdefault("pending_step", None)
+    sched.setdefault("scheduled_date", None)
+    sched.setdefault("scheduled_time", None)
+    sched.setdefault("raw_address", None)
+    sched.setdefault("address_verified", False)
+    sched.setdefault("appointment_type", None)
+    sched.setdefault("booking_created", False)
     profile.setdefault("name", None)
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
