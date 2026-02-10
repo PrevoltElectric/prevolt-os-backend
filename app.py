@@ -1450,13 +1450,34 @@ def generate_reply_for_inbound(
             base = f"{cid}|{label}"
             return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-        def pick_variant_once(label: str, options: list[str]) -> str:
+        def pick_variant_once(*args) -> str:
+            """
+            Deterministically pick and persist a prompt variant.
+
+            Supports both call styles:
+              - pick_variant_once(label, options)              (uses outer 'sched')
+              - pick_variant_once(sched_dict, label, options)  (uses provided dict)
+            """
+            if len(args) == 2:
+                _sched = sched
+                label, options = args
+            elif len(args) == 3:
+                _sched, label, options = args
+            else:
+                return ""
+
             if not options:
                 return ""
-            store = sched.setdefault("prompt_variants", {})
+
+            if not isinstance(_sched, dict):
+                _sched = sched
+
+            store = _sched.setdefault("prompt_variants", {})
+            # If we've already chosen a variant for this label, reuse it (but only if still valid).
             if label in store and store[label] in options:
                 return store[label]
-            h = _stable_choice_key(label)
+
+            h = _stable_choice_key(str(label))
             idx = int(h[:8], 16) % len(options)
             chosen = options[idx]
             store[label] = chosen
