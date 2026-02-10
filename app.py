@@ -66,6 +66,16 @@ twilio_client = (
     else None
 )
 
+
+# -------------------------------
+# Small shared helpers
+# -------------------------------
+def humanize_question(core_question: str) -> str:
+    """Lightweight wrapper used in route-level prompts.
+    The richer variant logic lives inside generate_reply_for_inbound()."""
+    core_question = (core_question or "").strip()
+    return core_question
+
 app = Flask(__name__)
 
 # ---------------------------------------------------
