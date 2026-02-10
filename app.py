@@ -1098,25 +1098,38 @@ def incoming_sms():
         sched["pending_step"] = None
 
     # Deterministic next-question override:
-    # Step4 can occasionally return an acknowledgement even though we still
-    # need identity fields before we can create a Square booking.
+    # Always derive the outbound message from the CURRENT pending_step.
+    # This prevents Step4 acknowledgement replies (e.g., "Okay.") from stalling the flow.
     sms_body = (reply.get("sms_body") or "").strip()
 
-    if sched.get("pending_step") == "need_name":
+    step = sched.get("pending_step")
+    if step == "need_appt_type":
+        sms_body = humanize_question("Is this an emergency or a regular appointment?")
+    elif step == "need_address":
+        # Keep it conversational and specific to what we already know when possible.
+        sms_body = humanize_question("What is the full service address?")
+    elif step == "need_date":
+        sms_body = humanize_question("What day works best for you?")
+    elif step == "need_time":
+        sms_body = humanize_question("What time works best?")
+    elif step == "need_name":
         sms_body = humanize_question("What is your first and last name?")
-    elif sched.get("pending_step") == "need_email":
+    elif step == "need_email":
         sms_body = humanize_question("What is the best email address for the appointment?")
-    elif sched.get("pending_step") is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
-        # We have date/time/address, but booking is not created yet. Confirm like a human.
+    elif step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
+        # We have what we need, but booking is not created yet. Confirm like a human.
+        human_d = None
         try:
-            from datetime import datetime
-            d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d") if sched.get("scheduled_date") else None
-            human_d = d.strftime("%A, %B %d").replace(" 0", " ") if d else None
-            human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else None
-            if human_d and human_t:
-                sms_body = f"You are currently scheduled for {human_d} at {human_t}. Is that still good?"
+            # Prefer ISO if present, otherwise fall back to the raw text.
+            if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
+                d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+                human_d = d.strftime("%A, %B %d").replace(" 0", " ")
         except Exception:
-            pass
+            human_d = None
+        if not human_d:
+            human_d = (sched.get("scheduled_date") or "").strip() or "that day"
+        human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else "that time"
+        sms_body = f"Just to confirm — {human_d} at {human_t}. Is that still good?"
 
     tw = MessagingResponse()
     tw.message(sms_body)
