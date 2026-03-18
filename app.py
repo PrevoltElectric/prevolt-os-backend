@@ -333,7 +333,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 # ---------------------------------------------------
 # Voice: Incoming Call (IVR + Spam Filter)
 # ---------------------------------------------------
-@app.route("/incoming-call", methods=["POST"])
+@app.route("/incoming-call", methods=["GET", "POST"])
 def incoming_call():
     from twilio.twiml.voice_response import Gather, VoiceResponse
 
@@ -1014,6 +1014,92 @@ def try_early_address_normalize(sched: dict) -> None:
 
 
 
+
+
+def extract_city_state_from_reply(text: str) -> tuple[str | None, str | None]:
+    """Parse compact city/state replies like 'Windsor CT' or 'Windsor, Connecticut'."""
+    txt = " ".join((text or "").strip().replace(",", " ").split())
+    if not txt:
+        return None, None
+
+    low = txt.lower()
+    state = None
+    if re.search(r"ct|connecticut", low):
+        state = "CT"
+        txt = re.sub(r"ct|connecticut", "", txt, flags=re.I).strip(" ,")
+    elif re.search(r"ma|massachusetts", low):
+        state = "MA"
+        txt = re.sub(r"ma|massachusetts", "", txt, flags=re.I).strip(" ,")
+
+    # Reject obvious non-city inputs
+    if re.search(r"\d", txt):
+        return None, state
+    if re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", txt, flags=re.I):
+        return None, state
+
+    city = " ".join(w.capitalize() for w in txt.split()) if txt else None
+    return city or None, state
+
+
+def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
+    """
+    Merge compact follow-up address replies into the existing street address.
+    Examples:
+      raw_address='54 Bloomfield Ave' + inbound='Windsor CT'
+      raw_address='54 Bloomfield Ave' + inbound='Windsor'
+      raw_address='54 Bloomfield Ave, Windsor' + inbound='CT'
+    Returns True when sched was updated.
+    """
+    inbound = (inbound_text or "").strip()
+    if not inbound:
+        return False
+
+    update_address_assembly_state(sched)
+    missing = (sched.get("address_missing") or "").strip().lower()
+    if missing not in {"confirm", "state"}:
+        return False
+
+    raw = (sched.get("raw_address") or "").strip()
+    if not raw:
+        return False
+
+    city, state = extract_city_state_from_reply(inbound)
+
+    # State-only reply like 'CT'
+    if not city and state:
+        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)", raw, flags=re.I):
+            merged = f"{raw}, {state}"
+        else:
+            merged = f"{raw}, {state}"
+    # City + optional state reply
+    elif city:
+        base = raw
+        # If raw already ends with the same city/state, do nothing.
+        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?", raw, flags=re.I):
+            merged = raw if not state else re.sub(r",\s*([A-Za-z .'-]+)(?:,\s*(CT|MA))?$", rf", {city}, {state}", raw, flags=re.I)
+        else:
+            merged = f"{base}, {city}" + (f", {state}" if state else "")
+    else:
+        return False
+
+    sched["raw_address"] = re.sub(r"\s+,", ",", merged).strip(" ,")
+
+    # Best effort normalization immediately so the thread advances instead of re-asking.
+    forced_state = state if state in {"CT", "MA"} else None
+    try:
+        result = normalize_address(sched["raw_address"], forced_state=forced_state)
+        if isinstance(result, tuple) and len(result) >= 2:
+            status, addr_struct = result[0], result[1]
+            if status == "ok" and isinstance(addr_struct, dict):
+                sched["normalized_address"] = addr_struct
+        elif isinstance(result, dict):
+            sched["normalized_address"] = result
+    except Exception as e:
+        print("[WARN] apply_partial_address_reply normalize failed:", repr(e))
+
+    update_address_assembly_state(sched)
+    return True
+
 def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     """Single deterministic next-step selector. Python enforces state; SRBs drive prompt choice."""
     import re
@@ -1212,6 +1298,12 @@ def incoming_sms():
 
     # Keep address state fresh (pre-Step4)
     update_address_assembly_state(sched)
+
+    # Pre-Step4 smart merge for compact city/state replies.
+    try:
+        apply_partial_address_reply(sched, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
     # ---------------------------------------------------
     # Run Step 4
@@ -1930,6 +2022,16 @@ def generate_reply_for_inbound(
 
         except Exception as e:
             print("[WARN] house-number merge patch failed:", repr(e))
+
+        # ✅ CITY/STATE FOLLOW-UP PATCH
+        try:
+            apply_partial_address_reply(sched, inbound_text)
+            # If we now have a complete verified address, clear any stale address-step loop.
+            if sched.get("address_verified"):
+                if sched.get("pending_step") in {"need_address", None}:
+                    recompute_pending_step(profile, sched)
+        except Exception as e:
+            print("[WARN] partial address merge patch failed:", repr(e))
 
         # --------------------------------------
         # Build System Prompt
