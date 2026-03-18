@@ -66,21 +66,35 @@ twilio_client = (
     else None
 )
 
-RULES_FILE = os.environ.get("PREVOLT_RULES_FILE", "/mnt/data/prevolt_rules (1).json")
+RULES_FILE = os.environ.get("PREVOLT_RULES_FILE") or os.environ.get("PREVOLT_RULES_PATH")
 
 def load_rule_matrix_text() -> str:
-    """Load the existing SRB matrix exactly as provided. No invented rules."""
-    try:
-        with open(RULES_FILE, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        if isinstance(payload, dict):
-            rules = payload.get("rules", "")
-            if isinstance(rules, str):
-                return rules.strip()
-        if isinstance(payload, str):
-            return payload.strip()
-    except Exception as e:
-        print("[WARN] load_rule_matrix_text failed:", repr(e))
+    """Load the existing SRB matrix from repo or env-configured path. No invented rules."""
+    candidates = [
+        RULES_FILE,
+        "prevolt_rules.json",
+        "./prevolt_rules.json",
+        str(Path(__file__).resolve().parent / "prevolt_rules.json"),
+    ]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = Path(candidate)
+            if not path.exists():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(payload, dict):
+                rules = payload.get("rules", "")
+                if isinstance(rules, str):
+                    return rules.strip()
+            if isinstance(payload, str):
+                return payload.strip()
+        except Exception as e:
+            print(f"[WARN] rule load failed for {candidate}: {e!r}")
+
+    print("[WARN] No rule matrix file found.")
     return ""
 
 RULE_MATRIX_TEXT = load_rule_matrix_text()
@@ -96,6 +110,11 @@ def humanize_question(core_question: str) -> str:
     return core_question
 
 app = Flask(__name__)
+
+@app.route("/", methods=["GET", "HEAD"])
+def home():
+    return "Prevolt OS running", 200
+
 
 # ---------------------------------------------------
 # In-Memory Conversation Store
