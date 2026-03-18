@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+from pathlib import Path
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
@@ -66,6 +67,39 @@ twilio_client = (
     else None
 )
 
+RULES_FILE = os.environ.get("PREVOLT_RULES_FILE") or os.environ.get("PREVOLT_RULES_PATH")
+
+def load_rule_matrix_text() -> str:
+    """Load the existing SRB matrix from repo or env-configured path. No invented rules."""
+    candidates = [
+        RULES_FILE,
+        "prevolt_rules.json",
+        "./prevolt_rules.json",
+        str(Path(__file__).resolve().parent / "prevolt_rules.json"),
+    ]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = Path(candidate)
+            if not path.exists():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(payload, dict):
+                rules = payload.get("rules", "")
+                if isinstance(rules, str):
+                    return rules.strip()
+            if isinstance(payload, str):
+                return payload.strip()
+        except Exception as e:
+            print(f"[WARN] rule load failed for {candidate}: {e!r}")
+
+    print("[WARN] No rule matrix file found.")
+    return ""
+
+RULE_MATRIX_TEXT = load_rule_matrix_text()
+
 
 # -------------------------------
 # Small shared helpers
@@ -77,6 +111,11 @@ def humanize_question(core_question: str) -> str:
     return core_question
 
 app = Flask(__name__)
+
+@app.route("/", methods=["GET", "HEAD"])
+def home():
+    return "Prevolt OS running", 200
+
 
 # ---------------------------------------------------
 # In-Memory Conversation Store
@@ -294,7 +333,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 # ---------------------------------------------------
 # Voice: Incoming Call (IVR + Spam Filter)
 # ---------------------------------------------------
-@app.route("/incoming-call", methods=["POST"])
+@app.route("/incoming-call", methods=["GET", "POST"])
 def incoming_call():
     from twilio.twiml.voice_response import Gather, VoiceResponse
 
@@ -630,12 +669,15 @@ def build_system_prompt(
     Reconstructed stable prompt used by Step 4.
     Tailored to the B-3 state-machine logic.
     """
+    rules_blob = RULE_MATRIX_TEXT or ""
     return f"""
 You are Prevolt OS — a deterministic scheduling engine.
 You ALWAYS return strict JSON with fields:
   sms_body, scheduled_date, scheduled_time, address.
 
 NEVER forget known values. NEVER reset fields unless the user changes them.
+NEVER invent policy. Follow the existing SRB matrix below when it applies.
+Python is the execution engine. The SRB matrix is the policy source.
 
 Known transcript: {cleaned_transcript}
 Category: {category}
@@ -649,13 +691,20 @@ Current stored values:
 
 Today's date: {today_date_str} ({today_weekday})
 
-Rules:
+Core behavioral constraints:
 - NEVER ask questions already answered.
 - If only one field is missing, ask ONLY for that field.
-- If all fields are present, confirm appointment.
+- Do not treat vague time phrases as explicit times.
+- Do not confirm a booking unless a real Square booking exists.
 - Use simple, direct language.
 - NEVER say “one moment”, “please wait”, “hold on”, “securing your appointment”, or anything implying background processing.
-- Only confirm a booking if it is ACTUALLY booked with Square (real booking id exists).
+- If the address is incomplete, ask only for the missing address atom.
+- If date is known but time is missing, ask only for time.
+- If time is known but date is missing, ask only for date.
+- Never overwrite stored name, email, date, time, or address with blank values.
+
+Existing SRB matrix:
+{rules_blob}
 """
 
 
@@ -965,76 +1014,151 @@ def try_early_address_normalize(sched: dict) -> None:
 
 
 
-# ---------------------------------------------------
-# Central next-prompt selector
-# Prevents NameError in route-level scheduling and enforces post-booking lock.
-# ---------------------------------------------------
-def choose_next_prompt_from_state(conv: dict, inbound_text: str = ""):
+
+
+def extract_city_state_from_reply(text: str) -> tuple[str | None, str | None]:
+    """Parse compact city/state replies like 'Windsor CT' or 'Windsor, Connecticut'."""
+    txt = " ".join((text or "").strip().replace(",", " ").split())
+    if not txt:
+        return None, None
+
+    low = txt.lower()
+    state = None
+    if re.search(r"ct|connecticut", low):
+        state = "CT"
+        txt = re.sub(r"ct|connecticut", "", txt, flags=re.I).strip(" ,")
+    elif re.search(r"ma|massachusetts", low):
+        state = "MA"
+        txt = re.sub(r"ma|massachusetts", "", txt, flags=re.I).strip(" ,")
+
+    # Reject obvious non-city inputs
+    if re.search(r"\d", txt):
+        return None, state
+    if re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", txt, flags=re.I):
+        return None, state
+
+    city = " ".join(w.capitalize() for w in txt.split()) if txt else None
+    return city or None, state
+
+
+def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     """
-    Returns the deterministic next prompt based on the current conversation state.
-    Returns None when the assistant should stay in support / post-booking mode.
+    Merge compact follow-up address replies into the existing street address.
+    Examples:
+      raw_address='54 Bloomfield Ave' + inbound='Windsor CT'
+      raw_address='54 Bloomfield Ave' + inbound='Windsor'
+      raw_address='54 Bloomfield Ave, Windsor' + inbound='CT'
+    Returns True when sched was updated.
     """
-    conv = conv or {}
+    inbound = (inbound_text or "").strip()
+    if not inbound:
+        return False
+
+    update_address_assembly_state(sched)
+    missing = (sched.get("address_missing") or "").strip().lower()
+    if missing not in {"confirm", "state"}:
+        return False
+
+    raw = (sched.get("raw_address") or "").strip()
+    if not raw:
+        return False
+
+    city, state = extract_city_state_from_reply(inbound)
+
+    # State-only reply like 'CT'
+    if not city and state:
+        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)", raw, flags=re.I):
+            merged = f"{raw}, {state}"
+        else:
+            merged = f"{raw}, {state}"
+    # City + optional state reply
+    elif city:
+        base = raw
+        # If raw already ends with the same city/state, do nothing.
+        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?", raw, flags=re.I):
+            merged = raw if not state else re.sub(r",\s*([A-Za-z .'-]+)(?:,\s*(CT|MA))?$", rf", {city}, {state}", raw, flags=re.I)
+        else:
+            merged = f"{base}, {city}" + (f", {state}" if state else "")
+    else:
+        return False
+
+    sched["raw_address"] = re.sub(r"\s+,", ",", merged).strip(" ,")
+
+    # Best effort normalization immediately so the thread advances instead of re-asking.
+    forced_state = state if state in {"CT", "MA"} else None
+    try:
+        result = normalize_address(sched["raw_address"], forced_state=forced_state)
+        if isinstance(result, tuple) and len(result) >= 2:
+            status, addr_struct = result[0], result[1]
+            if status == "ok" and isinstance(addr_struct, dict):
+                sched["normalized_address"] = addr_struct
+        elif isinstance(result, dict):
+            sched["normalized_address"] = result
+    except Exception as e:
+        print("[WARN] apply_partial_address_reply normalize failed:", repr(e))
+
+    update_address_assembly_state(sched)
+    return True
+
+def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
+    """Single deterministic next-step selector. Python enforces state; SRBs drive prompt choice."""
+    import re
+
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
+    update_address_assembly_state(sched)
+    recompute_pending_step(profile, sched)
 
     inbound_low = (inbound_text or "").strip().lower()
-    booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+    appt = (sched.get("appointment_type") or "").upper()
+    is_emergency = ("TROUBLESHOOT" in appt) or bool(sched.get("emergency_approved")) or bool(sched.get("awaiting_emergency_confirm"))
 
-    # Hard post-booking lock unless user explicitly reopens scheduling.
-    if booking_created:
-        reopen_keywords = [
-            "reschedule", "change", "move", "different time", "different day",
-            "cancel", "book another", "new appointment", "another appointment"
-        ]
-        if not any(k in inbound_low for k in reopen_keywords):
-            return None
+    ambiguous_times = {
+        "any time", "anytime", "whenever", "later", "sometime", "around",
+        "as soon as possible", "asap", "i'm around", "im around", "i'm home today",
+        "im home today", "i'm here all day", "im here all day", "it doesn't matter",
+        "it doesnt matter", "whenever works", "whenever you can", "sometime today", "later today"
+    }
+    time_of_day_phrases = {
+        "today", "this morning", "this afternoon", "this evening", "later today",
+        "sometime today", "i'm around today", "im around today", "i'll be home this afternoon",
+        "ill be home this afternoon", "today works", "i'm available today", "im available today"
+    }
+    provided_ambiguous_time = any(p in inbound_low for p in ambiguous_times | time_of_day_phrases)
 
     step = sched.get("pending_step")
-
-    if step == "need_appt_type":
-        return humanize_question("Is this an emergency or a regular appointment?")
-
     if step == "need_address":
-        missing = (sched.get("address_missing") or "").strip().lower()
-        parts = sched.get("address_parts") or {}
-        city = (parts.get("city") or "").strip()
-        state = (parts.get("state") or "").strip()
-        street = (parts.get("street") or "").strip()
-
-        if missing == "street" and city and state:
-            return humanize_question(f"What street is it on in {city}, {state}?")
-        if missing in ("city", "state", "city_state") and street:
-            return humanize_question("Which town is it in, and is that Connecticut or Massachusetts?")
-        return humanize_question("What is the full service address?")
-
+        return build_address_prompt(sched)
     if step == "need_date":
         return humanize_question("What day works best for you?")
-
     if step == "need_time":
+        if provided_ambiguous_time:
+            if is_emergency:
+                now_hour = datetime.now(ZoneInfo("America/New_York")).hour if ZoneInfo else datetime.utcnow().hour
+                part = "morning" if now_hour < 12 else ("afternoon" if now_hour < 17 else "evening")
+                return humanize_question(f"We can come today. What time later this {part} works for you?")
+            return humanize_question("What time works for you?")
         return humanize_question("What time works best for you?")
-
     if step == "need_name":
         return humanize_question("What is your first and last name?")
-
     if step == "need_email":
         return humanize_question("What is the best email address for the appointment?")
 
-    if step is None and not booking_created:
-        human_d = None
-        try:
-            raw_date = sched.get("scheduled_date")
-            if isinstance(raw_date, str) and re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date):
-                d = datetime.strptime(raw_date, "%Y-%m-%d")
-                human_d = d.strftime("%A, %B %d").replace(" 0", " ")
-        except Exception:
-            human_d = None
-        if not human_d:
-            human_d = (sched.get("scheduled_date") or "").strip() or "that day"
-        human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else "that time"
-        return f"Just to confirm, {human_d} at {human_t}. Is that still good?"
+    if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
+        if sched.get("scheduled_date") and sched.get("scheduled_time"):
+            try:
+                if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
+                    d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+                    human_d = d.strftime("%A, %B %d").replace(" 0", " ")
+                else:
+                    human_d = (sched.get("scheduled_date") or "that day").strip()
+            except Exception:
+                human_d = (sched.get("scheduled_date") or "that day").strip()
+            human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else "that time"
+            return f"Just to confirm, {human_d} at {human_t}. Is that still good?"
+        return "Okay."
 
-    return None
+    return (conv.get("last_sms_body") or "Okay.").strip() or "Okay."
 
 # ---------------------------------------------------
 # Incoming SMS (B-3 State Machine, Option A)
@@ -1175,6 +1299,12 @@ def incoming_sms():
     # Keep address state fresh (pre-Step4)
     update_address_assembly_state(sched)
 
+    # Pre-Step4 smart merge for compact city/state replies.
+    try:
+        apply_partial_address_reply(sched, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms partial address merge failed:", repr(e))
+
     # ---------------------------------------------------
     # Run Step 4
     # ---------------------------------------------------
@@ -1202,53 +1332,17 @@ def incoming_sms():
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
 
-    # POST-Step4 pending_step (Address complete only when verified)
-    if not sched.get("scheduled_date"):
-        sched["pending_step"] = "need_date"
-    elif not sched.get("scheduled_time"):
-        sched["pending_step"] = "need_time"
-    elif not sched.get("address_verified"):
-        sched["pending_step"] = "need_address"
-    elif not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip()):
-        sched["pending_step"] = "need_name"
-    elif not (profile.get("email") or "").strip():
-        sched["pending_step"] = "need_email"
-    else:
-        sched["pending_step"] = None
+    recompute_pending_step(profile, sched)
 
-    # Deterministic next-question override:
-    # Always derive the outbound message from the CURRENT pending_step.
-    # This prevents Step4 acknowledgement replies (e.g., "Okay.") from stalling the flow.
     sms_body = (reply.get("sms_body") or "").strip()
+    next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
-    step = sched.get("pending_step")
-    if step == "need_appt_type":
-        sms_body = humanize_question("Is this an emergency or a regular appointment?")
-    elif step == "need_address":
-        # Keep it conversational and specific to what we already know when possible.
-        sms_body = humanize_question("What is the full service address?")
-    elif step == "need_date":
-        sms_body = humanize_question("What day works best for you?")
-    elif step == "need_time":
-        sms_body = humanize_question("What time works best?")
-    elif step == "need_name":
-        sms_body = humanize_question("What is your first and last name?")
-    elif step == "need_email":
-        sms_body = humanize_question("What is the best email address for the appointment?")
-    elif step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
-        # We have what we need, but booking is not created yet. Confirm like a human.
-        human_d = None
-        try:
-            # Prefer ISO if present, otherwise fall back to the raw text.
-            if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
-                d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
-                human_d = d.strftime("%A, %B %d").replace(" 0", " ")
-        except Exception:
-            human_d = None
-        if not human_d:
-            human_d = (sched.get("scheduled_date") or "").strip() or "that day"
-        human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else "that time"
-        sms_body = f"Just to confirm — {human_d} at {human_t}. Is that still good?"
+    # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
+    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
+    if sms_body in generic_fillers:
+        sms_body = next_prompt
+
+    conv["last_sms_body"] = sms_body
 
     tw = MessagingResponse()
     tw.message(sms_body)
@@ -1929,6 +2023,16 @@ def generate_reply_for_inbound(
         except Exception as e:
             print("[WARN] house-number merge patch failed:", repr(e))
 
+        # ✅ CITY/STATE FOLLOW-UP PATCH
+        try:
+            apply_partial_address_reply(sched, inbound_text)
+            # If we now have a complete verified address, clear any stale address-step loop.
+            if sched.get("address_verified"):
+                if sched.get("pending_step") in {"need_address", None}:
+                    recompute_pending_step(profile, sched)
+        except Exception as e:
+            print("[WARN] partial address merge patch failed:", repr(e))
+
         # --------------------------------------
         # Build System Prompt
         # --------------------------------------
@@ -2061,41 +2165,8 @@ def generate_reply_for_inbound(
         # --------------------------------------
         if not (sched.get("booking_created") and sched.get("square_booking_id")):
             update_address_assembly_state(sched)
-
-            if not sched.get("address_verified"):
-                sms_body = build_address_prompt(sched)
-            elif not sched.get("scheduled_date"):
-                sms_body = humanize_question("What day works best for you?")
-            elif not sched.get("scheduled_time"):
-                sms_body = humanize_question("What time works best?")
-            elif not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip()):
-                sms_body = humanize_question("What is your first and last name?")
-            elif not (profile.get("email") or "").strip():
-                sms_body = humanize_question("What is the best email address for the appointment?")
-            else:
-                # Collected everything but booking not created. Neutral, human, not weird.
-                friendly_dt = None
-                try:
-                    # Use stored date + time if present
-                    if sched.get("scheduled_date") and sched.get("scheduled_time"):
-                        d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
-                        human_d = d.strftime("%A, %B %d").replace(" 0", " ")
-                        human_t = humanize_time(sched["scheduled_time"])
-                        friendly_dt = f"{human_d} at {human_t}"
-                except Exception:
-                    friendly_dt = None
-
-                keep_line = (
-                    f"You are currently scheduled for {friendly_dt}. Is that still good?"
-                    if friendly_dt else
-                    "You are currently scheduled for that day and time. Is that still good?"
-                )
-
-                sms_body = pick_variant_once(sched, "neutral_no_book", [
-                    "Okay. If anything changes, just text me here.",
-                    "All set. If you need to adjust anything, just message me here.",
-                    keep_line,
-                ])
+            recompute_pending_step(profile, sched)
+            sms_body = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
         booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
         sms_body = _finalize_sms(sms_body, appt_type, booking_created=booking_created)
