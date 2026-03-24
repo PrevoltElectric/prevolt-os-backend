@@ -4,7 +4,6 @@ import time
 import uuid
 from pathlib import Path
 import requests
-import re
 from datetime import datetime, timezone, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from flask import Flask, request, Response
@@ -167,46 +166,25 @@ def humanize_time(t: str) -> str:
 
 def send_sms(to_number: str, body: str) -> None:
     """
-    Prefer real SMS when TWILIO_FROM_NUMBER is configured.
-    Fall back to WhatsApp only when the configured sender or recipient explicitly uses that channel.
+    Outbound always routes to WhatsApp sandbox for safe testing.
     """
     if not twilio_client:
         print("[WARN] Twilio not configured. SMS not sent.")
         print("Message:", body)
         return
 
-    body = (body or "").strip()
-    to_number = (to_number or "").strip()
-    if not body or not to_number:
-        print("[WARN] send_sms missing body or destination.")
-        return
-
     try:
-        from_number = (TWILIO_FROM_NUMBER or "").strip()
-        use_whatsapp = from_number.startswith("whatsapp:") or to_number.startswith("whatsapp:")
+        whatsapp_from = "whatsapp:+14155238886"
+        whatsapp_to   = "whatsapp:+18609701727"  # your cell
 
-        if not from_number:
-            from_number = "whatsapp:+14155238886" if use_whatsapp else ""
-
-        if use_whatsapp:
-            if not from_number.startswith("whatsapp:"):
-                from_number = f"whatsapp:{from_number}"
-            if not to_number.startswith("whatsapp:"):
-                to_number = f"whatsapp:{to_number}"
-        else:
-            to_number = to_number.replace("whatsapp:", "")
-            from_number = from_number.replace("whatsapp:", "")
-
-        if not from_number:
-            print("[WARN] TWILIO_FROM_NUMBER missing. SMS not sent.")
-            print("Message:", body)
-            return
-
-        msg = twilio_client.messages.create(body=body, from_=from_number, to=to_number)
-        channel = "WhatsApp" if use_whatsapp else "SMS"
-        print(f"[{channel}] Sent SID:", msg.sid)
+        msg = twilio_client.messages.create(
+            body=body,
+            from_=whatsapp_from,
+            to=whatsapp_to
+        )
+        print("[WhatsApp] Sent SID:", msg.sid)
     except Exception as e:
-        print("[ERROR] send_sms failed:", repr(e))
+        print("[ERROR] WhatsApp send failed:", repr(e))
 
 
 
@@ -1216,8 +1194,6 @@ def incoming_sms():
                 # Emergency state flags (safe defaults)
                 "awaiting_emergency_confirm": False,
                 "emergency_approved": False,
-                "intro_sent": False,
-                "price_disclosed": False,
             }
         }
         resp = MessagingResponse()
@@ -1530,6 +1506,114 @@ def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_creat
     return sms
 
 
+def canonical_service_address(sched: dict) -> str:
+    """Return the best customer-facing service address string."""
+    sched = sched or {}
+    norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+    if norm:
+        line1 = (norm.get("address_line_1") or "").strip()
+        city = (norm.get("locality") or "").strip()
+        state = (norm.get("administrative_district_level_1") or "").strip()
+        zipc = (norm.get("postal_code") or "").strip()
+        parts = []
+        if line1:
+            parts.append(line1)
+        locality = ", ".join([p for p in [city, state] if p])
+        if locality:
+            parts.append(locality)
+        out = ", ".join(parts).strip().strip(",")
+        if zipc:
+            out = f"{out} {zipc}".strip()
+        if out:
+            return out
+    return (sched.get("raw_address") or sched.get("address_candidate") or "").strip()
+
+
+def canonical_service_datetime(sched: dict) -> str:
+    """Return the booked day/time in customer-facing form when available."""
+    sched = sched or {}
+    date_s = (sched.get("scheduled_date") or "").strip()
+    time_s = (sched.get("scheduled_time") or "").strip()
+    pretty_date = date_s
+    pretty_time = time_s
+    try:
+        if date_s:
+            pretty_date = datetime.strptime(date_s, "%Y-%m-%d").strftime("%A, %B %-d")
+    except Exception:
+        pass
+    try:
+        if time_s:
+            pretty_time = humanize_time(time_s)
+    except Exception:
+        pass
+    if pretty_date and pretty_time:
+        return f"{pretty_date} at {pretty_time}"
+    return pretty_date or pretty_time or ""
+
+
+def build_post_booking_reply(inbound_text: str, sched: dict, appt_type: str) -> str | None:
+    """Answer common post-booking customer questions without restarting scheduling."""
+    low = (inbound_text or "").strip().lower()
+    if not low:
+        return None
+
+    restart_keywords = [
+        "reschedule", "change", "different", "another", "new appointment",
+        "move it", "push it", "cancel", "need a new time", "need a new day"
+    ]
+    if any(k in low for k in restart_keywords):
+        return None
+
+    if bool(re.search(r"\d{1,6}", low)) and bool(re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I)):
+        return None
+
+    if any(w in low for w in ["tomorrow", "today", "next monday", "next tuesday", "next wednesday", "next thursday", "next friday", "next saturday", "next sunday"]) or bool(re.search(r"\d{1,2}(:\d{2})?\s*(am|pm)", low)):
+        return None
+
+    when_txt = canonical_service_datetime(sched)
+    addr_txt = canonical_service_address(sched)
+    where_line = f" I still have you set for {when_txt}" if when_txt else ""
+    if addr_txt:
+        where_line += f" at {addr_txt}"
+    if where_line:
+        where_line += "."
+
+    emergencyish = any(k in low for k in [
+        "water", "wet", "leak", "dripping", "panel", "sparking", "spark", "smoke",
+        "burning", "burnt", "fire", "hot", "buzzing", "arcing", "popping", "melted"
+    ])
+    if emergencyish:
+        return (
+            "Water or other hazard at the panel is serious. Please keep clear and do not touch the panel. "
+            "If you want this handled as an emergency visit instead, text emergency and we will switch this to a $395 troubleshoot and repair visit."
+            f"{where_line}"
+        ).strip()
+
+    if any(k in low for k in ["price", "cost", "how much", "$195", "$395"]):
+        if appt_type == "TROUBLESHOOT_395":
+            return f"This visit is set as a $395 troubleshoot and repair appointment.{where_line}".strip()
+        if appt_type == "WHOLE_HOME_INSPECTION":
+            return f"This visit is set as a $395 home inspection.{where_line}".strip()
+        return f"This visit is set as a $195 on site electrical evaluation.{where_line}".strip()
+
+    if any(k in low for k in ["how long", "duration", "how much time", "hour", "long will it take"]):
+        return f"The appointment window is one hour, and if anything else is needed we will go over it in person.{where_line}".strip()
+
+    if any(k in low for k in ["card", "cash", "check", "payment", "pay"]):
+        return f"Card or cash after the visit is totally fine.{where_line}".strip()
+
+    if any(k in low for k in ["what should i do", "anything i should do", "before you get here", "before the visit", "do i need to", "should i shut it off"]):
+        return f"Just make sure we have access when we get there, and if anything becomes unsafe before the visit, keep clear and text emergency.{where_line}".strip()
+
+    if any(k in low for k in ["ok", "okay", "thanks", "thank you", "sounds good", "see you then"]):
+        return f"Perfect.{where_line}".strip()
+
+    if "?" in low:
+        return f"We have you on the schedule. If anything changes before the visit, just text here.{where_line}".strip()
+
+    return None
+
+
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
 # PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY)
@@ -1587,6 +1671,35 @@ def generate_reply_for_inbound(
         profile.setdefault("email", None)
         profile.setdefault("square_customer_id", None)
         profile.setdefault("square_lookup_done", False)
+        profile.setdefault("name_explicit", False)
+        profile.setdefault("email_explicit", False)
+
+        # Fast explicit identity capture from the inbound text before any Square hydration.
+        inbound_identity_text = (inbound_text or "").strip()
+        inbound_identity_low = inbound_identity_text.lower()
+        identity_email_match = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", inbound_identity_text, flags=re.I)
+        if identity_email_match:
+            profile["email"] = identity_email_match.group(1).strip()
+            profile["email_explicit"] = True
+
+        explicit_name_patterns = [
+            r"\bmy name is\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+            r"\bthis is\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+            r"\bi am\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+            r"\bi'm\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+        ]
+        for pat in explicit_name_patterns:
+            m_name = re.search(pat, inbound_identity_text, flags=re.I)
+            if m_name:
+                first_guess = (m_name.group(1) or "").strip().title()
+                last_guess = (m_name.group(2) or "").strip().title()
+                if first_guess:
+                    profile["first_name"] = first_guess
+                    profile["name_explicit"] = True
+                if last_guess:
+                    profile["last_name"] = last_guess
+                    profile["name_explicit"] = True
+                break
 
         # One-time repeat-customer hydrate from Square (by phone)
         if not profile.get("square_lookup_done"):
@@ -1594,9 +1707,11 @@ def generate_reply_for_inbound(
                 cust = square_lookup_customer_by_phone(phone)
                 if cust and cust.get("id"):
                     profile["square_customer_id"] = cust.get("id")
-                    profile["first_name"] = profile.get("first_name") or cust.get("given_name")
-                    profile["last_name"] = profile.get("last_name") or cust.get("family_name")
-                    profile["email"] = profile.get("email") or cust.get("email_address")
+                    if not profile.get("name_explicit"):
+                        profile["first_name"] = profile.get("first_name") or cust.get("given_name")
+                        profile["last_name"] = profile.get("last_name") or cust.get("family_name")
+                    if not profile.get("email_explicit"):
+                        profile["email"] = profile.get("email") or cust.get("email_address")
                     # pull address to local memory if present
                     caddr = cust.get("address") or {}
                     line1 = (caddr.get("address_line_1") or "").strip()
@@ -1670,6 +1785,22 @@ def generate_reply_for_inbound(
         inbound_lower = inbound_text.lower().strip()
 
         # --------------------------------------
+        # Post-booking answers should not fall back into scheduling.
+        # --------------------------------------
+        if sched.get("booking_created") and sched.get("square_booking_id"):
+            post_booking_msg = build_post_booking_reply(inbound_text, sched, sched.get("appointment_type") or appointment_type or "EVAL_195")
+            if post_booking_msg:
+                post_booking_msg = _strip_ai_tells(post_booking_msg)
+                post_booking_msg = _shorten_texty(post_booking_msg, max_chars=320)
+                return {
+                    "sms_body": post_booking_msg,
+                    "scheduled_date": sched.get("scheduled_date"),
+                    "scheduled_time": sched.get("scheduled_time"),
+                    "address": canonical_service_address(sched),
+                    "booking_complete": True,
+                }
+
+        # --------------------------------------
         # Repeat booking safety: allow restart/reschedule
         # If an appointment is already booked for this phone, but the user sends
         # a different address or a new date/time intent, treat it as a new thread
@@ -1699,29 +1830,22 @@ def generate_reply_for_inbound(
                 sched["address_missing"] = None
                 sched["address_parts"] = {}
                 sched["pending_step"] = None
-            else:
-                post_booking = build_post_booking_response(conv, inbound_text)
-                if post_booking:
-                    return {
-                        "sms_body": post_booking,
-                        "scheduled_date": sched.get("scheduled_date"),
-                        "scheduled_time": sched.get("scheduled_time"),
-                        "address": format_canonical_address(sched),
-                        "booking_complete": True,
-                    }
-        # Opportunistic capture (only when relevant)
-        if not ((profile.get("first_name") or "").strip() and (profile.get("last_name") or "").strip()):
-            if sched.get("pending_step") == "need_name" or "my name" in inbound_lower or inbound_lower.startswith("name is"):
-                fn, ln = _extract_first_last(inbound_text)
-                if fn and ln:
-                    profile["first_name"] = profile.get("first_name") or fn
-                    profile["last_name"]  = profile.get("last_name") or ln
+        # Opportunistic capture, including explicit identity corrections.
+        explicit_name_signal = any(p in inbound_lower for p in ["my name", "name is", "this is", "i am ", "i'm "])
+        if sched.get("pending_step") == "need_name" or explicit_name_signal:
+            fn, ln = _extract_first_last(inbound_text)
+            if fn:
+                profile["first_name"] = fn
+                profile["name_explicit"] = True
+            if ln:
+                profile["last_name"] = ln
+                profile["name_explicit"] = True
 
-        if not (profile.get("email") or "").strip():
-            if sched.get("pending_step") == "need_email" or "@" in inbound_text:
-                em = _extract_email(inbound_text)
-                if em:
-                    profile["email"] = profile.get("email") or em
+        if sched.get("pending_step") == "need_email" or "@" in inbound_text:
+            em = _extract_email(inbound_text)
+            if em:
+                profile["email"] = em
+                profile["email_explicit"] = True
 
 
         # --------------------------------------
@@ -1867,25 +1991,18 @@ def generate_reply_for_inbound(
                 sched["intro_sent"] = True
             return _norm(s)
 
-        def _maybe_price_once(s: str, appt_type_local: str, booking_created: bool = False) -> str:
-            s = _norm(s)
-            if sched.get("price_disclosed"):
-                return s
-            if not s:
-                return s
-            try:
-                s = apply_price_injection(appt_type_local, s)
-            except Exception:
-                return s
-            if "$" in s:
-                sched["price_disclosed"] = True
-            elif booking_created:
+        def _maybe_price_once(s: str, appt_type_local: str) -> str:
+            if not sched.get("price_disclosed"):
+                try:
+                    s = apply_price_injection(appt_type_local, s)
+                except Exception:
+                    pass
                 sched["price_disclosed"] = True
             return _norm(s)
 
         def _finalize_sms(s: str, appt_type_local: str, booking_created: bool) -> str:
             s = _apply_intro_once(s)
-            s = _maybe_price_once(s, appt_type_local, booking_created=booking_created)
+            s = _maybe_price_once(s, appt_type_local)
 
             s = _strip_ai_tells(s)
             s = _shorten_texty(s)
@@ -1954,8 +2071,9 @@ def generate_reply_for_inbound(
         EMERGENCY_KEYWORDS = [
             "tree fell", "tree down", "power line", "lines down",
             "service ripped", "sparking", "burning", "fire",
-            "smoke", "no power", "power outage",
-            "urgent", "emergency"
+            "smoke", "no power", "power outage", "water in panel",
+            "water from panel", "wet panel", "water intrusion", "dripping from panel",
+            "arcing", "buzzing", "popping", "urgent", "emergency"
         ]
 
         IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
@@ -2014,7 +2132,7 @@ def generate_reply_for_inbound(
                 "breaker keeps", "gfci", "outlet not", "troubleshoot"
             ]):
                 appt_type = "TROUBLESHOOT_395"
-            elif any(w in inbound_lower for w in ["inspection", "whole home inspection", "electrical inspection", "home inspection", "inspector", "insurance inspection", "selling the property"]):
+            elif any(w in inbound_lower for w in ["inspection", "whole home inspection", "electrical inspection"]):
                 appt_type = "WHOLE_HOME_INSPECTION"
             else:
                 appt_type = "EVAL_195"
@@ -2186,22 +2304,15 @@ def generate_reply_for_inbound(
                 maybe_create_square_booking(phone, conv)
 
                 if sched.get("booking_created") and sched.get("square_booking_id"):
-                    canonical_addr = format_canonical_address(sched)
-                    try:
-                        human_d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d").strftime("%A, %B %d").replace(" 0", " ")
-                    except Exception:
-                        human_d = sched["scheduled_date"]
-                    booked_sms = (
-                        f"You are all set for {human_d} at {human_time}. "
-                        f"The service address is {canonical_addr}. "
-                        f"If anything changes before the visit, just text me here."
-                    )
+                    booked_when = canonical_service_datetime(sched) or f"{sched['scheduled_date']} at {human_time}"
+                    booked_where = canonical_service_address(sched) or model_addr
+                    booked_sms = f"You are all set for {booked_when}. The service address is {booked_where}. If anything changes before the visit, just text me here."
                     booked_sms = _finalize_sms(booked_sms, appt_type, booking_created=True)
                     return {
                         "sms_body": booked_sms,
                         "scheduled_date": sched["scheduled_date"],
                         "scheduled_time": sched["scheduled_time"],
-                        "address": canonical_addr,
+                        "address": model_addr,
                         "booking_complete": True
                     }
             except Exception as e:
@@ -2222,7 +2333,7 @@ def generate_reply_for_inbound(
             "sms_body": sms_body,
             "scheduled_date": model_date,
             "scheduled_time": model_time,
-            "address": format_canonical_address(sched) if sched.get("address_verified") else model_addr,
+            "address": model_addr,
             "booking_complete": False
         }
 
@@ -2240,89 +2351,18 @@ def generate_reply_for_inbound(
 
 
 
-def format_canonical_address(sched: dict) -> str:
-    """Return the best customer-facing address string from normalized data when available."""
-    norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
-    if norm:
-        line1 = (norm.get("address_line_1") or "").strip()
-        city = (norm.get("locality") or "").strip()
-        state = (norm.get("administrative_district_level_1") or "").strip()
-        postal = (norm.get("postal_code") or "").strip()
-        pieces = [p for p in [line1, city] if p]
-        tail = " ".join([p for p in [state, postal] if p]).strip()
-        if tail:
-            pieces.append(tail)
-        pretty = ", ".join([p for p in pieces if p]).strip()
-        if pretty:
-            return pretty
-    return (sched.get("raw_address") or "").strip()
-
-
-def build_post_booking_response(conv: dict, inbound_text: str) -> str | None:
-    """Answer common post-booking questions without restarting scheduling."""
-    txt = " ".join((inbound_text or "").strip().lower().split())
-    if not txt:
-        return None
-
-    sched = conv.setdefault("sched", {})
-    appt_type = (sched.get("appointment_type") or "EVAL_195").upper()
-    booked_date = (sched.get("scheduled_date") or "").strip()
-    booked_time = humanize_time((sched.get("scheduled_time") or "").strip())
-    addr = format_canonical_address(sched)
-
-    if any(k in txt for k in ["price", "cost", "charge", "$195", "$395", "how much"]):
-        if "TROUBLESHOOT" in appt_type:
-            return "This visit is set as a troubleshoot and repair appointment at $395. Any additional work would be explained in person first."
-        if "INSPECTION" in appt_type:
-            return "This visit is set as a home inspection at $395."
-        return "This visit is set as an on-site electrical evaluation at $195."
-
-    if any(k in txt for k in ["address", "where are you coming", "coming to", "service address"]):
-        if addr:
-            return f"I have the visit going to {addr}."
-        return "I have the address saved for the visit."
-
-    if any(k in txt for k in ["when", "what time", "what day", "appointment time", "appointment day"]):
-        if booked_date and booked_time:
-            try:
-                human_d = datetime.strptime(booked_date, "%Y-%m-%d").strftime("%A, %B %d").replace(" 0", " ")
-            except Exception:
-                human_d = booked_date
-            return f"You are set for {human_d} at {booked_time}."
-
-    if any(k in txt for k in ["how long", "window", "arrival window", "how long does it take"]):
-        return "The visit is booked as a one-hour appointment. We usually work within about a two-hour arrival window depending on the day."
-
-    if any(k in txt for k in ["card", "cash", "check", "payment", "pay"]):
-        return "Card or cash after the visit is totally fine."
-
-    if any(k in txt for k in ["what happens", "what should i expect", "what do i need to do", "anything else", "do i need to be home"]):
-        if "TROUBLESHOOT" in appt_type:
-            return "You are all set. We will come out, diagnose the issue on site, and explain anything we find before any additional work is done."
-        if "INSPECTION" in appt_type:
-            return "You are all set. We will come out, go through the home inspection items on site, and explain anything that stands out."
-        return "You are all set. We will come out, look everything over on site, and explain the next step in person."
-
-    if any(k in txt for k in ["running late", "be there", "eta", "on the way"]):
-        return "If anything changes before the visit, just text here and we will keep the appointment updated."
-
-    return None
-
-
 # ---------------------------------------------------
 # PRICE INJECTION HELPER (PATCH 2)
 # ---------------------------------------------------
 def apply_price_injection(appt_type: str, body: str) -> str:
-    body = (body or "").strip()
-    appt_type = (appt_type or "").upper()
     if "$" in body:
         return body
 
     if "TROUBLESHOOT" in appt_type:
-        return f"{body} The troubleshoot and repair visit is $395.".strip()
+        return f"{body} Troubleshooting and repair visits are $395."
     if "INSPECTION" in appt_type:
-        return f"{body} The home inspection visit is $395.".strip()
-    return f"{body} The on-site evaluation visit is $195.".strip()
+        return f"{body} Whole-home electrical inspections range from $375–$650 depending on square footage."
+    return f"{body} Our evaluation visit is $195."
 
 
 
@@ -2457,18 +2497,36 @@ def square_create_or_get_customer(
     # 1) Search
     cust = square_lookup_customer_by_phone(phone)
     if cust and cust.get("id"):
-        cid = cust["id"]
+        existing_given = (cust.get("given_name") or "").strip().lower()
+        existing_family = (cust.get("family_name") or "").strip().lower()
+        existing_email = (cust.get("email_address") or "").strip().lower()
+        requested_given = (profile.get("first_name") or "").strip().lower()
+        requested_family = (profile.get("last_name") or "").strip().lower()
+        requested_email = (profile.get("email") or "").strip().lower()
 
-        # Hydrate profile only if empty (never overwrite user-provided)
-        profile.setdefault("square_customer_id", cid)
+        explicit_name_conflict = bool(
+            profile.get("name_explicit") and (
+                (requested_given and existing_given and requested_given != existing_given) or
+                (requested_family and existing_family and requested_family != existing_family)
+            )
+        )
+        explicit_email_conflict = bool(
+            profile.get("email_explicit") and requested_email and existing_email and requested_email != existing_email
+        )
 
-        # Square fields
-        if not profile.get("first_name"):
-            profile["first_name"] = cust.get("given_name") or profile.get("first_name")
-        if not profile.get("last_name"):
-            profile["last_name"] = cust.get("family_name") or profile.get("last_name")
-        if not profile.get("email"):
-            profile["email"] = cust.get("email_address") or profile.get("email")
+        if not (explicit_name_conflict or explicit_email_conflict):
+            cid = cust["id"]
+
+            # Hydrate profile only if empty (never overwrite user-provided)
+            profile.setdefault("square_customer_id", cid)
+
+            # Square fields
+            if not profile.get("first_name"):
+                profile["first_name"] = cust.get("given_name") or profile.get("first_name")
+            if not profile.get("last_name"):
+                profile["last_name"] = cust.get("family_name") or profile.get("last_name")
+            if not profile.get("email"):
+                profile["email"] = cust.get("email_address") or profile.get("email")
 
         # Best-effort: pull address into our address memory if we don't already have one
         try:
@@ -2926,8 +2984,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
             "date": scheduled_date,
             "time": scheduled_time,
             "type": appointment_type,
-            "square_id": booking_id,
-            "address": format_canonical_address(sched)
+            "square_id": booking_id
         }
 
         if current_job.get("job_type"):
