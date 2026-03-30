@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -1166,6 +1167,78 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     update_address_assembly_state(sched)
     return True
 
+
+
+def force_capture_address_from_inbound(sched: dict, inbound_text: str) -> bool:
+    """
+    Deterministically capture address fragments from natural SMS replies.
+    Handles:
+      - "Bloomfield Ave" -> route only, asks for house number next
+      - "45 Bloomfield Ave" -> full street+number, asks for town/state next
+      - "54" while waiting on a house number -> merges into existing street
+      - "It's 54 Bloomfield Ave sorry" -> overwrites the prior street candidate
+    """
+    txt = (inbound_text or "").strip()
+    if not txt:
+        return False
+
+    low = txt.lower()
+    # Skip obvious non-address informational questions.
+    if any(x in low for x in ["how much", "price", "cost", "licensed", "insured", "card", "cash", "check", "payment", "permit", "dog", "dogs", "pet", "pets", "call when", "text when", "on the way"]):
+        # But do not skip if there is a clear street address embedded.
+        pass
+
+    update_address_assembly_state(sched)
+    current_missing = (sched.get("address_missing") or "").strip().lower()
+    raw_existing = (sched.get("raw_address") or "").strip()
+
+    cleaned = txt
+    cleaned = re.sub(r"^(ok|okay|its|it's|it is|im at|i'm at|my address is|address is|it\s+is)[\s,:-]*", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"(sorry|thanks|thank you)", "", cleaned, flags=re.I).strip(' ,.-')
+
+    street_pat = re.compile(
+        r"(\d{1,6}\s+[A-Za-z0-9.'\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace))",
+        flags=re.I
+    )
+    route_only_pat = re.compile(
+        r"([A-Za-z][A-Za-z0-9.'\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace))",
+        flags=re.I
+    )
+
+    # Full numbered street in one message.
+    m_full = street_pat.search(cleaned)
+    if m_full:
+        candidate = " ".join(m_full.group(1).split()).strip(' ,')
+        if candidate and candidate != raw_existing:
+            sched["raw_address"] = candidate
+            sched["normalized_address"] = None
+            update_address_assembly_state(sched)
+            return True
+        return False
+
+    # Customer only sent the missing house number while we already know the street.
+    if current_missing == "number" and raw_existing:
+        m_num = re.search(r"(\d{1,6})", cleaned)
+        if m_num and not route_only_pat.search(cleaned):
+            street_only = re.sub(r"^\d{1,6}\s+", "", raw_existing).strip()
+            if street_only:
+                sched["raw_address"] = f"{m_num.group(1)} {street_only}"
+                sched["normalized_address"] = None
+                update_address_assembly_state(sched)
+                return True
+
+    # Route-only street name, no number yet.
+    m_route = route_only_pat.search(cleaned)
+    if m_route:
+        candidate = " ".join(m_route.group(1).split()).strip(' ,')
+        if candidate:
+            sched["raw_address"] = candidate
+            sched["normalized_address"] = None
+            update_address_assembly_state(sched)
+            return True
+
+    return False
+
 def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     """Single deterministic next-step selector. Python enforces state; SRBs drive prompt choice."""
     import re
@@ -1417,6 +1490,18 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # Deterministic address capture for raw street / house-number replies.
+    try:
+        force_capture_address_from_inbound(sched, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms direct address capture failed:", repr(e))
+
+    # If the customer just corrected or completed the address, refresh immediately.
+    try:
+        try_early_address_normalize(sched)
+    except Exception as e:
+        print("[WARN] incoming_sms early normalize failed:", repr(e))
+
     # Deterministic fast path for pure interruption questions.
     # This prevents price / payment / permit questions from getting lost
     # behind the address collector when the inbound does not contain a new slot value.
@@ -1462,6 +1547,14 @@ def incoming_sms():
 
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
+
+    # One more deterministic address pass in case the inbound text corrected the house number
+    # but the model did not lock it cleanly.
+    try:
+        force_capture_address_from_inbound(sched, inbound_text)
+        try_early_address_normalize(sched)
+    except Exception as e:
+        print("[WARN] incoming_sms post-step4 address capture failed:", repr(e))
 
     recompute_pending_step(profile, sched)
 
@@ -2046,6 +2139,9 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
         return False
     if looks_like_slot_payload(inbound_text):
         return False
+    # If the message contains a street/address fragment, do not short-circuit.
+    if re.search(r"\b(?:\d{1,6}\s+)?[A-Za-z][A-Za-z0-9.'\- ]+\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", (inbound_text or ""), flags=re.I):
+        return False
     low = (inbound_text or "").lower().strip()
     interrupt_markers = [
         "how much", "price", "cost", "$195", "$395", "licensed", "insured",
@@ -2092,7 +2188,13 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
     sched = conv.setdefault("sched", {})
     appt = profile.get("upcoming_appointment") or {}
 
-    if not (sched.get("booking_created") and sched.get("square_booking_id")):
+    closed_thread = bool(
+        (sched.get("booking_created") and sched.get("square_booking_id"))
+        or sched.get("final_confirmation_accepted")
+        or sched.get("final_confirmation_sent")
+        or profile.get("upcoming_appointment")
+    )
+    if not closed_thread:
         return None
 
     low = (inbound_text or "").lower().strip()
@@ -2120,13 +2222,24 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
         sched["address_missing"] = None
         sched["address_parts"] = {}
         sched["pending_step"] = None
+        sched["final_confirmation_sent"] = False
+        sched["final_confirmation_accepted"] = False
         return None
 
+    if any(x in low for x in ["picture", "pictures", "photo", "photos", "image", "images"]):
+        return "Yes, you can send them over if you'd like, but we'll still evaluate everything in person."
+
+    if any(x in low for x in ["prepare", "prep", "anything i should do", "what should i do"]):
+        return "Nothing special. Just make sure we can safely get to the panel and work area when we arrive."
+
+    if any(x in low for x in ["card", "cash", "check", "payment", "pay", "forms of payment"]):
+        return "Card or cash after the visit is totally fine."
+
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
-        return "Yes, please make sure we can safely get to the panel when we arrive."
+        return "That is fine. Just make sure we can safely get to the panel when we arrive."
 
     if any(x in low for x in ["gate", "code", "lock", "locked", "access", "doorbell", "call when outside"]):
-        return "That's fine. Just make sure we can get to the panel when we arrive."
+        return "That is fine. Just make sure we can get to the panel when we arrive."
 
     if any(x in low for x in ["what time", "when are you coming", "what day", "when is my appointment", "are we good"]):
         date_txt = (appt.get("date") or sched.get("scheduled_date") or "").strip()
@@ -2137,7 +2250,7 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
             return f"You're all set for {date_txt}."
         return "You're all set for the visit."
 
-    if any(x in low for x in ["who is coming", "who's coming", "whos coming", "on the way", "arrival window", "will they call"]):
+    if any(x in low for x in ["who is coming", "who's coming", "whos coming", "on the way", "arrival window", "will they call", "text when"]):
         return "You'll get a text when we're on the way."
 
     if any(x in low for x in ["price", "how much", "cost"]):
