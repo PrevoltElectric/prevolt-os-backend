@@ -1369,8 +1369,6 @@ def incoming_sms():
     # ---------------------------------------------------
     try:
         if initial_sms:
-            import re
-
             m = re.search(r"\((.*?)\)", initial_sms)
             if m and not sched.get("raw_address"):
                 extracted = m.group(1).strip()
