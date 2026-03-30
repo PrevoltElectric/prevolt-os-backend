@@ -1186,7 +1186,8 @@ def incoming_sms():
     inbound_text = request.form.get("Body", "") or ""
     phone_raw   = request.form.get("From", "")
     phone       = (phone_raw or "").replace("whatsapp:", "")
-    convo_key   = phone or request.form.get("MessageSid") or request.form.get("SmsSid") or request.form.get("CallSid") or "unknown"
+    inbound_sid = request.form.get("MessageSid") or request.form.get("SmsSid") or ""
+    convo_key   = phone or inbound_sid or request.form.get("CallSid") or "unknown"
     inbound_low  = inbound_text.lower().strip()
 
     # SECRET RESET COMMAND
@@ -1228,6 +1229,14 @@ def incoming_sms():
     # Initialize layers (HARDENED: never assume dict shape)
     # ---------------------------------------------------
     conv = conversations.setdefault(phone, {})
+
+    # Twilio and WhatsApp can occasionally retry the same inbound webhook.
+    # If we already handled this exact inbound SID, return the last outbound text
+    # instead of re-running state transitions and sending a duplicate prompt.
+    if inbound_sid and conv.get("last_inbound_sid") == inbound_sid and conv.get("last_sms_body"):
+        tw = MessagingResponse()
+        tw.message(conv.get("last_sms_body"))
+        return Response(str(tw), mimetype="text/xml")
 
     profile = conv.setdefault("profile", {})
     profile.setdefault("name", None)
@@ -1383,6 +1392,7 @@ def incoming_sms():
     if sms_body in generic_fillers:
         sms_body = next_prompt
 
+    conv["last_inbound_sid"] = inbound_sid
     conv["last_sms_body"] = sms_body
 
     tw = MessagingResponse()
@@ -2694,6 +2704,24 @@ def generate_reply_for_inbound(
         if model_time:
             sched["scheduled_time"] = model_time
 
+        # Mid-flow customer interruptions: answer briefly, then return to the next step.
+        # Run this AFTER model extraction so combined messages like
+        # "Tuesdays usually work best. Is the $195 just to come out?" can
+        # both save the day preference and answer pricing without losing state.
+        # IMPORTANT: this must happen BEFORE the address-prompt override so
+        # pricing and other short questions still get answered while we are
+        # collecting the address.
+        interruption_reply = interruption_answer_and_return_prompt(conv, inbound_text)
+        if interruption_reply and not IS_EMERGENCY and not sched.get("booking_created"):
+            interruption_reply = _finalize_sms(interruption_reply, appt_type, booking_created=False)
+            return {
+                "sms_body": interruption_reply,
+                "scheduled_date": sched.get("scheduled_date"),
+                "scheduled_time": sched.get("scheduled_time"),
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+
         # If address STILL not verified, override immediately (humanized prompt stays in builder)
         if not sched.get("address_verified"):
             msg = build_address_prompt(sched)
@@ -2702,21 +2730,6 @@ def generate_reply_for_inbound(
                 "sms_body": msg,
                 "scheduled_date": sched.get("scheduled_date") or model_date,
                 "scheduled_time": sched.get("scheduled_time") or model_time,
-                "address": sched.get("raw_address"),
-                "booking_complete": False
-            }
-
-        # Mid-flow customer interruptions: answer briefly, then return to the next step.
-        # Run this AFTER model extraction so combined messages like
-        # "Tuesdays usually work best. Is the $195 just to come out?" can
-        # both save the day preference and answer pricing without losing state.
-        interruption_reply = interruption_answer_and_return_prompt(conv, inbound_text)
-        if interruption_reply and not IS_EMERGENCY and not sched.get("booking_created"):
-            interruption_reply = _finalize_sms(interruption_reply, appt_type, booking_created=False)
-            return {
-                "sms_body": interruption_reply,
-                "scheduled_date": sched.get("scheduled_date"),
-                "scheduled_time": sched.get("scheduled_time"),
                 "address": sched.get("raw_address"),
                 "booking_complete": False
             }
