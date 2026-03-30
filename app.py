@@ -1234,7 +1234,10 @@ def force_capture_address_from_inbound(sched: dict, inbound_text: str) -> bool:
         if candidate:
             sched["raw_address"] = candidate
             sched["normalized_address"] = None
-            update_address_assembly_state(sched)
+            sched["address_candidate"] = candidate
+            sched["address_verified"] = False
+            sched["address_missing"] = "number"
+            sched["address_parts"] = {"street": True, "number": False, "city": False, "state": False, "zip": False, "source": "raw_address"}
             return True
 
     return False
@@ -1870,7 +1873,8 @@ def yes_text(text: str) -> bool:
     low = normalize_short_reply(text)
     if low in {"yes", "y", "yeah", "yep", "correct", "that is correct", "right", "it is", "it is correct", "thats right", "that's right"}:
         return True
-    if low.startswith("yes ") and any(x in low for x in ["correct", "right"]):
+    yes_markers = ["yes", "yeah", "yep", "correct", "right", "thats right", "that's right"]
+    if any(marker in low for marker in yes_markers):
         return True
     return False
 
@@ -1989,9 +1993,16 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
     if state in {"awaiting_new_person_confirmation", "awaiting_new_person_confirmation_multi"}:
         candidate_first = normalize_person_name(sched.get("name_engine_candidate_first") or "")
         if yes_text(low):
-            profile["active_first_name"] = candidate_first
-            profile["first_name"] = candidate_first
+            corrected_first, _ = extract_possible_person_name(inbound_text)
+            chosen_first = candidate_first
+            if corrected_first:
+                corrected_first = normalize_person_name(corrected_first)
+                if corrected_first and corrected_first.lower() != candidate_first.lower():
+                    chosen_first = corrected_first
+            profile["active_first_name"] = chosen_first
+            profile["first_name"] = chosen_first
             profile["identity_source"] = "new_person_confirmed_from_voicemail"
+            sched["name_engine_candidate_first"] = chosen_first
             sched["name_engine_state"] = "awaiting_new_person_last_name"
             return "Perfect. What is your last name?"
         if no_text(low):
