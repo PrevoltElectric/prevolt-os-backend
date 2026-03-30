@@ -180,7 +180,7 @@ def extract_explicit_time_from_text(text: str) -> str | None:
     if not s:
         return None
 
-    m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m', s, flags=re.I)
+    m = re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m\b', s, flags=re.I)
     if m:
         hh = int(m.group(1))
         mm = int(m.group(2) or '00')
@@ -192,11 +192,11 @@ def extract_explicit_time_from_text(text: str) -> str | None:
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
-    m = re.search(r'([01]?\d|2[0-3]):([0-5]\d)', s)
+    m = re.search(r'\b([01]?\d|2[0-3]):([0-5]\d)\b', s)
     if m:
         return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
 
-    m = re.search(r'(\d{3,4})', s)
+    m = re.search(r'\b(\d{3,4})\b', s)
     if m:
         raw = m.group(1).zfill(4)
         hh = int(raw[:2])
@@ -1091,17 +1091,17 @@ def extract_city_state_from_reply(text: str) -> tuple[str | None, str | None]:
 
     low = txt.lower()
     state = None
-    if re.search(r"ct|connecticut", low):
+    if re.search(r"\bct\b|\bconnecticut\b", low):
         state = "CT"
-        txt = re.sub(r"ct|connecticut", "", txt, flags=re.I).strip(" ,")
-    elif re.search(r"ma|massachusetts", low):
+        txt = re.sub(r"\bct\b|\bconnecticut\b", "", txt, flags=re.I).strip(" ,")
+    elif re.search(r"\bma\b|\bmassachusetts\b", low):
         state = "MA"
-        txt = re.sub(r"ma|massachusetts", "", txt, flags=re.I).strip(" ,")
+        txt = re.sub(r"\bma\b|\bmassachusetts\b", "", txt, flags=re.I).strip(" ,")
 
     # Reject obvious non-city inputs
     if re.search(r"\d", txt):
         return None, state
-    if re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", txt, flags=re.I):
+    if re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", txt, flags=re.I):
         return None, state
 
     city = " ".join(w.capitalize() for w in txt.split()) if txt else None
@@ -1134,7 +1134,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
 
     # State-only reply like 'CT'
     if not city and state:
-        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)", raw, flags=re.I):
+        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)\b", raw, flags=re.I):
             merged = f"{raw}, {state}"
         else:
             merged = f"{raw}, {state}"
@@ -1142,7 +1142,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     elif city:
         base = raw
         # If raw already ends with the same city/state, do nothing.
-        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?", raw, flags=re.I):
+        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?\b", raw, flags=re.I):
             merged = raw if not state else re.sub(r",\s*([A-Za-z .'-]+)(?:,\s*(CT|MA))?$", rf", {city}, {state}", raw, flags=re.I)
         else:
             merged = f"{base}, {city}" + (f", {state}" if state else "")
@@ -1193,15 +1193,15 @@ def force_capture_address_from_inbound(sched: dict, inbound_text: str) -> bool:
     raw_existing = (sched.get("raw_address") or "").strip()
 
     cleaned = txt
-    cleaned = re.sub(r"^(ok|okay|its|it's|it is|im at|i'm at|my address is|address is|it\s+is)[\s,:-]*", "", cleaned, flags=re.I).strip()
-    cleaned = re.sub(r"(sorry|thanks|thank you)", "", cleaned, flags=re.I).strip(' ,.-')
+    cleaned = re.sub(r"^(ok|okay|its|it's|it is|im at|i'm at|my address is|address is|it\s+is)\b[\s,:-]*", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"\b(sorry|thanks|thank you)\b", "", cleaned, flags=re.I).strip(' ,.-')
 
     street_pat = re.compile(
-        r"(\d{1,6}\s+[A-Za-z0-9.'\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace))",
+        r"\b(\d{1,6}\s+[A-Za-z0-9.'\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace))\b",
         flags=re.I
     )
     route_only_pat = re.compile(
-        r"([A-Za-z][A-Za-z0-9.'\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace))",
+        r"\b([A-Za-z][A-Za-z0-9.'\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace))\b",
         flags=re.I
     )
 
@@ -1218,7 +1218,7 @@ def force_capture_address_from_inbound(sched: dict, inbound_text: str) -> bool:
 
     # Customer only sent the missing house number while we already know the street.
     if current_missing == "number" and raw_existing:
-        m_num = re.search(r"(\d{1,6})", cleaned)
+        m_num = re.search(r"\b(\d{1,6})\b", cleaned)
         if m_num and not route_only_pat.search(cleaned):
             street_only = re.sub(r"^\d{1,6}\s+", "", raw_existing).strip()
             if street_only:
@@ -1564,8 +1564,15 @@ def incoming_sms():
     sms_body = (reply.get("sms_body") or "").strip()
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
-    # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
+    # Route-level guardrail: override obvious state mismatches and generic filler.
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
+    sms_low = sms_body.lower()
+    missing_atom = (sched.get("address_missing") or "").strip().lower()
+    if sched.get("pending_step") == "need_address":
+        if missing_atom == "number" and ("what street" in sms_low or "street name" in sms_low or "which street" in sms_low):
+            sms_body = build_address_prompt(sched)
+        elif missing_atom == "street" and ("house number" in sms_low or "street number" in sms_low or "what number" in sms_low):
+            sms_body = build_address_prompt(sched)
     if sms_body in generic_fillers:
         sms_body = next_prompt
 
@@ -1769,6 +1776,8 @@ def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
     patterns = [
         r"\b(?:my name is|this is|i am|i'm)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
         r"\bname\s+is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
+        r"^it(?:\'s| is)?\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+(?:yes|yeah|yep|correct|right))?$",
+        r"^(?:yes|yeah|yep|correct|right)\s+it(?:\'s| is)?\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?$",
     ]
     for pat in patterns:
         m = re.search(pat, txt, flags=re.I)
@@ -2131,9 +2140,9 @@ def looks_like_slot_payload(inbound_text: str) -> bool:
         return False
     if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", txt, flags=re.I):
         return True
-    if re.search(r"\d{1,6}", txt) and re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
+    if re.search(r"\b\d{1,6}\b", txt) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
         return True
-    if re.search(r"\d{1,2}(:\d{2})?\s*(am|pm)", low, flags=re.I):
+    if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", low, flags=re.I):
         return True
     if re.search(r"^\d{3,4}$", txt):
         return True
