@@ -1895,14 +1895,15 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str) -> str 
         answer = "If anything needs a permit, we'll go over that during the visit."
     elif any(x in low for x in ["card", "cash", "check", "payment"]):
         answer = "Card or cash after the visit is fine."
-    elif any(x in low for x in ["how much", "price", "cost"]) and sched.get("price_disclosed"):
+    elif any(x in low for x in ["how much", "price", "cost", "$195", "$395"]):
         appt = (sched.get("appointment_type") or "").upper()
         if "TROUBLESHOOT" in appt:
-            answer = "It's $395 for the troubleshoot visit."
+            answer = "The $395 is the troubleshoot and repair visit to come out and diagnose the issue."
         elif "INSPECTION" in appt:
-            answer = "Whole-home inspections run $375 to $650 depending on square footage."
+            answer = "Whole-home inspections run $395, and larger homes can range higher depending on square footage."
         else:
-            answer = "It's $195 for the visit."
+            answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
+        sched["price_disclosed"] = True
 
     if not answer:
         return None
@@ -2613,17 +2614,6 @@ def generate_reply_for_inbound(
         ):
             sched["final_confirmation_accepted"] = True
 
-        # Mid-flow customer interruptions: answer briefly, then return to the next step.
-        interruption_reply = interruption_answer_and_return_prompt(conv, inbound_text)
-        if interruption_reply and not IS_EMERGENCY and not sched.get("booking_created"):
-            return {
-                "sms_body": interruption_reply,
-                "scheduled_date": sched.get("scheduled_date"),
-                "scheduled_time": sched.get("scheduled_time"),
-                "address": sched.get("raw_address"),
-                "booking_complete": False
-            }
-
         # --------------------------------------
         # Build System Prompt
         # --------------------------------------
@@ -2716,6 +2706,21 @@ def generate_reply_for_inbound(
                 "booking_complete": False
             }
 
+        # Mid-flow customer interruptions: answer briefly, then return to the next step.
+        # Run this AFTER model extraction so combined messages like
+        # "Tuesdays usually work best. Is the $195 just to come out?" can
+        # both save the day preference and answer pricing without losing state.
+        interruption_reply = interruption_answer_and_return_prompt(conv, inbound_text)
+        if interruption_reply and not IS_EMERGENCY and not sched.get("booking_created"):
+            interruption_reply = _finalize_sms(interruption_reply, appt_type, booking_created=False)
+            return {
+                "sms_body": interruption_reply,
+                "scheduled_date": sched.get("scheduled_date"),
+                "scheduled_time": sched.get("scheduled_time"),
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+
         # --------------------------------------
         # AUTOBOOKING (Step 5)
         # --------------------------------------
@@ -2747,8 +2752,7 @@ def generate_reply_for_inbound(
                     sched["last_final_confirmation_key"] = None
                     booked_sms = (
                         f"You're all set for {human_day} at {human_time}. "
-                        f"We've got the visit booked and attached to your address. "
-                        f"Confirmation: {sched.get('square_booking_id')}."
+                        "We have you on the schedule."
                     )
                     booked_sms = _finalize_sms(booked_sms, appt_type, booking_created=True)
                     return {
