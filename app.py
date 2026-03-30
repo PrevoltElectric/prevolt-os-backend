@@ -1608,11 +1608,14 @@ def wrap_name_engine_message(sched: dict, message: str, first_name: str | None =
         return msg
 
     intro = f"Hello {first_name}, this is Prevolt Electric." if (first_name or "").strip() else "Hello, this is Prevolt Electric."
+    context = "I'm following up on the service request from this number."
 
+    # The very first identity-related text must ALWAYS establish who we are and why we're texting.
+    # Never lead with a naked verification question.
     if not sched.get("name_engine_branded"):
         sched["name_engine_branded"] = True
         sched["intro_sent"] = True
-        return f"{intro} {msg}".strip()
+        return f"{intro} {context} {msg}".strip()
 
     return msg
 
@@ -1730,7 +1733,7 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
             sched["name_engine_candidate_first"] = voicemail_first
             sched["name_engine_candidate_last"] = voicemail_last
             sched["name_engine_expected_known_first"] = known_names[0]
-            return wrap_name_engine_message(sched, f"Last time we worked with {known_names[0]} from this number. You said your name in the voicemail was {voicemail_first}. Is that right?", voicemail_first)
+            return wrap_name_engine_message(sched, f"I have {known_names[0]} on file from a past visit, but the voicemail said {voicemail_first}. Is this {voicemail_first}?", voicemail_first)
 
         # Multiple known people and voicemail gives a new first name -> clarify against the known names.
         if len(known_names) >= 2:
@@ -1738,7 +1741,7 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
             sched["name_engine_state"] = "awaiting_new_person_confirmation_multi"
             sched["name_engine_candidate_first"] = voicemail_first
             sched["name_engine_candidate_last"] = voicemail_last
-            return wrap_name_engine_message(sched, f"I have {joined} on this number. You said your name in the voicemail was {voicemail_first}. Is that right?", voicemail_first)
+            return wrap_name_engine_message(sched, f"I have {joined} on file for this number, but the voicemail said {voicemail_first}. Is this {voicemail_first}?", voicemail_first)
 
         # No known people yet -> use voicemail first name as active first name, but still collect last/email later.
         profile["active_first_name"] = voicemail_first
@@ -1779,7 +1782,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 return wrap_name_engine_message(sched, f"No problem. Which person is calling today, {joined}?")
             sched["name_engine_state"] = "awaiting_manual_first_name"
             return wrap_name_engine_message(sched, "No problem. What first name should I use today?")
-        return wrap_name_engine_message(sched, f"Just to confirm, you said your name was {candidate_first}. Is that right?", candidate_first)
+        return wrap_name_engine_message(sched, f"I heard the name {candidate_first}. Did I get that right?", candidate_first)
 
     if state == "awaiting_known_person_selection":
         for p in get_known_people(profile):
