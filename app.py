@@ -1231,9 +1231,20 @@ def incoming_sms():
     conv = conversations.setdefault(phone, {})
 
     # Twilio and WhatsApp can occasionally retry the same inbound webhook.
-    # If we already handled this exact inbound SID, return the last outbound text
-    # instead of re-running state transitions and sending a duplicate prompt.
+    # Guard both by inbound SID and by a short body fingerprint window.
+    inbound_fingerprint = re.sub(r"\s+", " ", inbound_low).strip()
+    now_ts = time.time()
     if inbound_sid and conv.get("last_inbound_sid") == inbound_sid and conv.get("last_sms_body"):
+        tw = MessagingResponse()
+        tw.message(conv.get("last_sms_body"))
+        return Response(str(tw), mimetype="text/xml")
+    if (
+        inbound_fingerprint
+        and conv.get("last_inbound_fingerprint") == inbound_fingerprint
+        and conv.get("last_inbound_fingerprint_ts")
+        and (now_ts - float(conv.get("last_inbound_fingerprint_ts") or 0)) <= 90
+        and conv.get("last_sms_body")
+    ):
         tw = MessagingResponse()
         tw.message(conv.get("last_sms_body"))
         return Response(str(tw), mimetype="text/xml")
@@ -1355,6 +1366,25 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # Deterministic fast path for pure interruption questions.
+    # This prevents price / payment / permit questions from getting lost
+    # behind the address collector when the inbound does not contain a new slot value.
+    fast_interrupt = None
+    try:
+        if should_short_circuit_interrupt(conv, inbound_text):
+            fast_interrupt = interruption_answer_and_return_prompt(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms fast interrupt failed:", repr(e))
+
+    if fast_interrupt:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = fast_interrupt.strip()
+        tw = MessagingResponse()
+        tw.message(fast_interrupt.strip())
+        return Response(str(tw), mimetype="text/xml")
+
     # ---------------------------------------------------
     # Run Step 4
     # ---------------------------------------------------
@@ -1393,6 +1423,8 @@ def incoming_sms():
         sms_body = next_prompt
 
     conv["last_inbound_sid"] = inbound_sid
+    conv["last_inbound_fingerprint"] = inbound_fingerprint
+    conv["last_inbound_fingerprint_ts"] = now_ts
     conv["last_sms_body"] = sms_body
 
     tw = MessagingResponse()
@@ -1684,8 +1716,14 @@ def list_known_first_names(profile: dict) -> list[str]:
             names.append(fn)
     return names
 
-def yes_text(text: str) -> bool:
+def normalize_short_reply(text: str) -> str:
     low = " ".join((text or "").strip().lower().split())
+    low = re.sub(r"[^a-z0-9' ]+", "", low)
+    low = " ".join(low.split())
+    return low
+
+def yes_text(text: str) -> bool:
+    low = normalize_short_reply(text)
     if low in {"yes", "y", "yeah", "yep", "correct", "that is correct", "right", "it is", "it is correct", "thats right", "that's right"}:
         return True
     if low.startswith("yes ") and any(x in low for x in ["correct", "right"]):
@@ -1693,11 +1731,11 @@ def yes_text(text: str) -> bool:
     return False
 
 def no_text(text: str) -> bool:
-    low = (text or "").strip().lower()
+    low = normalize_short_reply(text)
     return low in {"no", "n", "nope", "not me", "wrong", "incorrect", "that is wrong", "that's wrong"}
 
 def confirmation_accept_text(text: str) -> bool:
-    low = " ".join((text or "").strip().lower().split())
+    low = normalize_short_reply(text)
     if not low:
         return False
 
@@ -1929,6 +1967,42 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str) -> str 
     if next_prompt and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}:
         return f"{answer} {next_prompt}"
     return answer
+
+
+def looks_like_slot_payload(inbound_text: str) -> bool:
+    txt = (inbound_text or "").strip()
+    low = txt.lower()
+    if not txt:
+        return False
+    if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", txt, flags=re.I):
+        return True
+    if re.search(r"\d{1,6}", txt) and re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
+        return True
+    if re.search(r"\d{1,2}(:\d{2})?\s*(am|pm)", low, flags=re.I):
+        return True
+    if re.search(r"^\d{3,4}$", txt):
+        return True
+    if any(day in low for day in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","tomorrow","today","next monday","next tuesday","next wednesday","next thursday","next friday","next saturday","next sunday"]):
+        return True
+    if len(txt.split()) <= 3 and re.fullmatch(r"[A-Za-z'\- ]+", txt):
+        return True
+    return False
+
+
+def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
+    sched = conv.setdefault("sched", {})
+    if sched.get("booking_created") and sched.get("square_booking_id"):
+        return False
+    if looks_like_slot_payload(inbound_text):
+        return False
+    low = (inbound_text or "").lower().strip()
+    interrupt_markers = [
+        "how much", "price", "cost", "$195", "$395", "licensed", "insured",
+        "card", "cash", "check", "payment", "permit", "permit required",
+        "dog", "dogs", "pet", "pets", "call when", "text when", "on the way",
+        "arrival window", "bring anything", "materials"
+    ]
+    return any(x in low for x in interrupt_markers)
 
 def looks_like_new_booking_request(inbound_text: str) -> bool:
     low = (inbound_text or "").lower().strip()
