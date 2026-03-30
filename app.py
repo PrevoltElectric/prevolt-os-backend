@@ -164,6 +164,47 @@ def humanize_time(t: str) -> str:
         hh12 = 12
     return f"{hh12}:{mm:02d} {ap}"
 
+def extract_explicit_time_from_text(text: str) -> str | None:
+    """
+    Pull an explicit time out of a mixed customer message.
+    Examples:
+      - "2pm and I have dogs is that ok" -> "14:00"
+      - "around 2:30 pm" -> "14:30"
+      - "1500" -> "15:00"
+    Returns None for vague phrases like "this afternoon" or "later".
+    """
+    import re
+
+    s = (text or "").strip().lower()
+    if not s:
+        return None
+
+    m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m', s, flags=re.I)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2) or '00')
+        ap = m.group(3).lower()
+        if hh == 12:
+            hh = 0
+        if ap == 'p':
+            hh += 12
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+
+    m = re.search(r'([01]?\d|2[0-3]):([0-5]\d)', s)
+    if m:
+        return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+
+    m = re.search(r'(\d{3,4})', s)
+    if m:
+        raw = m.group(1).zfill(4)
+        hh = int(raw[:2])
+        mm = int(raw[2:])
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+
+    return None
+
 def send_sms(to_number: str, body: str) -> None:
     """
     Outbound always routes to WhatsApp sandbox for safe testing.
@@ -1183,7 +1224,6 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
-    import re
     inbound_text = request.form.get("Body", "") or ""
     phone_raw   = request.form.get("From", "")
     phone       = (phone_raw or "").replace("whatsapp:", "")
@@ -2738,6 +2778,13 @@ def generate_reply_for_inbound(
         model_date = ai_raw.get("scheduled_date")
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
+
+        # Heuristic slot salvage: preserve explicit times embedded in mixed messages
+        # like "2pm and I have dogs is that ok?" when the LLM only answers the question.
+        if not model_time:
+            salvaged_time = extract_explicit_time_from_text(inbound_text)
+            if salvaged_time:
+                model_time = salvaged_time
 
         # --------------------------------------
         # RESET-LOCK (never lose good stored values)
