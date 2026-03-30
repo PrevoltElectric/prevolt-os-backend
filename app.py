@@ -456,6 +456,9 @@ def handle_call_selection():
     # Emergency flags (safe defaults)
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
+    sched.setdefault("final_confirmation_sent", False)
+    sched.setdefault("final_confirmation_accepted", False)
+    sched.setdefault("last_final_confirmation_key", None)
 
     # -----------------------------
     # OPTION 1 → RESIDENTIAL
@@ -1156,6 +1159,9 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
 
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
+            final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
+            if sched.get("final_confirmation_accepted") and sched.get("last_final_confirmation_key") == final_key:
+                return "Everything looks good here."
             try:
                 if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
                     d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
@@ -1165,6 +1171,8 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
             except Exception:
                 human_d = (sched.get("scheduled_date") or "that day").strip()
             human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else "that time"
+            sched["final_confirmation_sent"] = True
+            sched["last_final_confirmation_key"] = final_key
             return f"Just to confirm, {human_d} at {human_t}. Is that still good?"
         return "Okay."
 
@@ -1667,12 +1675,32 @@ def list_known_first_names(profile: dict) -> list[str]:
     return names
 
 def yes_text(text: str) -> bool:
-    low = (text or "").strip().lower()
-    return low in {"yes", "y", "yeah", "yep", "correct", "that is correct", "right", "it is", "it is correct", "thats right", "that's right"}
+    low = " ".join((text or "").strip().lower().split())
+    if low in {"yes", "y", "yeah", "yep", "correct", "that is correct", "right", "it is", "it is correct", "thats right", "that's right"}:
+        return True
+    if low.startswith("yes ") and any(x in low for x in ["correct", "right"]):
+        return True
+    return False
 
 def no_text(text: str) -> bool:
     low = (text or "").strip().lower()
     return low in {"no", "n", "nope", "not me", "wrong", "incorrect", "that is wrong", "that's wrong"}
+
+def confirmation_accept_text(text: str) -> bool:
+    low = " ".join((text or "").strip().lower().split())
+    if not low:
+        return False
+
+    direct = {
+        "yes", "y", "yeah", "yep", "sure", "ok", "okay", "correct",
+        "that works", "sounds good", "book it", "schedule it", "lets do it",
+        "let's do it", "do it", "go ahead", "yes please", "works for me"
+    }
+    if low in direct:
+        return True
+
+    yes_words = ["yes", "yeah", "yep", "correct", "right", "works", "good", "book", "schedule"]
+    return any(w in low for w in yes_words)
 
 def apply_known_person_to_active(profile: dict, person: dict, *, source: str) -> None:
     if not isinstance(person, dict):
@@ -1880,8 +1908,14 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str) -> str 
         return None
 
     recompute_pending_step(profile, sched)
+
+    # Do not restate the final confirmation while answering an interrupting question.
+    if sched.get("final_confirmation_sent") or sched.get("final_confirmation_accepted"):
+        if not sched.get("pending_step") and sched.get("scheduled_date") and sched.get("scheduled_time"):
+            return answer
+
     next_prompt = choose_next_prompt_from_state(conv, inbound_text="")
-    if next_prompt and next_prompt not in {"Okay.", "Okay", answer}:
+    if next_prompt and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}:
         return f"{answer} {next_prompt}"
     return answer
 
@@ -2130,6 +2164,9 @@ def generate_reply_for_inbound(
         sched.setdefault("price_disclosed", False)
         sched.setdefault("awaiting_emergency_confirm", False)
         sched.setdefault("emergency_approved", False)
+        sched.setdefault("final_confirmation_sent", False)
+        sched.setdefault("final_confirmation_accepted", False)
+        sched.setdefault("last_final_confirmation_key", None)
 
         # Booking flags
         sched.setdefault("booking_created", False)
@@ -2562,6 +2599,20 @@ def generate_reply_for_inbound(
         except Exception as e:
             print("[WARN] partial address merge patch failed:", repr(e))
 
+        # If the customer is accepting the last final confirmation, lock that immediately.
+        current_final_key = None
+        if sched.get("scheduled_date") and sched.get("scheduled_time"):
+            current_final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
+
+        if (
+            sched.get("final_confirmation_sent")
+            and not sched.get("booking_created")
+            and confirmation_accept_text(inbound_text)
+            and current_final_key
+            and sched.get("last_final_confirmation_key") == current_final_key
+        ):
+            sched["final_confirmation_accepted"] = True
+
         # Mid-flow customer interruptions: answer briefly, then return to the next step.
         interruption_reply = interruption_answer_and_return_prompt(conv, inbound_text)
         if interruption_reply and not IS_EMERGENCY and not sched.get("booking_created"):
@@ -2691,6 +2742,9 @@ def generate_reply_for_inbound(
                     except Exception:
                         human_day = sched["scheduled_date"]
 
+                    sched["final_confirmation_sent"] = False
+                    sched["final_confirmation_accepted"] = False
+                    sched["last_final_confirmation_key"] = None
                     booked_sms = (
                         f"You're all set for {human_day} at {human_time}. "
                         f"We've got the visit booked and attached to your address. "
