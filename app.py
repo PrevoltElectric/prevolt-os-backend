@@ -1183,6 +1183,7 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
 # ---------------------------------------------------
 @app.route("/incoming-sms", methods=["POST"])
 def incoming_sms():
+    import re
     inbound_text = request.form.get("Body", "") or ""
     phone_raw   = request.form.get("From", "")
     phone       = (phone_raw or "").replace("whatsapp:", "")
