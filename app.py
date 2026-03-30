@@ -1599,6 +1599,22 @@ def ensure_name_engine_defaults(profile: dict, sched: dict) -> None:
     sched.setdefault("name_engine_candidate_last", None)
     sched.setdefault("name_engine_expected_known_first", None)
     sched.setdefault("name_engine_selected_first", None)
+    sched.setdefault("name_engine_branded", False)
+
+
+def wrap_name_engine_message(sched: dict, message: str, first_name: str | None = None) -> str:
+    msg = (message or "").strip()
+    if not msg:
+        return msg
+
+    intro = f"Hello {first_name}, this is Prevolt Electric." if (first_name or "").strip() else "Hello, this is Prevolt Electric."
+
+    if not sched.get("name_engine_branded"):
+        sched["name_engine_branded"] = True
+        sched["intro_sent"] = True
+        return f"{intro} {msg}".strip()
+
+    return msg
 
 def get_known_people(profile: dict) -> list:
     ppl = profile.setdefault("known_people", [])
@@ -1714,7 +1730,7 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
             sched["name_engine_candidate_first"] = voicemail_first
             sched["name_engine_candidate_last"] = voicemail_last
             sched["name_engine_expected_known_first"] = known_names[0]
-            return f"Hello {voicemail_first}, last time we worked with {known_names[0]} from this number. You said your name in the voicemail was {voicemail_first}. Is that right?"
+            return wrap_name_engine_message(sched, f"Last time we worked with {known_names[0]} from this number. You said your name in the voicemail was {voicemail_first}. Is that right?", voicemail_first)
 
         # Multiple known people and voicemail gives a new first name -> clarify against the known names.
         if len(known_names) >= 2:
@@ -1722,7 +1738,7 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
             sched["name_engine_state"] = "awaiting_new_person_confirmation_multi"
             sched["name_engine_candidate_first"] = voicemail_first
             sched["name_engine_candidate_last"] = voicemail_last
-            return f"Hello {voicemail_first}, I have {joined} on this number. You said your name in the voicemail was {voicemail_first}. Is that right?"
+            return wrap_name_engine_message(sched, f"I have {joined} on this number. You said your name in the voicemail was {voicemail_first}. Is that right?", voicemail_first)
 
         # No known people yet -> use voicemail first name as active first name, but still collect last/email later.
         profile["active_first_name"] = voicemail_first
@@ -1734,7 +1750,7 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
     if len(known_names) >= 2 and not get_active_first_name(profile):
         joined = ", ".join(known_names[:-1]) + f" or {known_names[-1]}" if len(known_names) > 1 else known_names[0]
         sched["name_engine_state"] = "awaiting_known_person_selection"
-        return f"Hello, I have {joined} on this number. Which person is calling today?"
+        return wrap_name_engine_message(sched, f"I have {joined} on this number. Which person is calling today?")
 
     return None
 
@@ -1754,16 +1770,16 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
             profile["first_name"] = candidate_first
             profile["identity_source"] = "new_person_confirmed_from_voicemail"
             sched["name_engine_state"] = "awaiting_new_person_last_name"
-            return f"Got it. What is your last name?"
+            return wrap_name_engine_message(sched, "Just to make sure I have the right person, what is your last name?")
         if no_text(low):
             known_names = list_known_first_names(profile)
             if known_names:
                 joined = ", ".join(known_names[:-1]) + f" or {known_names[-1]}" if len(known_names) > 1 else known_names[0]
                 sched["name_engine_state"] = "awaiting_known_person_selection"
-                return f"No problem. Which person is calling today, {joined}?"
+                return wrap_name_engine_message(sched, f"No problem. Which person is calling today, {joined}?")
             sched["name_engine_state"] = "awaiting_manual_first_name"
-            return "No problem. What first name should I use today?"
-        return f"Just to confirm, you said your name was {candidate_first}. Is that right?"
+            return wrap_name_engine_message(sched, "No problem. What first name should I use today?")
+        return wrap_name_engine_message(sched, f"Just to confirm, you said your name was {candidate_first}. Is that right?", candidate_first)
 
     if state == "awaiting_known_person_selection":
         for p in get_known_people(profile):
@@ -1772,7 +1788,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 apply_known_person_to_active(profile, p, source="known_person_selection")
                 sched["name_engine_state"] = None
                 return None
-        return f"Which first name should I use today?"
+        return wrap_name_engine_message(sched, "Which first name should I use today?")
 
     if state == "awaiting_manual_first_name":
         first, last = extract_possible_person_name(inbound_text)
@@ -1787,10 +1803,10 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 profile["active_last_name"] = last
                 profile["last_name"] = last
                 sched["name_engine_state"] = "awaiting_new_person_email"
-                return "What is the best email address for the appointment?"
+                return wrap_name_engine_message(sched, "What is the best email address for the appointment?")
             sched["name_engine_state"] = "awaiting_new_person_last_name"
-            return "What is your last name?"
-        return "What first name should I use today?"
+            return wrap_name_engine_message(sched, "What is your last name?")
+        return wrap_name_engine_message(sched, "What first name should I use today?")
 
     if state == "awaiting_new_person_last_name":
         cleaned = re.sub(r"[^A-Za-z'\- ]", " ", inbound_text).strip()
@@ -1801,8 +1817,8 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 profile["active_last_name"] = last
                 profile["last_name"] = last
                 sched["name_engine_state"] = "awaiting_new_person_email"
-                return "What is the best email address for the appointment?"
-        return "What is your last name?"
+                return wrap_name_engine_message(sched, "What is the best email address for the appointment?")
+        return wrap_name_engine_message(sched, "What is your last name?")
 
     if state == "awaiting_new_person_email":
         m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", inbound_text or "", flags=re.I)
@@ -1820,7 +1836,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 square_customer_id=None,
             )
             return None
-        return "What is the best email address for the appointment?"
+        return wrap_name_engine_message(sched, "What is the best email address for the appointment?")
 
     return None
 
