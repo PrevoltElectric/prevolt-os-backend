@@ -207,25 +207,37 @@ def extract_explicit_time_from_text(text: str) -> str | None:
 
 def send_sms(to_number: str, body: str) -> None:
     """
-    Outbound always routes to WhatsApp sandbox for safe testing.
+    Send a normal outbound SMS to the actual customer number.
+    Requires TWILIO_FROM_NUMBER to be a real SMS-capable Twilio number.
     """
     if not twilio_client:
         print("[WARN] Twilio not configured. SMS not sent.")
         print("Message:", body)
         return
 
+    if not TWILIO_FROM_NUMBER:
+        print("[WARN] TWILIO_FROM_NUMBER is not configured. SMS not sent.")
+        print("Target:", to_number)
+        print("Message:", body)
+        return
+
     try:
-        whatsapp_from = "whatsapp:+14155238886"
-        whatsapp_to   = "whatsapp:+18609701727"  # your cell
+        sms_to = (to_number or "").replace("whatsapp:", "").strip()
+        sms_from = (TWILIO_FROM_NUMBER or "").replace("whatsapp:", "").strip()
+
+        if not sms_to:
+            print("[WARN] Missing destination number. SMS not sent.")
+            print("Message:", body)
+            return
 
         msg = twilio_client.messages.create(
             body=body,
-            from_=whatsapp_from,
-            to=whatsapp_to
+            from_=sms_from,
+            to=sms_to
         )
-        print("[WhatsApp] Sent SID:", msg.sid)
+        print("[SMS] Sent SID:", msg.sid, "to", sms_to)
     except Exception as e:
-        print("[ERROR] WhatsApp send failed:", repr(e))
+        print("[ERROR] SMS send failed:", repr(e))
 
 
 
