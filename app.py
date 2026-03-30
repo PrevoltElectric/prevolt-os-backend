@@ -1610,14 +1610,14 @@ def wrap_name_engine_message(sched: dict, message: str, first_name: str | None =
     intro = f"Hello {first_name}, this is Prevolt Electric." if (first_name or "").strip() else "Hello, this is Prevolt Electric."
     context = "I'm following up on the service request from this number."
 
-    # The very first identity-related text must ALWAYS establish who we are and why we're texting.
-    # Never lead with a naked verification question.
-    if not sched.get("name_engine_branded"):
-        sched["name_engine_branded"] = True
-        sched["intro_sent"] = True
-        return f"{intro} {context} {msg}".strip()
+    # Name-engine messages should NEVER read like a cold identity verification text.
+    # Always include business identity and service context in the message itself.
+    sched["name_engine_branded"] = True
+    sched["intro_sent"] = True
 
-    return msg
+    full = f"{intro} {context} {msg}".strip()
+    full = " ".join(full.split())
+    return full
 
 def get_known_people(profile: dict) -> list:
     ppl = profile.setdefault("known_people", [])
@@ -1773,7 +1773,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
             profile["first_name"] = candidate_first
             profile["identity_source"] = "new_person_confirmed_from_voicemail"
             sched["name_engine_state"] = "awaiting_new_person_last_name"
-            return wrap_name_engine_message(sched, "Just to make sure I have the right person, what is your last name?")
+            return "Perfect. What is your last name?"
         if no_text(low):
             known_names = list_known_first_names(profile)
             if known_names:
@@ -1782,7 +1782,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 return wrap_name_engine_message(sched, f"No problem. Which person is calling today, {joined}?")
             sched["name_engine_state"] = "awaiting_manual_first_name"
             return wrap_name_engine_message(sched, "No problem. What first name should I use today?")
-        return wrap_name_engine_message(sched, f"I heard the name {candidate_first}. Did I get that right?", candidate_first)
+        return wrap_name_engine_message(sched, f"I heard the name {candidate_first} in the voicemail. Did I get that right?", candidate_first)
 
     if state == "awaiting_known_person_selection":
         for p in get_known_people(profile):
@@ -1806,7 +1806,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 profile["active_last_name"] = last
                 profile["last_name"] = last
                 sched["name_engine_state"] = "awaiting_new_person_email"
-                return wrap_name_engine_message(sched, "What is the best email address for the appointment?")
+                return "What is the best email address for the appointment?"
             sched["name_engine_state"] = "awaiting_new_person_last_name"
             return wrap_name_engine_message(sched, "What is your last name?")
         return wrap_name_engine_message(sched, "What first name should I use today?")
@@ -1820,7 +1820,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 profile["active_last_name"] = last
                 profile["last_name"] = last
                 sched["name_engine_state"] = "awaiting_new_person_email"
-                return wrap_name_engine_message(sched, "What is the best email address for the appointment?")
+                return "What is the best email address for the appointment?"
         return wrap_name_engine_message(sched, "What is your last name?")
 
     if state == "awaiting_new_person_email":
@@ -1839,7 +1839,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
                 square_customer_id=None,
             )
             return None
-        return wrap_name_engine_message(sched, "What is the best email address for the appointment?")
+        return "What is the best email address for the appointment?"
 
     return None
 
