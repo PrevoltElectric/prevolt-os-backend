@@ -416,6 +416,12 @@ def handle_call_selection():
     sched.setdefault("address_verified", False)
     sched.setdefault("appointment_type", None)
     sched.setdefault("booking_created", False)
+    sched.setdefault("name_engine_state", None)
+    sched.setdefault("name_engine_prompted", False)
+    sched.setdefault("name_engine_candidate_first", None)
+    sched.setdefault("name_engine_candidate_last", None)
+    sched.setdefault("name_engine_expected_known_first", None)
+    sched.setdefault("name_engine_selected_first", None)
     profile.setdefault("name", None)
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
@@ -1178,7 +1184,7 @@ def incoming_sms():
     # SECRET RESET COMMAND
     if inbound_low == "mobius1":
         conversations[convo_key] = {
-            "profile": {"name": None, "first_name": None, "last_name": None, "email": None, "recognized_first_name": None, "recognized_last_name": None, "recognized_email": None, "active_first_name": None, "active_last_name": None, "active_email": None, "identity_source": None, "square_customer_id": None, "square_lookup_done": False, "addresses": [], "upcoming_appointment": None, "past_jobs": []},
+            "profile": {"name": None, "first_name": None, "last_name": None, "email": None, "recognized_first_name": None, "recognized_last_name": None, "recognized_email": None, "active_first_name": None, "active_last_name": None, "active_email": None, "voicemail_first_name": None, "voicemail_last_name": None, "known_people": [], "identity_source": None, "square_customer_id": None, "square_lookup_done": False, "addresses": [], "upcoming_appointment": None, "past_jobs": []},
             "current_job": {"job_type": None, "raw_description": None},
             "sched": {
                 "pending_step": None,
@@ -1198,6 +1204,12 @@ def incoming_sms():
                 # Emergency state flags (safe defaults)
                 "awaiting_emergency_confirm": False,
                 "emergency_approved": False,
+                "name_engine_state": None,
+                "name_engine_prompted": False,
+                "name_engine_candidate_first": None,
+                "name_engine_candidate_last": None,
+                "name_engine_expected_known_first": None,
+                "name_engine_selected_first": None,
             }
         }
         resp = MessagingResponse()
@@ -1226,6 +1238,12 @@ def incoming_sms():
     profile.setdefault("active_first_name", None)
     profile.setdefault("active_last_name", None)
     profile.setdefault("active_email", None)
+    profile.setdefault("voicemail_first_name", None)
+    profile.setdefault("voicemail_last_name", None)
+    profile.setdefault("known_people", [])
+    profile.setdefault("voicemail_first_name", None)
+    profile.setdefault("voicemail_last_name", None)
+    profile.setdefault("known_people", [])
 
     profile.setdefault("identity_source", None)
     profile.setdefault("square_customer_id", None)
@@ -1534,10 +1552,319 @@ def get_active_email(profile: dict) -> str:
 def get_display_first_name(profile: dict) -> str:
     return (
         profile.get("active_first_name")
+        or profile.get("voicemail_first_name")
         or profile.get("recognized_first_name")
         or profile.get("first_name")
         or ""
     ).strip()
+
+def normalize_person_name(s: str) -> str:
+    s = " ".join((s or "").strip().split())
+    if not s:
+        return ""
+    return " ".join(p[:1].upper() + p[1:].lower() for p in s.split())
+
+def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
+    txt = " ".join((text or "").strip().split())
+    if not txt:
+        return None, None
+
+    patterns = [
+        r"\b(?:my name is|this is|i am|i'm)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
+        r"\bname\s+is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
+    ]
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.I)
+        if m:
+            first = normalize_person_name(m.group(1) or "") or None
+            last = normalize_person_name(m.group(2) or "") or None
+            return first, last
+    return None, None
+
+def ensure_name_engine_defaults(profile: dict, sched: dict) -> None:
+    profile.setdefault("recognized_first_name", None)
+    profile.setdefault("recognized_last_name", None)
+    profile.setdefault("recognized_email", None)
+    profile.setdefault("active_first_name", None)
+    profile.setdefault("active_last_name", None)
+    profile.setdefault("active_email", None)
+    profile.setdefault("voicemail_first_name", None)
+    profile.setdefault("voicemail_last_name", None)
+    profile.setdefault("known_people", [])
+    profile.setdefault("identity_source", None)
+
+    sched.setdefault("name_engine_state", None)
+    sched.setdefault("name_engine_prompted", False)
+    sched.setdefault("name_engine_candidate_first", None)
+    sched.setdefault("name_engine_candidate_last", None)
+    sched.setdefault("name_engine_expected_known_first", None)
+    sched.setdefault("name_engine_selected_first", None)
+
+def get_known_people(profile: dict) -> list:
+    ppl = profile.setdefault("known_people", [])
+    if isinstance(ppl, list):
+        return ppl
+    profile["known_people"] = []
+    return profile["known_people"]
+
+def find_known_person_by_first(profile: dict, first_name: str) -> dict | None:
+    target = (first_name or "").strip().lower()
+    if not target:
+        return None
+    for p in get_known_people(profile):
+        if (p.get("first_name") or "").strip().lower() == target:
+            return p
+    return None
+
+def upsert_known_person(profile: dict, *, first_name: str, last_name: str, email: str, square_customer_id: str | None = None) -> None:
+    first_name = normalize_person_name(first_name)
+    last_name = normalize_person_name(last_name)
+    email = (email or "").strip()
+    if not first_name:
+        return
+    ppl = get_known_people(profile)
+    for p in ppl:
+        if (p.get("first_name") or "").strip().lower() == first_name.lower() and (p.get("last_name") or "").strip().lower() == (last_name or "").lower():
+            if last_name:
+                p["last_name"] = last_name
+            if email:
+                p["email"] = email
+            if square_customer_id:
+                p["square_customer_id"] = square_customer_id
+            return
+    ppl.append({
+        "first_name": first_name,
+        "last_name": last_name or "",
+        "email": email or "",
+        "square_customer_id": square_customer_id or "",
+    })
+
+def list_known_first_names(profile: dict) -> list[str]:
+    names = []
+    for p in get_known_people(profile):
+        fn = normalize_person_name(p.get("first_name") or "")
+        if fn and fn not in names:
+            names.append(fn)
+    return names
+
+def yes_text(text: str) -> bool:
+    low = (text or "").strip().lower()
+    return low in {"yes", "y", "yeah", "yep", "correct", "that is correct", "right", "it is", "it is correct", "thats right", "that's right"}
+
+def no_text(text: str) -> bool:
+    low = (text or "").strip().lower()
+    return low in {"no", "n", "nope", "not me", "wrong", "incorrect", "that is wrong", "that's wrong"}
+
+def apply_known_person_to_active(profile: dict, person: dict, *, source: str) -> None:
+    if not isinstance(person, dict):
+        return
+    fn = normalize_person_name(person.get("first_name") or "")
+    ln = normalize_person_name(person.get("last_name") or "")
+    em = (person.get("email") or "").strip()
+    if fn:
+        profile["active_first_name"] = fn
+        profile["first_name"] = fn
+    if ln:
+        profile["active_last_name"] = ln
+        profile["last_name"] = ln
+    if em:
+        profile["active_email"] = em
+        profile["email"] = em
+    profile["identity_source"] = source
+
+def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_transcript: str, initial_sms: str) -> str | None:
+    ensure_name_engine_defaults(profile, sched)
+
+    voicemail_first = profile.get("voicemail_first_name")
+    voicemail_last = profile.get("voicemail_last_name")
+    if not voicemail_first:
+        first, last = extract_possible_person_name(cleaned_transcript or initial_sms or "")
+        if first:
+            profile["voicemail_first_name"] = first
+            profile["voicemail_last_name"] = last
+            voicemail_first = first
+            voicemail_last = last
+
+    known_names = list_known_first_names(profile)
+    recognized_first = normalize_person_name(profile.get("recognized_first_name") or "")
+
+    if not known_names and recognized_first:
+        upsert_known_person(
+            profile,
+            first_name=recognized_first,
+            last_name=profile.get("recognized_last_name") or "",
+            email=profile.get("recognized_email") or "",
+            square_customer_id=profile.get("square_customer_id") or None,
+        )
+        known_names = list_known_first_names(profile)
+
+    if sched.get("name_engine_state"):
+        return None
+
+    # If voicemail first name matches a known person, lock onto that person.
+    if voicemail_first:
+        known = find_known_person_by_first(profile, voicemail_first)
+        if known:
+            apply_known_person_to_active(profile, known, source="known_person_match")
+            return None
+
+        # One known person on file but voicemail says a different first name -> clarify.
+        if len(known_names) == 1:
+            sched["name_engine_state"] = "awaiting_new_person_confirmation"
+            sched["name_engine_candidate_first"] = voicemail_first
+            sched["name_engine_candidate_last"] = voicemail_last
+            sched["name_engine_expected_known_first"] = known_names[0]
+            return f"Hello {voicemail_first}, last time we worked with {known_names[0]} from this number. You said your name in the voicemail was {voicemail_first}. Is that right?"
+
+        # Multiple known people and voicemail gives a new first name -> clarify against the known names.
+        if len(known_names) >= 2:
+            joined = ", ".join(known_names[:-1]) + f" or {known_names[-1]}" if len(known_names) > 1 else known_names[0]
+            sched["name_engine_state"] = "awaiting_new_person_confirmation_multi"
+            sched["name_engine_candidate_first"] = voicemail_first
+            sched["name_engine_candidate_last"] = voicemail_last
+            return f"Hello {voicemail_first}, I have {joined} on this number. You said your name in the voicemail was {voicemail_first}. Is that right?"
+
+        # No known people yet -> use voicemail first name as active first name, but still collect last/email later.
+        profile["active_first_name"] = voicemail_first
+        profile["first_name"] = voicemail_first
+        profile["identity_source"] = "voicemail_first_name"
+        return None
+
+    # No voicemail name, multiple known people on the number -> ask who is calling.
+    if len(known_names) >= 2 and not get_active_first_name(profile):
+        joined = ", ".join(known_names[:-1]) + f" or {known_names[-1]}" if len(known_names) > 1 else known_names[0]
+        sched["name_engine_state"] = "awaiting_known_person_selection"
+        return f"Hello, I have {joined} on this number. Which person is calling today?"
+
+    return None
+
+def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    ensure_name_engine_defaults(profile, sched)
+    state = sched.get("name_engine_state")
+    low = (inbound_text or "").strip().lower()
+    if not state:
+        return None
+
+    if state in {"awaiting_new_person_confirmation", "awaiting_new_person_confirmation_multi"}:
+        candidate_first = normalize_person_name(sched.get("name_engine_candidate_first") or "")
+        if yes_text(low):
+            profile["active_first_name"] = candidate_first
+            profile["first_name"] = candidate_first
+            profile["identity_source"] = "new_person_confirmed_from_voicemail"
+            sched["name_engine_state"] = "awaiting_new_person_last_name"
+            return f"Got it. What is your last name?"
+        if no_text(low):
+            known_names = list_known_first_names(profile)
+            if known_names:
+                joined = ", ".join(known_names[:-1]) + f" or {known_names[-1]}" if len(known_names) > 1 else known_names[0]
+                sched["name_engine_state"] = "awaiting_known_person_selection"
+                return f"No problem. Which person is calling today, {joined}?"
+            sched["name_engine_state"] = "awaiting_manual_first_name"
+            return "No problem. What first name should I use today?"
+        return f"Just to confirm, you said your name was {candidate_first}. Is that right?"
+
+    if state == "awaiting_known_person_selection":
+        for p in get_known_people(profile):
+            fn = normalize_person_name(p.get("first_name") or "")
+            if fn and fn.lower() in low:
+                apply_known_person_to_active(profile, p, source="known_person_selection")
+                sched["name_engine_state"] = None
+                return None
+        return f"Which first name should I use today?"
+
+    if state == "awaiting_manual_first_name":
+        first, last = extract_possible_person_name(inbound_text)
+        if not first:
+            cleaned = re.sub(r"[^A-Za-z'\- ]", " ", inbound_text).strip()
+            first = normalize_person_name(cleaned.split()[0]) if cleaned.split() else ""
+        if first:
+            profile["active_first_name"] = first
+            profile["first_name"] = first
+            profile["identity_source"] = "manual_first_name"
+            if last:
+                profile["active_last_name"] = last
+                profile["last_name"] = last
+                sched["name_engine_state"] = "awaiting_new_person_email"
+                return "What is the best email address for the appointment?"
+            sched["name_engine_state"] = "awaiting_new_person_last_name"
+            return "What is your last name?"
+        return "What first name should I use today?"
+
+    if state == "awaiting_new_person_last_name":
+        cleaned = re.sub(r"[^A-Za-z'\- ]", " ", inbound_text).strip()
+        parts = cleaned.split()
+        if parts:
+            last = normalize_person_name(" ".join(parts[-2:]) if len(parts) > 1 and parts[0].lower() in {"my", "is"} else parts[-1])
+            if last:
+                profile["active_last_name"] = last
+                profile["last_name"] = last
+                sched["name_engine_state"] = "awaiting_new_person_email"
+                return "What is the best email address for the appointment?"
+        return "What is your last name?"
+
+    if state == "awaiting_new_person_email":
+        m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", inbound_text or "", flags=re.I)
+        if m:
+            email = m.group(1).strip()
+            profile["active_email"] = email
+            profile["email"] = email
+            sched["name_engine_state"] = None
+            sched["pending_step"] = None
+            upsert_known_person(
+                profile,
+                first_name=get_active_first_name(profile),
+                last_name=get_active_last_name(profile),
+                email=get_active_email(profile),
+                square_customer_id=None,
+            )
+            return None
+        return "What is the best email address for the appointment?"
+
+    return None
+
+def interruption_answer_and_return_prompt(conv: dict, inbound_text: str) -> str | None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    low = (inbound_text or "").lower().strip()
+    if not low:
+        return None
+
+    # Only use this during active booking, not after booking.
+    if sched.get("booking_created") and sched.get("square_booking_id"):
+        return None
+
+    answer = None
+    if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
+        answer = "Yes, please make sure we can safely get to the panel when we arrive."
+    elif any(x in low for x in ["licensed", "insured"]):
+        answer = "Yes, we're licensed and insured."
+    elif any(x in low for x in ["call when", "text when", "on the way", "arrival window"]):
+        answer = "Yes, you'll get a text when we're on the way."
+    elif any(x in low for x in ["do i need to buy", "bring anything", "materials"]):
+        answer = "Nope, we bring what we need for the visit."
+    elif any(x in low for x in ["permit", "permit required"]):
+        answer = "If anything needs a permit, we'll go over that during the visit."
+    elif any(x in low for x in ["card", "cash", "check", "payment"]):
+        answer = "Card or cash after the visit is fine."
+    elif any(x in low for x in ["how much", "price", "cost"]) and sched.get("price_disclosed"):
+        appt = (sched.get("appointment_type") or "").upper()
+        if "TROUBLESHOOT" in appt:
+            answer = "It's $395 for the troubleshoot visit."
+        elif "INSPECTION" in appt:
+            answer = "Whole-home inspections run $375 to $650 depending on square footage."
+        else:
+            answer = "It's $195 for the visit."
+
+    if not answer:
+        return None
+
+    recompute_pending_step(profile, sched)
+    next_prompt = choose_next_prompt_from_state(conv, inbound_text="")
+    if next_prompt and next_prompt not in {"Okay.", "Okay", answer}:
+        return f"{answer} {next_prompt}"
+    return answer
 
 def looks_like_new_booking_request(inbound_text: str) -> bool:
     low = (inbound_text or "").lower().strip()
@@ -1583,6 +1910,15 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
     if not low:
         return None
 
+    # Let hazards break out of post-booking mode immediately.
+    emergency_words = [
+        "sparking", "burning", "smoke", "water pouring", "water in panel",
+        "panel has water", "no power", "arcing", "buzzing", "hot panel",
+        "fire", "melted", "shocked", "shock", "tree fell", "service ripped"
+    ]
+    if any(x in low for x in emergency_words):
+        return None
+
     if looks_like_new_booking_request(inbound_text):
         sched["booking_created"] = False
         sched["square_booking_id"] = None
@@ -1597,7 +1933,13 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
         sched["pending_step"] = None
         return None
 
-    if any(x in low for x in ["what time", "when are you coming", "what day", "when is my appointment"]):
+    if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
+        return "Yes, please make sure we can safely get to the panel when we arrive."
+
+    if any(x in low for x in ["gate", "code", "lock", "locked", "access", "doorbell", "call when outside"]):
+        return "That's fine. Just make sure we can get to the panel when we arrive."
+
+    if any(x in low for x in ["what time", "when are you coming", "what day", "when is my appointment", "are we good"]):
         date_txt = (appt.get("date") or sched.get("scheduled_date") or "").strip()
         time_txt = humanize_time(appt.get("time") or sched.get("scheduled_time") or "")
         if date_txt and time_txt:
@@ -1606,7 +1948,7 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
             return f"You're all set for {date_txt}."
         return "You're all set for the visit."
 
-    if any(x in low for x in ["who is coming", "who's coming", "whos coming", "on the way", "arrival window"]):
+    if any(x in low for x in ["who is coming", "who's coming", "whos coming", "on the way", "arrival window", "will they call"]):
         return "You'll get a text when we're on the way."
 
     if any(x in low for x in ["price", "how much", "cost"]):
@@ -1616,9 +1958,9 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
         return "We've got the address already attached to the visit."
 
     if any(x in low for x in ["thanks", "thank you", "ok", "okay", "got it", "perfect"]):
-        return "You're all set."
+        return ""
 
-    return "You're all set. If you need to change anything, just let me know."
+    return "You're all set."
 
 # ---------------------------------------------------
 # Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
@@ -1710,6 +2052,15 @@ def generate_reply_for_inbound(
                     if not profile.get("active_email") and cust.get("email_address"):
                         profile["active_email"] = cust.get("email_address")
 
+                    if cust.get("given_name"):
+                        upsert_known_person(
+                            profile,
+                            first_name=cust.get("given_name") or "",
+                            last_name=cust.get("family_name") or "",
+                            email=cust.get("email_address") or "",
+                            square_customer_id=cust.get("id") or None,
+                        )
+
                     caddr = cust.get("address") or {}
                     line1 = (caddr.get("address_line_1") or "").strip()
                     city = (caddr.get("locality") or "").strip()
@@ -1781,20 +2132,54 @@ def generate_reply_for_inbound(
         inbound_text  = (inbound_text or "").strip()
         inbound_lower = inbound_text.lower().strip()
 
-        # --------------------------------------
-        # Post-booking handling
-        # --------------------------------------
-        post_booking_reply = handle_post_booking(conv, inbound_text)
-        if post_booking_reply is not None:
-            booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
-            post_booking_reply = sanitize_sms_body(post_booking_reply, booking_created=booking_created)
+        ensure_name_engine_defaults(profile, sched)
+        name_engine_prompt = maybe_apply_name_engine_from_context(profile, sched, cleaned_transcript, initial_sms)
+
+        # Hazard detection must override post-booking mode.
+        EMERGENCY_KEYWORDS = [
+            "tree fell", "tree down", "power line", "lines down",
+            "service ripped", "sparking", "burning", "fire",
+            "smoke", "no power", "power outage", "water pouring",
+            "water in panel", "panel has water", "arcing", "buzzing",
+            "hot panel", "burning smell", "main breaker", "melted",
+            "shocked", "shock"
+        ]
+        IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
+
+        # Name engine gets first shot before the normal scheduler.
+        name_engine_reply = handle_name_engine_response(conv, inbound_text)
+        if name_engine_reply is not None:
             return {
-                "sms_body": post_booking_reply,
+                "sms_body": name_engine_reply,
                 "scheduled_date": sched.get("scheduled_date"),
                 "scheduled_time": sched.get("scheduled_time"),
                 "address": sched.get("raw_address"),
-                "booking_complete": True
+                "booking_complete": False
             }
+        if name_engine_prompt:
+            return {
+                "sms_body": name_engine_prompt,
+                "scheduled_date": sched.get("scheduled_date"),
+                "scheduled_time": sched.get("scheduled_time"),
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+
+        # --------------------------------------
+        # Post-booking handling
+        # --------------------------------------
+        if not IS_EMERGENCY:
+            post_booking_reply = handle_post_booking(conv, inbound_text)
+            if post_booking_reply is not None:
+                booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+                post_booking_reply = sanitize_sms_body(post_booking_reply, booking_created=booking_created)
+                return {
+                    "sms_body": post_booking_reply,
+                    "scheduled_date": sched.get("scheduled_date"),
+                    "scheduled_time": sched.get("scheduled_time"),
+                    "address": sched.get("raw_address"),
+                    "booking_complete": True
+                }
         # Opportunistic capture.
         # IMPORTANT: customer-provided identity overrides Square-recognized identity for this booking.
         if sched.get("pending_step") == "need_name" or "my name" in inbound_lower or inbound_lower.startswith("name is"):
@@ -1929,6 +2314,8 @@ def generate_reply_for_inbound(
 
         def build_human_intro_line() -> str:
             greet_name = get_display_first_name(profile)
+            if sched.get("name_engine_state") == "awaiting_known_person_selection":
+                greet_name = ""
 
             if greet_name:
                 options = [
@@ -2041,14 +2428,6 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # Emergency flow (2-step confirmation)
         # --------------------------------------
-        EMERGENCY_KEYWORDS = [
-            "tree fell", "tree down", "power line", "lines down",
-            "service ripped", "sparking", "burning", "fire",
-            "smoke", "no power", "power outage",
-            "urgent", "emergency"
-        ]
-
-        IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
         EMERGENCY = IS_EMERGENCY
 
         if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
@@ -2164,6 +2543,17 @@ def generate_reply_for_inbound(
         except Exception as e:
             print("[WARN] partial address merge patch failed:", repr(e))
 
+        # Mid-flow customer interruptions: answer briefly, then return to the next step.
+        interruption_reply = interruption_answer_and_return_prompt(conv, inbound_text)
+        if interruption_reply and not IS_EMERGENCY and not sched.get("booking_created"):
+            return {
+                "sms_body": interruption_reply,
+                "scheduled_date": sched.get("scheduled_date"),
+                "scheduled_time": sched.get("scheduled_time"),
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
+
         # --------------------------------------
         # Build System Prompt
         # --------------------------------------
@@ -2276,8 +2666,14 @@ def generate_reply_for_inbound(
                 maybe_create_square_booking(phone, conv)
 
                 if sched.get("booking_created") and sched.get("square_booking_id"):
+                    try:
+                        booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+                        human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
+                    except Exception:
+                        human_day = sched["scheduled_date"]
+
                     booked_sms = (
-                        f"You're all set for {sched['scheduled_date']} at {human_time}. "
+                        f"You're all set for {human_day} at {human_time}. "
                         f"We've got the visit booked and attached to your address. "
                         f"Confirmation: {sched.get('square_booking_id')}."
                     )
@@ -2546,6 +2942,13 @@ def square_create_or_get_customer(
 
         if cid:
             profile["square_customer_id"] = cid
+            upsert_known_person(
+                profile,
+                first_name=active_first or profile.get("recognized_first_name") or "",
+                last_name=active_last or profile.get("recognized_last_name") or "",
+                email=active_email or profile.get("recognized_email") or "",
+                square_customer_id=cid,
+            )
 
         return cid
 
@@ -2671,6 +3074,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
     profile.setdefault("active_first_name", None)
     profile.setdefault("active_last_name", None)
     profile.setdefault("active_email", None)
+    profile.setdefault("known_people", [])
 
     active_first = (profile.get("active_first_name") or profile.get("first_name") or "").strip()
     active_last = (profile.get("active_last_name") or profile.get("last_name") or "").strip()
