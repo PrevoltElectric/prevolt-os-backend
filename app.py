@@ -205,6 +205,76 @@ def extract_explicit_time_from_text(text: str) -> str | None:
 
     return None
 
+
+
+def extract_explicit_date_from_text(text: str, base_dt=None) -> str | None:
+    """
+    Pull an explicit date out of a mixed customer message.
+    Examples:
+      - "can you come this Friday?" -> "YYYY-MM-DD"
+      - "tomorrow works" -> "YYYY-MM-DD"
+      - "4/3" or "04/03/2026" -> "YYYY-MM-DD"
+    Returns None when no clear date is present.
+    """
+    import re
+    from datetime import datetime, timedelta
+
+    s = (text or "").strip().lower()
+    if not s:
+        return None
+
+    try:
+        now = base_dt or datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now = base_dt or datetime.now()
+
+    s = s.replace("’", "'")
+
+    if re.search(r"\btoday\b", s):
+        return now.strftime("%Y-%m-%d")
+    if re.search(r"\btomorrow\b", s):
+        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    weekdays = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+    for name, idx in weekdays.items():
+        m = re.search(rf"\b(?:(next|this)\s+)?{name}\b", s)
+        if not m:
+            continue
+        qualifier = (m.group(1) or "").strip()
+        days_ahead = (idx - now.weekday()) % 7
+        if qualifier == "next":
+            days_ahead = days_ahead + 7 if days_ahead == 0 else days_ahead + 7
+        elif qualifier == "this":
+            days_ahead = 0 if days_ahead == 0 else days_ahead
+        else:
+            days_ahead = 0 if days_ahead == 0 else days_ahead
+        target = now + timedelta(days=days_ahead)
+        return target.strftime("%Y-%m-%d")
+
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", s)
+    if m:
+        mm = int(m.group(1))
+        dd = int(m.group(2))
+        yy = m.group(3)
+        year = now.year
+        if yy:
+            year = int(yy)
+            if year < 100:
+                year += 2000
+        try:
+            target = datetime(year, mm, dd)
+            if not yy and target.date() < now.date():
+                target = datetime(year + 1, mm, dd)
+            return target.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    return None
+
+
 def send_sms(to_number: str, body: str) -> None:
     """
     Send a normal outbound SMS to the actual customer number.
@@ -2100,16 +2170,22 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         answer = "Card or cash after the visit is fine."
     elif any(x in low for x in [
         "how much", "price", "cost", "$195", "$395", "195", "395",
-        "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee"
+        "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee",
+        "quote", "estimate", "free estimate", "ballpark", "rough price", "firm number",
+        "what do you charge", "what does the visit include", "what does that include"
     ]):
         appt = (sched.get("appointment_type") or "").upper()
-        if "TROUBLESHOOT" in appt:
-            answer = "The $395 is the troubleshoot and repair visit to come out and diagnose the issue."
+        if any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
+            answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
+        elif "TROUBLESHOOT" in appt:
+            answer = "The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site."
         elif "INSPECTION" in appt:
             answer = "Whole-home inspections are $395, and larger homes can run higher depending on square footage."
         else:
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
+    elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
+        answer = "Once I have the booking details, I can get you on the schedule."
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
@@ -2163,27 +2239,36 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
     low = (inbound_text or "").lower().strip()
     interrupt_markers = [
         "how much", "price", "cost", "$195", "$395", "195", "395", "just to come out", "just to come",
+        "quote", "estimate", "free estimate", "ballpark", "firm number", "rough price",
         "licensed", "insured", "card", "cash", "check", "payment", "pay by",
         "permit", "permit required", "dog", "dogs", "pet", "pets", "call when",
         "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close",
         "bring anything", "materials", "do i need to buy", "do you do panel", "panel upgrade",
-        "how long does it take", "how long is the visit"
+        "availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out",
+        "how long does it take", "how long is the visit", "what does the visit include", "what does that include"
     ]
     return any(x in low for x in interrupt_markers)
 
+def _loose_text(s: str) -> str:
+    import re
+    s = (s or "").lower()
+    s = s.replace("’", "'")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = " ".join(s.split())
+    return s
+
+
 def detect_soft_rejection(inbound_text: str) -> str | None:
-    low = (inbound_text or "").lower().strip()
+    low = _loose_text(inbound_text)
     if not low:
         return None
 
-    buckets = {
-        "spouse": ["talk to my spouse", "talk to my husband", "talk to my wife", "check with my spouse", "run it by my spouse", "ask my husband", "ask my wife"],
-        "shopping": ["call around", "shop around", "check around", "see if someone can come sooner", "find someone sooner", "compare prices", "get a few quotes", "get other quotes"],
-        "timing": ["not ready yet", "maybe later", "let me think about it", "i'll let you know", "ill let you know", "i will get back to you", "i'll get back to you", "ill get back to you"],
-    }
-    for label, phrases in buckets.items():
-        if any(p in low for p in phrases):
-            return label
+    if (("wife" in low or "husband" in low or "spouse" in low) and any(x in low for x in ["talk", "tell", "check", "ask", "run it by", "first"])):
+        return "spouse"
+    if any(p in low for p in ["call around", "shop around", "check around", "come sooner", "find someone sooner", "compare prices", "get a few quotes", "get other quotes"]):
+        return "shopping"
+    if any(p in low for p in ["not ready yet", "maybe later", "let me think about it", "ill let you know", "i ll let you know", "i will get back to you", "i ll get back to you"]):
+        return "timing"
     return None
 
 
@@ -2210,7 +2295,7 @@ def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | Non
     if not sched.get("soft_rejection_open"):
         return None
 
-    low = (inbound_text or "").lower().strip()
+    low = _loose_text(inbound_text)
     if not low:
         return None
 
@@ -2218,7 +2303,8 @@ def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | Non
         "okay", "ok", "yes", "yeah", "yep", "that works", "lets do it", "let's do it",
         "book it", "go ahead", "move forward", "i'm ready", "im ready", "can we schedule",
         "schedule it", "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday",
-        "friday", "saturday", "sunday"
+        "friday", "saturday", "sunday", "its a go", "it's a go", "wife says", "husband says",
+        "spouse says", "when can you come", "when can you come out", "ready to book", "lets book", "let's book"
     ]
     if looks_like_slot_payload(inbound_text) or any(x in low for x in resume_markers):
         sched["soft_rejection_open"] = False
@@ -3002,12 +3088,16 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
-        # Heuristic slot salvage: preserve explicit times embedded in mixed messages
-        # like "2pm and I have dogs is that ok?" when the LLM only answers the question.
+        # Heuristic slot salvage: preserve explicit times and dates embedded in mixed messages
+        # like "2pm and I have dogs is that ok?" or "can you come this Friday?"
         if not model_time:
             salvaged_time = extract_explicit_time_from_text(inbound_text)
             if salvaged_time:
                 model_time = salvaged_time
+        if not model_date:
+            salvaged_date = extract_explicit_date_from_text(inbound_text)
+            if salvaged_date:
+                model_date = salvaged_date
 
         # --------------------------------------
         # RESET-LOCK (never lose good stored values)
