@@ -1426,6 +1426,44 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # Warm soft rejection handling during booking. This must run before generic
+    # question handling so messages like "I need to talk to my husband first,
+    # I just wanted a quote" do not get trapped in the quote-answer path.
+    try:
+        soft_reject_reply = build_soft_rejection_reply(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms soft rejection failed:", repr(e))
+        soft_reject_reply = None
+
+    if soft_reject_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = soft_reject_reply.strip()
+        tw = MessagingResponse()
+        tw.message(soft_reject_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
+
+    # Resume paused conversation if the customer comes back later. This also
+    # needs to run before generic interruption answers so resume messages like
+    # "it's a go, when can you come out" do not get reduced to a generic availability reply.
+    try:
+        if conv.setdefault("sched", {}).get("soft_rejection_open"):
+            absorb_obvious_booking_details(conv, inbound_text)
+        resumed_reply = maybe_resume_paused_conversation(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms resume failed:", repr(e))
+        resumed_reply = None
+
+    if resumed_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = resumed_reply.strip()
+        tw = MessagingResponse()
+        tw.message(resumed_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
+
     # Deterministic fast path for pure interruption questions.
     # This prevents price / payment / permit questions from getting lost
     # behind the address collector when the inbound does not contain a new slot value.
@@ -1443,40 +1481,6 @@ def incoming_sms():
         conv["last_sms_body"] = fast_interrupt.strip()
         tw = MessagingResponse()
         tw.message(fast_interrupt.strip())
-        return Response(str(tw), mimetype="text/xml")
-
-    # Warm soft rejection handling during booking.
-    try:
-        soft_reject_reply = build_soft_rejection_reply(conv, inbound_text)
-    except Exception as e:
-        print("[WARN] incoming_sms soft rejection failed:", repr(e))
-        soft_reject_reply = None
-
-    if soft_reject_reply:
-        conv["last_inbound_sid"] = inbound_sid
-        conv["last_inbound_fingerprint"] = inbound_fingerprint
-        conv["last_inbound_fingerprint_ts"] = now_ts
-        conv["last_sms_body"] = soft_reject_reply.strip()
-        tw = MessagingResponse()
-        tw.message(soft_reject_reply.strip())
-        return Response(str(tw), mimetype="text/xml")
-
-    # Resume paused conversation if the customer comes back later.
-    try:
-        if conv.setdefault("sched", {}).get("soft_rejection_open"):
-            absorb_obvious_booking_details(conv, inbound_text)
-        resumed_reply = maybe_resume_paused_conversation(conv, inbound_text)
-    except Exception as e:
-        print("[WARN] incoming_sms resume failed:", repr(e))
-        resumed_reply = None
-
-    if resumed_reply:
-        conv["last_inbound_sid"] = inbound_sid
-        conv["last_inbound_fingerprint"] = inbound_fingerprint
-        conv["last_inbound_fingerprint_ts"] = now_ts
-        conv["last_sms_body"] = resumed_reply.strip()
-        tw = MessagingResponse()
-        tw.message(resumed_reply.strip())
         return Response(str(tw), mimetype="text/xml")
 
     # Post-booking questions should answer cleanly without reopening the booking flow.
@@ -2079,7 +2083,7 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
 def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
-    low = (inbound_text or "").lower().strip()
+    low = _loose_text(inbound_text)
     if not low:
         return None
 
@@ -2087,62 +2091,87 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked and not allow_post_booking:
         return None
 
-    answer = None
-    if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
-        answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
-    elif any(x in low for x in ["licensed", "insured"]):
-        answer = "Yes, we're licensed and insured."
-    elif any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close"]):
-        answer = "Yes, you'll get a text when we're on the way."
-    elif any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
-        answer = "No, you do not need to buy anything ahead of time for the visit."
-    elif any(x in low for x in ["permit", "permit required"]):
-        answer = "If anything needs a permit, we'll go over that during the visit."
-    elif any(x in low for x in ["card", "cash", "check", "payment", "pay by", "how do i pay"]):
-        answer = "Card or cash after the visit is fine."
-    elif any(x in low for x in [
-        "how much", "price", "cost", "$195", "$395", "195", "395",
-        "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee",
-        "quote", "estimate", "free estimate", "ballpark", "rough price", "firm number",
-        "what do you charge", "what does the visit include", "what does that include",
+    def has_any(phrases: list[str]) -> bool:
+        return any(p in low for p in phrases)
+
+    # Soft rejections are handled by their own warmer branch and should win over QA.
+    if detect_soft_rejection(inbound_text):
+        return None
+
+    appt = (sched.get("appointment_type") or "").upper()
+
+    asks_animals = has_any(["dog", "dogs", "pet", "pets"])
+    asks_credentials = has_any(["licensed", "insured"])
+    asks_eta_text = has_any(["call when", "text when", "on the way", "arrival window", "when close", "when you re close", "when youre close"])
+    asks_materials = has_any(["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"])
+    asks_permit = has_any(["permit", "permit required"])
+    asks_payment = has_any(["card", "cash", "check", "payment", "pay by", "how do i pay"])
+    asks_project_credit = has_any([
         "go towards the project", "go toward the project", "goes towards the project", "goes toward the project",
         "apply to the project", "applied to the project", "credit toward the project", "credited toward the project",
         "does it go toward", "does it go towards", "does that go toward", "does that go towards",
         "does the fee go toward", "does the fee go towards", "does the service fee go toward", "does the service fee go towards",
         "deposit", "credited back", "applied back"
-    ]):
-        appt = (sched.get("appointment_type") or "").upper()
-        if any(x in low for x in [
-            "go towards the project", "go toward the project", "goes towards the project", "goes toward the project",
-            "apply to the project", "applied to the project", "credit toward the project", "credited toward the project",
-            "does it go toward", "does it go towards", "does that go toward", "does that go towards",
-            "does the fee go toward", "does the fee go towards", "does the service fee go toward", "does the service fee go towards",
-            "deposit", "credited back", "applied back"
-        ]):
-            if "TROUBLESHOOT" in appt:
-                answer = "The $395 covers the troubleshoot and repair visit itself. If any larger repair is needed, we go over that separately on site before anything moves forward."
-            elif "INSPECTION" in appt:
-                answer = "The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately."
-            else:
-                answer = "The $195 covers the evaluation visit itself. If you decide to move forward with project work after that, we go over the next step in person."
-        elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
-            answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
-        elif "TROUBLESHOOT" in appt:
-            answer = "The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site."
-        elif "INSPECTION" in appt:
-            answer = "Whole-home inspections are $395, and larger homes can run higher depending on square footage."
-        else:
-            answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
-        sched["price_disclosed"] = True
-    elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        answer = "Once I have the booking details, I can get you on the schedule."
-    elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
-        answer = "Most visits are about an hour, depending on what you have going on."
-    elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
-        answer = "Yes, we handle panel upgrades and replacements."
+    ])
+    asks_quote = has_any(["quote", "estimate", "free estimate", "ballpark", "rough price", "firm number", "just wanted a quote", "looking to get a quote"])
+    asks_price = has_any(["how much", "price", "cost", "$195", "$395", "195", "395", "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee", "what do you charge", "what does the visit include", "what does that include"])
+    asks_availability = has_any(["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"])
+    asks_duration = has_any(["how long", "visit take", "how long does it take", "how long is the visit"])
+    asks_panel = has_any(["panel upgrade", "do you do panel", "service change", "panel replacement"])
 
-    if not answer:
+    answers: list[str] = []
+
+    if asks_quote:
+        answers.append("For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number.")
+
+    if asks_project_credit:
+        if "TROUBLESHOOT" in appt:
+            answers.append("The $395 covers the troubleshoot and repair visit itself. If any larger repair is needed, we go over that separately on site before anything moves forward.")
+        elif "INSPECTION" in appt:
+            answers.append("The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately.")
+        else:
+            answers.append("The $195 covers the evaluation visit itself. If you decide to move forward with project work after that, we go over the next step in person.")
+        sched["price_disclosed"] = True
+    elif asks_price:
+        if "TROUBLESHOOT" in appt:
+            answers.append("The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site.")
+        elif "INSPECTION" in appt:
+            answers.append("Whole-home inspections are $395, and larger homes can run higher depending on square footage.")
+        else:
+            answers.append("The $195 is the service visit to come out, evaluate the issue, and go over the next step.")
+        sched["price_disclosed"] = True
+
+    if asks_availability:
+        answers.append("Once I have the booking details, I can get you on the schedule.")
+    if asks_animals:
+        answers.append("Yes, that is fine. Just make sure we can safely get to the panel when we arrive.")
+    if asks_credentials:
+        answers.append("Yes, we're licensed and insured.")
+    if asks_eta_text:
+        answers.append("Yes, you'll get a text when we're on the way.")
+    if asks_materials:
+        answers.append("No, you do not need to buy anything ahead of time for the visit.")
+    if asks_permit:
+        answers.append("If anything needs a permit, we'll go over that during the visit.")
+    if asks_payment:
+        answers.append("Card or cash after the visit is fine.")
+    if asks_duration:
+        answers.append("Most visits are about an hour, depending on what you have going on.")
+    if asks_panel:
+        answers.append("Yes, we handle panel upgrades and replacements.")
+
+    deduped = []
+    seen = set()
+    for a in answers:
+        key = a.lower()
+        if key not in seen:
+            deduped.append(a)
+            seen.add(key)
+
+    if not deduped:
         return None
+
+    answer = " ".join(deduped[:2])
 
     recompute_pending_step(profile, sched)
 
@@ -2158,333 +2187,6 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         return f"{answer} {next_prompt}"
     return answer
 
-
-def looks_like_slot_payload(inbound_text: str) -> bool:
-    txt = (inbound_text or "").strip()
-    low = txt.lower()
-    if not txt:
-        return False
-    if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", txt, flags=re.I):
-        return True
-    if re.search(r"\d{1,6}", txt) and re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
-        return True
-    if re.search(r"\d{1,2}(:\d{2})?\s*(am|pm)", low, flags=re.I):
-        return True
-    if re.search(r"^\d{3,4}$", txt):
-        return True
-    if any(day in low for day in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","tomorrow","today","next monday","next tuesday","next wednesday","next thursday","next friday","next saturday","next sunday"]):
-        return True
-    if len(txt.split()) <= 3 and re.fullmatch(r"[A-Za-z'\- ]+", txt):
-        return True
-    return False
-
-
-def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
-    sched = conv.setdefault("sched", {})
-    if sched.get("booking_created") and sched.get("square_booking_id"):
-        return False
-    if looks_like_slot_payload(inbound_text):
-        return False
-    low = (inbound_text or "").lower().strip()
-    interrupt_markers = [
-        "how much", "price", "cost", "$195", "$395", "195", "395", "just to come out", "just to come",
-        "quote", "estimate", "free estimate", "ballpark", "firm number", "rough price",
-        "go towards the project", "go toward the project", "goes towards the project", "goes toward the project",
-        "apply to the project", "applied to the project", "credit toward the project", "credited toward the project",
-        "does it go toward", "does it go towards", "does that go toward", "does that go towards",
-        "does the fee go toward", "does the fee go towards", "does the service fee go toward", "does the service fee go towards",
-        "deposit", "credited back", "applied back",
-        "licensed", "insured", "card", "cash", "check", "payment", "pay by",
-        "permit", "permit required", "dog", "dogs", "pet", "pets", "call when",
-        "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close",
-        "bring anything", "materials", "do i need to buy", "do you do panel", "panel upgrade",
-        "availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out",
-        "how long does it take", "how long is the visit", "what does the visit include", "what does that include"
-    ]
-    return any(x in low for x in interrupt_markers)
-
-def _loose_text(s: str) -> str:
-    s = (s or "").lower().replace("’", "'")
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    return " ".join(s.split())
-
-
-def salvage_relative_date_from_text(inbound_text: str) -> str | None:
-    low = _loose_text(inbound_text)
-    if not low:
-        return None
-    now_local = datetime.now(ZoneInfo("America/New_York")) if ZoneInfo else datetime.now()
-    today = now_local.date()
-
-    if "today" in low:
-        return today.strftime("%Y-%m-%d")
-    if "tomorrow" in low:
-        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    weekdays = {
-        "monday": 0,
-        "tuesday": 1,
-        "wednesday": 2,
-        "thursday": 3,
-        "friday": 4,
-        "saturday": 5,
-        "sunday": 6,
-    }
-    for name, idx in weekdays.items():
-        if f"next {name}" in low:
-            delta = (idx - today.weekday()) % 7
-            if delta == 0:
-                delta = 7
-            delta += 7
-            return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
-        if re.search(rf"\b(?:this )?{name}\b", low):
-            delta = (idx - today.weekday()) % 7
-            return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
-
-    m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", low)
-    if m:
-        mo = int(m.group(1))
-        day = int(m.group(2))
-        yr_raw = m.group(3)
-        year = today.year
-        if yr_raw:
-            year = int(yr_raw)
-            if year < 100:
-                year += 2000
-        try:
-            dt = datetime(year, mo, day)
-            if not yr_raw and dt.date() < today:
-                dt = datetime(year + 1, mo, day)
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            return None
-
-    return None
-
-
-def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-    txt = (inbound_text or "").strip()
-    if not txt:
-        return
-
-    if not sched.get("scheduled_date"):
-        d = salvage_relative_date_from_text(txt)
-        if d:
-            sched["scheduled_date"] = d
-
-    if not sched.get("scheduled_time"):
-        t = extract_explicit_time_from_text(txt)
-        if t:
-            sched["scheduled_time"] = t
-
-    if not sched.get("raw_address"):
-        low = txt.lower()
-        if re.search(r"\d{1,6}", txt) and re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
-            sched["raw_address"] = txt
-            try:
-                if txt not in profile.setdefault("addresses", []):
-                    profile["addresses"].append(txt)
-            except Exception:
-                pass
-            try:
-                try_early_address_normalize(sched)
-            except Exception:
-                pass
-
-    update_address_assembly_state(sched)
-    recompute_pending_step(profile, sched)
-
-
-def detect_soft_rejection(inbound_text: str) -> str | None:
-    low = _loose_text(inbound_text)
-    if not low:
-        return None
-
-    if (("wife" in low or "husband" in low or "spouse" in low) and any(x in low for x in ["talk", "tell", "check", "ask", "run it by", "first"])):
-        return "spouse"
-    if any(p in low for p in ["call around", "shop around", "check around", "come sooner", "find someone sooner", "compare prices", "get a few quotes", "get other quotes"]):
-        return "shopping"
-    if any(p in low for p in ["not ready yet", "maybe later", "let me think about it", "ill let you know", "i ll let you know", "i will get back to you", "i ll get back to you"]):
-        return "timing"
-    return None
-
-
-def build_soft_rejection_reply(conv: dict, inbound_text: str) -> str | None:
-    sched = conv.setdefault("sched", {})
-    kind = detect_soft_rejection(inbound_text)
-    if not kind:
-        return None
-
-    sched["soft_rejection_state"] = kind
-    sched["soft_rejection_open"] = True
-    sched["soft_rejection_ts"] = time.time()
-
-    if kind == "spouse":
-        return "No problem at all. Talk it over and if you want to move forward just message me back here and I’ll pick it up where we left off."
-    if kind == "shopping":
-        return "No problem at all. If you want to move forward later just message me back here and I’ll pick it up where we left off."
-    return "No problem at all. Whenever you're ready, just message me back here and I’ll pick it up where we left off."
-
-
-def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | None:
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-    if not sched.get("soft_rejection_open"):
-        return None
-
-    low = _loose_text(inbound_text)
-    if not low:
-        return None
-
-    resume_markers = [
-        "okay", "ok", "yes", "yeah", "yep", "that works", "lets do it", "let's do it",
-        "book it", "go ahead", "move forward", "i'm ready", "im ready", "can we schedule",
-        "schedule it", "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday",
-        "friday", "saturday", "sunday", "its a go", "it's a go", "wife says", "husband says",
-        "spouse says", "when can you come", "when can you come out", "ready to book", "lets book", "let's book"
-    ]
-    if looks_like_slot_payload(inbound_text) or any(x in low for x in resume_markers):
-        sched["soft_rejection_open"] = False
-        absorb_obvious_booking_details(conv, inbound_text)
-        recompute_pending_step(profile, sched)
-        next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
-        if next_prompt and next_prompt not in {"Okay.", "Okay", "Everything looks good here."}:
-            return f"Sounds good. {next_prompt}"
-        return "Sounds good."
-    return None
-
-
-def handle_post_booking_question(conv: dict, inbound_text: str) -> str | None:
-    sched = conv.setdefault("sched", {})
-    if not (sched.get("booking_created") and sched.get("square_booking_id")):
-        return None
-
-    answered = interruption_answer_and_return_prompt(conv, inbound_text, allow_post_booking=True)
-    if answered:
-        return answered
-
-    low = (inbound_text or "").lower().strip()
-    if any(x in low for x in ["what day", "what time", "when am i on", "when are you coming", "confirm", "appointment time"]):
-        try:
-            booked_dt = datetime.strptime(sched.get("scheduled_date") or "", "%Y-%m-%d")
-            human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
-        except Exception:
-            human_day = (sched.get("scheduled_date") or "").strip() or "the scheduled day"
-        human_t = humanize_time(sched.get("scheduled_time") or "") or "the scheduled time"
-        return f"You’re set for {human_day} at {human_t}."
-
-    return None
-
-def looks_like_new_booking_request(inbound_text: str) -> bool:
-    low = (inbound_text or "").lower().strip()
-    if not low:
-        return False
-
-    restart_keywords = [
-        "reschedule", "change", "different", "another", "new appointment",
-        "move it", "push it", "cancel", "need a new time", "need a new day",
-        "book", "schedule", "come out", "come by"
-    ]
-    if any(k in low for k in restart_keywords):
-        return True
-
-    if any(w in low for w in [
-        "tomorrow", "today", "next monday", "next tuesday", "next wednesday",
-        "next thursday", "next friday", "monday", "tuesday", "wednesday",
-        "thursday", "friday", "saturday", "sunday"
-    ]):
-        return True
-
-    if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", low, flags=re.I):
-        return True
-
-    if re.search(
-        r"\b\d{1,6}\b.*\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b",
-        low,
-        flags=re.I
-    ):
-        return True
-
-    return False
-
-def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-    appt = profile.get("upcoming_appointment") or {}
-
-    if not (sched.get("booking_created") and sched.get("square_booking_id")):
-        return None
-
-    low = (inbound_text or "").lower().strip()
-    if not low:
-        return None
-
-    # Let hazards break out of post-booking mode immediately.
-    emergency_words = [
-        "sparking", "burning", "smoke", "water pouring", "water in panel",
-        "panel has water", "no power", "arcing", "buzzing", "hot panel",
-        "fire", "melted", "shocked", "shock", "tree fell", "service ripped"
-    ]
-    if any(x in low for x in emergency_words):
-        return None
-
-    if looks_like_new_booking_request(inbound_text):
-        sched["booking_created"] = False
-        sched["square_booking_id"] = None
-        sched["scheduled_date"] = None
-        sched["scheduled_time"] = None
-        sched["raw_address"] = None
-        sched["normalized_address"] = None
-        sched["address_candidate"] = None
-        sched["address_verified"] = False
-        sched["address_missing"] = None
-        sched["address_parts"] = {}
-        sched["pending_step"] = None
-        return None
-
-    if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
-        return "Yes, please make sure we can safely get to the panel when we arrive."
-
-    if any(x in low for x in ["gate", "code", "lock", "locked", "access", "doorbell", "call when outside"]):
-        return "That's fine. Just make sure we can get to the panel when we arrive."
-
-    if any(x in low for x in ["what time", "when are you coming", "what day", "when is my appointment", "are we good"]):
-        date_txt = (appt.get("date") or sched.get("scheduled_date") or "").strip()
-        time_txt = humanize_time(appt.get("time") or sched.get("scheduled_time") or "")
-        if date_txt and time_txt:
-            return f"You're all set for {date_txt} at {time_txt}."
-        if date_txt:
-            return f"You're all set for {date_txt}."
-        return "You're all set for the visit."
-
-    if any(x in low for x in ["who is coming", "who's coming", "whos coming", "on the way", "arrival window", "will they call"]):
-        return "You'll get a text when we're on the way."
-
-    if any(x in low for x in ["price", "how much", "cost"]):
-        return "You're all set for the visit."
-
-    if any(x in low for x in ["address", "coming to", "where are you going"]):
-        return "We've got the address already attached to the visit."
-
-    if any(x in low for x in ["thanks", "thank you", "ok", "okay", "got it", "perfect"]):
-        return ""
-
-    return "You're all set."
-
-# ---------------------------------------------------
-# Step 4 — Generate Replies (Hybrid Logic + Deterministic State Machine)
-# PATCHED (HUMAN + HOUSE# + NO WAIT-TEXT + ACK MEMORY)
-#   - Longer, more human intros + prompts (deterministic per conversation)
-#   - No em dash "—" and no " - " telltales
-#   - No "Got it", "Thanks" filler
-#   - No "one moment / securing" messages (ever)
-#   - House-number patch: handles
-#   - Re-check address state AFTER model output (prevents booking without house number)
-#   - If Square did NOT book, never "confirm"; always ask the next missing atom (or send a neutral line)
-#   - Adds acknowledgement memory so it doesn't repeat acknowledgements
-# ---------------------------------------------------
 def generate_reply_for_inbound(
     cleaned_transcript,
     category,
