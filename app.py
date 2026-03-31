@@ -475,6 +475,9 @@ def handle_call_selection():
     sched.setdefault("name_engine_candidate_last", None)
     sched.setdefault("name_engine_expected_known_first", None)
     sched.setdefault("name_engine_selected_first", None)
+    sched.setdefault("soft_rejection_state", None)
+    sched.setdefault("soft_rejection_open", False)
+    sched.setdefault("soft_rejection_ts", None)
     profile.setdefault("name", None)
     profile.setdefault("addresses", [])
     profile.setdefault("upcoming_appointment", None)
@@ -1272,6 +1275,9 @@ def incoming_sms():
                 "name_engine_candidate_last": None,
                 "name_engine_expected_known_first": None,
                 "name_engine_selected_first": None,
+                "soft_rejection_state": None,
+                "soft_rejection_open": False,
+                "soft_rejection_ts": None,
             }
         }
         resp = MessagingResponse()
@@ -1344,6 +1350,9 @@ def incoming_sms():
     sched.setdefault("normalized_address", None)
     sched.setdefault("raw_address", None)
     sched.setdefault("booking_created", False)
+    sched.setdefault("soft_rejection_state", None)
+    sched.setdefault("soft_rejection_open", False)
+    sched.setdefault("soft_rejection_ts", None)
 
     # Address Assembly State
     sched.setdefault("address_candidate", None)
@@ -1434,6 +1443,54 @@ def incoming_sms():
         conv["last_sms_body"] = fast_interrupt.strip()
         tw = MessagingResponse()
         tw.message(fast_interrupt.strip())
+        return Response(str(tw), mimetype="text/xml")
+
+    # Warm soft rejection handling during booking.
+    try:
+        soft_reject_reply = build_soft_rejection_reply(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms soft rejection failed:", repr(e))
+        soft_reject_reply = None
+
+    if soft_reject_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = soft_reject_reply.strip()
+        tw = MessagingResponse()
+        tw.message(soft_reject_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
+
+    # Resume paused conversation if the customer comes back later.
+    try:
+        resumed_reply = maybe_resume_paused_conversation(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms resume failed:", repr(e))
+        resumed_reply = None
+
+    if resumed_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = resumed_reply.strip()
+        tw = MessagingResponse()
+        tw.message(resumed_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
+
+    # Post-booking questions should answer cleanly without reopening the booking flow.
+    try:
+        post_booking_reply = handle_post_booking_question(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms post booking question failed:", repr(e))
+        post_booking_reply = None
+
+    if post_booking_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = post_booking_reply.strip()
+        tw = MessagingResponse()
+        tw.message(post_booking_reply.strip())
         return Response(str(tw), mimetype="text/xml")
 
     # ---------------------------------------------------
@@ -1725,6 +1782,9 @@ def ensure_name_engine_defaults(profile: dict, sched: dict) -> None:
     sched.setdefault("name_engine_candidate_last", None)
     sched.setdefault("name_engine_expected_known_first", None)
     sched.setdefault("name_engine_selected_first", None)
+    sched.setdefault("soft_rejection_state", None)
+    sched.setdefault("soft_rejection_open", False)
+    sched.setdefault("soft_rejection_ts", None)
     sched.setdefault("name_engine_branded", False)
 
 
@@ -2014,44 +2074,54 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
 
     return None
 
-def interruption_answer_and_return_prompt(conv: dict, inbound_text: str) -> str | None:
+def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
     low = (inbound_text or "").lower().strip()
     if not low:
         return None
 
-    # Only use this during active booking, not after booking.
-    if sched.get("booking_created") and sched.get("square_booking_id"):
+    booked = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+    if booked and not allow_post_booking:
         return None
 
     answer = None
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
-        answer = "Yes, please make sure we can safely get to the panel when we arrive."
+        answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
     elif any(x in low for x in ["licensed", "insured"]):
         answer = "Yes, we're licensed and insured."
-    elif any(x in low for x in ["call when", "text when", "on the way", "arrival window"]):
+    elif any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close"]):
         answer = "Yes, you'll get a text when we're on the way."
-    elif any(x in low for x in ["do i need to buy", "bring anything", "materials"]):
-        answer = "Nope, we bring what we need for the visit."
+    elif any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
+        answer = "No, you do not need to buy anything ahead of time for the visit."
     elif any(x in low for x in ["permit", "permit required"]):
         answer = "If anything needs a permit, we'll go over that during the visit."
-    elif any(x in low for x in ["card", "cash", "check", "payment"]):
+    elif any(x in low for x in ["card", "cash", "check", "payment", "pay by", "how do i pay"]):
         answer = "Card or cash after the visit is fine."
-    elif any(x in low for x in ["how much", "price", "cost", "$195", "$395"]):
+    elif any(x in low for x in [
+        "how much", "price", "cost", "$195", "$395", "195", "395",
+        "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee"
+    ]):
         appt = (sched.get("appointment_type") or "").upper()
         if "TROUBLESHOOT" in appt:
             answer = "The $395 is the troubleshoot and repair visit to come out and diagnose the issue."
         elif "INSPECTION" in appt:
-            answer = "Whole-home inspections run $395, and larger homes can range higher depending on square footage."
+            answer = "Whole-home inspections are $395, and larger homes can run higher depending on square footage."
         else:
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
+    elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
+        answer = "Most visits are about an hour, depending on what you have going on."
+    elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
+        answer = "Yes, we handle panel upgrades and replacements."
 
     if not answer:
         return None
 
     recompute_pending_step(profile, sched)
+
+    if booked:
+        return answer
 
     # Do not restate the final confirmation while answering an interrupting question.
     if sched.get("final_confirmation_sent") or sched.get("final_confirmation_accepted"):
@@ -2092,12 +2162,94 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
         return False
     low = (inbound_text or "").lower().strip()
     interrupt_markers = [
-        "how much", "price", "cost", "$195", "$395", "licensed", "insured",
-        "card", "cash", "check", "payment", "permit", "permit required",
-        "dog", "dogs", "pet", "pets", "call when", "text when", "on the way",
-        "arrival window", "bring anything", "materials"
+        "how much", "price", "cost", "$195", "$395", "195", "395", "just to come out", "just to come",
+        "licensed", "insured", "card", "cash", "check", "payment", "pay by",
+        "permit", "permit required", "dog", "dogs", "pet", "pets", "call when",
+        "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close",
+        "bring anything", "materials", "do i need to buy", "do you do panel", "panel upgrade",
+        "how long does it take", "how long is the visit"
     ]
     return any(x in low for x in interrupt_markers)
+
+def detect_soft_rejection(inbound_text: str) -> str | None:
+    low = (inbound_text or "").lower().strip()
+    if not low:
+        return None
+
+    buckets = {
+        "spouse": ["talk to my spouse", "talk to my husband", "talk to my wife", "check with my spouse", "run it by my spouse", "ask my husband", "ask my wife"],
+        "shopping": ["call around", "shop around", "check around", "see if someone can come sooner", "find someone sooner", "compare prices", "get a few quotes", "get other quotes"],
+        "timing": ["not ready yet", "maybe later", "let me think about it", "i'll let you know", "ill let you know", "i will get back to you", "i'll get back to you", "ill get back to you"],
+    }
+    for label, phrases in buckets.items():
+        if any(p in low for p in phrases):
+            return label
+    return None
+
+
+def build_soft_rejection_reply(conv: dict, inbound_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    kind = detect_soft_rejection(inbound_text)
+    if not kind:
+        return None
+
+    sched["soft_rejection_state"] = kind
+    sched["soft_rejection_open"] = True
+    sched["soft_rejection_ts"] = time.time()
+
+    if kind == "spouse":
+        return "No problem at all. Talk it over and if you want to move forward just message me back here and I’ll pick it up where we left off."
+    if kind == "shopping":
+        return "No problem at all. If you want to move forward later just message me back here and I’ll pick it up where we left off."
+    return "No problem at all. Whenever you're ready, just message me back here and I’ll pick it up where we left off."
+
+
+def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    if not sched.get("soft_rejection_open"):
+        return None
+
+    low = (inbound_text or "").lower().strip()
+    if not low:
+        return None
+
+    resume_markers = [
+        "okay", "ok", "yes", "yeah", "yep", "that works", "lets do it", "let's do it",
+        "book it", "go ahead", "move forward", "i'm ready", "im ready", "can we schedule",
+        "schedule it", "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday",
+        "friday", "saturday", "sunday"
+    ]
+    if looks_like_slot_payload(inbound_text) or any(x in low for x in resume_markers):
+        sched["soft_rejection_open"] = False
+        recompute_pending_step(profile, sched)
+        next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+        if next_prompt and next_prompt not in {"Okay.", "Okay", "Everything looks good here."}:
+            return f"Sounds good. {next_prompt}"
+        return "Sounds good."
+    return None
+
+
+def handle_post_booking_question(conv: dict, inbound_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    if not (sched.get("booking_created") and sched.get("square_booking_id")):
+        return None
+
+    answered = interruption_answer_and_return_prompt(conv, inbound_text, allow_post_booking=True)
+    if answered:
+        return answered
+
+    low = (inbound_text or "").lower().strip()
+    if any(x in low for x in ["what day", "what time", "when am i on", "when are you coming", "confirm", "appointment time"]):
+        try:
+            booked_dt = datetime.strptime(sched.get("scheduled_date") or "", "%Y-%m-%d")
+            human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
+        except Exception:
+            human_day = (sched.get("scheduled_date") or "").strip() or "the scheduled day"
+        human_t = humanize_time(sched.get("scheduled_time") or "") or "the scheduled time"
+        return f"You’re set for {human_day} at {human_t}."
+
+    return None
 
 def looks_like_new_booking_request(inbound_text: str) -> bool:
     low = (inbound_text or "").lower().strip()
