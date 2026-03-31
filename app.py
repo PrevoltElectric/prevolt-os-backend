@@ -1,6 +1,5 @@
 import os
 import json
-import re
 import time
 import uuid
 from pathlib import Path
@@ -180,7 +179,7 @@ def extract_explicit_time_from_text(text: str) -> str | None:
     if not s:
         return None
 
-    m = re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m\b', s, flags=re.I)
+    m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m', s, flags=re.I)
     if m:
         hh = int(m.group(1))
         mm = int(m.group(2) or '00')
@@ -192,11 +191,11 @@ def extract_explicit_time_from_text(text: str) -> str | None:
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
-    m = re.search(r'\b([01]?\d|2[0-3]):([0-5]\d)\b', s)
+    m = re.search(r'([01]?\d|2[0-3]):([0-5]\d)', s)
     if m:
         return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
 
-    m = re.search(r'\b(\d{3,4})\b', s)
+    m = re.search(r'(\d{3,4})', s)
     if m:
         raw = m.group(1).zfill(4)
         hh = int(raw[:2])
@@ -1091,17 +1090,17 @@ def extract_city_state_from_reply(text: str) -> tuple[str | None, str | None]:
 
     low = txt.lower()
     state = None
-    if re.search(r"\bct\b|\bconnecticut\b", low):
+    if re.search(r"ct|connecticut", low):
         state = "CT"
-        txt = re.sub(r"\bct\b|\bconnecticut\b", "", txt, flags=re.I).strip(" ,")
-    elif re.search(r"\bma\b|\bmassachusetts\b", low):
+        txt = re.sub(r"ct|connecticut", "", txt, flags=re.I).strip(" ,")
+    elif re.search(r"ma|massachusetts", low):
         state = "MA"
-        txt = re.sub(r"\bma\b|\bmassachusetts\b", "", txt, flags=re.I).strip(" ,")
+        txt = re.sub(r"ma|massachusetts", "", txt, flags=re.I).strip(" ,")
 
     # Reject obvious non-city inputs
     if re.search(r"\d", txt):
         return None, state
-    if re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", txt, flags=re.I):
+    if re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", txt, flags=re.I):
         return None, state
 
     city = " ".join(w.capitalize() for w in txt.split()) if txt else None
@@ -1134,7 +1133,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
 
     # State-only reply like 'CT'
     if not city and state:
-        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)\b", raw, flags=re.I):
+        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)", raw, flags=re.I):
             merged = f"{raw}, {state}"
         else:
             merged = f"{raw}, {state}"
@@ -1142,7 +1141,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     elif city:
         base = raw
         # If raw already ends with the same city/state, do nothing.
-        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?\b", raw, flags=re.I):
+        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?", raw, flags=re.I):
             merged = raw if not state else re.sub(r",\s*([A-Za-z .'-]+)(?:,\s*(CT|MA))?$", rf", {city}, {state}", raw, flags=re.I)
         else:
             merged = f"{base}, {city}" + (f", {state}" if state else "")
@@ -1166,81 +1165,6 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
 
     update_address_assembly_state(sched)
     return True
-
-
-
-def force_capture_address_from_inbound(sched: dict, inbound_text: str) -> bool:
-    """
-    Deterministically capture address fragments from natural SMS replies.
-    Handles:
-      - "Bloomfield Ave" -> route only, asks for house number next
-      - "45 Bloomfield Ave" -> full street+number, asks for town/state next
-      - "54" while waiting on a house number -> merges into existing street
-      - "It's 54 Bloomfield Ave sorry" -> overwrites the prior street candidate
-    """
-    txt = (inbound_text or "").strip()
-    if not txt:
-        return False
-
-    low = txt.lower()
-    # Skip obvious non-address informational questions.
-    if any(x in low for x in ["how much", "price", "cost", "licensed", "insured", "card", "cash", "check", "payment", "permit", "dog", "dogs", "pet", "pets", "call when", "text when", "on the way"]):
-        # But do not skip if there is a clear street address embedded.
-        pass
-
-    update_address_assembly_state(sched)
-    current_missing = (sched.get("address_missing") or "").strip().lower()
-    raw_existing = (sched.get("raw_address") or "").strip()
-
-    cleaned = txt
-    cleaned = re.sub(r"^(ok|okay|its|it's|it is|im at|i'm at|my address is|address is|it\s+is)\b[\s,:-]*", "", cleaned, flags=re.I).strip()
-    cleaned = re.sub(r"\b(sorry|thanks|thank you)\b", "", cleaned, flags=re.I).strip(' ,.-')
-
-    street_pat = re.compile(
-        r"\b(\d{1,6}\s+[A-Za-z0-9.'\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace))\b",
-        flags=re.I
-    )
-    route_only_pat = re.compile(
-        r"\b([A-Za-z][A-Za-z0-9.'\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace))\b",
-        flags=re.I
-    )
-
-    # Full numbered street in one message.
-    m_full = street_pat.search(cleaned)
-    if m_full:
-        candidate = " ".join(m_full.group(1).split()).strip(' ,')
-        if candidate and candidate != raw_existing:
-            sched["raw_address"] = candidate
-            sched["normalized_address"] = None
-            update_address_assembly_state(sched)
-            return True
-        return False
-
-    # Customer only sent the missing house number while we already know the street.
-    if current_missing == "number" and raw_existing:
-        m_num = re.search(r"\b(\d{1,6})\b", cleaned)
-        if m_num and not route_only_pat.search(cleaned):
-            street_only = re.sub(r"^\d{1,6}\s+", "", raw_existing).strip()
-            if street_only:
-                sched["raw_address"] = f"{m_num.group(1)} {street_only}"
-                sched["normalized_address"] = None
-                update_address_assembly_state(sched)
-                return True
-
-    # Route-only street name, no number yet.
-    m_route = route_only_pat.search(cleaned)
-    if m_route:
-        candidate = " ".join(m_route.group(1).split()).strip(' ,')
-        if candidate:
-            sched["raw_address"] = candidate
-            sched["normalized_address"] = None
-            sched["address_candidate"] = candidate
-            sched["address_verified"] = False
-            sched["address_missing"] = "number"
-            sched["address_parts"] = {"street": True, "number": False, "city": False, "state": False, "zip": False, "source": "raw_address"}
-            return True
-
-    return False
 
 def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     """Single deterministic next-step selector. Python enforces state; SRBs drive prompt choice."""
@@ -1493,18 +1417,6 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
-    # Deterministic address capture for raw street / house-number replies.
-    try:
-        force_capture_address_from_inbound(sched, inbound_text)
-    except Exception as e:
-        print("[WARN] incoming_sms direct address capture failed:", repr(e))
-
-    # If the customer just corrected or completed the address, refresh immediately.
-    try:
-        try_early_address_normalize(sched)
-    except Exception as e:
-        print("[WARN] incoming_sms early normalize failed:", repr(e))
-
     # Deterministic fast path for pure interruption questions.
     # This prevents price / payment / permit questions from getting lost
     # behind the address collector when the inbound does not contain a new slot value.
@@ -1551,28 +1463,13 @@ def incoming_sms():
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
 
-    # One more deterministic address pass in case the inbound text corrected the house number
-    # but the model did not lock it cleanly.
-    try:
-        force_capture_address_from_inbound(sched, inbound_text)
-        try_early_address_normalize(sched)
-    except Exception as e:
-        print("[WARN] incoming_sms post-step4 address capture failed:", repr(e))
-
     recompute_pending_step(profile, sched)
 
     sms_body = (reply.get("sms_body") or "").strip()
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
-    # Route-level guardrail: override obvious state mismatches and generic filler.
+    # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
-    sms_low = sms_body.lower()
-    missing_atom = (sched.get("address_missing") or "").strip().lower()
-    if sched.get("pending_step") == "need_address":
-        if missing_atom == "number" and ("what street" in sms_low or "street name" in sms_low or "which street" in sms_low):
-            sms_body = build_address_prompt(sched)
-        elif missing_atom == "street" and ("house number" in sms_low or "street number" in sms_low or "what number" in sms_low):
-            sms_body = build_address_prompt(sched)
     if sms_body in generic_fillers:
         sms_body = next_prompt
 
@@ -1769,22 +1666,45 @@ def normalize_person_name(s: str) -> str:
     return " ".join(p[:1].upper() + p[1:].lower() for p in s.split())
 
 def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
+    """
+    Conservative name extraction for voicemail identity only.
+
+    IMPORTANT:
+    - Do NOT infer names from phrases like "I'm looking to..." or "I am calling about..."
+    - Only accept explicit self-identification patterns.
+    - If the caller did not clearly say their name, return (None, None).
+    """
     txt = " ".join((text or "").strip().split())
     if not txt:
         return None, None
 
     patterns = [
-        r"\b(?:my name is|this is|i am|i'm)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
+        r"\bmy name is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
         r"\bname\s+is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
-        r"^it(?:\'s| is)?\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+(?:yes|yeah|yep|correct|right))?$",
-        r"^(?:yes|yeah|yep|correct|right)\s+it(?:\'s| is)?\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?$",
+        r"\bthis is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
     ]
+
+    stop_words = {
+        "looking", "calling", "trying", "needing", "need", "wanting", "want",
+        "with", "for", "about", "because", "regarding", "located", "living",
+        "from", "at", "in", "the", "a", "an"
+    }
+
     for pat in patterns:
         m = re.search(pat, txt, flags=re.I)
-        if m:
-            first = normalize_person_name(m.group(1) or "") or None
-            last = normalize_person_name(m.group(2) or "") or None
-            return first, last
+        if not m:
+            continue
+
+        first = normalize_person_name(m.group(1) or "")
+        last = normalize_person_name(m.group(2) or "")
+
+        if not first:
+            continue
+        if first.lower() in stop_words:
+            continue
+
+        return first or None, last or None
+
     return None, None
 
 def ensure_name_engine_defaults(profile: dict, sched: dict) -> None:
@@ -1882,8 +1802,7 @@ def yes_text(text: str) -> bool:
     low = normalize_short_reply(text)
     if low in {"yes", "y", "yeah", "yep", "correct", "that is correct", "right", "it is", "it is correct", "thats right", "that's right"}:
         return True
-    yes_markers = ["yes", "yeah", "yep", "correct", "right", "thats right", "that's right"]
-    if any(marker in low for marker in yes_markers):
+    if low.startswith("yes ") and any(x in low for x in ["correct", "right"]):
         return True
     return False
 
@@ -1939,12 +1858,13 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
 
     known_names = list_known_first_names(profile)
     recognized_first = normalize_person_name(profile.get("recognized_first_name") or "")
+    recognized_last = normalize_person_name(profile.get("recognized_last_name") or "")
 
     if not known_names and recognized_first:
         upsert_known_person(
             profile,
             first_name=recognized_first,
-            last_name=profile.get("recognized_last_name") or "",
+            last_name=recognized_last or "",
             email=profile.get("recognized_email") or "",
             square_customer_id=profile.get("square_customer_id") or None,
         )
@@ -1953,36 +1873,54 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
     if sched.get("name_engine_state"):
         return None
 
-    # If voicemail first name matches a known person, lock onto that person.
+    # If voicemail clearly identified a person and that person is already known on this number,
+    # use that caller as the active identity for this booking.
     if voicemail_first:
         known = find_known_person_by_first(profile, voicemail_first)
         if known:
             apply_known_person_to_active(profile, known, source="known_person_match")
             return None
 
-        # One known person on file but voicemail says a different first name -> clarify.
+        # Exactly one known person on file but voicemail named someone different -> clarify.
         if len(known_names) == 1:
+            known_first = known_names[0]
             sched["name_engine_state"] = "awaiting_new_person_confirmation"
             sched["name_engine_candidate_first"] = voicemail_first
             sched["name_engine_candidate_last"] = voicemail_last
-            sched["name_engine_expected_known_first"] = known_names[0]
-            return wrap_name_engine_message(sched, f"I have {known_names[0]} on file from a past visit, but the voicemail said {voicemail_first}. Is this {voicemail_first}?", voicemail_first)
+            sched["name_engine_expected_known_first"] = known_first
+            return wrap_name_engine_message(
+                sched,
+                f"We worked with {known_first} on this number before, but the voicemail sounded like {voicemail_first}. Is {voicemail_first} the correct name for this visit?",
+                voicemail_first,
+            )
 
-        # Multiple known people and voicemail gives a new first name -> clarify against the known names.
+        # Multiple known people and voicemail gives a new first name -> clarify against known names.
         if len(known_names) >= 2:
             joined = ", ".join(known_names[:-1]) + f" or {known_names[-1]}" if len(known_names) > 1 else known_names[0]
             sched["name_engine_state"] = "awaiting_new_person_confirmation_multi"
             sched["name_engine_candidate_first"] = voicemail_first
             sched["name_engine_candidate_last"] = voicemail_last
-            return wrap_name_engine_message(sched, f"I have {joined} on file for this number, but the voicemail said {voicemail_first}. Is this {voicemail_first}?", voicemail_first)
+            return wrap_name_engine_message(
+                sched,
+                f"I have {joined} on this number, but the voicemail sounded like {voicemail_first}. Is {voicemail_first} the correct name for this visit?",
+                voicemail_first,
+            )
 
-        # No known people yet -> use voicemail first name as active first name, but still collect last/email later.
+        # No known people yet -> trust the explicit voicemail name.
         profile["active_first_name"] = voicemail_first
         profile["first_name"] = voicemail_first
         profile["identity_source"] = "voicemail_first_name"
         return None
 
-    # No voicemail name, multiple known people on the number -> ask who is calling.
+    # No voicemail name was given.
+    # If there is exactly one known person on file, use that person quietly.
+    if len(known_names) == 1 and not get_active_first_name(profile):
+        known = find_known_person_by_first(profile, known_names[0])
+        if known:
+            apply_known_person_to_active(profile, known, source="single_known_person_phone_match")
+            return None
+
+    # No voicemail name and multiple known people on the number -> ask who is calling.
     if len(known_names) >= 2 and not get_active_first_name(profile):
         joined = ", ".join(known_names[:-1]) + f" or {known_names[-1]}" if len(known_names) > 1 else known_names[0]
         sched["name_engine_state"] = "awaiting_known_person_selection"
@@ -2002,16 +1940,9 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
     if state in {"awaiting_new_person_confirmation", "awaiting_new_person_confirmation_multi"}:
         candidate_first = normalize_person_name(sched.get("name_engine_candidate_first") or "")
         if yes_text(low):
-            corrected_first, _ = extract_possible_person_name(inbound_text)
-            chosen_first = candidate_first
-            if corrected_first:
-                corrected_first = normalize_person_name(corrected_first)
-                if corrected_first and corrected_first.lower() != candidate_first.lower():
-                    chosen_first = corrected_first
-            profile["active_first_name"] = chosen_first
-            profile["first_name"] = chosen_first
+            profile["active_first_name"] = candidate_first
+            profile["first_name"] = candidate_first
             profile["identity_source"] = "new_person_confirmed_from_voicemail"
-            sched["name_engine_candidate_first"] = chosen_first
             sched["name_engine_state"] = "awaiting_new_person_last_name"
             return "Perfect. What is your last name?"
         if no_text(low):
@@ -2140,9 +2071,9 @@ def looks_like_slot_payload(inbound_text: str) -> bool:
         return False
     if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", txt, flags=re.I):
         return True
-    if re.search(r"\b\d{1,6}\b", txt) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
+    if re.search(r"\d{1,6}", txt) and re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
         return True
-    if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", low, flags=re.I):
+    if re.search(r"\d{1,2}(:\d{2})?\s*(am|pm)", low, flags=re.I):
         return True
     if re.search(r"^\d{3,4}$", txt):
         return True
@@ -2158,9 +2089,6 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
     if sched.get("booking_created") and sched.get("square_booking_id"):
         return False
     if looks_like_slot_payload(inbound_text):
-        return False
-    # If the message contains a street/address fragment, do not short-circuit.
-    if re.search(r"\b(?:\d{1,6}\s+)?[A-Za-z][A-Za-z0-9.'\- ]+\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", (inbound_text or ""), flags=re.I):
         return False
     low = (inbound_text or "").lower().strip()
     interrupt_markers = [
@@ -2208,13 +2136,7 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
     sched = conv.setdefault("sched", {})
     appt = profile.get("upcoming_appointment") or {}
 
-    closed_thread = bool(
-        (sched.get("booking_created") and sched.get("square_booking_id"))
-        or sched.get("final_confirmation_accepted")
-        or sched.get("final_confirmation_sent")
-        or profile.get("upcoming_appointment")
-    )
-    if not closed_thread:
+    if not (sched.get("booking_created") and sched.get("square_booking_id")):
         return None
 
     low = (inbound_text or "").lower().strip()
@@ -2242,24 +2164,13 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
         sched["address_missing"] = None
         sched["address_parts"] = {}
         sched["pending_step"] = None
-        sched["final_confirmation_sent"] = False
-        sched["final_confirmation_accepted"] = False
         return None
 
-    if any(x in low for x in ["picture", "pictures", "photo", "photos", "image", "images"]):
-        return "Yes, you can send them over if you'd like, but we'll still evaluate everything in person."
-
-    if any(x in low for x in ["prepare", "prep", "anything i should do", "what should i do"]):
-        return "Nothing special. Just make sure we can safely get to the panel and work area when we arrive."
-
-    if any(x in low for x in ["card", "cash", "check", "payment", "pay", "forms of payment"]):
-        return "Card or cash after the visit is totally fine."
-
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
-        return "That is fine. Just make sure we can safely get to the panel when we arrive."
+        return "Yes, please make sure we can safely get to the panel when we arrive."
 
     if any(x in low for x in ["gate", "code", "lock", "locked", "access", "doorbell", "call when outside"]):
-        return "That is fine. Just make sure we can get to the panel when we arrive."
+        return "That's fine. Just make sure we can get to the panel when we arrive."
 
     if any(x in low for x in ["what time", "when are you coming", "what day", "when is my appointment", "are we good"]):
         date_txt = (appt.get("date") or sched.get("scheduled_date") or "").strip()
@@ -2270,7 +2181,7 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
             return f"You're all set for {date_txt}."
         return "You're all set for the visit."
 
-    if any(x in low for x in ["who is coming", "who's coming", "whos coming", "on the way", "arrival window", "will they call", "text when"]):
+    if any(x in low for x in ["who is coming", "who's coming", "whos coming", "on the way", "arrival window", "will they call"]):
         return "You'll get a text when we're on the way."
 
     if any(x in low for x in ["price", "how much", "cost"]):
