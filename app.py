@@ -2104,10 +2104,28 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         "how much", "price", "cost", "$195", "$395", "195", "395",
         "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee",
         "quote", "estimate", "free estimate", "ballpark", "rough price", "firm number",
-        "what do you charge", "what does the visit include", "what does that include"
+        "what do you charge", "what does the visit include", "what does that include",
+        "go towards the project", "go toward the project", "goes towards the project", "goes toward the project",
+        "apply to the project", "applied to the project", "credit toward the project", "credited toward the project",
+        "does it go toward", "does it go towards", "does that go toward", "does that go towards",
+        "does the fee go toward", "does the fee go towards", "does the service fee go toward", "does the service fee go towards",
+        "deposit", "credited back", "applied back"
     ]):
         appt = (sched.get("appointment_type") or "").upper()
-        if any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
+        if any(x in low for x in [
+            "go towards the project", "go toward the project", "goes towards the project", "goes toward the project",
+            "apply to the project", "applied to the project", "credit toward the project", "credited toward the project",
+            "does it go toward", "does it go towards", "does that go toward", "does that go towards",
+            "does the fee go toward", "does the fee go towards", "does the service fee go toward", "does the service fee go towards",
+            "deposit", "credited back", "applied back"
+        ]):
+            if "TROUBLESHOOT" in appt:
+                answer = "The $395 covers the troubleshoot and repair visit itself. If any larger repair is needed, we go over that separately on site before anything moves forward."
+            elif "INSPECTION" in appt:
+                answer = "The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately."
+            else:
+                answer = "The $195 covers the evaluation visit itself. If you decide to move forward with project work after that, we go over the next step in person."
+        elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
             answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
         elif "TROUBLESHOOT" in appt:
             answer = "The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site."
@@ -2171,6 +2189,11 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
     interrupt_markers = [
         "how much", "price", "cost", "$195", "$395", "195", "395", "just to come out", "just to come",
         "quote", "estimate", "free estimate", "ballpark", "firm number", "rough price",
+        "go towards the project", "go toward the project", "goes towards the project", "goes toward the project",
+        "apply to the project", "applied to the project", "credit toward the project", "credited toward the project",
+        "does it go toward", "does it go towards", "does that go toward", "does that go towards",
+        "does the fee go toward", "does the fee go towards", "does the service fee go toward", "does the service fee go towards",
+        "deposit", "credited back", "applied back",
         "licensed", "insured", "card", "cash", "check", "payment", "pay by",
         "permit", "permit required", "dog", "dogs", "pet", "pets", "call when",
         "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close",
@@ -2660,10 +2683,7 @@ def generate_reply_for_inbound(
         # Post-booking handling
         # --------------------------------------
         if not IS_EMERGENCY:
-            post_booking_handler = globals().get("handle_post_booking") or globals().get("handle_post_booking_question")
-            post_booking_reply = None
-            if callable(post_booking_handler):
-                post_booking_reply = post_booking_handler(conv, inbound_text)
+            post_booking_reply = handle_post_booking(conv, inbound_text)
             if post_booking_reply is not None:
                 booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
                 post_booking_reply = sanitize_sms_body(post_booking_reply, booking_created=booking_created)
