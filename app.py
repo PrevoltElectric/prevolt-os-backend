@@ -952,16 +952,16 @@ def build_address_prompt(sched: dict) -> str:
     if missing == "street":
         if parts.get("city") and candidate and not parts.get("street"):
             options = [
-                f"What street is it on in {candidate}?",
-                f"Which street in {candidate} is this on?",
-                f"What’s the street name in {candidate}?",
+                f"What is the house number and street name in {candidate}?",
+                f"What’s the house number and street for the place in {candidate}?",
+                f"Send the house number and street name in {candidate}.",
             ]
             return pick_variant_once(sched, "addr_missing_street_with_city", options)
 
         options = [
-            "What street is it on?",
-            "What’s the street name?",
-            "Which street is this on?",
+            "What is the house number and street name?",
+            "Send the house number and street name for the address.",
+            "What’s the house number and street for the visit?",
         ]
         return pick_variant_once(sched, "addr_missing_street", options)
 
@@ -2734,26 +2734,43 @@ def generate_reply_for_inbound(
         try:
             update_address_assembly_state(sched)
             missing_atom = (sched.get("address_missing") or "").strip().lower()
+            inbound_clean = inbound_text.strip()
 
-            if missing_atom == "number":
-                inbound_clean = inbound_text.strip()
+            low = inbound_clean.lower()
+            street_suffixes = (
+                " st", " street", " ave", " avenue", " rd", " road", " ln", " lane",
+                " dr", " drive", " ct", " court", " cir", " circle", " blvd", " boulevard",
+                " way", " pkwy", " parkway", " ter", " terrace"
+            )
+            inbound_has_street_word = any(suf in f" {low} " for suf in street_suffixes)
+            inbound_starts_with_number = bool(re.match(r"^\s*\d{1,6}\b", inbound_clean))
+            m_num = re.search(r"\b(\d{1,6})\b", inbound_clean)
+            num = m_num.group(1) if m_num else None
 
-                m_num = re.search(r"\b(\d{1,6})\b", inbound_clean)
-                num = m_num.group(1) if m_num else None
+            raw = (sched.get("raw_address") or "").strip()
+            norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+            norm_line1 = (norm.get("address_line_1") or "").strip() if norm else ""
 
-                low = inbound_clean.lower()
-                street_suffixes = (
-                    " st", " street", " ave", " avenue", " rd", " road", " ln", " lane",
-                    " dr", " drive", " ct", " court", " cir", " circle", " blvd", " boulevard",
-                    " way", " pkwy", " parkway", " ter", " terrace"
-                )
-                inbound_has_street_word = any(suf in f" {low} " for suf in street_suffixes)
-                inbound_starts_with_number = bool(re.match(r"^\s*\d{1,6}\b", inbound_clean))
+            if missing_atom == "street":
+                if inbound_has_street_word and not inbound_starts_with_number:
+                    city_hint = raw.strip()
+                    if city_hint and city_hint.lower() not in inbound_clean.lower():
+                        sched["raw_address"] = f"{inbound_clean}, {city_hint}".strip(" ,")
+                    else:
+                        sched["raw_address"] = inbound_clean
+                    sched["normalized_address"] = None
+                    update_address_assembly_state(sched)
 
-                raw = (sched.get("raw_address") or "").strip()
-                norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
-                norm_line1 = (norm.get("address_line_1") or "").strip() if norm else ""
+                elif inbound_starts_with_number and inbound_has_street_word:
+                    city_hint = raw.strip()
+                    if city_hint and city_hint.lower() not in inbound_clean.lower():
+                        sched["raw_address"] = f"{inbound_clean}, {city_hint}".strip(" ,")
+                    else:
+                        sched["raw_address"] = inbound_clean
+                    sched["normalized_address"] = None
+                    update_address_assembly_state(sched)
 
+            elif missing_atom == "number":
                 if inbound_starts_with_number and inbound_has_street_word:
                     sched["raw_address"] = inbound_clean
                     sched["normalized_address"] = None
