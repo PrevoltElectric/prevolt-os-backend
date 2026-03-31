@@ -110,6 +110,15 @@ def humanize_question(core_question: str) -> str:
     core_question = (core_question or "").strip()
     return core_question
 
+
+def _loose_text(text: str) -> str:
+    """Lowercase, de-punctuated text for loose intent matching."""
+    s = (text or "").lower().strip()
+    if not s:
+        return ""
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
 app = Flask(__name__)
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -3816,8 +3825,6 @@ def _square_search_availability_range(start_local: datetime, end_local: datetime
                 }
             }
         }
-        if variation_version is not None:
-            payload["query"]["filter"]["segment_filters"][0]["service_variation_version"] = variation_version
         r = requests.post(
             "https://connect.squareup.com/v2/bookings/availability/search",
             headers=square_headers(),
@@ -3825,7 +3832,7 @@ def _square_search_availability_range(start_local: datetime, end_local: datetime
             timeout=15,
         )
         if r.status_code not in (200, 201):
-            print("[WARN] availability search failed:", r.status_code, r.text)
+            print("[WARN] availability search failed:", r.status_code, r.text, "payload_keys=", list((payload.get("query",{}).get("filter",{}).get("segment_filters",[{}])[0] or {}).keys()))
             return []
         return (r.json() or {}).get("availabilities") or []
     except Exception as e:
