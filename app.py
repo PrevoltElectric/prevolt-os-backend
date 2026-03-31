@@ -1560,6 +1560,24 @@ def incoming_sms():
         tw.message(post_booking_reply.strip())
         return Response(str(tw), mimetype="text/xml")
 
+    # If the customer simply acknowledges a prior price or quote answer,
+    # move forward to the next missing booking step instead of letting
+    # Step 4 recycle the same answer.
+    try:
+        if is_ack_message(inbound_text) and not sched.get("booking_created"):
+            recompute_pending_step(profile, sched)
+            ack_next = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+            if ack_next and ack_next not in {"Okay.", "Okay", "Everything looks good here."}:
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = ack_next.strip()
+                tw = MessagingResponse()
+                tw.message(ack_next.strip())
+                return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms ack advance failed:", repr(e))
+
     # ---------------------------------------------------
     # Run Step 4
     # ---------------------------------------------------
@@ -2144,9 +2162,21 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
 def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
-    burst_text = build_burst_text(conv, inbound_text) or inbound_text
-    low = (burst_text or "").lower().strip()
+    # IMPORTANT: use only the CURRENT inbound text here.
+    # Pulling burst history into interruption answers causes old quote/pricing
+    # questions to contaminate later replies like "ok" or a new address.
+    current_text = (inbound_text or "").strip()
+    low = current_text.lower().strip()
     if not low:
+        return None
+
+    # Booking payloads and simple acknowledgements should advance state,
+    # not trigger a repeated interruption answer.
+    if is_ack_message(current_text):
+        return None
+    if looks_like_slot_payload(current_text):
+        return None
+    if re.search(r"\b\d{1,6}\s+[A-Za-z0-9.'\- ]+\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
         return None
 
     booked = bool(sched.get("booking_created") and sched.get("square_booking_id"))
@@ -2243,7 +2273,7 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             add_answer("It covers the evaluation visit itself so we can see everything in person and go over the next step.")
 
     if any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        absorb_burst_booking_details(conv, burst_text)
+        absorb_burst_booking_details(conv, current_text)
         update_address_assembly_state(sched)
         recompute_pending_step(profile, sched)
 
@@ -2258,7 +2288,7 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         else:
             if not sched.get("raw_address") or not sched.get("address_verified"):
                 add_answer("I can line up the soonest opening once I have the address.")
-            next_prompt = choose_next_prompt_from_state(conv, inbound_text=burst_text)
+            next_prompt = choose_next_prompt_from_state(conv, inbound_text=current_text)
             if next_prompt and next_prompt not in {"Okay.", "Okay", "Everything looks good here."}:
                 add_answer(next_prompt)
 
@@ -2396,9 +2426,16 @@ def should_short_circuit_interrupt(conv: dict, text: str) -> bool:
     low = (text or "").lower().strip()
     if not low:
         return False
+    if is_ack_message(text):
+        return False
+    if looks_like_slot_payload(text):
+        return False
+    if re.search(r"\b\d{1,6}\s+[A-Za-z0-9.'\- ]+\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
+        return False
     questionish = ("?" in text) or any(p in low for p in [
         "how soon", "when can you come", "do you", "can you", "are you", "what if", "is the $195",
-        "does it go toward", "licensed", "insured", "permits", "payment", "cash", "card", "dogs"
+        "does it go toward", "licensed", "insured", "permits", "payment", "cash", "card", "dogs",
+        "quote", "estimate", "price", "cost", "195", "395", "written quote", "written estimate"
     ])
     has_slot = bool(extract_explicit_time_from_text(text)) or bool(re.search(r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", low, flags=re.I))
     return bool(questionish and not has_slot)
