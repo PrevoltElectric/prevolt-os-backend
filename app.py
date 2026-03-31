@@ -236,6 +236,60 @@ def looks_like_slot_payload(text: str) -> bool:
 
     return False
 
+
+
+def looks_like_address_payload(text: str) -> bool:
+    low = (text or "").lower().strip()
+    if not low:
+        return False
+    if re.search(r"\d{1,6}\s+[A-Za-z0-9.'\- ]+(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
+        return True
+    return False
+
+
+def looks_like_town_reply(text: str) -> bool:
+    txt = " ".join((text or "").strip().replace(',', ' ').split())
+    if not txt:
+        return False
+    low = txt.lower()
+    if re.search(r"\d", low):
+        return False
+    if re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low):
+        return False
+    if len(low.split()) > 4:
+        return False
+    return True
+
+
+def capture_access_notes(sched: dict, inbound_text: str) -> bool:
+    low = (inbound_text or "").lower().strip()
+    if not low:
+        return False
+    markers = [
+        "gate", "gate code", "code", "doorbell", "call when outside", "text when outside",
+        "side door", "back door", "rear door", "use the side", "use the back",
+        "parking", "driveway", "garage", "basement entrance", "upstairs unit", "downstairs unit",
+        "unit", "apt", "apartment", "suite", "ste", "floor", "building", "left door", "right door"
+    ]
+    if not any(m in low for m in markers):
+        return False
+    clean = " ".join((inbound_text or "").strip().split())
+    existing = sched.get("access_notes") or ""
+    if clean and clean.lower() not in existing.lower():
+        sched["access_notes"] = (existing + " | " + clean).strip(" |") if existing else clean
+    return True
+
+
+def refresh_runtime_state(conv: dict) -> tuple[dict, dict, str | None, str | None, str | None]:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    update_address_assembly_state(sched)
+    recompute_pending_step(profile, sched)
+    scheduled_date = sched.get("scheduled_date")
+    scheduled_time = sched.get("scheduled_time")
+    address = sched.get("raw_address") or sched.get("normalized_address")
+    return profile, sched, scheduled_date, scheduled_time, address
+
 def send_sms(to_number: str, body: str) -> None:
     """
     Send a normal outbound SMS to the actual customer number.
@@ -546,6 +600,8 @@ def handle_call_selection():
     sched.setdefault("final_confirmation_sent", False)
     sched.setdefault("final_confirmation_accepted", False)
     sched.setdefault("last_final_confirmation_key", None)
+    sched.setdefault("access_notes", None)
+    sched.setdefault("access_note_prompted", False)
 
     # -----------------------------
     # OPTION 1 → RESIDENTIAL
@@ -661,6 +717,8 @@ def voicemail_complete():
     # Emergency flags
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
+    sched.setdefault("access_notes", None)
+    sched.setdefault("access_note_prompted", False)
 
     # ---------------------------------------------------
     # Store classification results
@@ -1257,6 +1315,9 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
         return humanize_question("What is the best email address for the appointment?")
 
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
+        if sched.get("scheduled_date") and sched.get("scheduled_time") and sched.get("address_verified") and not sched.get("access_note_prompted") and not (sched.get("access_notes") or ""):
+            sched["access_note_prompted"] = True
+            return "Anything specific we should know to find the place, like a unit, gate code, or side door? If not, just say no."
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
             final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
             if sched.get("final_confirmation_accepted") and sched.get("last_final_confirmation_key") == final_key:
@@ -1321,6 +1382,9 @@ def incoming_sms():
                 "soft_rejection_state": None,
                 "soft_rejection_open": False,
                 "soft_rejection_ts": None,
+                "access_notes": None,
+        "access_note_prompted": False,
+                "access_note_prompted": False,
             }
         }
         resp = MessagingResponse()
@@ -1409,12 +1473,15 @@ def incoming_sms():
     sched.setdefault("availability_offer_pending", False)
     sched.setdefault("availability_offer_options", [])
     sched.setdefault("availability_offer_requested_label", None)
+    sched.setdefault("access_notes", None)
+    sched.setdefault("access_note_prompted", False)
 
     try:
         maybe_apply_pending_availability_selection(conv, inbound_text)
     except Exception as e:
         print("[WARN] pending availability selection failed:", repr(e))
 
+    profile, sched, scheduled_date, scheduled_time, address = refresh_runtime_state(conv)
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
     appointment_type = sched.get("appointment_type")
@@ -1477,6 +1544,11 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms burst absorb failed:", repr(e))
 
+    try:
+        capture_access_notes(sched, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms access note capture failed:", repr(e))
+
     # In-progress lifecycle handling before interruption routing
     try:
         lifecycle_reply = handle_prebooking_lifecycle(conv, inbound_text)
@@ -1523,6 +1595,30 @@ def incoming_sms():
         tw = MessagingResponse()
         tw.message(soft_reject_reply.strip())
         return Response(str(tw), mimetype="text/xml")
+
+    if sched.get("access_note_prompted") and _loose_text(inbound_text) in {"no", "nope", "none", "nothing", "no access notes"}:
+        sched["access_notes"] = sched.get("access_notes") or "none"
+        next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = next_prompt.strip()
+        tw = MessagingResponse()
+        tw.message(next_prompt.strip())
+        return Response(str(tw), mimetype="text/xml")
+
+    # Deterministic ack fast path. If the user just says "ok" after a side answer,
+    # do not let stale quote or pricing context replay. Move straight to the next step.
+    if is_ack_message(inbound_text) and not looks_like_slot_payload(inbound_text) and not sched.get("availability_offer_pending"):
+        next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+        if next_prompt not in {"", "Okay.", "Okay", "ok", "ok."}:
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = next_prompt.strip()
+            tw = MessagingResponse()
+            tw.message(next_prompt.strip())
+            return Response(str(tw), mimetype="text/xml")
 
     # Deterministic fast path for pure interruption questions.
     # Use the CURRENT inbound only here. Burst text is still useful for
@@ -1636,9 +1732,7 @@ def incoming_sms():
             profile["addresses"].append(reply["address"])
 
     # Re-derive address assembly state after Step 4 updates
-    update_address_assembly_state(sched)
-
-    recompute_pending_step(profile, sched)
+    profile, sched, scheduled_date, scheduled_time, address = refresh_runtime_state(conv)
 
     sms_body = (reply.get("sms_body") or "").strip()
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
@@ -1647,6 +1741,11 @@ def incoming_sms():
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
+
+    try:
+        sms_body = postprocess_sms(sms_body, inbound_text, sched, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
+    except Exception as e:
+        print("[WARN] incoming_sms postprocess failed:", repr(e))
 
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
@@ -2238,6 +2337,9 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
         add_answer("No, you do not need to buy anything ahead of time for the visit.")
 
+    if capture_access_notes(sched, inbound_text):
+        add_answer("Perfect. I saved that note for the visit.")
+
     if any(x in low for x in ["need to be home", "be home", "do i have to be there", "do i need to be there"]):
         add_answer("For the initial visit, yes, someone should be there so we can access everything safely.")
 
@@ -2382,7 +2484,7 @@ def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | Non
         "its a go", "it's a go", "wife says", "husband says", "spouse says", "ready to book",
         "lets book", "let's book", "when can you come", "when can you come out"
     ]
-    if looks_like_slot_payload(inbound_text) or any(x in low for x in resume_markers):
+    if looks_like_slot_payload(inbound_text) or looks_like_address_payload(inbound_text) or any(x in low for x in resume_markers):
         sched["soft_rejection_open"] = False
         absorb_obvious_booking_details(conv, inbound_text)
         recompute_pending_step(profile, sched)
