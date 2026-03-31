@@ -188,7 +188,7 @@ def extract_explicit_time_from_text(text: str) -> str | None:
     if not s:
         return None
 
-    m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m', s, flags=re.I)
+    m = re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m\b', s, flags=re.I)
     if m:
         hh = int(m.group(1))
         mm = int(m.group(2) or '00')
@@ -200,11 +200,11 @@ def extract_explicit_time_from_text(text: str) -> str | None:
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
-    m = re.search(r'([01]?\d|2[0-3]):([0-5]\d)', s)
+    m = re.search(r'\b([01]?\d|2[0-3]):([0-5]\d)\b', s)
     if m:
         return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
 
-    m = re.search(r'(\d{3,4})', s)
+    m = re.search(r'\b(\d{3,4})\b', s)
     if m:
         raw = m.group(1).zfill(4)
         hh = int(raw[:2])
@@ -1110,17 +1110,17 @@ def extract_city_state_from_reply(text: str) -> tuple[str | None, str | None]:
 
     low = txt.lower()
     state = None
-    if re.search(r"ct|connecticut", low):
+    if re.search(r"\bct\b|\bconnecticut\b", low):
         state = "CT"
-        txt = re.sub(r"ct|connecticut", "", txt, flags=re.I).strip(" ,")
-    elif re.search(r"ma|massachusetts", low):
+        txt = re.sub(r"\bct\b|\bconnecticut\b", "", txt, flags=re.I).strip(" ,")
+    elif re.search(r"\bma\b|\bmassachusetts\b", low):
         state = "MA"
-        txt = re.sub(r"ma|massachusetts", "", txt, flags=re.I).strip(" ,")
+        txt = re.sub(r"\bma\b|\bmassachusetts\b", "", txt, flags=re.I).strip(" ,")
 
     # Reject obvious non-city inputs
     if re.search(r"\d", txt):
         return None, state
-    if re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", txt, flags=re.I):
+    if re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", txt, flags=re.I):
         return None, state
 
     city = " ".join(w.capitalize() for w in txt.split()) if txt else None
@@ -1153,7 +1153,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
 
     # State-only reply like 'CT'
     if not city and state:
-        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)", raw, flags=re.I):
+        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)\b", raw, flags=re.I):
             merged = f"{raw}, {state}"
         else:
             merged = f"{raw}, {state}"
@@ -1161,7 +1161,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     elif city:
         base = raw
         # If raw already ends with the same city/state, do nothing.
-        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?", raw, flags=re.I):
+        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?\b", raw, flags=re.I):
             merged = raw if not state else re.sub(r",\s*([A-Za-z .'-]+)(?:,\s*(CT|MA))?$", rf", {city}, {state}", raw, flags=re.I)
         else:
             merged = f"{base}, {city}" + (f", {state}" if state else "")
@@ -1477,14 +1477,34 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # Warm soft rejection handling during booking.
+    # This has to run BEFORE interruption answers so messages like
+    # "I need to talk to my wife first" do not get hijacked by a prior
+    # quote/pricing question still sitting in burst memory.
+    try:
+        soft_reject_reply = build_soft_rejection_reply(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms soft rejection failed:", repr(e))
+        soft_reject_reply = None
+
+    if soft_reject_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = soft_reject_reply.strip()
+        tw = MessagingResponse()
+        tw.message(soft_reject_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
+
     # Deterministic fast path for pure interruption questions.
-    # This prevents price / payment / permit questions from getting lost
-    # behind the address collector when the inbound does not contain a new slot value.
+    # Use the CURRENT inbound only here. Burst text is still useful for
+    # slot extraction elsewhere, but using it here causes old quote/payment
+    # questions to contaminate later non-question replies like "ok".
     fast_interrupt = None
     try:
-        burst_text = build_burst_text(conv, inbound_text) or inbound_text
-        if should_short_circuit_interrupt(conv, burst_text):
-            fast_interrupt = interruption_answer_and_return_prompt(conv, burst_text)
+        build_burst_text(conv, inbound_text)
+        if should_short_circuit_interrupt(conv, inbound_text):
+            fast_interrupt = interruption_answer_and_return_prompt(conv, inbound_text)
     except Exception as e:
         print("[WARN] incoming_sms fast interrupt failed:", repr(e))
 
@@ -1496,13 +1516,6 @@ def incoming_sms():
         tw = MessagingResponse()
         tw.message(fast_interrupt.strip())
         return Response(str(tw), mimetype="text/xml")
-
-    # Warm soft rejection handling during booking.
-    try:
-        soft_reject_reply = build_soft_rejection_reply(conv, inbound_text)
-    except Exception as e:
-        print("[WARN] incoming_sms soft rejection failed:", repr(e))
-        soft_reject_reply = None
 
     if soft_reject_reply:
         conv["last_inbound_sid"] = inbound_sid
@@ -2205,6 +2218,8 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
                 add_answer("The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately.")
             else:
                 add_answer("The $195 covers the evaluation visit itself. If you decide to move forward with project work after that, we go over the next step in person.")
+        elif any(x in low for x in ["written quote", "quote be written", "will the quote be written", "written estimate"]):
+            add_answer("Yes. Once we see everything in person, we can put together a written quote from there.")
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
             add_answer("For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number.")
         elif "TROUBLESHOOT" in appt:
@@ -2251,7 +2266,7 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         return None
 
     reply = " ".join(answers).strip()
-    reply = re.sub(r"(Once I have the booking details, I can get you on the schedule\.\s*){2,}", "Once I have the booking details, I can get you on the schedule. ", reply, flags=re.I)
+    reply = re.sub(r"\b(Once I have the booking details, I can get you on the schedule\.\s*){2,}", "Once I have the booking details, I can get you on the schedule. ", reply, flags=re.I)
     reply = re.sub(r"\s+", " ", reply).strip()
     return reply
 
@@ -2298,11 +2313,11 @@ def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | Non
         return None
 
     resume_markers = [
-        "okay", "ok", "yes", "yeah", "yep", "that works", "lets do it", "let's do it",
-        "book it", "go ahead", "move forward", "i'm ready", "im ready", "can we schedule",
-        "schedule it", "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday",
-        "friday", "saturday", "sunday", "its a go", "it's a go", "wife says", "husband says",
-        "spouse says", "when can you come", "when can you come out", "ready to book", "lets book", "let's book"
+        "that works", "lets do it", "let's do it", "book it", "go ahead", "move forward",
+        "i'm ready", "im ready", "can we schedule", "schedule it", "tomorrow", "today",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+        "its a go", "it's a go", "wife says", "husband says", "spouse says", "ready to book",
+        "lets book", "let's book", "when can you come", "when can you come out"
     ]
     if looks_like_slot_payload(inbound_text) or any(x in low for x in resume_markers):
         sched["soft_rejection_open"] = False
@@ -2505,11 +2520,11 @@ def looks_like_new_booking_request(inbound_text: str) -> bool:
     ]):
         return True
 
-    if re.search(r"\d{1,2}(:\d{2})?\s*(am|pm)", low, flags=re.I):
+    if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", low, flags=re.I):
         return True
 
     if re.search(
-        r"\d{1,6}.*(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)",
+        r"\b\d{1,6}\b.*\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b",
         low,
         flags=re.I
     ):
@@ -3935,11 +3950,18 @@ def build_availability_offer_prompt(sched: dict) -> str | None:
     for i, o in enumerate(opts[:3], start=1):
         bits.append(f"{i}) {o.get('label')}")
     joined = "; ".join(bits)
-    return f"That exact slot is no longer open. I can do {joined}. Reply with 1, 2, or 3."
+    return f"That exact slot is no longer open. I can do {joined}. Reply with 1, 2, or 3, or send the time you want from the list."
 
 
 def maybe_apply_pending_availability_selection(conv: dict, inbound_text: str) -> bool:
     import re
+
+    def _slot_loose(s: str) -> str:
+        s = (s or "").lower()
+        s = s.replace("a.m.", "am").replace("p.m.", "pm")
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        return " ".join(s.split())
+
     sched = conv.setdefault("sched", {})
     if not sched.get("availability_offer_pending"):
         return False
@@ -3947,19 +3969,35 @@ def maybe_apply_pending_availability_selection(conv: dict, inbound_text: str) ->
     if not options:
         sched["availability_offer_pending"] = False
         return False
-    low = (inbound_text or "").strip().lower()
+
+    raw = (inbound_text or "").strip()
+    low = raw.lower()
+    loose = _slot_loose(raw)
     choice = None
-    m = re.search(r"([123])", low)
+
+    m = re.search(r"\b([123])\b", low)
     if m:
         choice = int(m.group(1))
-    elif "first" in low or low == "one":
+    elif re.fullmatch(r"(?:one|first)", loose):
         choice = 1
-    elif "second" in low or low == "two":
+    elif re.fullmatch(r"(?:two|second)", loose):
         choice = 2
-    elif "third" in low or low == "three":
+    elif re.fullmatch(r"(?:three|third)", loose):
         choice = 3
+    else:
+        # Allow the customer to reply with the actual offered slot text,
+        # e.g. "April 3 at 1pm" or "Friday April 3 at 1:00 PM".
+        normalized_options = [(_slot_loose(o.get("label") or ""), idx + 1) for idx, o in enumerate(options)]
+        for opt_text, idx in normalized_options:
+            if not opt_text:
+                continue
+            if loose == opt_text or loose in opt_text or opt_text in loose:
+                choice = idx
+                break
+
     if not choice or choice > len(options):
         return False
+
     picked = options[choice - 1]
     sched["scheduled_date"] = picked.get("date")
     sched["scheduled_time"] = picked.get("time")
@@ -3967,6 +4005,9 @@ def maybe_apply_pending_availability_selection(conv: dict, inbound_text: str) ->
     sched["availability_offer_options"] = []
     sched["availability_offer_requested_label"] = None
     sched["booking_created"] = False
+    sched["final_confirmation_sent"] = False
+    sched["final_confirmation_accepted"] = False
+    sched["last_final_confirmation_key"] = None
     return True
 
 
