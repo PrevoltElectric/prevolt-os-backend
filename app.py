@@ -2152,7 +2152,12 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         sched["price_disclosed"] = True
 
     if any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        add_answer("Once I have the booking details, I can get you on the schedule.")
+        update_address_assembly_state(sched)
+        recompute_pending_step(profile, sched)
+        avail_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+        if not avail_prompt or avail_prompt in {"Okay.", "Okay", "Everything looks good here."}:
+            avail_prompt = "What time works for you?"
+        add_answer(avail_prompt)
 
     if any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         add_answer("Most visits are about an hour, depending on what you have going on.")
@@ -2885,8 +2890,30 @@ def generate_reply_for_inbound(
                 sched["intro_sent"] = True
             return _norm(s)
 
+        def _inbound_explicit_price_question(txt: str) -> bool:
+            low = _loose_text(txt)
+            if not low:
+                return False
+            markers = [
+                "how much", "price", "cost", "195", "395", "just to come out", "just to come",
+                "service fee", "trip fee", "diagnostic fee", "quote", "estimate", "free estimate",
+                "ballpark", "rough price", "firm number", "what do you charge", "what does the visit include",
+                "what does that include", "go towards the project", "go toward the project", "goes towards the project",
+                "goes toward the project", "apply to the project", "applied to the project", "credit toward the project",
+                "credited toward the project", "does it go toward", "does it go towards", "does that go toward",
+                "does that go towards", "does the fee go toward", "does the fee go towards",
+                "does the service fee go toward", "does the service fee go towards", "deposit", "credited back", "applied back"
+            ]
+            return any(x in low for x in markers)
+
         def _maybe_price_once(s: str, appt_type_local: str) -> str:
-            if not sched.get("price_disclosed"):
+            if sched.get("price_disclosed"):
+                return _norm(s)
+
+            already_has_price = any(x in (s or "") for x in ["$195", "$395"])
+            should_inject = (not sched.get("intro_sent")) or _inbound_explicit_price_question(inbound_text)
+
+            if should_inject and not already_has_price:
                 try:
                     s = apply_price_injection(appt_type_local, s)
                 except Exception:
