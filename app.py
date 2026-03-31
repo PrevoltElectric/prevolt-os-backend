@@ -214,6 +214,28 @@ def extract_explicit_time_from_text(text: str) -> str | None:
 
     return None
 
+
+
+def looks_like_slot_payload(text: str) -> bool:
+    """Return True when a message looks like scheduling data rather than a side-question."""
+    low = (text or "").lower().strip()
+    if not low:
+        return False
+
+    if extract_explicit_time_from_text(low):
+        return True
+
+    if re.search(r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next monday|next tuesday|next wednesday|next thursday|next friday|next saturday|next sunday)\b", low, flags=re.I):
+        return True
+
+    if re.search(r"\b\d{1,6}\s+[A-Za-z0-9.'\- ]+\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
+        return True
+
+    if re.search(r"\b(unit|apt|apartment|suite|ste|floor)\b", low, flags=re.I):
+        return True
+
+    return False
+
 def send_sms(to_number: str, body: str) -> None:
     """
     Send a normal outbound SMS to the actual customer number.
