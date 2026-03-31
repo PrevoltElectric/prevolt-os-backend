@@ -761,6 +761,7 @@ Current stored values:
 Today's date: {today_date_str} ({today_weekday})
 
 Core behavioral constraints:
+- If a customer bundles multiple simple questions in one message, answer each supported question once in the same reply, then return to the single next missing booking step.
 - NEVER ask questions already answered.
 - If only one field is missing, ask ONLY for that field.
 - Do not treat vague time phrases as explicit times.
@@ -2087,20 +2088,35 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked and not allow_post_booking:
         return None
 
-    answer = None
+    answers: list[str] = []
+    seen_answers: set[str] = set()
+
+    def add_answer(text: str) -> None:
+        text = (text or "").strip()
+        if not text or text in seen_answers:
+            return
+        answers.append(text)
+        seen_answers.add(text)
+
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
-        answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
-    elif any(x in low for x in ["licensed", "insured"]):
-        answer = "Yes, we're licensed and insured."
-    elif any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close"]):
-        answer = "Yes, you'll get a text when we're on the way."
-    elif any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
-        answer = "No, you do not need to buy anything ahead of time for the visit."
-    elif any(x in low for x in ["permit", "permit required"]):
-        answer = "If anything needs a permit, we'll go over that during the visit."
-    elif any(x in low for x in ["card", "cash", "check", "payment", "pay by", "how do i pay"]):
-        answer = "Card or cash after the visit is fine."
-    elif any(x in low for x in [
+        add_answer("Yes, that is fine. Just make sure we can safely get to the panel when we arrive.")
+
+    if any(x in low for x in ["licensed", "insured"]):
+        add_answer("Yes, we're licensed and insured.")
+
+    if any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close"]):
+        add_answer("Yes, you'll get a text when we're on the way.")
+
+    if any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
+        add_answer("No, you do not need to buy anything ahead of time for the visit.")
+
+    if any(x in low for x in ["permit", "permit required"]):
+        add_answer("If anything needs a permit, we'll go over that during the visit.")
+
+    if any(x in low for x in ["card", "cash", "check", "payment", "pay by", "how do i pay"]):
+        add_answer("Card or cash after the visit is fine.")
+
+    if any(x in low for x in [
         "how much", "price", "cost", "$195", "$395", "195", "395",
         "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee",
         "quote", "estimate", "free estimate", "ballpark", "rough price", "firm number",
@@ -2120,30 +2136,34 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             "deposit", "credited back", "applied back"
         ]):
             if "TROUBLESHOOT" in appt:
-                answer = "The $395 covers the troubleshoot and repair visit itself. If any larger repair is needed, we go over that separately on site before anything moves forward."
+                add_answer("The $395 covers the troubleshoot and repair visit itself. If any larger repair is needed, we go over that separately on site before anything moves forward.")
             elif "INSPECTION" in appt:
-                answer = "The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately."
+                add_answer("The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately.")
             else:
-                answer = "The $195 covers the evaluation visit itself. If you decide to move forward with project work after that, we go over the next step in person."
+                add_answer("The $195 covers the evaluation visit itself. If you decide to move forward with project work after that, we go over the next step in person.")
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
-            answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
+            add_answer("For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number.")
         elif "TROUBLESHOOT" in appt:
-            answer = "The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site."
+            add_answer("The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site.")
         elif "INSPECTION" in appt:
-            answer = "Whole-home inspections are $395, and larger homes can run higher depending on square footage."
+            add_answer("Whole-home inspections are $395, and larger homes can run higher depending on square footage.")
         else:
-            answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
+            add_answer("The $195 is the service visit to come out, evaluate the issue, and go over the next step.")
         sched["price_disclosed"] = True
-    elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        answer = "Once I have the booking details, I can get you on the schedule."
-    elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
-        answer = "Most visits are about an hour, depending on what you have going on."
-    elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
-        answer = "Yes, we handle panel upgrades and replacements."
 
-    if not answer:
+    if any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
+        add_answer("Once I have the booking details, I can get you on the schedule.")
+
+    if any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
+        add_answer("Most visits are about an hour, depending on what you have going on.")
+
+    if any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
+        add_answer("Yes, we handle panel upgrades and replacements.")
+
+    if not answers:
         return None
 
+    answer = " ".join(answers)
     recompute_pending_step(profile, sched)
 
     if booked:
