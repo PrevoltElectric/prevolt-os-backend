@@ -1203,6 +1203,10 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     }
     provided_ambiguous_time = any(p in inbound_low for p in ambiguous_times | time_of_day_phrases)
 
+    offer_prompt = build_availability_offer_prompt(sched)
+    if offer_prompt:
+        return offer_prompt
+
     step = sched.get("pending_step")
     if step == "need_address":
         return build_address_prompt(sched)
@@ -1371,6 +1375,14 @@ def incoming_sms():
     # Emergency flags (used by incoming_sms patch logic too)
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
+    sched.setdefault("availability_offer_pending", False)
+    sched.setdefault("availability_offer_options", [])
+    sched.setdefault("availability_offer_requested_label", None)
+
+    try:
+        maybe_apply_pending_availability_selection(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] pending availability selection failed:", repr(e))
 
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
@@ -2400,6 +2412,9 @@ def reset_scheduler_for_rebooking(conv: dict, keep_identity: bool = True, keep_a
         "square_booking_id": booking_id,
         "booking_modify_target_id": modify_target,
         "booking_modify_mode": sched.get("booking_modify_mode"),
+        "availability_offer_pending": False,
+        "availability_offer_options": [],
+        "availability_offer_requested_label": None,
         "address_candidate": raw_address,
         "address_verified": address_verified,
         "address_missing": None,
@@ -3752,6 +3767,202 @@ def is_weekend(date_str: str) -> bool:
 #   ✅ Only sets booking_created / square_booking_id AFTER verify+accept succeeds
 #   ✅ Prevents stale booking flags from causing ghost confirmations
 # ---------------------------------------------------
+def _square_local_tz():
+    try:
+        return ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+    except Exception:
+        return timezone.utc
+
+
+def _parse_square_start_at_to_local(start_at: str):
+    if not start_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(start_at).replace("Z", "+00:00"))
+        return dt.astimezone(_square_local_tz())
+    except Exception:
+        return None
+
+
+def _format_slot_label(date_str: str, time_str: str) -> str:
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        day = d.strftime("%A, %B %d").replace(" 0", " ")
+    except Exception:
+        day = date_str
+    return f"{day} at {humanize_time(time_str)}"
+
+
+def _square_search_availability_range(start_local: datetime, end_local: datetime, variation_id: str, variation_version: int | None, preferred_team_member_id: str | None = None) -> list:
+    if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and variation_id):
+        return []
+    try:
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = end_local.astimezone(timezone.utc)
+        payload = {
+            "query": {
+                "filter": {
+                    "start_at_range": {
+                        "start_at": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "end_at": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                    "location_id": SQUARE_LOCATION_ID,
+                    "segment_filters": [
+                        {
+                            "service_variation_id": variation_id,
+                            "team_member_id_filter": {"any": [preferred_team_member_id or SQUARE_TEAM_MEMBER_ID]},
+                        }
+                    ],
+                }
+            }
+        }
+        if variation_version is not None:
+            payload["query"]["filter"]["segment_filters"][0]["service_variation_version"] = variation_version
+        r = requests.post(
+            "https://connect.squareup.com/v2/bookings/availability/search",
+            headers=square_headers(),
+            json=payload,
+            timeout=15,
+        )
+        if r.status_code not in (200, 201):
+            print("[WARN] availability search failed:", r.status_code, r.text)
+            return []
+        return (r.json() or {}).get("availabilities") or []
+    except Exception as e:
+        print("[WARN] availability search exception:", repr(e))
+        return []
+
+
+def _square_rank_fallback_slots(availabilities: list, requested_local: datetime) -> list:
+    ranked = []
+    seen = set()
+    parsed = []
+    for a in availabilities or []:
+        dt_local = _parse_square_start_at_to_local(a.get("start_at"))
+        if not dt_local:
+            continue
+        slot = {
+            "start_local": dt_local,
+            "start_at": a.get("start_at"),
+            "location_id": a.get("location_id") or SQUARE_LOCATION_ID,
+            "appointment_segments": a.get("appointment_segments") or [],
+            "date": dt_local.strftime("%Y-%m-%d"),
+            "time": dt_local.strftime("%H:%M"),
+        }
+        parsed.append(slot)
+
+    exact = None
+    for s in parsed:
+        if s["date"] == requested_local.strftime("%Y-%m-%d") and s["time"] == requested_local.strftime("%H:%M"):
+            exact = s
+            break
+
+    same_day = [s for s in parsed if s["date"] == requested_local.strftime("%Y-%m-%d")]
+    same_day.sort(key=lambda s: ((s["start_local"] < requested_local), abs((s["start_local"] - requested_local).total_seconds())))
+
+    same_time_future = [
+        s for s in parsed
+        if s["time"] == requested_local.strftime("%H:%M") and s["start_local"].date() > requested_local.date()
+    ]
+    same_time_future.sort(key=lambda s: s["start_local"])
+
+    future = [s for s in parsed if s["start_local"] >= requested_local]
+    future.sort(key=lambda s: s["start_local"])
+
+    for bucket in (same_day, same_time_future, future):
+        for s in bucket:
+            key = (s["date"], s["time"])
+            if key in seen:
+                continue
+            seen.add(key)
+            ranked.append(s)
+            if len(ranked) >= 3:
+                break
+        if len(ranked) >= 3:
+            break
+
+    return exact, ranked
+
+
+def square_find_best_availability(scheduled_date: str, scheduled_time: str, appointment_type: str, preferred_team_member_id: str | None = None) -> dict:
+    variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
+    if not variation_id:
+        return {"exact": None, "options": [], "searched": False}
+    req_utc = parse_local_datetime(scheduled_date, scheduled_time)
+    if not req_utc:
+        return {"exact": None, "options": [], "searched": False}
+    req_local = req_utc.astimezone(_square_local_tz())
+    day_start = req_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    range_end = day_start + timedelta(days=14)
+    avail = _square_search_availability_range(day_start, range_end, variation_id, variation_version, preferred_team_member_id)
+    exact, options = _square_rank_fallback_slots(avail, req_local)
+    return {
+        "exact": exact,
+        "options": options,
+        "searched": True,
+        "requested_label": _format_slot_label(scheduled_date, scheduled_time),
+    }
+
+
+def _store_availability_fallback_options(sched: dict, search_result: dict) -> None:
+    options = []
+    for s in (search_result or {}).get("options") or []:
+        options.append({
+            "date": s.get("date"),
+            "time": s.get("time"),
+            "label": _format_slot_label(s.get("date") or "", s.get("time") or ""),
+        })
+    sched["availability_offer_pending"] = bool(options)
+    sched["availability_offer_options"] = options
+    sched["availability_offer_requested_label"] = (search_result or {}).get("requested_label")
+
+
+def build_availability_offer_prompt(sched: dict) -> str | None:
+    if not sched.get("availability_offer_pending"):
+        return None
+    opts = sched.get("availability_offer_options") or []
+    if not opts:
+        return None
+    requested = sched.get("availability_offer_requested_label") or "that exact time"
+    bits = []
+    for i, o in enumerate(opts[:3], start=1):
+        bits.append(f"{i}) {o.get('label')}")
+    joined = "; ".join(bits)
+    return f"That exact slot is no longer open. I can do {joined}. Reply with 1, 2, or 3."
+
+
+def maybe_apply_pending_availability_selection(conv: dict, inbound_text: str) -> bool:
+    import re
+    sched = conv.setdefault("sched", {})
+    if not sched.get("availability_offer_pending"):
+        return False
+    options = sched.get("availability_offer_options") or []
+    if not options:
+        sched["availability_offer_pending"] = False
+        return False
+    low = (inbound_text or "").strip().lower()
+    choice = None
+    m = re.search(r"([123])", low)
+    if m:
+        choice = int(m.group(1))
+    elif "first" in low or low == "one":
+        choice = 1
+    elif "second" in low or low == "two":
+        choice = 2
+    elif "third" in low or low == "three":
+        choice = 3
+    if not choice or choice > len(options):
+        return False
+    picked = options[choice - 1]
+    sched["scheduled_date"] = picked.get("date")
+    sched["scheduled_time"] = picked.get("time")
+    sched["availability_offer_pending"] = False
+    sched["availability_offer_options"] = []
+    sched["availability_offer_requested_label"] = None
+    sched["booking_created"] = False
+    return True
+
+
 def maybe_create_square_booking(phone: str, convo: dict):
     import re
 
@@ -3809,6 +4020,18 @@ def maybe_create_square_booking(phone: str, convo: dict):
     if not variation_id:
         print("[ERROR] Unknown appt_type:", appointment_type)
         return
+
+    # Square availability search fallback
+    try:
+        availability = square_find_best_availability(scheduled_date, scheduled_time, appointment_type, SQUARE_TEAM_MEMBER_ID)
+        exact_slot = availability.get("exact")
+        if availability.get("searched") and not exact_slot:
+            _store_availability_fallback_options(sched, availability)
+            print("[INFO] Requested slot unavailable. Offered fallback options.")
+            return
+    except Exception as e:
+        print("[WARN] availability precheck failed:", repr(e))
+        exact_slot = None
 
     # weekend rule
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
@@ -3936,6 +4159,19 @@ def maybe_create_square_booking(phone: str, convo: dict):
         f"{(addr_struct.get('postal_code') or '').strip()}"
     )
 
+    segment_payload = [
+        {
+            "duration_minutes": 60,
+            "service_variation_id": variation_id,
+            "service_variation_version": variation_version,
+            "team_member_id": SQUARE_TEAM_MEMBER_ID
+        }
+    ]
+    if exact_slot and exact_slot.get("appointment_segments"):
+        segment_payload = exact_slot.get("appointment_segments")
+        if exact_slot.get("start_at"):
+            start_at_utc = datetime.fromisoformat(str(exact_slot.get("start_at")).replace("Z", "+00:00"))
+
     booking_payload = {
         "idempotency_key": idempotency_key,
         "booking": {
@@ -3944,14 +4180,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
             "address": booking_address,
-            "appointment_segments": [
-                {
-                    "duration_minutes": 60,
-                    "service_variation_id": variation_id,
-                    "service_variation_version": variation_version,
-                    "team_member_id": SQUARE_TEAM_MEMBER_ID
-                }
-            ],
+            "appointment_segments": segment_payload,
             "customer_note": (
                 "Auto-booked by Prevolt OS. "
                 f"Raw address: {raw_address or '[none]'} | "
@@ -4049,6 +4278,9 @@ def maybe_create_square_booking(phone: str, convo: dict):
         # ✅ Only mark booked AFTER create + retrieve + accept succeeds
         sched["booking_created"] = True
         sched["square_booking_id"] = booking_id
+        sched["availability_offer_pending"] = False
+        sched["availability_offer_options"] = []
+        sched["availability_offer_requested_label"] = None
 
         profile["upcoming_appointment"] = {
             "date": scheduled_date,
@@ -4173,6 +4405,24 @@ def maybe_update_square_booking(phone: str, convo: dict):
         sched["square_update_error"] = "retrieve_failed"
         return
 
+    preferred_tm = None
+    try:
+        existing_segs = existing.get("appointment_segments") or []
+        preferred_tm = existing_segs[0].get("team_member_id") if existing_segs else None
+    except Exception:
+        preferred_tm = None
+
+    try:
+        availability = square_find_best_availability(scheduled_date, scheduled_time, appointment_type, preferred_tm or SQUARE_TEAM_MEMBER_ID)
+        exact_slot = availability.get("exact")
+        if availability.get("searched") and not exact_slot:
+            _store_availability_fallback_options(sched, availability)
+            sched["square_update_error"] = "unavailable"
+            return
+    except Exception as e:
+        print("[WARN] update availability precheck failed:", repr(e))
+        exact_slot = None
+
     version = existing.get("version")
     if version is None:
         sched["square_update_error"] = "missing_version"
@@ -4198,6 +4448,19 @@ def maybe_update_square_booking(phone: str, convo: dict):
     booking_address = dict(addr_struct)
     booking_address.pop("country", None)
 
+    segment_payload = [
+        {
+            "duration_minutes": 60,
+            "service_variation_id": variation_id,
+            "service_variation_version": variation_version,
+            "team_member_id": team_member_id,
+        }
+    ]
+    if exact_slot and exact_slot.get("appointment_segments"):
+        segment_payload = exact_slot.get("appointment_segments")
+        if exact_slot.get("start_at"):
+            start_at_utc = datetime.fromisoformat(str(exact_slot.get("start_at")).replace("Z", "+00:00"))
+
     payload = {
         "idempotency_key": f"prevolt-update-{target_id}-{int(time.time())}",
         "booking": {
@@ -4207,14 +4470,7 @@ def maybe_update_square_booking(phone: str, convo: dict):
             "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "location_type": "CUSTOMER_LOCATION",
             "address": booking_address,
-            "appointment_segments": [
-                {
-                    "duration_minutes": 60,
-                    "service_variation_id": variation_id,
-                    "service_variation_version": variation_version,
-                    "team_member_id": team_member_id,
-                }
-            ],
+            "appointment_segments": segment_payload,
             "customer_note": (
                 "Updated by Prevolt OS. "
                 f"Raw address: {raw_address or '[none]'} | "
@@ -4240,6 +4496,9 @@ def maybe_update_square_booking(phone: str, convo: dict):
         status = (updated.get("status") or "").upper()
         sched["booking_created"] = True
         sched["square_booking_id"] = updated.get("id") or target_id
+        sched["availability_offer_pending"] = False
+        sched["availability_offer_options"] = []
+        sched["availability_offer_requested_label"] = None
         sched["booking_modify_target_id"] = None
         sched["booking_modify_mode"] = None
         sched["booking_was_updated"] = True
