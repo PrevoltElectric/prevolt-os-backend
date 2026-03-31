@@ -1496,6 +1496,12 @@ def incoming_sms():
     # Pre-Step4 smart merge for compact city/state replies.
     try:
         apply_partial_address_reply(sched, inbound_text)
+        # IMPORTANT: refresh the local copies after a partial-address merge so
+        # Step 4 does not get a stale pre-merge address like "45 Main St" and
+        # then re-ask for the town even though the customer just sent it.
+        scheduled_date = sched.get("scheduled_date")
+        scheduled_time = sched.get("scheduled_time")
+        address = sched.get("raw_address") or sched.get("normalized_address")
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
@@ -1603,6 +1609,11 @@ def incoming_sms():
     # ---------------------------------------------------
     # Run Step 4
     # ---------------------------------------------------
+    # Final refresh so Step 4 always receives the latest merged booking state.
+    scheduled_date = sched.get("scheduled_date")
+    scheduled_time = sched.get("scheduled_time")
+    address = sched.get("raw_address") or sched.get("normalized_address")
+
     reply = generate_reply_for_inbound(
         cleaned_transcript,
         category,
