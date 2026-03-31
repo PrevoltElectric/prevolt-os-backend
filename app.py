@@ -205,76 +205,6 @@ def extract_explicit_time_from_text(text: str) -> str | None:
 
     return None
 
-
-
-def extract_explicit_date_from_text(text: str, base_dt=None) -> str | None:
-    """
-    Pull an explicit date out of a mixed customer message.
-    Examples:
-      - "can you come this Friday?" -> "YYYY-MM-DD"
-      - "tomorrow works" -> "YYYY-MM-DD"
-      - "4/3" or "04/03/2026" -> "YYYY-MM-DD"
-    Returns None when no clear date is present.
-    """
-    import re
-    from datetime import datetime, timedelta
-
-    s = (text or "").strip().lower()
-    if not s:
-        return None
-
-    try:
-        now = base_dt or datetime.now(ZoneInfo("America/New_York"))
-    except Exception:
-        now = base_dt or datetime.now()
-
-    s = s.replace("’", "'")
-
-    if re.search(r"\btoday\b", s):
-        return now.strftime("%Y-%m-%d")
-    if re.search(r"\btomorrow\b", s):
-        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    weekdays = {
-        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-        "friday": 4, "saturday": 5, "sunday": 6,
-    }
-    for name, idx in weekdays.items():
-        m = re.search(rf"\b(?:(next|this)\s+)?{name}\b", s)
-        if not m:
-            continue
-        qualifier = (m.group(1) or "").strip()
-        days_ahead = (idx - now.weekday()) % 7
-        if qualifier == "next":
-            days_ahead = days_ahead + 7 if days_ahead == 0 else days_ahead + 7
-        elif qualifier == "this":
-            days_ahead = 0 if days_ahead == 0 else days_ahead
-        else:
-            days_ahead = 0 if days_ahead == 0 else days_ahead
-        target = now + timedelta(days=days_ahead)
-        return target.strftime("%Y-%m-%d")
-
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", s)
-    if m:
-        mm = int(m.group(1))
-        dd = int(m.group(2))
-        yy = m.group(3)
-        year = now.year
-        if yy:
-            year = int(yy)
-            if year < 100:
-                year += 2000
-        try:
-            target = datetime(year, mm, dd)
-            if not yy and target.date() < now.date():
-                target = datetime(year + 1, mm, dd)
-            return target.strftime("%Y-%m-%d")
-        except Exception:
-            return None
-
-    return None
-
-
 def send_sms(to_number: str, body: str) -> None:
     """
     Send a normal outbound SMS to the actual customer number.
@@ -1533,6 +1463,8 @@ def incoming_sms():
 
     # Resume paused conversation if the customer comes back later.
     try:
+        if conv.setdefault("sched", {}).get("soft_rejection_open"):
+            absorb_obvious_booking_details(conv, inbound_text)
         resumed_reply = maybe_resume_paused_conversation(conv, inbound_text)
     except Exception as e:
         print("[WARN] incoming_sms resume failed:", repr(e))
@@ -2199,7 +2131,6 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked:
         return answer
 
-    # Do not restate the final confirmation while answering an interrupting question.
     if sched.get("final_confirmation_sent") or sched.get("final_confirmation_accepted"):
         if not sched.get("pending_step") and sched.get("scheduled_date") and sched.get("scheduled_time"):
             return answer
@@ -2250,12 +2181,97 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
     return any(x in low for x in interrupt_markers)
 
 def _loose_text(s: str) -> str:
-    import re
-    s = (s or "").lower()
-    s = s.replace("’", "'")
+    s = (s or "").lower().replace("’", "'")
     s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = " ".join(s.split())
-    return s
+    return " ".join(s.split())
+
+
+def salvage_relative_date_from_text(inbound_text: str) -> str | None:
+    low = _loose_text(inbound_text)
+    if not low:
+        return None
+    now_local = datetime.now(ZoneInfo("America/New_York")) if ZoneInfo else datetime.now()
+    today = now_local.date()
+
+    if "today" in low:
+        return today.strftime("%Y-%m-%d")
+    if "tomorrow" in low:
+        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    for name, idx in weekdays.items():
+        if f"next {name}" in low:
+            delta = (idx - today.weekday()) % 7
+            if delta == 0:
+                delta = 7
+            delta += 7
+            return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
+        if re.search(rf"\b(?:this )?{name}\b", low):
+            delta = (idx - today.weekday()) % 7
+            return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
+
+    m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", low)
+    if m:
+        mo = int(m.group(1))
+        day = int(m.group(2))
+        yr_raw = m.group(3)
+        year = today.year
+        if yr_raw:
+            year = int(yr_raw)
+            if year < 100:
+                year += 2000
+        try:
+            dt = datetime(year, mo, day)
+            if not yr_raw and dt.date() < today:
+                dt = datetime(year + 1, mo, day)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    return None
+
+
+def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    txt = (inbound_text or "").strip()
+    if not txt:
+        return
+
+    if not sched.get("scheduled_date"):
+        d = salvage_relative_date_from_text(txt)
+        if d:
+            sched["scheduled_date"] = d
+
+    if not sched.get("scheduled_time"):
+        t = extract_explicit_time_from_text(txt)
+        if t:
+            sched["scheduled_time"] = t
+
+    if not sched.get("raw_address"):
+        low = txt.lower()
+        if re.search(r"\d{1,6}", txt) and re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
+            sched["raw_address"] = txt
+            try:
+                if txt not in profile.setdefault("addresses", []):
+                    profile["addresses"].append(txt)
+            except Exception:
+                pass
+            try:
+                try_early_address_normalize(sched)
+            except Exception:
+                pass
+
+    update_address_assembly_state(sched)
+    recompute_pending_step(profile, sched)
 
 
 def detect_soft_rejection(inbound_text: str) -> str | None:
@@ -2308,6 +2324,7 @@ def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | Non
     ]
     if looks_like_slot_payload(inbound_text) or any(x in low for x in resume_markers):
         sched["soft_rejection_open"] = False
+        absorb_obvious_booking_details(conv, inbound_text)
         recompute_pending_step(profile, sched)
         next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
         if next_prompt and next_prompt not in {"Okay.", "Okay", "Everything looks good here."}:
@@ -3088,16 +3105,12 @@ def generate_reply_for_inbound(
         model_time = ai_raw.get("scheduled_time")
         model_addr = ai_raw.get("address")
 
-        # Heuristic slot salvage: preserve explicit times and dates embedded in mixed messages
-        # like "2pm and I have dogs is that ok?" or "can you come this Friday?"
+        # Heuristic slot salvage: preserve explicit times embedded in mixed messages
+        # like "2pm and I have dogs is that ok?" when the LLM only answers the question.
         if not model_time:
             salvaged_time = extract_explicit_time_from_text(inbound_text)
             if salvaged_time:
                 model_time = salvaged_time
-        if not model_date:
-            salvaged_date = extract_explicit_date_from_text(inbound_text)
-            if salvaged_date:
-                model_date = salvaged_date
 
         # --------------------------------------
         # RESET-LOCK (never lose good stored values)
