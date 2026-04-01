@@ -2222,7 +2222,7 @@ Use these rules as the source of truth:
 def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
-    low = (inbound_text or "").lower().strip()
+    low = _loose_text(inbound_text)
     if not low:
         return None
 
@@ -2230,12 +2230,29 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked and not allow_post_booking:
         return None
 
+    # Let the LLM handle trust / hesitation / multi-question turns first.
+    trust = llm_trust_reply(conv, inbound_text)
+    if trust and trust.get("answer"):
+        answer = trust["answer"].strip()
+        resume = bool(trust.get("resume_booking"))
+        next_prompt = (trust.get("next_prompt") or "").strip()
+        if booked or sched.get("soft_rejection_open") or is_conversation_hesitation(inbound_text):
+            resume = False
+        if resume and next_prompt and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}:
+            return f"{answer} {next_prompt}"
+        return answer
+
     answer = None
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
         answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
-    elif any(x in low for x in ["licensed", "insured"]):
-        answer = "Yes, we're licensed and insured."
-    elif any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close"]):
+    elif any(x in low for x in ["licensed", "license", "insured", "insurance"]):
+        if "copy" in low or "certificate" in low or "proof" in low:
+            answer = "We can provide insurance documentation when the visit is moving forward."
+        else:
+            answer = "Yes, we're licensed and insured."
+    elif any(x in low for x in ["where are you located", "where are you guys located", "where are you based", "where are you out of"]):
+        answer = "We service Connecticut and Massachusetts."
+    elif any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you re close", "when you're close", "when youre close"]):
         answer = "Yes, you'll get a text when we're on the way."
     elif any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
         answer = "No, you do not need to buy anything ahead of time for the visit."
@@ -2263,11 +2280,11 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             "deposit", "credited back", "applied back"
         ]):
             if "TROUBLESHOOT" in appt:
-                answer = "The $395 covers the troubleshoot and repair visit itself. If any larger repair is needed, we go over that separately on site before anything moves forward."
+                answer = "The $395 covers the troubleshoot and repair visit itself. If larger repair work is needed, we go over that separately on site first."
             elif "INSPECTION" in appt:
                 answer = "The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately."
             else:
-                answer = "The $195 covers the evaluation visit itself. If you decide to move forward with project work after that, we go over the next step in person."
+                answer = "The $195 covers the evaluation visit itself. If you decide to move forward after that, we go over the next step in person."
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
             answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
         elif "TROUBLESHOOT" in appt:
@@ -2283,6 +2300,10 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         answer = "Most visits are about an hour, depending on what you have going on."
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
         answer = "Yes, we handle panel upgrades and replacements."
+    elif "favorite color" in low:
+        answer = "Let's keep it on the visit details."
+    elif any(x in low for x in ["roll me over", "pick me up", "carry me"]):
+        answer = "We handle the electrical work itself. If someone needs to help with access, just make sure that is covered when we come out."
 
     if not answer:
         return None
@@ -2290,6 +2311,9 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     recompute_pending_step(profile, sched)
 
     if booked:
+        return answer
+
+    if sched.get("soft_rejection_open") or is_conversation_hesitation(inbound_text):
         return answer
 
     if sched.get("final_confirmation_sent") or sched.get("final_confirmation_accepted"):
@@ -2301,23 +2325,24 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         return f"{answer} {next_prompt}"
     return answer
 
-
 def looks_like_slot_payload(inbound_text: str) -> bool:
     txt = (inbound_text or "").strip()
-    low = txt.lower()
+    low = _loose_text(txt)
     if not txt:
         return False
+    if "?" in txt or QUESTIONISH_RE.search(low):
+        # Questions are not slot payloads unless they also contain a clear address/date/time/email.
+        pass
     if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", txt, flags=re.I):
         return True
-    if re.search(r"\d{1,6}", txt) and re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
+    if is_plausible_address_text(txt):
         return True
-    if re.search(r"\d{1,2}(:\d{2})?\s*(am|pm)", low, flags=re.I):
+    if extract_explicit_time_from_text(txt):
         return True
-    if re.search(r"^\d{3,4}$", txt):
+    if salvage_relative_date_from_text(txt):
         return True
-    if any(day in low for day in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","tomorrow","today","next monday","next tuesday","next wednesday","next thursday","next friday","next saturday","next sunday"]):
-        return True
-    if len(txt.split()) <= 3 and re.fullmatch(r"[A-Za-z'\- ]+", txt):
+    # Only treat a very short alpha-only reply as slot data when it looks like a name, not a question.
+    if len(txt.split()) <= 3 and re.fullmatch(r"[A-Za-z'\- ]+", txt) and not QUESTIONISH_RE.search(low):
         return True
     return False
 
@@ -2326,9 +2351,13 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
     sched = conv.setdefault("sched", {})
     if sched.get("booking_created") and sched.get("square_booking_id"):
         return False
+    low = _loose_text(inbound_text)
+    if not low:
+        return False
+    if _question_count(inbound_text) or is_conversation_hesitation(inbound_text):
+        return True
     if looks_like_slot_payload(inbound_text):
         return False
-    low = (inbound_text or "").lower().strip()
     interrupt_markers = [
         "how much", "price", "cost", "$195", "$395", "195", "395", "just to come out", "just to come",
         "quote", "estimate", "free estimate", "ballpark", "firm number", "rough price",
@@ -2337,12 +2366,13 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
         "does it go toward", "does it go towards", "does that go toward", "does that go towards",
         "does the fee go toward", "does the fee go towards", "does the service fee go toward", "does the service fee go towards",
         "deposit", "credited back", "applied back",
-        "licensed", "insured", "card", "cash", "check", "payment", "pay by",
+        "licensed", "license", "insured", "insurance", "where are you", "where are you located", "where are you guys located",
         "permit", "permit required", "dog", "dogs", "pet", "pets", "call when",
         "text when", "on the way", "arrival window", "when close", "when you're close", "when youre close",
         "bring anything", "materials", "do i need to buy", "do you do panel", "panel upgrade",
         "availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out",
-        "how long does it take", "how long is the visit", "what does the visit include", "what does that include"
+        "how long does it take", "how long is the visit", "what does the visit include", "what does that include",
+        "favorite color", "is this ai", "are you ai", "real person", "talk to my husband", "talk to my wife", "copy of your insurance"
     ]
     return any(x in low for x in interrupt_markers)
 
@@ -2449,7 +2479,7 @@ def detect_soft_rejection(inbound_text: str) -> str | None:
         return "spouse"
     if any(p in low for p in ["call around", "shop around", "check around", "come sooner", "find someone sooner", "compare prices", "get a few quotes", "get other quotes"]):
         return "shopping"
-    if any(p in low for p in ["not ready yet", "maybe later", "let me think about it", "ill let you know", "i ll let you know", "i will get back to you", "i ll get back to you"]):
+    if any(p in low for p in ["not ready yet", "maybe later", "let me think about it", "ill let you know", "i ll let you know", "i will get back to you", "i ll get back to you", "not sure what day", "not sure ill be free", "not sure i will be free", "have to check", "need to check"]):
         return "timing"
     return None
 
@@ -2468,7 +2498,7 @@ def build_soft_rejection_reply(conv: dict, inbound_text: str) -> str | None:
         return "No problem at all. Talk it over and if you want to move forward just message me back here and I’ll pick it up where we left off."
     if kind == "shopping":
         return "No problem at all. If you want to move forward later just message me back here and I’ll pick it up where we left off."
-    return "No problem at all. Whenever you're ready, just message me back here and I’ll pick it up where we left off."
+    return "No problem at all. When you know what day works, just message me back here and I'll pick it up where we left off."
 
 
 def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | None:
@@ -2480,6 +2510,15 @@ def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | Non
     low = _loose_text(inbound_text)
     if not low:
         return None
+
+    # While paused, answer questions without forcing the booking flow back open.
+    if _question_count(inbound_text) or is_conversation_hesitation(inbound_text):
+        answered = interruption_answer_and_return_prompt(conv, inbound_text)
+        if answered:
+            return answered
+        trust = llm_trust_reply(conv, inbound_text)
+        if trust and trust.get("answer"):
+            return trust.get("answer").strip()
 
     resume_markers = [
         "okay", "ok", "yes", "yeah", "yep", "that works", "lets do it", "let's do it",
