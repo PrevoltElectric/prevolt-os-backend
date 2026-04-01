@@ -4380,3 +4380,239 @@ def maybe_create_square_booking(phone: str, convo: dict):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
+# ===================================================
+# PREVOLT PATCH V2 — CONVERSATION FLEX / PRICE REPETITION / QUESTION PRIORITY
+# ===================================================
+
+def _rb2_loose(s: str) -> str:
+    s = (s or '').lower().replace('’', "'")
+    s = re.sub(r"[^a-z0-9\s?]", ' ', s)
+    return ' '.join(s.split())
+
+
+def _rb2_contains_any(low: str, phrases: list[str]) -> bool:
+    return any(p in low for p in phrases)
+
+
+def _rb2_question_only(inbound_text: str) -> bool:
+    low = _rb2_loose(inbound_text)
+    if not low:
+        return False
+    if '?' in (inbound_text or ''):
+        return True
+    starters = [
+        'are you', 'do you', 'did you', 'can you', 'will you', 'what ', 'how ', 'when ',
+        'why ', 'is it', 'does it', 'should i', 'would you', 'could you'
+    ]
+    return any(low.startswith(x) for x in starters)
+
+
+def _rb2_is_soft_hesitation(inbound_text: str) -> bool:
+    low = _rb2_loose(inbound_text)
+    return _rb2_contains_any(low, [
+        'not going to book', 'not gonna book', 'i dont think so', "i don't think so",
+        'never mind', 'nevermind', 'ill think about it', "i'll think about it",
+        'let me think about it', 'not right now', 'maybe later', 'just checking',
+        'just curious', 'shopping around', 'getting prices', 'i need to think about it'
+    ])
+
+
+def looks_like_slot_payload(inbound_text: str) -> bool:
+    txt = (inbound_text or '').strip()
+    low = _rb2_loose(txt)
+    if not txt:
+        return False
+
+    # Question priority fix: licensing / pricing / service-area / reassurance questions
+    # must not get swallowed as slot payloads.
+    if _rb2_question_only(txt):
+        question_markers = [
+            'licensed', 'insured', 'service area', 'do you service', 'do you work', 'work in',
+            'come to', 'how much', 'price', 'cost', 'what does that include', 'what does the visit include',
+            'free estimate', 'estimate', 'quote', 'ballpark', 'permit', 'dog', 'pet', 'cash', 'card',
+            'payment', 'is it safe', 'can i flip the breaker', 'can i reset it', 'when close', 'on the way'
+        ]
+        if _rb2_contains_any(low, question_markers):
+            return False
+
+    if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", txt, flags=re.I):
+        return True
+    if re.search(r"\b\d{1,6}\b", txt) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
+        return True
+    if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", low, flags=re.I):
+        return True
+    if re.search(r"^\d{3,4}$", txt):
+        return True
+    if re.search(r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next monday|next tuesday|next wednesday|next thursday|next friday|next saturday|next sunday)\b", low):
+        return True
+    if len(txt.split()) <= 3 and re.fullmatch(r"[A-Za-z'\- ]+", txt) and not _rb2_question_only(txt):
+        return True
+    return False
+
+
+def _rb2_next_prompt(conv: dict, inbound_text: str = '') -> str | None:
+    sched = conv.setdefault('sched', {})
+    profile = conv.setdefault('profile', {})
+    recompute_pending_step(profile, sched)
+    if _rb2_is_soft_hesitation(inbound_text):
+        return None
+    nxt = _ORIG_CHOOSE_NEXT_PROMPT_FROM_STATE(conv, inbound_text='')
+    if not nxt or nxt in {'Okay.', 'Okay', 'Everything looks good here.'}:
+        return None
+    return nxt
+
+
+def _rb2_answer_for_question(conv: dict, inbound_text: str) -> str | None:
+    profile = conv.setdefault('profile', {})
+    sched = conv.setdefault('sched', {})
+    low = _rb2_loose(inbound_text)
+    if not low:
+        return None
+
+    appt = (sched.get('appointment_type') or '').upper()
+    emergency = ('TROUBLESHOOT' in appt) or bool(sched.get('emergency_approved')) or bool(sched.get('awaiting_emergency_confirm'))
+    price_disclosed = bool(sched.get('price_disclosed'))
+
+    answer = None
+    continue_booking = True
+
+    if _rb2_contains_any(low, ['licensed in ct', 'licensed in connecticut', 'licensed in ct?']):
+        answer = 'Yes, we are licensed in Connecticut.'
+    elif _rb2_contains_any(low, ['licensed', 'insured']):
+        answer = 'Yes, we are licensed and insured.'
+    elif _rb2_contains_any(low, ['do you even work in', 'do you work in', 'do you service', 'do you come to', 'service area']):
+        if 'windsor locks' in low:
+            answer = 'Yes, we work in Windsor Locks.'
+        elif 'connecticut' in low or 'massachusetts' in low or 'ct' in low or 'ma' in low:
+            answer = 'Yes, we service Connecticut and Massachusetts.'
+        else:
+            answer = 'Yes, we service Connecticut and Massachusetts.'
+    elif _rb2_contains_any(low, ['what does that include', 'what does the visit include', 'what is the 195 for', 'is the 195 just to come out', 'is 195 just to come out', 'just to come out', 'just to come']) :
+        if 'TROUBLESHOOT' in appt:
+            answer = 'The $395 troubleshoot visit covers coming out, diagnosing the issue, and handling minor repair work if it is something straightforward.'
+        elif 'INSPECTION' in appt:
+            answer = 'The inspection visit covers coming out, inspecting the home, and going over what we find.'
+        else:
+            answer = 'The $195 evaluation covers coming out, seeing the issue in person, and going over the next step with you.'
+        sched['price_disclosed'] = True
+    elif _rb2_contains_any(low, ['how much', 'price', 'cost', 'what do you charge', '195', '395', 'service fee', 'trip fee', 'diagnostic fee']):
+        if 'TROUBLESHOOT' in appt:
+            answer = 'The troubleshoot and repair visit is $395.'
+        elif 'INSPECTION' in appt:
+            answer = 'The inspection visit is $395.'
+        else:
+            answer = 'The evaluation visit is $195.'
+        sched['price_disclosed'] = True
+    elif _rb2_contains_any(low, ['free estimate', 'estimate', 'quote', 'ballpark', 'rough price', 'firm number']):
+        answer = 'We handle that with a $195 evaluation so we can see everything in person and give you a firm number.'
+        sched['price_disclosed'] = True
+    elif _rb2_contains_any(low, ['go toward the project', 'go towards the project', 'does that go toward', 'does it go toward', 'credited back', 'applied back', 'deposit']):
+        if 'TROUBLESHOOT' in appt:
+            answer = 'That covers the troubleshoot visit itself. If anything larger is needed, we go over it on site before anything moves forward.'
+        else:
+            answer = 'That covers the visit itself. If additional work is needed after that, we go over it in person.'
+    elif _rb2_contains_any(low, ['permit', 'permit required']):
+        answer = 'If anything needs a permit, we go over that during the visit.'
+    elif _rb2_contains_any(low, ['cash', 'card', 'check', 'payment', 'pay by']):
+        answer = 'Card or cash after the visit is fine.'
+    elif _rb2_contains_any(low, ['dog', 'dogs', 'pet', 'pets']):
+        answer = 'That is totally fine. Just make sure we can safely get to the panel when we arrive.'
+    elif _rb2_contains_any(low, ['on the way', 'when close', "when you're close", 'when youre close', 'arrival window', 'text when']):
+        answer = 'Yes, you will get a text when we are on the way.'
+    elif _rb2_contains_any(low, ['buy anything', 'bring anything', 'materials', 'do i need anything', 'should i buy']):
+        answer = 'No, you do not need to buy anything ahead of time for the visit.'
+    elif _rb2_contains_any(low, ['how long', 'visit take', 'how long is the visit']):
+        answer = 'Usually about an hour, depending on what you have going on.'
+    elif _rb2_contains_any(low, ['is it safe', 'can i flip the breaker', 'can i reset it', 'should i shut the power off', 'should i turn it off']):
+        if emergency:
+            answer = 'I would leave that alone for now and we can handle it when we get there.'
+        else:
+            answer = 'I would rather not troubleshoot that over text. We can take a look in person and make sure everything is safe.'
+    elif _rb2_contains_any(low, ['do i need an electrician', 'do you think its serious', 'is this dangerous']):
+        answer = 'We would want to see it in person to say for sure, but we can take a look and make sure everything is safe.'
+    elif _rb2_contains_any(low, ['panel upgrade', 'panel replacement', 'service change']):
+        answer = 'Yes, we handle panel upgrades and replacements.'
+    elif _rb2_contains_any(low, ['available today', 'availability', 'how soon', 'when can you come', 'earliest', 'soonest']):
+        answer = 'Once I have the booking details, I can get you on the schedule.'
+    elif _rb2_is_soft_hesitation(inbound_text):
+        continue_booking = False
+        answer = 'No problem at all. If you want to think it over or circle back later, just send a message and we can pick it back up.'
+
+    if not answer:
+        return None
+
+    # Do not re-insert pricing over and over once already disclosed, unless user explicitly asks pricing again.
+    if price_disclosed and sched.get('price_disclosed') and _rb2_contains_any(low, ['licensed', 'insured', 'do you work in', 'do you even work in', 'do you service', 'permit', 'dog', 'pets', 'payment', 'cash', 'card', 'how long', 'when close', 'on the way']):
+        pass
+
+    nxt = _rb2_next_prompt(conv, inbound_text=inbound_text) if continue_booking else None
+    if nxt:
+        return f'{answer} {nxt}'
+    return answer
+
+
+def _response_brain_answer(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
+    sched = conv.setdefault('sched', {})
+    booked = bool(sched.get('booking_created') and sched.get('square_booking_id'))
+    if booked and not allow_post_booking:
+        return None
+    ans = _rb2_answer_for_question(conv, inbound_text)
+    if ans:
+        return ans
+    return None
+
+
+def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
+    sched = conv.setdefault('sched', {})
+    if sched.get('booking_created') and sched.get('square_booking_id'):
+        return False
+    # Question priority fix.
+    if _rb2_question_only(inbound_text):
+        return _rb2_answer_for_question(conv, inbound_text) is not None
+    if looks_like_slot_payload(inbound_text):
+        return False
+    return _rb2_answer_for_question(conv, inbound_text) is not None or _ORIG_SHOULD_SHORT_CIRCUIT_INTERRUPT(conv, inbound_text)
+
+
+def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
+    rb = _rb2_answer_for_question(conv, inbound_text)
+    if rb:
+        return rb
+    return _ORIG_INTERRUPTION_ANSWER_AND_RETURN_PROMPT(conv, inbound_text, allow_post_booking=allow_post_booking)
+
+
+def build_soft_rejection_reply(conv: dict, inbound_text: str) -> str | None:
+    sched = conv.setdefault('sched', {})
+    low = _rb2_loose(inbound_text)
+
+    if _rb2_is_soft_hesitation(inbound_text):
+        sched['soft_rejection_open'] = True
+        sched['soft_rejection_state'] = 'paused_customer_hesitation'
+        sched['soft_rejection_ts'] = int(time.time())
+        return 'No problem at all. If you want to think it over or circle back later, just send a message and we can pick it back up.'
+
+    if sched.get('slot_recovery_mode') and _rb2_contains_any(low, ['none', 'none of those', "those don't work", 'those dont work', 'different day', 'another day']):
+        sched['scheduled_time'] = None
+        sched['scheduled_date'] = None
+        sched['slot_recovery_mode'] = False
+        return 'No problem. What day works better for you?'
+
+    return _ORIG_BUILD_SOFT_REJECTION_REPLY(conv, inbound_text) if '_ORIG_BUILD_SOFT_REJECTION_REPLY' in globals() else None
+
+
+def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | None:
+    low = _rb2_loose(inbound_text)
+    sched = conv.setdefault('sched', {})
+    if sched.get('soft_rejection_open') and _rb2_contains_any(low, ['book', 'schedule', 'lets do it', "let's do it", 'ready', 'okay lets', 'ok lets', 'tomorrow', 'today', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']):
+        sched['soft_rejection_open'] = False
+        sched['soft_rejection_state'] = None
+        recompute_pending_step(conv.setdefault('profile', {}), sched)
+        nxt = _rb2_next_prompt(conv, inbound_text=inbound_text)
+        if nxt:
+            return f'Okay. {nxt}'
+        return 'Okay.'
+    return _ORIG_MAYBE_RESUME_PAUSED_CONVERSATION(conv, inbound_text) if '_ORIG_MAYBE_RESUME_PAUSED_CONVERSATION' in globals() else None
+
+# keep latest override handles alive
+_ORIG_MAYBE_RESUME_PAUSED_CONVERSATION = globals().get('_ORIG_MAYBE_RESUME_PAUSED_CONVERSATION', maybe_resume_paused_conversation)
