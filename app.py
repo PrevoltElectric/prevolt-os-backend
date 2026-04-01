@@ -1510,21 +1510,13 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
 
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
-            final_key = build_final_confirmation_key(sched)
-            if sched.get("final_confirmation_accepted") and sched.get("last_final_confirmation_key") == final_key:
-                return "Everything looks good here."
-            try:
-                if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
-                    d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
-                    human_d = d.strftime("%A, %B %d").replace(" 0", " ")
-                else:
-                    human_d = (sched.get("scheduled_date") or "that day").strip()
-            except Exception:
-                human_d = (sched.get("scheduled_date") or "that day").strip()
-            human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else "that time"
-            sched["final_confirmation_sent"] = True
-            sched["last_final_confirmation_key"] = final_key
-            return f"Just to confirm, {human_d} at {human_t}. Is that still good?"
+            human_d, human_t = _human_day_and_time(sched)
+            booking_result = (sched.get("booking_last_result") or "").strip().lower()
+            if booking_result == "needs_state":
+                return "Just to confirm, is this address in Connecticut or Massachusetts?"
+            if booking_result in {"slot_unavailable", "inactive_booking_status", "create_failed", "retrieve_failed", "availability_unknown", "exception"}:
+                return f"I’m not seeing {human_t} open on {human_d}. What other time works for you?"
+            return f"I’m not seeing that slot lock in yet. What other time works on {human_d}?"
         return "Okay."
 
     return (conv.get("last_sms_body") or "Okay.").strip() or "Okay."
@@ -3921,7 +3913,7 @@ def generate_reply_for_inbound(
 
         if ready_for_booking or (EMERGENCY and has_identity_for_booking):
             try:
-                maybe_create_square_booking(phone, conv)
+                booking_attempt = maybe_create_square_booking(phone, conv) or {}
 
                 if sched.get("booking_created") and sched.get("square_booking_id"):
                     try:
@@ -3945,6 +3937,37 @@ def generate_reply_for_inbound(
                         "address": model_addr,
                         "booking_complete": True
                     }
+
+                attempt_result = (booking_attempt.get("result") or sched.get("booking_last_result") or "").strip().lower()
+                if attempt_result == "slot_unavailable":
+                    fallback = f"I’m not seeing {human_time} open on {human_day}. What other time works for you?"
+                    fallback = _finalize_sms(fallback, appt_type, booking_created=False)
+                    return {
+                        "sms_body": fallback,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": None,
+                        "address": model_addr,
+                        "booking_complete": False
+                    }
+                if attempt_result in {"availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
+                    fallback = f"That time did not lock into the calendar. What other time works on {human_day}?"
+                    fallback = _finalize_sms(fallback, appt_type, booking_created=False)
+                    return {
+                        "sms_body": fallback,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": None,
+                        "address": model_addr,
+                        "booking_complete": False
+                    }
+                if attempt_result == "needs_state":
+                    fallback = _finalize_sms("Just to confirm, is this address in Connecticut or Massachusetts?", appt_type, booking_created=False)
+                    return {
+                        "sms_body": fallback,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": model_addr,
+                        "booking_complete": False
+                    }
             except Exception as e:
                 print("[ERROR] Autobooking:", repr(e))
 
@@ -3952,6 +3975,11 @@ def generate_reply_for_inbound(
         # HARD SAFETY: If Square didn't book, never confirm. Ask next missing atom.
         # --------------------------------------
         if not (sched.get("booking_created") and sched.get("square_booking_id")):
+            if (sched.get("booking_last_result") or "").strip().lower() in {"slot_unavailable", "availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
+                sched["final_confirmation_sent"] = False
+                sched["final_confirmation_accepted"] = False
+                sched["last_final_confirmation_key"] = None
+                sched["scheduled_time"] = None
             update_address_assembly_state(sched)
             recompute_pending_step(profile, sched)
             sms_body = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
@@ -4309,6 +4337,79 @@ def is_weekend(date_str: str) -> bool:
 
 
 # ---------------------------------------------------
+# Square availability + booking outcome helpers
+# ---------------------------------------------------
+def square_active_booking_status(status: str) -> bool:
+    s = (status or '').strip().upper()
+    if not s:
+        return False
+    return s not in {
+        'CANCELLED_BY_CUSTOMER', 'CANCELLED_BY_SELLER', 'DECLINED', 'NO_SHOW', 'REJECTED', 'FAILED'
+    }
+
+
+def square_search_exact_availability(scheduled_date: str, scheduled_time: str, variation_id: str, variation_version: int | None, team_member_id: str, location_id: str) -> dict:
+    """Search Square availability for the exact requested local slot."""
+    try:
+        tz = ZoneInfo('America/New_York') if ZoneInfo else timezone.utc
+        local_day = datetime.strptime(scheduled_date, '%Y-%m-%d').replace(tzinfo=tz)
+        range_start_local = local_day.replace(hour=0, minute=0, second=0, microsecond=0)
+        range_end_local = range_start_local + timedelta(days=1)
+        exact_start_utc = parse_local_datetime(scheduled_date, scheduled_time)
+        if not exact_start_utc:
+            return {'ok': False, 'available': False, 'matched': None, 'error': 'invalid_start'}
+        payload = {
+            'query': {
+                'filter': {
+                    'start_at_range': {
+                        'start_at': range_start_local.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'end_at': range_end_local.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    },
+                    'location_id': location_id,
+                    'segment_filters': [
+                        {
+                            'service_variation_id': variation_id,
+                            'service_variation_version': variation_version,
+                            'team_member_id_filter': {'any': [team_member_id]}
+                        }
+                    ]
+                }
+            }
+        }
+        resp = requests.post('https://connect.squareup.com/v2/bookings/availability/search', headers=square_headers(), json=payload, timeout=12)
+        if resp.status_code not in (200, 201):
+            return {'ok': False, 'available': False, 'matched': None, 'error': f'http_{resp.status_code}:{resp.text[:300]}'}
+        data = resp.json() or {}
+        exact_iso = exact_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        for av in data.get('availabilities') or []:
+            if (av.get('start_at') or '').strip() != exact_iso:
+                continue
+            if (av.get('location_id') or '').strip() != (location_id or '').strip():
+                continue
+            segs = av.get('appointment_segments') or []
+            if not segs:
+                continue
+            seg0 = segs[0] if isinstance(segs, list) else {}
+            if (seg0.get('team_member_id') or '').strip() != (team_member_id or '').strip():
+                continue
+            if (seg0.get('service_variation_id') or '').strip() != (variation_id or '').strip():
+                continue
+            return {'ok': True, 'available': True, 'matched': av, 'error': None}
+        return {'ok': True, 'available': False, 'matched': None, 'error': None}
+    except Exception as e:
+        return {'ok': False, 'available': False, 'matched': None, 'error': repr(e)}
+
+
+def _human_day_and_time(sched: dict) -> tuple[str, str]:
+    try:
+        booked_dt = datetime.strptime(sched.get('scheduled_date') or '', '%Y-%m-%d')
+        human_day = booked_dt.strftime('%A, %B %d').replace(' 0', ' ')
+    except Exception:
+        human_day = (sched.get('scheduled_date') or 'that day').strip()
+    human_t = humanize_time(sched.get('scheduled_time') or '') or (sched.get('scheduled_time') or 'that time')
+    return human_day, human_t
+
+# ---------------------------------------------------
 # Create Square Booking (Corrected + Step 5B Compatible) — PATCHED (requires house number)
 #   ✅ Creates booking
 #   ✅ Retrieves booking to confirm status/version
@@ -4319,380 +4420,239 @@ def is_weekend(date_str: str) -> bool:
 def maybe_create_square_booking(phone: str, convo: dict):
     import re
 
-    lock = get_conversation_lock(phone or convo.get("_convo_key") or "unknown")
+    lock = get_conversation_lock(phone or convo.get('_convo_key') or 'unknown')
     with lock:
-        sched = convo.setdefault("sched", {})
-        profile = convo.setdefault("profile", {})
-        current_job = convo.setdefault("current_job", {})
-
-        inflight_until = float(sched.get("booking_inflight_until") or 0)
+        sched = convo.setdefault('sched', {})
+        profile = convo.setdefault('profile', {})
+        current_job = convo.setdefault('current_job', {})
+        inflight_until = float(sched.get('booking_inflight_until') or 0)
         if inflight_until and inflight_until > time.time():
-            return
-        sched["booking_inflight_until"] = time.time() + 20
-
-    # Harden profile keys (prevents KeyError elsewhere)
-    profile.setdefault("addresses", [])
-    profile.setdefault("past_jobs", [])
-    profile.setdefault("upcoming_appointment", None)
-
-    profile.setdefault("first_name", None)
-    profile.setdefault("last_name", None)
-    profile.setdefault("email", None)
-    profile.setdefault("active_first_name", None)
-    profile.setdefault("active_last_name", None)
-    profile.setdefault("active_email", None)
-    profile.setdefault("known_people", [])
-
-    active_first = (profile.get("active_first_name") or profile.get("first_name") or "").strip()
-    active_last = (profile.get("active_last_name") or profile.get("last_name") or "").strip()
-    active_email = (profile.get("active_email") or profile.get("email") or "").strip()
-
-    profile["first_name"] = active_first
-    profile["last_name"] = active_last
-    profile["email"] = active_email
-
-    # Repeat callers can still be booked when we already have a Square customer on file,
-    # even if the current thread never re-collected their email.
-    if not ((active_first and active_last) or profile.get("square_customer_id")):
-        return
-
-
-    # Never double-book
-    if sched.get("booking_created") and sched.get("square_booking_id"):
-        return
-
-    # Clear stale booking state before a fresh attempt
-    sched["booking_created"] = False
-    sched["square_booking_id"] = None
-
-    scheduled_date   = sched.get("scheduled_date")
-    scheduled_time   = sched.get("scheduled_time")
-    raw_address      = (sched.get("raw_address") or "").strip()
-    appointment_type = sched.get("appointment_type")
-
-    # ✅ Step 5 hard gate: do NOT attempt Square booking until address is VERIFIED
-    # (Verified now MUST mean "has a house number" per your patched address state helper.)
-    if not sched.get("address_verified"):
-        return
-
-    if not (scheduled_date and scheduled_time and appointment_type):
-        return
-
-    variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
-    if not variation_id:
-        print("[ERROR] Unknown appt_type:", appointment_type)
-        return
-
-    # weekend rule
-    if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
-        print("[BLOCKED] Weekend not allowed for non-emergency.")
-        return
-
-    # time-window rule
-    if appointment_type != "TROUBLESHOOT_395":
-        if not is_within_normal_hours(scheduled_time):
-            print("[BLOCKED] Time outside 9–4")
-            return
-
-    if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
-        print("[ERROR] Square not configured.")
-        return
-
-    # ---------------------------------------------------
-    # Address normalization precedence (Step 5B)
-    # 1) Use sched["normalized_address"] if it is a dict and complete
-    # 2) Otherwise attempt normalize_address(raw_address)
-    # ---------------------------------------------------
-    addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
-
-    def _is_complete_norm(a: dict) -> bool:
-        return bool(
-            isinstance(a, dict)
-            and (a.get("address_line_1") or "").strip()
-            and (a.get("locality") or "").strip()
-            and (a.get("administrative_district_level_1") or "").strip()
-            and (a.get("postal_code") or "").strip()
-        )
-
-    def _has_house_number(line1: str) -> bool:
-        line1 = (line1 or "").strip()
-        return bool(re.match(r"^\d{1,6}\b", line1))
-
-    if not _is_complete_norm(addr_struct):
-        # If we somehow reached here with address_verified True but no good normalized struct, re-normalize
-        if not raw_address:
-            # Nothing to normalize; bail safely
-            sched["address_verified"] = False
-            sched["address_missing"] = "street"
-            return
-
-        try:
-            status, fresh = normalize_address(raw_address)
-        except Exception as e:
-            print("[ERROR] normalize_address exception:", repr(e))
-            return
-
-        # Preserve your existing "needs_state" flow
-        if status == "needs_state":
-            send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
-            # Mark not verified until we have a full normalized address
-            sched["address_verified"] = False
-            sched["address_missing"] = "state"
-            return
-
-        # If normalization fails, do not book
-        if status != "ok" or not isinstance(fresh, dict):
-            print("[ERROR] Address normalization failed. status=", status)
-            sched["address_verified"] = False
-            sched["address_missing"] = "confirm"
-            return
-
-        addr_struct = fresh
-        sched["normalized_address"] = addr_struct
-
-    # Final check: must be complete
-    if not _is_complete_norm(addr_struct):
-        print("[ERROR] Normalized address missing required fields.")
-        sched["address_verified"] = False
-        sched["address_missing"] = "confirm"
-        return
-
-    # ---------------------------------------------------
-    # ✅ HARD BLOCK if no house number in normalized address_line_1
-    # ---------------------------------------------------
-    line1 = (addr_struct.get("address_line_1") or "").strip()
-    if not _has_house_number(line1):
-        sched["address_verified"] = False
-        sched["address_missing"] = "number"
-        return
-
-    # ---------------------------------------------------
-    # Square booking.address FIX (remove unsupported field)
-    # ---------------------------------------------------
-    booking_address = dict(addr_struct)
-    booking_address.pop("country", None)  # Square booking.address rejects country in some setups
-
-    # ---------------------------------------------------
-    # Travel check (uses normalized destination)
-    # ---------------------------------------------------
-    origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
-    if origin:
-        destination = (
-            f"{(addr_struct.get('address_line_1') or '').strip()}, "
-            f"{(addr_struct.get('locality') or '').strip()}, "
-            f"{(addr_struct.get('administrative_district_level_1') or '').strip()} "
-            f"{(addr_struct.get('postal_code') or '').strip()}"
-        ).strip()
-
-        travel_minutes = compute_travel_time_minutes(origin, destination)
-        if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES:
-            print("[BLOCKED] Travel too long.")
-            return
-
-    # ---------------------------------------------------
-    # Square customer (customer CAN include country)
-    # ---------------------------------------------------
-    customer_id = square_create_or_get_customer(phone, profile, addr_struct)
-    if not customer_id:
-        print("[ERROR] Can't create/fetch customer.")
-        return
-
-    start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
-    if not start_at_utc:
-        print("[ERROR] Invalid start time.")
-        return
-
-    # Use normalized address in the idempotency key so partial text changes don't accidentally create dupes
-    idempotency_key = (
-        f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}-"
-        f"{(addr_struct.get('address_line_1') or '').strip()}-"
-        f"{(addr_struct.get('postal_code') or '').strip()}"
-    )
-
-    booking_payload = {
-        "idempotency_key": idempotency_key,
-        "booking": {
-            "location_id": SQUARE_LOCATION_ID,
-            "customer_id": customer_id,
-            "start_at": start_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "location_type": "CUSTOMER_LOCATION",
-            "address": booking_address,
-            "appointment_segments": [
-                {
-                    "duration_minutes": 60,
-                    "service_variation_id": variation_id,
-                    "service_variation_version": variation_version,
-                    "team_member_id": SQUARE_TEAM_MEMBER_ID
-                }
-            ],
-            "customer_note": (
-                "Auto-booked by Prevolt OS. "
-                f"Raw address: {raw_address or '[none]'} | "
-                f"Normalized: {addr_struct.get('address_line_1')}, {addr_struct.get('locality')}, "
-                f"{(addr_struct.get('administrative_district_level_1') or '').strip()} {(addr_struct.get('postal_code') or '').strip()}"
-            )
-        }
-    }
+            return {'ok': False, 'result': 'inflight', 'message': None}
+        sched['booking_inflight_until'] = time.time() + 20
+        sched['booking_last_result'] = None
+        sched['booking_last_error'] = None
 
     try:
-        # -----------------------------
-        # 1) Create booking
-        # -----------------------------
-        resp = requests.post(
-            "https://connect.squareup.com/v2/bookings",
-            headers=square_headers(),
-            json=booking_payload,
-            timeout=12,
-        )
-        if resp.status_code not in (200, 201):
-            print("[ERROR] Square booking failed:", resp.status_code, resp.text)
-            return
+        profile.setdefault('addresses', [])
+        profile.setdefault('past_jobs', [])
+        profile.setdefault('upcoming_appointment', None)
+        profile.setdefault('first_name', None)
+        profile.setdefault('last_name', None)
+        profile.setdefault('email', None)
+        profile.setdefault('active_first_name', None)
+        profile.setdefault('active_last_name', None)
+        profile.setdefault('active_email', None)
+        profile.setdefault('known_people', [])
 
-        data = resp.json()
-        booking = data.get("booking") or {}
-        booking_id = booking.get("id")
+        active_first = (profile.get('active_first_name') or profile.get('first_name') or '').strip()
+        active_last = (profile.get('active_last_name') or profile.get('last_name') or '').strip()
+        active_email = (profile.get('active_email') or profile.get('email') or '').strip()
+        profile['first_name'] = active_first
+        profile['last_name'] = active_last
+        profile['email'] = active_email
 
-        if not booking_id:
-            print("[ERROR] booking_id missing. payload=", data)
-            return
+        if not ((active_first and active_last) or profile.get('square_customer_id')):
+            sched['booking_last_result'] = 'identity_missing'
+            return {'ok': False, 'result': 'identity_missing', 'message': None}
+        if sched.get('booking_created') and sched.get('square_booking_id'):
+            sched['booking_last_result'] = 'already_booked'
+            return {'ok': True, 'result': 'already_booked', 'message': None}
 
-        # -----------------------------
-        # 2) Retrieve booking to confirm status/version
-        # -----------------------------
-        r2 = requests.get(
-            f"https://connect.squareup.com/v2/bookings/{booking_id}",
-            headers=square_headers(),
-            timeout=12,
-        )
-        if r2.status_code not in (200, 201):
-            print("[ERROR] retrieve booking failed:", r2.status_code, r2.text)
-            return
+        sched['booking_created'] = False
+        sched['square_booking_id'] = None
+        scheduled_date = sched.get('scheduled_date')
+        scheduled_time = sched.get('scheduled_time')
+        raw_address = (sched.get('raw_address') or '').strip()
+        appointment_type = sched.get('appointment_type')
 
-        b2 = (r2.json() or {}).get("booking") or {}
-        status = (b2.get("status") or "").upper()
-        version = b2.get("version")
+        if not sched.get('address_verified'):
+            sched['booking_last_result'] = 'address_unverified'
+            return {'ok': False, 'result': 'address_unverified', 'message': None}
+        if not (scheduled_date and scheduled_time and appointment_type):
+            sched['booking_last_result'] = 'missing_slot'
+            return {'ok': False, 'result': 'missing_slot', 'message': None}
 
-        try:
-            segs = b2.get("appointment_segments") or []
-            tm = segs[0].get("team_member_id") if segs and isinstance(segs, list) else None
-        except Exception:
-            tm = None
+        variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
+        if not variation_id:
+            sched['booking_last_result'] = 'unknown_appt_type'
+            sched['booking_last_error'] = appointment_type
+            return {'ok': False, 'result': 'unknown_appt_type', 'message': None}
 
-        print("[DEBUG] booking retrieved:", {
-            "id": booking_id,
-            "status": status,
-            "version": version,
-            "location_id": b2.get("location_id"),
-            "team_member_id": tm
-        })
+        if is_weekend(scheduled_date) and appointment_type != 'TROUBLESHOOT_395':
+            sched['booking_last_result'] = 'weekend_blocked'
+            return {'ok': False, 'result': 'weekend_blocked', 'message': None}
+        if appointment_type != 'TROUBLESHOOT_395' and not is_within_normal_hours(scheduled_time):
+            sched['booking_last_result'] = 'outside_hours'
+            return {'ok': False, 'result': 'outside_hours', 'message': None}
+        if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
+            sched['booking_last_result'] = 'square_not_configured'
+            return {'ok': False, 'result': 'square_not_configured', 'message': None}
 
-        # -----------------------------
-        # 3) Accept booking if not already accepted/confirmed
-        # -----------------------------
-        if status not in ("ACCEPTED", "CONFIRMED"):
-            if version is None:
-                print("[ERROR] booking version missing; cannot accept.")
-                return
+        addr_struct = sched.get('normalized_address') if isinstance(sched.get('normalized_address'), dict) else None
 
-            accept_payload = {
-                "booking": {
-                    "version": version,
-                    "status": "ACCEPTED",
-                }
+        def _is_complete_norm(a: dict) -> bool:
+            return bool(isinstance(a, dict) and (a.get('address_line_1') or '').strip() and (a.get('locality') or '').strip() and (a.get('administrative_district_level_1') or '').strip() and (a.get('postal_code') or '').strip())
+
+        def _has_house_number(line1: str) -> bool:
+            return bool(re.match(r'^\d{1,6}', (line1 or '').strip()))
+
+        if not _is_complete_norm(addr_struct):
+            if not raw_address:
+                sched['address_verified'] = False
+                sched['address_missing'] = 'street'
+                sched['booking_last_result'] = 'address_unverified'
+                return {'ok': False, 'result': 'address_unverified', 'message': None}
+            try:
+                norm_res = normalize_address(raw_address)
+                if isinstance(norm_res, tuple) and len(norm_res) >= 2:
+                    status, fresh = norm_res[0], norm_res[1]
+                else:
+                    status, fresh = ('ok', norm_res)
+            except Exception as e:
+                sched['booking_last_result'] = 'normalize_exception'
+                sched['booking_last_error'] = repr(e)
+                return {'ok': False, 'result': 'normalize_exception', 'message': None}
+            if status == 'needs_state':
+                sched['address_verified'] = False
+                sched['address_missing'] = 'state'
+                sched['booking_last_result'] = 'needs_state'
+                return {'ok': False, 'result': 'needs_state', 'message': 'Just to confirm, is this address in Connecticut or Massachusetts?'}
+            if status != 'ok' or not isinstance(fresh, dict):
+                sched['address_verified'] = False
+                sched['address_missing'] = 'confirm'
+                sched['booking_last_result'] = 'normalize_failed'
+                return {'ok': False, 'result': 'normalize_failed', 'message': None}
+            addr_struct = fresh
+            sched['normalized_address'] = addr_struct
+
+        if not _is_complete_norm(addr_struct):
+            sched['address_verified'] = False
+            sched['address_missing'] = 'confirm'
+            sched['booking_last_result'] = 'normalize_failed'
+            return {'ok': False, 'result': 'normalize_failed', 'message': None}
+        if not _has_house_number((addr_struct.get('address_line_1') or '').strip()):
+            sched['address_verified'] = False
+            sched['address_missing'] = 'number'
+            sched['booking_last_result'] = 'address_number_missing'
+            return {'ok': False, 'result': 'address_number_missing', 'message': None}
+
+        booking_address = dict(addr_struct)
+        booking_address.pop('country', None)
+
+        origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+        if origin:
+            destination = f"{(addr_struct.get('address_line_1') or '').strip()}, {(addr_struct.get('locality') or '').strip()}, {(addr_struct.get('administrative_district_level_1') or '').strip()} {(addr_struct.get('postal_code') or '').strip()}".strip()
+            travel_minutes = compute_travel_time_minutes(origin, destination)
+            if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES:
+                sched['booking_last_result'] = 'travel_too_long'
+                return {'ok': False, 'result': 'travel_too_long', 'message': None}
+
+        customer_id = square_create_or_get_customer(phone, profile, addr_struct)
+        if not customer_id:
+            sched['booking_last_result'] = 'customer_lookup_failed'
+            return {'ok': False, 'result': 'customer_lookup_failed', 'message': None}
+
+        av = square_search_exact_availability(scheduled_date, scheduled_time, variation_id, variation_version, SQUARE_TEAM_MEMBER_ID, SQUARE_LOCATION_ID)
+        if av.get('ok') and not av.get('available'):
+            sched['booking_last_result'] = 'slot_unavailable'
+            return {'ok': False, 'result': 'slot_unavailable', 'message': None}
+        if not av.get('ok'):
+            sched['booking_last_result'] = 'availability_unknown'
+            sched['booking_last_error'] = av.get('error')
+            return {'ok': False, 'result': 'availability_unknown', 'message': None}
+
+        start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
+        if not start_at_utc:
+            sched['booking_last_result'] = 'invalid_start'
+            return {'ok': False, 'result': 'invalid_start', 'message': None}
+
+        desired_slot_key = f"{scheduled_date}|{scheduled_time}|{appointment_type}|{(addr_struct.get('address_line_1') or '').strip()}|{(addr_struct.get('postal_code') or '').strip()}"
+        if sched.get('booking_attempt_slot_key') != desired_slot_key:
+            sched['booking_attempt_slot_key'] = desired_slot_key
+            sched['booking_attempt_nonce'] = uuid.uuid4().hex
+        attempt_nonce = sched.get('booking_attempt_nonce') or uuid.uuid4().hex
+        sched['booking_attempt_nonce'] = attempt_nonce
+
+        booking_payload = {
+            'idempotency_key': f'prevolt-{attempt_nonce}',
+            'booking': {
+                'location_id': SQUARE_LOCATION_ID,
+                'customer_id': customer_id,
+                'start_at': start_at_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'location_type': 'CUSTOMER_LOCATION',
+                'address': booking_address,
+                'appointment_segments': [{
+                    'duration_minutes': 60,
+                    'service_variation_id': variation_id,
+                    'service_variation_version': variation_version,
+                    'team_member_id': SQUARE_TEAM_MEMBER_ID
+                }],
+                'customer_note': 'Auto-booked by Prevolt OS. ' + f"Raw address: {raw_address or '[none]'} | Normalized: {addr_struct.get('address_line_1')}, {addr_struct.get('locality')}, {(addr_struct.get('administrative_district_level_1') or '').strip()} {(addr_struct.get('postal_code') or '').strip()}"
             }
-
-            r3 = requests.put(
-                f"https://connect.squareup.com/v2/bookings/{booking_id}",
-                headers=square_headers(),
-                json=accept_payload,
-                timeout=12,
-            )
-            if r3.status_code not in (200, 201):
-                print("[ERROR] accept booking failed:", r3.status_code, r3.text)
-                return
-
-            b3 = (r3.json() or {}).get("booking") or {}
-            status2 = (b3.get("status") or "").upper()
-            print("[DEBUG] booking accepted:", {"id": booking_id, "status": status2})
-
-            if status2 not in ("ACCEPTED", "CONFIRMED"):
-                print("[ERROR] booking did not end in ACCEPTED/CONFIRMED. status=", status2)
-                return
-
-        # ✅ Only mark booked AFTER create + retrieve + accept succeeds
-        sched["booking_created"] = True
-        sched["square_booking_id"] = booking_id
-
-        profile["upcoming_appointment"] = {
-            "date": scheduled_date,
-            "time": scheduled_time,
-            "type": appointment_type,
-            "square_id": booking_id,
-            "first_name": active_first,
-            "last_name": active_last,
-            "email": active_email
         }
 
-        if current_job.get("job_type"):
-            profile.setdefault("past_jobs", []).append({
-                "type": current_job["job_type"],
-                "date": scheduled_date
-            })
+        resp = requests.post('https://connect.squareup.com/v2/bookings', headers=square_headers(), json=booking_payload, timeout=12)
+        if resp.status_code not in (200, 201):
+            sched['booking_last_result'] = 'create_failed'
+            sched['booking_last_error'] = f"{resp.status_code} {resp.text[:400]}"
+            print('[ERROR] Square booking failed:', resp.status_code, resp.text)
+            return {'ok': False, 'result': 'create_failed', 'message': None}
+        data = resp.json() or {}
+        booking = data.get('booking') or {}
+        booking_id = booking.get('id')
+        if not booking_id:
+            sched['booking_last_result'] = 'create_failed'
+            sched['booking_last_error'] = str(data)[:400]
+            return {'ok': False, 'result': 'create_failed', 'message': None}
 
-        print("[SUCCESS] Booking created and accepted:", booking_id)
+        r2 = requests.get(f'https://connect.squareup.com/v2/bookings/{booking_id}', headers=square_headers(), timeout=12)
+        if r2.status_code not in (200, 201):
+            sched['booking_last_result'] = 'retrieve_failed'
+            sched['booking_last_error'] = f"{r2.status_code} {r2.text[:400]}"
+            return {'ok': False, 'result': 'retrieve_failed', 'message': None}
+        b2 = (r2.json() or {}).get('booking') or {}
+        status = (b2.get('status') or '').upper()
+        version = b2.get('version')
+        try:
+            segs = b2.get('appointment_segments') or []
+            tm = segs[0].get('team_member_id') if segs and isinstance(segs, list) else None
+        except Exception:
+            tm = None
+        print('[DEBUG] booking retrieved:', {'id': booking_id, 'status': status, 'version': version, 'location_id': b2.get('location_id'), 'team_member_id': tm})
 
+        if not square_active_booking_status(status):
+            sched['booking_last_result'] = 'inactive_booking_status'
+            sched['booking_last_error'] = status
+            return {'ok': False, 'result': 'inactive_booking_status', 'message': None}
+
+        sched['booking_created'] = True
+        sched['square_booking_id'] = booking_id
+        sched['booking_last_result'] = 'booked'
+        sched['booking_last_error'] = None
+        profile['upcoming_appointment'] = {
+            'date': scheduled_date,
+            'time': scheduled_time,
+            'type': appointment_type,
+            'square_id': booking_id,
+            'first_name': active_first,
+            'last_name': active_last,
+            'email': active_email
+        }
+        if current_job.get('job_type'):
+            profile.setdefault('past_jobs', []).append({'type': current_job['job_type'], 'date': scheduled_date})
+        print('[SUCCESS] Booking created:', booking_id, 'status=', status)
+        return {'ok': True, 'result': 'booked', 'message': None}
     except Exception as e:
-        print("[ERROR] Square exception:", repr(e))
+        sched = convo.setdefault('sched', {})
+        sched['booking_last_result'] = 'exception'
+        sched['booking_last_error'] = repr(e)
+        print('[ERROR] Square exception:', repr(e))
+        return {'ok': False, 'result': 'exception', 'message': None}
     finally:
         try:
-            sched["booking_inflight_until"] = 0
+            convo.setdefault('sched', {})['booking_inflight_until'] = 0
         except Exception:
             pass
-
-
-def _build_regression_messages() -> list[str]:
-    slots = [
-        "2pm works and we have dogs",
-        "tomorrow at 1 and my email is amy@test.com",
-        "next friday at 3",
-        "1500 works",
-        "today",
-        "this friday 2:30 pm",
-        "actually make that 3pm instead",
-        "use 54 Bloomfield Ave Windsor CT instead",
-        "Dickerman Ave",
-        "54",
-        "Windsor CT",
-        "CT",
-        "my name is Kyle Prevost",
-        "this is Amy Jones",
-        "kyle@prevoltllc.com",
-        "no power right now",
-        "panel smells like smoke",
-        "sparks from the outlet",
-        "do you service Windsor Locks",
-        "does the 195 go toward the work",
-        "can you text when close",
-        "i need to ask my wife first",
-        "same address as last time",
-        "i already gave the address",
-        "use my work email instead test2@example.com",
-    ]
-    addresses = [
-        "54 Bloomfield Ave Windsor CT",
-        "12B Greenbrier Dr Enfield CT",
-        "125 West Rd gate code 1888",
-        "24 Main St Springfield MA",
-    ]
-    out = []
-    for s in slots:
-        out.append(s)
-        for a in addresses:
-            out.append(f"{s} {a}")
-    while len(out) < 500:
-        out.append(random.choice(out))
-    random.Random(42).shuffle(out)
-    return out[:500]
 
 
 def run_local_regression_smoke_tests() -> dict:
