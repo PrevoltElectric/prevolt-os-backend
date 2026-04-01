@@ -242,9 +242,9 @@ def send_sms(to_number: str, body: str) -> None:
 
 
 def recompute_pending_step(profile: dict, sched: dict) -> None:
-    active_first = (profile.get("active_first_name") or profile.get("first_name") or "").strip()
-    active_last = (profile.get("active_last_name") or profile.get("last_name") or "").strip()
-    active_email = (profile.get("active_email") or profile.get("email") or "").strip()
+    active_first = (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or "").strip()
+    active_last = (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or "").strip()
+    active_email = (profile.get("active_email") or profile.get("email") or profile.get("recognized_email") or "").strip()
 
     if not sched.get("appointment_type"):
         sched["pending_step"] = "need_appt_type"
@@ -1876,13 +1876,13 @@ def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_creat
 
 
 def get_active_first_name(profile: dict) -> str:
-    return (profile.get("active_first_name") or profile.get("first_name") or "").strip()
+    return (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or "").strip()
 
 def get_active_last_name(profile: dict) -> str:
-    return (profile.get("active_last_name") or profile.get("last_name") or "").strip()
+    return (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or "").strip()
 
 def get_active_email(profile: dict) -> str:
-    return (profile.get("active_email") or profile.get("email") or "").strip()
+    return (profile.get("active_email") or profile.get("email") or profile.get("recognized_email") or "").strip()
 
 def get_display_first_name(profile: dict) -> str:
     return (
@@ -3642,19 +3642,51 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # AUTOBOOKING (Step 5)
         # --------------------------------------
+        has_identity_for_booking = bool(
+            (get_active_first_name(profile) and get_active_last_name(profile))
+            or profile.get("square_customer_id")
+        )
+        has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+
+        # If the same slot is already saved as the upcoming appointment, do not try to recreate it.
+        upcoming = profile.get("upcoming_appointment") or {}
+        if (
+            upcoming.get("date")
+            and upcoming.get("time")
+            and sched.get("scheduled_date") == upcoming.get("date")
+            and sched.get("scheduled_time") == upcoming.get("time")
+            and not sched.get("booking_created")
+        ):
+            sched["booking_created"] = True
+            sched["square_booking_id"] = upcoming.get("square_id") or "existing_on_file"
+            try:
+                booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+                human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
+            except Exception:
+                human_day = sched.get("scheduled_date") or "that day"
+            human_t = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
+            booked_sms = f"You're already all set for {human_day} at {human_t}."
+            booked_sms = _finalize_sms(booked_sms, appt_type, booking_created=True)
+            return {
+                "sms_body": booked_sms,
+                "scheduled_date": sched.get("scheduled_date"),
+                "scheduled_time": sched.get("scheduled_time"),
+                "address": sched.get("raw_address"),
+                "booking_complete": True
+            }
+
         ready_for_booking = (
             bool(sched.get("scheduled_date")) and
             bool(sched.get("scheduled_time")) and
             bool(sched.get("address_verified")) and
             bool(sched.get("appointment_type")) and
-            bool(get_active_first_name(profile)) and
-            bool(get_active_last_name(profile)) and
-            bool(get_active_email(profile)) and
+            has_identity_for_booking and
+            has_contact_for_booking and
             not sched.get("pending_step") and
             not sched.get("booking_created")
         )
 
-        if ready_for_booking or (EMERGENCY and bool(get_active_first_name(profile)) and bool(get_active_last_name(profile)) and bool(get_active_email(profile))):
+        if ready_for_booking or (EMERGENCY and has_identity_for_booking):
             try:
                 maybe_create_square_booking(phone, conv)
 
@@ -4079,7 +4111,9 @@ def maybe_create_square_booking(phone: str, convo: dict):
     profile["last_name"] = active_last
     profile["email"] = active_email
 
-    if not (active_first and active_last and active_email):
+    # Repeat callers can still be booked when we already have a Square customer on file,
+    # even if the current thread never re-collected their email.
+    if not ((active_first and active_last) or profile.get("square_customer_id")):
         return
 
 
