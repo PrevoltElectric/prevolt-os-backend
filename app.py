@@ -336,6 +336,35 @@ def clean_transcript_text(raw_text: str) -> str:
 
 
 # ---------------------------------------------------
+# Voicemail Task Topic Fallback Extractor
+# ---------------------------------------------------
+def fallback_extract_task_topics(cleaned_text: str) -> list[str]:
+    s = (cleaned_text or '').lower()
+    if not s:
+        return []
+
+    patterns = [
+        (r'\bev charger|car charger|tesla charger|level 2 charger\b', 'ev charger install'),
+        (r'\bpanel upgrade|service upgrade|upgrade the panel|upgrade my panel\b', 'panel upgrade'),
+        (r'\bsmoke.*panel|panel.*smoke|burning smell|sparks|arcing|buzzing panel\b', 'smoke from panel'),
+        (r'\boutlet(s)?\b', 'outlet issue'),
+        (r'\bgfci\b', 'gfci issue'),
+        (r'\bbreaker keeps tripping|breaker wont reset|breaker won't reset|tripping breaker\b', 'breaker issue'),
+        (r'\brecessed light|can light|pot light\b', 'recessed lighting'),
+        (r'\bceiling fan\b', 'ceiling fan install'),
+        (r'\bsubpanel\b', 'subpanel work'),
+        (r'\bgenerator\b', 'generator hookup'),
+        (r'\bservice mast|meter socket|weatherhead\b', 'service equipment issue'),
+        (r'\blight(s)? not working|switch not working|fixture\b', 'lighting issue'),
+    ]
+
+    seen = []
+    for pat, label in patterns:
+        if re.search(pat, s, flags=re.I) and label not in seen:
+            seen.append(label)
+    return seen[:6]
+
+# ---------------------------------------------------
 # Step 3 — Voicemail Classifier (NO SMS GENERATED)
 # ---------------------------------------------------
 def generate_initial_sms(cleaned_text: str) -> dict:
@@ -380,6 +409,12 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         if not isinstance(topics, list):
             topics = []
         topics = [str(t).strip() for t in topics if str(t).strip()][:6]
+        if len(topics) < 2:
+            fallback_topics = fallback_extract_task_topics(cleaned_text)
+            for topic in fallback_topics:
+                if topic not in topics:
+                    topics.append(topic)
+            topics = topics[:6]
 
         return {
             "category": data.get("category"),
@@ -3350,6 +3385,28 @@ def generate_reply_for_inbound(
             and sched.get("last_final_confirmation_key") == current_final_key
         ):
             sched["final_confirmation_accepted"] = True
+
+        # --------------------------------------
+        # Initial outbound shortcut: if this is the first text after voicemail and
+        # we already have a full saved address on file, confirm that address instead
+        # of asking from scratch for house number/street.
+        # --------------------------------------
+        if not inbound_text:
+            try:
+                update_address_assembly_state(sched)
+                if not sched.get("address_verified"):
+                    known_q = _known_address_question()
+                    if known_q:
+                        msg = _finalize_sms(known_q, appt_type, booking_created=False)
+                        return {
+                            "sms_body": msg,
+                            "scheduled_date": sched.get("scheduled_date"),
+                            "scheduled_time": sched.get("scheduled_time"),
+                            "address": sched.get("raw_address"),
+                            "booking_complete": False
+                        }
+            except Exception as e:
+                print("[WARN] initial known-address shortcut failed:", repr(e))
 
         # --------------------------------------
         # Build System Prompt
