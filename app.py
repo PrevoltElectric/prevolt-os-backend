@@ -349,7 +349,7 @@ def fallback_extract_task_topics(cleaned_text: str) -> list[str]:
         (r'\bsmoke.*panel|panel.*smoke|burning smell|sparks|arcing|buzzing panel\b', 'smoke from panel'),
         (r'\boutlet(s)?\b', 'outlet issue'),
         (r'\bgfci\b', 'gfci issue'),
-        (r'\bbreaker keeps tripping|breaker wont reset|breaker won't reset|tripping breaker\b', 'breaker issue'),
+        (r"\bbreaker keeps tripping|breaker wont reset|breaker won't reset|tripping breaker\b", 'breaker issue'),
         (r'\brecessed light|can light|pot light\b', 'recessed lighting'),
         (r'\bceiling fan\b', 'ceiling fan install'),
         (r'\bsubpanel\b', 'subpanel work'),
