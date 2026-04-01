@@ -648,6 +648,9 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
 
     address_line = ""
     if saved_full:
+        # Arm a real state transition so a simple "yes" locks this address in.
+        sched["awaiting_known_address_confirm"] = True
+        sched["known_address_candidate"] = saved_full
         # If a town hint exists and conflicts, still confirm the actual saved full address.
         address_line = f" I have {saved_full} on file. Is this for that address?"
     elif town_hint and not re.match(r"^\d{1,6}\b", town_hint):
