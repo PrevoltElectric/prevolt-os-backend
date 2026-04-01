@@ -5034,6 +5034,142 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     return result
 
+
+# ---------------------------------------------------
+# Patch 6 — stop unavailable-time loops and use plain customer wording
+# ---------------------------------------------------
+
+def _dedupe_sms_sentences(text: str) -> str:
+    s = ' '.join((text or '').replace('\n', ' ').split())
+    if not s:
+        return ''
+    parts = [p.strip() for p in re.split(r'(?<=[.!?])\s+', s) if p.strip()]
+    out = []
+    seen = set()
+    for p in parts:
+        fp = re.sub(r'[^a-z0-9]+', '', p.lower())
+        if not fp or fp in seen:
+            continue
+        seen.add(fp)
+        out.append(p)
+    s = ' '.join(out).strip()
+    s = re.sub(r'(?i)(what time works best for you\?)\s+\1', r'\1', s)
+    s = re.sub(r'(?i)(what other time works for you that day\?)\s+\1', r'\1', s)
+    s = re.sub(r'(?i)(what day works best for you\?)\s+\1', r'\1', s)
+    return ' '.join(s.split()).strip()
+
+
+def _slot_candidates_excluding_failed(sched: dict) -> list[str]:
+    day = sched.get('scheduled_date')
+    failed = set(_failed_times_for_day(sched, day))
+    vals = []
+    for t in (sched.get('booking_alt_times') or []):
+        t = str(t).strip()
+        if t and t not in failed and t not in vals:
+            vals.append(t)
+    return vals
+
+
+def _canonical_booking_issue_message(sched: dict) -> str:
+    human_d, human_t = _human_day_and_time(sched)
+    booking_result = (sched.get('booking_last_result') or '').strip().lower()
+    alt_times = _slot_candidates_excluding_failed(sched)
+    alt_text = _format_time_options_for_sms(alt_times)
+
+    # If the customer has already relaxed the time constraint, stop asking for another time on the same day.
+    if sched.get('booking_anytime_requested'):
+        if alt_text:
+            return f"{human_d} is booked at {human_t if human_t and human_t != 'that time' else 'that time'}. I do have {alt_text} open instead. Which works best?"
+        return f"{human_d} looks full. What other day works best for you?"
+
+    if booking_result == 'slot_unavailable':
+        if alt_text and human_t and human_t != 'that time':
+            return f"{human_t} is already booked on {human_d}. I do have {alt_text} open instead. Which works best?"
+        if alt_text:
+            return f"That time is already booked on {human_d}. I do have {alt_text} open instead. Which works best?"
+        if human_t and human_t != 'that time':
+            return f"{human_t} is already booked on {human_d}. What other time works for you that day?"
+        return f"That time is already booked on {human_d}. What other time works for you that day?"
+
+    if booking_result in {'availability_unknown', 'create_failed', 'retrieve_failed', 'inactive_booking_status', 'exception'}:
+        if alt_text and human_t and human_t != 'that time':
+            return f"I’m not seeing {human_t} open on {human_d}. I do have {alt_text} open instead. Which works best?"
+        if alt_text:
+            return f"I’m not seeing that time open on {human_d}. I do have {alt_text} open instead. Which works best?"
+        return f"I’m not seeing that time open on {human_d}. What other time works for you that day?"
+
+    return ''
+
+
+_orig_absorb_obvious_booking_details_patch6 = absorb_obvious_booking_details
+
+def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
+    _orig_absorb_obvious_booking_details_patch6(conv, inbound_text)
+    sched = conv.setdefault('sched', {})
+    txt = (inbound_text or '').strip()
+    low = _loose_text(txt)
+    any_time = any(p in low for p in ['any time', 'anytime', 'whenever', 'whatever works', 'anything open', 'any works'])
+    if any_time:
+        sched['booking_anytime_requested'] = True
+        # If same-day alternatives are known, immediately move to the first one.
+        alt_times = _slot_candidates_excluding_failed(sched)
+        if alt_times:
+            sched['scheduled_time'] = alt_times[0]
+            sched['booking_force_another_day'] = False
+            sched['booking_last_result'] = None
+            sched['booking_last_error'] = None
+        else:
+            # Stop the same-day time loop and ask for another day.
+            sched['scheduled_time'] = None
+            sched['booking_force_another_day'] = True
+            sched['pending_step'] = 'need_date'
+
+
+_orig_choose_next_prompt_from_state_patch6 = choose_next_prompt_from_state
+
+def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
+    sched = conv.setdefault('sched', {})
+    booking_result = (sched.get('booking_last_result') or '').strip().lower()
+    if sched.get('booking_force_another_day') or (sched.get('booking_anytime_requested') and booking_result in {'slot_unavailable','availability_unknown','create_failed','retrieve_failed','inactive_booking_status','exception'} and not _slot_candidates_excluding_failed(sched)):
+        human_d, _ = _human_day_and_time(sched)
+        return f"{human_d} looks full. What other day works best for you?"
+    return _orig_choose_next_prompt_from_state_patch6(conv, inbound_text=inbound_text)
+
+
+_orig_authoritative_sms_override_patch6 = _authoritative_sms_override
+
+def _authoritative_sms_override(current_sms: str, sched: dict, booking_created: bool) -> str:
+    if booking_created:
+        return _dedupe_sms_sentences(current_sms)
+    booking_result = (sched.get('booking_last_result') or '').strip().lower()
+    if sched.get('booking_force_another_day') or (sched.get('booking_anytime_requested') and booking_result in {'slot_unavailable','availability_unknown','create_failed','retrieve_failed','inactive_booking_status','exception'} and not _slot_candidates_excluding_failed(sched)):
+        human_d, _ = _human_day_and_time(sched)
+        return f"{human_d} looks full. What other day works best for you?"
+    if booking_result in {'slot_unavailable','availability_unknown','create_failed','retrieve_failed','inactive_booking_status','exception'}:
+        return _canonical_booking_issue_message(sched)
+    return _dedupe_sms_sentences(current_sms)
+
+
+_orig_maybe_create_square_booking_patch6 = maybe_create_square_booking
+
+def maybe_create_square_booking(phone: str, convo: dict):
+    sched = convo.setdefault('sched', {})
+    result = _orig_maybe_create_square_booking_patch6(phone, convo)
+    outcome = (result.get('result') or sched.get('booking_last_result') or '').strip().lower()
+
+    # If the user said any time and we still failed without viable alternates, break the loop and move to another day.
+    if not (sched.get('booking_created') and sched.get('square_booking_id')):
+        if sched.get('booking_anytime_requested') and outcome in {'slot_unavailable','availability_unknown','create_failed','retrieve_failed','inactive_booking_status','exception'}:
+            alts = _slot_candidates_excluding_failed(sched)
+            if alts:
+                # keep the alternatives for messaging, but don't re-run hidden retries endlessly
+                sched['booking_alt_times'] = alts
+            else:
+                sched['booking_force_another_day'] = True
+                sched['scheduled_time'] = None
+                sched['pending_step'] = 'need_date'
+    return result
+
 # ---------------------------------------------------
 # Local Development Entrypoint
 # ---------------------------------------------------
