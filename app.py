@@ -4851,6 +4851,189 @@ def run_local_regression_smoke_tests() -> dict:
     return stats
 
 
+
+# ---------------------------------------------------
+# Patch 5 — booking fallback, anytime handling, and stronger dedupe
+# ---------------------------------------------------
+
+def _failed_times_for_day(sched: dict, day: str) -> list[str]:
+    store = sched.setdefault('booking_failed_times', {})
+    vals = store.get(day) or []
+    return [str(v).strip() for v in vals if str(v).strip()]
+
+
+def _record_failed_time(sched: dict, day: str | None, hhmm: str | None) -> None:
+    if not day or not hhmm:
+        return
+    store = sched.setdefault('booking_failed_times', {})
+    vals = [str(v).strip() for v in (store.get(day) or []) if str(v).strip()]
+    if hhmm not in vals:
+        vals.append(hhmm)
+    store[day] = vals
+
+
+def _slot_time_candidates_for_day(sched: dict) -> list[str]:
+    appt = (sched.get('appointment_type') or '').upper()
+    day = sched.get('scheduled_date')
+    failed = set(_failed_times_for_day(sched, day))
+    current = (sched.get('scheduled_time') or '').strip()
+    explicit = [str(t).strip() for t in (sched.get('booking_alt_times') or []) if str(t).strip()]
+    out = []
+
+    def add(v: str):
+        if not v or v in failed:
+            return
+        if current and v == current:
+            return
+        if appt != 'TROUBLESHOOT_395' and not is_within_normal_hours(v):
+            return
+        if v not in out:
+            out.append(v)
+
+    for t in explicit:
+        add(t)
+
+    if not out:
+        if appt == 'TROUBLESHOOT_395':
+            base = [f"{h:02d}:00" for h in range(8, 19)]
+        else:
+            base = [f"{h:02d}:00" for h in range(BOOKING_START_HOUR, BOOKING_END_HOUR + 1)]
+        for t in base:
+            add(t)
+
+    return out
+
+
+def _canonical_booking_issue_message(sched: dict) -> str:
+    human_d, human_t = _human_day_and_time(sched)
+    booking_result = (sched.get('booking_last_result') or '').strip().lower()
+    alt_text = _format_time_options_for_sms(_slot_time_candidates_for_day(sched))
+
+    if sched.get('booking_force_another_day'):
+        return f"I’m not seeing another open time on {human_d}. Would another day work better?"
+
+    if booking_result == 'slot_unavailable':
+        if alt_text and human_t:
+            return f"We’re booked at {human_t} on {human_d}. I do have {alt_text} open. Which works best?"
+        if alt_text:
+            return f"That time is booked on {human_d}. I do have {alt_text} open. Which works best?"
+        if sched.get('booking_anytime_requested'):
+            return f"I’m not seeing another open time on {human_d}. Would another day work better?"
+        if human_t:
+            return f"We’re booked at {human_t} on {human_d}. What other time works for you that day?"
+        return f"That time is booked on {human_d}. What other time works for you that day?"
+
+    if booking_result in {'availability_unknown', 'create_failed', 'retrieve_failed', 'inactive_booking_status', 'exception'}:
+        if alt_text and human_t and not sched.get('booking_anytime_requested'):
+            return f"I couldn’t confirm {human_t} on {human_d}, but I do have {alt_text} open. Which works best?"
+        if alt_text and not sched.get('booking_anytime_requested'):
+            return f"I couldn’t confirm that time on {human_d}, but I do have {alt_text} open. Which works best?"
+        return f"I’m not able to confirm another time on {human_d} right now. Would another day work better?"
+
+    return ''
+
+
+_orig_dedupe_sms_sentences = _dedupe_sms_sentences
+
+def _dedupe_sms_sentences(text: str) -> str:
+    s = ' '.join((text or '').replace('\n', ' ').split())
+    if not s:
+        return ''
+    try:
+        s = _orig_dedupe_sms_sentences(s)
+    except Exception:
+        pass
+    bits = re.split(r'(?<=[?.!])\s+', s)
+    out = []
+    seen = set()
+    for b in bits:
+        raw = ' '.join((b or '').split()).strip()
+        if not raw:
+            continue
+        fp = re.sub(r'[^a-z0-9]+', '', raw.lower())
+        if not fp or fp in seen:
+            continue
+        seen.add(fp)
+        out.append(raw)
+    return ' '.join(out).strip()
+
+
+_orig_absorb_obvious_booking_details = absorb_obvious_booking_details
+
+def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
+    _orig_absorb_obvious_booking_details(conv, inbound_text)
+    sched = conv.setdefault('sched', {})
+    txt = (inbound_text or '').strip()
+    low = _loose_text(txt)
+    if any(p in low for p in ['any time', 'anytime', 'whenever', 'whatever works', 'any works', 'anything open']):
+        sched['booking_anytime_requested'] = True
+        sched['booking_force_another_day'] = False
+        cands = _slot_time_candidates_for_day(sched)
+        if cands:
+            sched['scheduled_time'] = cands[0]
+            sched['booking_last_result'] = None
+            sched['booking_last_error'] = None
+        else:
+            sched['scheduled_time'] = None
+            sched['booking_force_another_day'] = True
+    elif extract_explicit_time_from_text(txt):
+        sched['booking_anytime_requested'] = False
+        sched['booking_force_another_day'] = False
+
+
+_orig_maybe_create_square_booking = maybe_create_square_booking
+
+def maybe_create_square_booking(phone: str, convo: dict):
+    sched = convo.setdefault('sched', {})
+    sched.setdefault('booking_force_another_day', False)
+    tried = []
+    max_attempts = 3
+    result = {'ok': False, 'result': sched.get('booking_last_result')}
+
+    for _ in range(max_attempts):
+        current_day = sched.get('scheduled_date')
+        current_time = sched.get('scheduled_time')
+        if sched.get('booking_anytime_requested') and (not current_time or current_time in _failed_times_for_day(sched, current_day)):
+            cands = _slot_time_candidates_for_day(sched)
+            if cands:
+                sched['scheduled_time'] = cands[0]
+                current_time = cands[0]
+
+        result = _orig_maybe_create_square_booking(phone, convo)
+        outcome = (result.get('result') or sched.get('booking_last_result') or '').strip().lower()
+        current_day = sched.get('scheduled_date')
+        current_time = sched.get('scheduled_time')
+
+        if sched.get('booking_created') and sched.get('square_booking_id'):
+            sched['booking_force_another_day'] = False
+            return result
+
+        if outcome in {'slot_unavailable', 'availability_unknown', 'create_failed', 'retrieve_failed', 'inactive_booking_status', 'exception'}:
+            _record_failed_time(sched, current_day, current_time)
+            if not (sched.get('booking_alt_times') or []):
+                sched['booking_alt_times'] = _slot_time_candidates_for_day(sched)
+
+            if sched.get('booking_anytime_requested'):
+                if outcome == 'slot_unavailable':
+                    next_cands = [t for t in _slot_time_candidates_for_day(sched) if t not in tried and t != current_time]
+                    if next_cands:
+                        tried.append(current_time)
+                        sched['scheduled_time'] = next_cands[0]
+                        sched['booking_last_result'] = None
+                        sched['booking_last_error'] = None
+                        continue
+                    sched['scheduled_time'] = None
+                    sched['booking_force_another_day'] = True
+                    return result
+                else:
+                    sched['scheduled_time'] = None
+                    sched['booking_force_another_day'] = True
+                    sched['booking_alt_times'] = []
+                    return result
+        return result
+
+    return result
+
 # ---------------------------------------------------
 # Local Development Entrypoint
 # ---------------------------------------------------
