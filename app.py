@@ -5252,3 +5252,260 @@ def generate_reply_for_inbound(cleaned_transcript, category, appointment_type, i
         print('[WARN] reset outbound override failed:', repr(e))
         return result
 
+
+# ---------------------------------------------------
+# Patch 7 — authoritative relaxed day-availability search and truthful fallback wording
+# ---------------------------------------------------
+
+def square_search_day_availability_relaxed(scheduled_date: str, variation_id: str, variation_version: int | None, team_member_id: str, location_id: str) -> dict:
+    def _to_utc(dt_str: str):
+        try:
+            return datetime.fromisoformat((dt_str or '').replace('Z', '+00:00')).astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    tz = ZoneInfo('America/New_York') if ZoneInfo else timezone.utc
+    try:
+        local_day = datetime.strptime(scheduled_date, '%Y-%m-%d').replace(tzinfo=tz)
+    except Exception as e:
+        return {'ok': False, 'day_times': [], 'availabilities': [], 'error': f'invalid_date:{e!r}', 'mode': 'invalid_date'}
+
+    range_start_local = local_day.replace(hour=0, minute=0, second=0, microsecond=0)
+    range_end_local = range_start_local + timedelta(days=1)
+
+    filter_modes = [
+        {'name': 'strict', 'include_version': True,  'include_team': True},
+        {'name': 'no_version', 'include_version': False, 'include_team': True},
+        {'name': 'no_version_no_team', 'include_version': False, 'include_team': False},
+    ]
+
+    last_error = None
+    best_day_times = []
+    best_avs = []
+    best_mode = None
+
+    for mode in filter_modes:
+        seg_filter = {'service_variation_id': variation_id}
+        if mode['include_version'] and variation_version is not None:
+            seg_filter['service_variation_version'] = variation_version
+        if mode['include_team'] and team_member_id:
+            seg_filter['team_member_id_filter'] = {'any': [team_member_id]}
+
+        payload = {
+            'query': {
+                'filter': {
+                    'start_at_range': {
+                        'start_at': range_start_local.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'end_at': range_end_local.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    },
+                    'location_id': location_id,
+                    'segment_filters': [seg_filter]
+                }
+            }
+        }
+        try:
+            resp = requests.post('https://connect.squareup.com/v2/bookings/availability/search', headers=square_headers(), json=payload, timeout=12)
+            if resp.status_code not in (200, 201):
+                last_error = f"{mode['name']}:http_{resp.status_code}:{resp.text[:300]}"
+                continue
+            data = resp.json() or {}
+            times = []
+            avs = []
+            for av in data.get('availabilities') or []:
+                if (av.get('location_id') or '').strip() != (location_id or '').strip():
+                    continue
+                segs = av.get('appointment_segments') or []
+                if not segs:
+                    continue
+                seg0 = segs[0] if isinstance(segs, list) else {}
+                if (seg0.get('service_variation_id') or '').strip() != (variation_id or '').strip():
+                    continue
+                if mode['include_team'] and team_member_id and (seg0.get('team_member_id') or '').strip() != (team_member_id or '').strip():
+                    continue
+                start_at_utc = _to_utc(av.get('start_at') or '')
+                if not start_at_utc:
+                    continue
+                hhmm = start_at_utc.astimezone(tz).strftime('%H:%M')
+                if hhmm not in times:
+                    times.append(hhmm)
+                avs.append(av)
+            times = sorted(times)
+            if times:
+                return {'ok': True, 'day_times': times, 'availabilities': avs, 'error': None, 'mode': mode['name']}
+            if best_mode is None:
+                best_mode = mode['name']
+                best_day_times = times
+                best_avs = avs
+        except Exception as e:
+            last_error = f"{mode['name']}:{e!r}"
+            continue
+
+    return {'ok': bool(best_day_times), 'day_times': best_day_times, 'availabilities': best_avs, 'error': last_error or 'no_availability', 'mode': best_mode or 'none'}
+
+
+# override with relaxed search
+_def_square_search_exact_availability_orig = square_search_exact_availability
+
+def square_search_exact_availability(scheduled_date: str, scheduled_time: str, variation_id: str, variation_version: int | None, team_member_id: str, location_id: str) -> dict:
+    try:
+        day = square_search_day_availability_relaxed(scheduled_date, variation_id, variation_version, team_member_id, location_id)
+        exact_start_utc = parse_local_datetime(scheduled_date, scheduled_time)
+        if not exact_start_utc:
+            return {'ok': False, 'available': False, 'matched': None, 'day_times': day.get('day_times') or [], 'error': 'invalid_start'}
+        desired_utc = exact_start_utc.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        matched = None
+        for av in day.get('availabilities') or []:
+            try:
+                start_at_utc = datetime.fromisoformat((av.get('start_at') or '').replace('Z', '+00:00')).astimezone(timezone.utc)
+            except Exception:
+                continue
+            if start_at_utc.replace(second=0, microsecond=0) == desired_utc:
+                matched = av
+                break
+        return {
+            'ok': bool(day.get('ok')),
+            'available': bool(matched),
+            'matched': matched,
+            'day_times': list(day.get('day_times') or []),
+            'error': day.get('error'),
+            'mode': day.get('mode')
+        }
+    except Exception as e:
+        return {'ok': False, 'available': False, 'matched': None, 'day_times': [], 'error': repr(e), 'mode': 'exception'}
+
+
+_maybe_create_square_booking_patch6 = maybe_create_square_booking
+
+def maybe_create_square_booking(phone: str, convo: dict):
+    sched = convo.setdefault('sched', {})
+    appt = (sched.get('appointment_type') or '').upper()
+    variation_id, variation_version = map_appointment_type_to_variation(appt)
+
+    # If customer loosened time to "any time", choose a real open Square slot for that day before trying to book.
+    if sched.get('booking_anytime_requested') and sched.get('scheduled_date') and variation_id and SQUARE_LOCATION_ID:
+        day = square_search_day_availability_relaxed(sched.get('scheduled_date'), variation_id, variation_version, SQUARE_TEAM_MEMBER_ID, SQUARE_LOCATION_ID)
+        real_times = [t for t in (day.get('day_times') or []) if t]
+        sched['booking_alt_times'] = real_times
+        if real_times:
+            current = (sched.get('scheduled_time') or '').strip()
+            if current not in real_times:
+                sched['scheduled_time'] = real_times[0]
+            sched['booking_force_another_day'] = False
+            sched['booking_last_result'] = None
+            sched['booking_last_error'] = None
+        else:
+            # Do not falsely call the whole day full unless Square explicitly returned no openings.
+            sched['scheduled_time'] = None
+            if day.get('ok'):
+                sched['booking_last_result'] = 'day_full'
+                sched['booking_force_another_day'] = True
+            else:
+                sched['booking_last_result'] = 'availability_unknown'
+                sched['booking_force_another_day'] = False
+            sched['booking_last_error'] = day.get('error')
+            return {'ok': False, 'result': sched.get('booking_last_result'), 'message': None}
+
+    result = _maybe_create_square_booking_patch6(phone, convo)
+    sched = convo.setdefault('sched', {})
+
+    # After any failed exact-time attempt, refresh with real same-day Square openings.
+    if (result.get('result') or sched.get('booking_last_result') or '').strip().lower() in {'slot_unavailable','availability_unknown','create_failed','retrieve_failed','inactive_booking_status','exception'}:
+        if sched.get('scheduled_date') and variation_id and SQUARE_LOCATION_ID:
+            day = square_search_day_availability_relaxed(sched.get('scheduled_date'), variation_id, variation_version, SQUARE_TEAM_MEMBER_ID, SQUARE_LOCATION_ID)
+            real_times = [t for t in (day.get('day_times') or []) if t]
+            sched['booking_alt_times'] = real_times
+            if real_times:
+                sched['booking_force_another_day'] = False
+                if sched.get('booking_anytime_requested'):
+                    current = (sched.get('scheduled_time') or '').strip()
+                    if current not in real_times:
+                        sched['scheduled_time'] = real_times[0]
+                        sched['booking_last_result'] = None
+                        sched['booking_last_error'] = None
+                        return _maybe_create_square_booking_patch6(phone, convo)
+            else:
+                if day.get('ok'):
+                    sched['booking_last_result'] = 'day_full'
+                    sched['booking_force_another_day'] = True
+                else:
+                    sched['booking_last_result'] = 'availability_unknown'
+                    sched['booking_force_another_day'] = False
+                sched['booking_last_error'] = day.get('error')
+    return result
+
+
+_orig_generate_reply_for_inbound_patch7 = generate_reply_for_inbound
+
+def generate_reply_for_inbound(cleaned_transcript, category, appointment_type, initial_sms, inbound_text, scheduled_date, scheduled_time, address):
+    result = _orig_generate_reply_for_inbound_patch7(cleaned_transcript, category, appointment_type, initial_sms, inbound_text, scheduled_date, scheduled_time, address)
+    try:
+        phone = ((request.values.get('From') or '').replace('whatsapp:', '').strip())
+        conv = conversations.get(phone) or {}
+        sched = conv.setdefault('sched', {})
+        low = _loose_text(inbound_text or '')
+        any_time = any(p in low for p in ['any time', 'anytime', 'whenever', 'whatever works', 'anything open', 'any works'])
+        any_day = any(p in low for p in ['any day', 'anyday', 'whatever day', 'any weekday', 'first available day'])
+        booking_result = (sched.get('booking_last_result') or '').strip().lower()
+        alt_times = [t for t in (sched.get('booking_alt_times') or []) if t]
+        alt_text = _format_time_options_for_sms(alt_times)
+        human_d, human_t = _human_day_and_time(sched)
+
+        if any_day:
+            sched['scheduled_date'] = None
+            sched['scheduled_time'] = None
+            sched['booking_force_another_day'] = False
+            sched['booking_anytime_requested'] = False
+            sched['pending_step'] = 'need_date'
+            result['sms_body'] = 'What day works best for you?'
+            result['booking_complete'] = False
+            return result
+
+        if any_time:
+            if alt_text:
+                sched['pending_step'] = 'need_time'
+                result['sms_body'] = f"I do have {alt_text} open on {human_d}. Which works best?"
+            else:
+                if booking_result == 'day_full':
+                    sched['pending_step'] = 'need_date'
+                    result['sms_body'] = f"{human_d} is booked up. What other day works best for you?"
+                else:
+                    sched['pending_step'] = 'need_date'
+                    result['sms_body'] = f"I’m having trouble pulling the open times for {human_d} right now. What other day works best for you?"
+            result['booking_complete'] = False
+            result['scheduled_time'] = sched.get('scheduled_time')
+            result['scheduled_date'] = sched.get('scheduled_date')
+            result['address'] = sched.get('raw_address') or address
+            result['sms_body'] = _dedupe_sms_sentences(result['sms_body'])
+            return result
+
+        if booking_result == 'slot_unavailable':
+            if alt_text:
+                result['sms_body'] = f"{human_t} is already booked on {human_d}. I do have {alt_text} open instead. Which works best?"
+            else:
+                result['sms_body'] = f"{human_t} is already booked on {human_d}. What other time works for you that day?"
+            sched['pending_step'] = 'need_time'
+            result['booking_complete'] = False
+            return result
+
+        if booking_result == 'day_full':
+            sched['pending_step'] = 'need_date'
+            result['sms_body'] = f"{human_d} is booked up. What other day works best for you?"
+            result['booking_complete'] = False
+            return result
+
+        if booking_result in {'availability_unknown','create_failed','retrieve_failed','inactive_booking_status','exception'}:
+            if alt_text:
+                result['sms_body'] = f"I’m not able to hold {human_t} on {human_d}, but I do have {alt_text} open instead. Which works best?"
+                sched['pending_step'] = 'need_time'
+            else:
+                result['sms_body'] = f"I’m having trouble checking open times for {human_d} right now. What other day works best for you?"
+                sched['pending_step'] = 'need_date'
+            result['booking_complete'] = False
+            return result
+
+        if result and isinstance(result, dict) and result.get('sms_body'):
+            result['sms_body'] = _dedupe_sms_sentences(result['sms_body'])
+        return result
+    except Exception as e:
+        print('[WARN] patch7 outbound override failed:', repr(e))
+        return result
