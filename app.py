@@ -443,6 +443,116 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         }
 
 
+
+
+# ---------------------------------------------------
+# Initial Voicemail SMS Builder (deterministic first text)
+# ---------------------------------------------------
+def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
+    """Best-effort one-time Square hydrate for repeat callers before the first text goes out."""
+    profile.setdefault("addresses", [])
+    profile.setdefault("square_lookup_done", False)
+    profile.setdefault("square_customer_id", None)
+    profile.setdefault("recognized_first_name", None)
+    profile.setdefault("recognized_last_name", None)
+    profile.setdefault("recognized_email", None)
+    profile.setdefault("active_first_name", None)
+    profile.setdefault("active_last_name", None)
+    profile.setdefault("active_email", None)
+    profile.setdefault("identity_source", None)
+
+    if profile.get("square_lookup_done"):
+        return
+
+    try:
+        cust = square_lookup_customer_by_phone(phone)
+        if cust and cust.get("id"):
+            profile["square_customer_id"] = cust.get("id")
+            profile["recognized_first_name"] = cust.get("given_name")
+            profile["recognized_last_name"] = cust.get("family_name")
+            profile["recognized_email"] = cust.get("email_address")
+
+            if not profile.get("active_first_name") and cust.get("given_name"):
+                profile["active_first_name"] = cust.get("given_name")
+            if not profile.get("active_last_name") and cust.get("family_name"):
+                profile["active_last_name"] = cust.get("family_name")
+            if not profile.get("active_email") and cust.get("email_address"):
+                profile["active_email"] = cust.get("email_address")
+            profile["identity_source"] = profile.get("identity_source") or "square_phone_match"
+
+            caddr = cust.get("address") or {}
+            line1 = (caddr.get("address_line_1") or "").strip()
+            city = (caddr.get("locality") or "").strip()
+            state = (caddr.get("administrative_district_level_1") or "").strip()
+            zipc = (caddr.get("postal_code") or "").strip()
+            if line1 and city and state:
+                pretty = f"{line1}, {city}, {state} {zipc}".strip()
+                if pretty and pretty not in profile["addresses"]:
+                    profile["addresses"].append(pretty)
+    except Exception as e:
+        print("[WARN] initial Square hydrate failed:", repr(e))
+    finally:
+        profile["square_lookup_done"] = True
+
+
+def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) -> str:
+    """Build the very first outbound text after voicemail without relying on downstream reply routing."""
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    hydrate_square_profile_by_phone(profile, phone)
+
+    first_name = (profile.get("active_first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
+    intro = f"Hello {first_name}, you've reached Prevolt Electric. I'll help you here by text." if first_name else "You've reached Prevolt Electric. I'll help you here by text."
+
+    topics = conv.get("task_topics") or classification.get("task_topics") or []
+    topics = [str(t).strip() for t in topics if str(t).strip()]
+    task_line = ""
+    if topics:
+        topics = topics[:4]
+        if len(topics) == 1:
+            joined = topics[0]
+        elif len(topics) == 2:
+            joined = f"{topics[0]} and {topics[1]}"
+        else:
+            joined = ", ".join(topics[:-1]) + f", and {topics[-1]}"
+        task_line = f" It sounds like you're looking for help with {joined}."
+
+    # Prefer a real full saved address if available.
+    saved_full = None
+    for a in profile.get("addresses") or []:
+        a = (a or "").strip()
+        if re.match(r"^\d{1,6}", a):
+            saved_full = a
+            break
+
+    raw_hint = (sched.get("raw_address") or classification.get("detected_address") or "").strip()
+    town_hint = raw_hint
+    town_hint_low = town_hint.lower()
+
+    address_line = ""
+    if saved_full:
+        # If a town hint exists and conflicts, still confirm the actual saved full address.
+        address_line = f" I have {saved_full} on file. Is this for that address?"
+    elif town_hint and not re.match(r"^\d{1,6}", town_hint):
+        address_line = f" What is the house number and street name in {town_hint}?"
+    else:
+        address_line = " What is the address for the visit?"
+
+    # Only inject price once in the first outbound text.
+    price_line = ""
+    appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
+    if appt_type == "TROUBLESHOOT_395":
+        price_line = " Troubleshoot and repair visits are $395."
+    elif appt_type == "WHOLE_HOME_INSPECTION":
+        price_line = " Home inspections are $395."
+    else:
+        price_line = " Our evaluation visit is $195."
+
+    sms = (intro + task_line + address_line + price_line).strip()
+    sched["intro_sent"] = True
+    sched["price_disclosed"] = True
+    return re.sub(r"\s+", " ", sms).strip()
+
 # ---------------------------------------------------
 # Voice: Incoming Call (IVR + Spam Filter)
 # ---------------------------------------------------
@@ -718,23 +828,27 @@ def voicemail_complete():
         sched["awaiting_emergency_confirm"] = True
         sched["emergency_approved"] = False
 
-    # 4) Trigger First SMS (Step 4 call)
+    # 4) Trigger First SMS using deterministic voicemail opener so task topics and known addresses land reliably
     try:
-        outbound = generate_reply_for_inbound(
-            cleaned,
-            conv.get("category"),
-            conv.get("appointment_type"),
-            conv.get("initial_sms"),
-            "",  # no user inbound yet
-            sched.get("scheduled_date"),
-            sched.get("scheduled_time"),
-            sched.get("raw_address")
-        )
-
-        initial_msg = outbound.get("sms_body") or "Thanks for your voicemail — how can we help?"
+        initial_msg = build_initial_voicemail_sms(conv, classification, from_number)
         send_sms(from_number, initial_msg)
     except Exception as e:
-        print("[ERROR] voicemail_complete → Step4:", repr(e))
+        print("[ERROR] voicemail_complete → initial sms:", repr(e))
+        try:
+            outbound = generate_reply_for_inbound(
+                cleaned,
+                conv.get("category"),
+                conv.get("appointment_type"),
+                conv.get("initial_sms"),
+                "",
+                sched.get("scheduled_date"),
+                sched.get("scheduled_time"),
+                sched.get("raw_address")
+            )
+            initial_msg = outbound.get("sms_body") or "Thanks for your voicemail — how can we help?"
+            send_sms(from_number, initial_msg)
+        except Exception as e2:
+            print("[ERROR] voicemail_complete fallback → Step4:", repr(e2))
 
     resp.say("Thank you. Your message has been recorded.")
     resp.hangup()
