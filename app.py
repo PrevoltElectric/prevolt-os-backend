@@ -1911,10 +1911,43 @@ def incoming_sms():
         if reply["address"] not in profile["addresses"]:
             profile["addresses"].append(reply["address"])
 
+    # Keep booking-conflict state authoritative at the route level.
+    booking_result = (sched.get("booking_last_result") or "").strip().lower()
+    if booking_result in {"slot_unavailable", "availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
+        if not (sched.get("booking_alt_times") or []):
+            try:
+                sched["booking_alt_times"] = _slot_time_candidates_for_day(sched)
+            except Exception:
+                sched["booking_alt_times"] = list(sched.get("booking_alt_times") or [])
+
+        alt_times = []
+        try:
+            alt_times = _slot_candidates_excluding_failed(sched)
+        except Exception:
+            alt_times = [str(t).strip() for t in (sched.get("booking_alt_times") or []) if str(t).strip()]
+
+        if alt_times:
+            sched["pending_step"] = "need_time"
+        else:
+            sched["scheduled_time"] = None
+            sched["pending_step"] = "need_date"
+            sched["booking_force_another_day"] = True
+
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
 
     recompute_pending_step(profile, sched)
+
+    if booking_result in {"slot_unavailable", "availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
+        alt_times = []
+        try:
+            alt_times = _slot_candidates_excluding_failed(sched)
+        except Exception:
+            alt_times = [str(t).strip() for t in (sched.get("booking_alt_times") or []) if str(t).strip()]
+        if alt_times:
+            sched["pending_step"] = "need_time"
+        else:
+            sched["pending_step"] = "need_date"
 
     sms_body = (reply.get("sms_body") or "").strip()
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
@@ -1923,6 +1956,16 @@ def incoming_sms():
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
+
+    booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+    try:
+        sms_body = _authoritative_sms_override(sms_body, sched, booking_created)
+    except Exception:
+        pass
+    try:
+        sms_body = postprocess_sms(sms_body, inbound_text, sched, booking_created=booking_created)
+    except Exception:
+        pass
 
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
