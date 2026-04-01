@@ -1911,43 +1911,10 @@ def incoming_sms():
         if reply["address"] not in profile["addresses"]:
             profile["addresses"].append(reply["address"])
 
-    # Keep booking-conflict state authoritative at the route level.
-    booking_result = (sched.get("booking_last_result") or "").strip().lower()
-    if booking_result in {"slot_unavailable", "availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
-        if not (sched.get("booking_alt_times") or []):
-            try:
-                sched["booking_alt_times"] = _slot_time_candidates_for_day(sched)
-            except Exception:
-                sched["booking_alt_times"] = list(sched.get("booking_alt_times") or [])
-
-        alt_times = []
-        try:
-            alt_times = _slot_candidates_excluding_failed(sched)
-        except Exception:
-            alt_times = [str(t).strip() for t in (sched.get("booking_alt_times") or []) if str(t).strip()]
-
-        if alt_times:
-            sched["pending_step"] = "need_time"
-        else:
-            sched["scheduled_time"] = None
-            sched["pending_step"] = "need_date"
-            sched["booking_force_another_day"] = True
-
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
 
     recompute_pending_step(profile, sched)
-
-    if booking_result in {"slot_unavailable", "availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
-        alt_times = []
-        try:
-            alt_times = _slot_candidates_excluding_failed(sched)
-        except Exception:
-            alt_times = [str(t).strip() for t in (sched.get("booking_alt_times") or []) if str(t).strip()]
-        if alt_times:
-            sched["pending_step"] = "need_time"
-        else:
-            sched["pending_step"] = "need_date"
 
     sms_body = (reply.get("sms_body") or "").strip()
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
@@ -1956,16 +1923,6 @@ def incoming_sms():
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
-
-    booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
-    try:
-        sms_body = _authoritative_sms_override(sms_body, sched, booking_created)
-    except Exception:
-        pass
-    try:
-        sms_body = postprocess_sms(sms_body, inbound_text, sched, booking_created=booking_created)
-    except Exception:
-        pass
 
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
@@ -5570,3 +5527,96 @@ def generate_reply_for_inbound(cleaned_transcript, category, appointment_type, i
     except Exception as e:
         print('[WARN] patch7 outbound override failed:', repr(e))
         return result
+
+# ---------------------------------------------------
+# PATCH 8 — hard intercept for saved-address yes/no confirms
+# Prevents the flow from falling through to older transcript/address logic
+# after the customer says "Yes it is" to a known address on file.
+# ---------------------------------------------------
+_orig_generate_reply_for_inbound_patch8 = generate_reply_for_inbound
+
+def generate_reply_for_inbound(cleaned_transcript, category, appointment_type, initial_sms, inbound_text, scheduled_date, scheduled_time, address):
+    try:
+        phone = ((request.values.get('From') or '').replace('whatsapp:', '').strip())
+        conv = conversations.get(phone) or {}
+        profile = conv.setdefault('profile', {})
+        sched = conv.setdefault('sched', {})
+
+        if inbound_text and sched.get('awaiting_known_address_confirm') and sched.get('known_address_candidate'):
+            candidate = (sched.get('known_address_candidate') or '').strip()
+
+            if yes_text(inbound_text) or confirmation_accept_text(inbound_text):
+                if not sched.get('appointment_type'):
+                    inferred_appt = (conv.get('appointment_type') or appointment_type or 'EVAL_195').strip()
+                    if inferred_appt:
+                        sched['appointment_type'] = inferred_appt
+
+                sched['raw_address'] = candidate
+                try:
+                    result = normalize_address(candidate)
+                    if isinstance(result, tuple) and len(result) >= 2:
+                        status, addr_struct = result[0], result[1]
+                        if status == 'ok' and isinstance(addr_struct, dict):
+                            sched['normalized_address'] = addr_struct
+                    elif isinstance(result, dict):
+                        sched['normalized_address'] = result
+                except Exception as e:
+                    print('[WARN] patch8 known-address confirm normalize failed:', repr(e))
+
+                update_address_assembly_state(sched)
+                sched['address_verified'] = True
+                sched['address_missing'] = None
+                sched['address_candidate'] = candidate
+                sched['awaiting_known_address_confirm'] = False
+                sched['known_address_candidate'] = None
+                if candidate and candidate not in (profile.get('addresses') or []):
+                    profile.setdefault('addresses', []).append(candidate)
+                recompute_pending_step(profile, sched)
+
+                msg = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+                if not msg or 'winterloch' in (msg or '').lower() or 'house number and street' in (msg or '').lower():
+                    if sched.get('pending_step') == 'need_date':
+                        msg = 'What day works best for you?'
+                    elif sched.get('pending_step') == 'need_time':
+                        human_d = ''
+                        try:
+                            human_d, _ = _human_day_and_time(sched)
+                        except Exception:
+                            human_d = ''
+                        msg = f'What time works best for you on {human_d}?' if human_d else 'What time works best for you?'
+                    elif sched.get('pending_step') == 'need_name':
+                        msg = 'What is your first and last name?'
+                    elif sched.get('pending_step') == 'need_email':
+                        msg = 'What email address should we use for the booking?'
+                    else:
+                        msg = 'What day works best for you?'
+
+                return {
+                    'sms_body': _dedupe_sms_sentences((msg or '').strip()),
+                    'scheduled_date': sched.get('scheduled_date'),
+                    'scheduled_time': sched.get('scheduled_time'),
+                    'address': sched.get('raw_address'),
+                    'booking_complete': False,
+                }
+
+            if no_text(inbound_text):
+                sched['awaiting_known_address_confirm'] = False
+                sched['known_address_candidate'] = None
+                sched['address_verified'] = False
+                if not sched.get('raw_address') or sched.get('raw_address') == candidate:
+                    sched['raw_address'] = None
+                sched['normalized_address'] = None
+                update_address_assembly_state(sched)
+                recompute_pending_step(profile, sched)
+                msg = build_address_prompt(sched)
+                return {
+                    'sms_body': _dedupe_sms_sentences((msg or '').strip()),
+                    'scheduled_date': sched.get('scheduled_date'),
+                    'scheduled_time': sched.get('scheduled_time'),
+                    'address': sched.get('raw_address'),
+                    'booking_complete': False,
+                }
+    except Exception as e:
+        print('[WARN] patch8 known-address intercept failed:', repr(e))
+
+    return _orig_generate_reply_for_inbound_patch8(cleaned_transcript, category, appointment_type, initial_sms, inbound_text, scheduled_date, scheduled_time, address)
