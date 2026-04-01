@@ -347,17 +347,27 @@ def generate_initial_sms(cleaned_text: str) -> dict:
                 {
                     "role": "system",
                     "content": (
-                        "You extract structured info from voicemail. "
+                        "You extract structured info from a messy voicemail left for an electrical contractor. "
+                        "The caller may ramble, pause, self-correct, and mention multiple jobs. "
                         "You DO NOT generate SMS replies.\n\n"
-                        "Return JSON:\n"
+                        "Return strict JSON with these keys only:\n"
                         "{\n"
                         "  'category': str,\n"
                         "  'appointment_type': str,\n"
+                        "  'detected_first_name': str|null,\n"
+                        "  'detected_last_name': str|null,\n"
                         "  'detected_address': str|null,\n"
                         "  'detected_date': 'YYYY-MM-DD'|null,\n"
                         "  'detected_time': 'HH:MM'|null,\n"
-                        "  'intent': 'schedule'|'quote'|'emergency'|'other'\n"
-                        "}"
+                        "  'intent': 'schedule'|'quote'|'emergency'|'other',\n"
+                        "  'task_topics': [str]\n"
+                        "}\n\n"
+                        "Rules for task_topics:\n"
+                        "- Extract the real customer work items, not life story details.\n"
+                        "- Return 1 to 6 short plain-English task labels.\n"
+                        "- Examples: 'outlet issue', 'ev charger install', 'panel upgrade', 'recessed lighting', 'smoke from panel'.\n"
+                        "- Keep them concise and electrician-facing.\n"
+                        "- If nothing is clear, return an empty list."
                     ),
                 },
                 {"role": "user", "content": cleaned_text},
@@ -366,13 +376,21 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 
         data = json.loads(completion.choices[0].message.content)
 
+        topics = data.get("task_topics") or []
+        if not isinstance(topics, list):
+            topics = []
+        topics = [str(t).strip() for t in topics if str(t).strip()][:6]
+
         return {
             "category": data.get("category"),
             "appointment_type": data.get("appointment_type"),
+            "detected_first_name": data.get("detected_first_name"),
+            "detected_last_name": data.get("detected_last_name"),
             "detected_address": data.get("detected_address"),
             "detected_date": data.get("detected_date"),
             "detected_time": data.get("detected_time"),
             "intent": data.get("intent"),
+            "task_topics": topics,
         }
 
     except Exception as e:
@@ -380,10 +398,13 @@ def generate_initial_sms(cleaned_text: str) -> dict:
         return {
             "category": "OTHER",
             "appointment_type": "EVAL_195",
+            "detected_first_name": None,
+            "detected_last_name": None,
             "detected_address": None,
             "detected_date": None,
             "detected_time": None,
             "intent": "other",
+            "task_topics": [],
         }
 
 
@@ -1652,7 +1673,7 @@ def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_creat
         update_address_assembly_state(sched)
 
         if not sched.get("address_verified"):
-            sms = build_address_prompt(sched)
+            sms = (_known_address_question() or build_address_prompt(sched))
         elif not sched.get("scheduled_date"):
             sms = "What day works for you?"
         elif not sched.get("scheduled_time"):
@@ -1679,7 +1700,7 @@ def postprocess_sms(sms_body: str, inbound_text: str, sched: dict, booking_creat
         if any(m in low for m in confirmation_markers):
             update_address_assembly_state(sched)
             if not sched.get("address_verified"):
-                sms = build_address_prompt(sched)
+                sms = (_known_address_question() or build_address_prompt(sched))
             elif not sched.get("scheduled_date"):
                 sms = "What day works for you?"
             elif not sched.get("scheduled_time"):
@@ -2768,6 +2789,41 @@ def generate_reply_for_inbound(
             finally:
                 profile["square_lookup_done"] = True
 
+        def _best_saved_address(profile_obj: dict) -> str | None:
+            for a in profile_obj.get("addresses") or []:
+                a = (a or "").strip()
+                if re.match(r"^\d{1,6}\b", a):
+                    return a
+            return None
+
+        def _saved_address_for_town(profile_obj: dict, town_hint: str) -> str | None:
+            town_hint = (town_hint or "").strip().lower()
+            if not town_hint:
+                return _best_saved_address(profile_obj)
+            for a in profile_obj.get("addresses") or []:
+                s = (a or "").strip()
+                if s and re.match(r"^\d{1,6}\b", s) and town_hint in s.lower():
+                    return s
+            return _best_saved_address(profile_obj)
+
+        def _task_topics_text() -> str:
+            topics = conv.get("task_topics") or []
+            topics = [str(t).strip() for t in topics if str(t).strip()]
+            if not topics:
+                return ""
+            topics = topics[:4]
+            if len(topics) == 1:
+                return topics[0]
+            if len(topics) == 2:
+                return f"{topics[0]} and {topics[1]}"
+            return ", ".join(topics[:-1]) + f", and {topics[-1]}"
+
+        def _known_address_question() -> str | None:
+            saved = _saved_address_for_town(profile, sched.get("raw_address") or "")
+            if not saved:
+                return None
+            return f"I have {saved} on file. Is this for that address?"
+
         # Helpers to capture name/email from inbound text
         def _extract_email(txt: str) -> str | None:
             txt = (txt or "").strip()
@@ -3043,7 +3099,12 @@ def generate_reply_for_inbound(
         def _apply_intro_once(s: str) -> str:
             s = _norm(s)
             if not sched.get("intro_sent"):
-                s = f"{build_human_intro_line()} {s}".strip()
+                intro = build_human_intro_line()
+                if not inbound_text:
+                    topics_text = _task_topics_text()
+                    if topics_text:
+                        intro = f"{intro} It sounds like you're looking for help with {topics_text}."
+                s = f"{intro} {s}".strip()
                 sched["intro_sent"] = True
             return _norm(s)
 
@@ -3121,6 +3182,22 @@ def generate_reply_for_inbound(
 
             return s
 
+        if inbound_text:
+            on_file_patterns = [
+                "on file", "have me on file", "my address", "already have my address", "already have me",
+                "same address", "saved address"
+            ]
+            if any(p in inbound_lower for p in on_file_patterns):
+                known_q = _known_address_question()
+                if known_q:
+                    return {
+                        "sms_body": _finalize_sms(known_q, sched.get("appointment_type") or appointment_type or "EVAL_195", booking_created=False),
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+
         # --------------------------------------
         # Emergency flow (2-step confirmation)
         # --------------------------------------
@@ -3132,7 +3209,11 @@ def generate_reply_for_inbound(
             sched["pending_step"] = None
 
             if not sched.get("raw_address"):
-                msg = "This sounds urgent. " + build_address_prompt(sched)
+                known_q = _known_address_question()
+                if known_q:
+                    msg = f"This sounds urgent. {known_q}"
+                else:
+                    msg = "This sounds urgent. " + build_address_prompt(sched)
                 msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
                 return {
                     "sms_body": msg,
