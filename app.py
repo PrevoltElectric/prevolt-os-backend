@@ -637,7 +637,12 @@ def voicemail_complete():
     conv["cleaned_transcript"] = cleaned
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
+    conv["task_topics"] = classification.get("task_topics") or []
     conv.setdefault("initial_sms", cleaned)
+    if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
+        profile["voicemail_first_name"] = classification.get("detected_first_name")
+    if classification.get("detected_last_name") and not profile.get("voicemail_last_name"):
+        profile["voicemail_last_name"] = classification.get("detected_last_name")
 
     if classification.get("detected_date"):
         sched["scheduled_date"] = classification["detected_date"]
@@ -2076,6 +2081,144 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
 
     return None
 
+
+ADDRESS_WORD_RE = re.compile(r"\b(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|court|ct|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", flags=re.I)
+QUESTIONISH_RE = re.compile(r"\b(?:are|is|do|does|did|can|could|would|will|why|what|when|where|who|how)\b", flags=re.I)
+
+
+def is_plausible_address_text(text: str) -> bool:
+    txt = (text or "").strip()
+    if not txt:
+        return False
+    low = txt.lower()
+    banned = [
+        "licensed", "insured", "insurance", "permit", "ai", "artificial", "favorite color",
+        "how much", "price", "cost", "what does", "include", "where are you", "who are you",
+        "do you", "are you", "can you", "would you", "will you"
+    ]
+    if any(b in low for b in banned):
+        return False
+    if "?" in txt and not re.search(r"\b\d{1,6}\b", txt):
+        return False
+    if re.search(r"\b\d{1,6}\b", txt) and ADDRESS_WORD_RE.search(low):
+        return True
+    if "," in txt and ADDRESS_WORD_RE.search(low):
+        return True
+    if ADDRESS_WORD_RE.search(low) and len(txt.split()) <= 6 and not QUESTIONISH_RE.search(low):
+        return True
+    return False
+
+
+def is_conversation_hesitation(text: str) -> bool:
+    low = _loose_text(text)
+    markers = [
+        "not sure", "nervous", "hesitant", "hesitation", "is this ai", "are you ai", "real person",
+        "licensed", "insured", "insurance", "permit", "where are you located", "where are you guys located",
+        "where are you based", "where are you out of", "do you service", "do you work in", "trust",
+        "not ready", "want to think", "shopping around", "just looking", "want to feel good", "not going to book"
+    ]
+    return any(m in low for m in markers)
+
+
+def _question_count(text: str) -> int:
+    t = (text or "")
+    c = t.count("?")
+    if c:
+        return c
+    low = _loose_text(t)
+    return 1 if QUESTIONISH_RE.search(low) else 0
+
+
+def hybrid_rule_excerpt(low: str) -> str:
+    rb = RULE_MATRIX_TEXT or ""
+    chunks = []
+    key_groups = [
+        (["licensed", "insured", "insurance", "where are you", "service", "permit", "ai"], "SRB-16"),
+        (["price", "cost", "195", "395", "estimate", "quote"], "SRB-5"),
+        (["safe", "danger", "shut", "breaker", "sparks", "burning", "smoke"], "SRB-2"),
+        (["address", "street", "town", "ct", "ma"], "SRB-3"),
+        (["not sure", "book", "hesitant", "think about it", "shopping around"], "SRB-11"),
+        (["question", "?"], "Rule 20."),
+    ]
+    for needles, anchor in key_groups:
+        if any(n in low for n in needles) and anchor in rb:
+            i = rb.find(anchor)
+            if i >= 0:
+                chunks.append(rb[i:i+2200])
+    if not chunks:
+        return rb[:2200]
+    return "\n\n".join(chunks[:3])
+
+
+def llm_trust_reply(conv: dict, inbound_text: str) -> dict | None:
+    low = _loose_text(inbound_text)
+    if not low:
+        return None
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    if not (_question_count(inbound_text) or is_conversation_hesitation(inbound_text)):
+        return None
+
+    next_prompt = choose_next_prompt_from_state(conv, inbound_text="")
+    if next_prompt in {"Okay.", "Okay", "Everything looks good here."}:
+        next_prompt = ""
+
+    system = f"""
+You are writing one SMS reply for Prevolt Electric.
+Return strict JSON with keys:
+{{
+  "answer": string,
+  "resume_booking": boolean,
+  "next_prompt": string,
+  "address": string|null
+}}
+
+Priorities:
+- answer the customer's actual question naturally
+- protect Prevolt's interests
+- keep trust high
+- never sound robotic
+- never invent license numbers, policy numbers, addresses, permits, or legal promises
+- never restate price unless the user is actively asking about price in this message
+- if the customer is still deciding, do NOT force the booking flow
+- if the customer is cooperative and the trust question is answered, you may gently return to the next missing booking step
+- never turn the customer's question into an address or rewrite the question as an address
+- do not output paragraphs
+- one clean text
+
+Known state:
+- customer name: {(profile.get('active_first_name') or profile.get('first_name') or '').strip()}
+- stored address: {(sched.get('raw_address') or '').strip()}
+- pending step: {sched.get('pending_step')}
+- price already disclosed: {bool(sched.get('price_disclosed'))}
+- next_prompt_if_resuming: {next_prompt}
+
+Use these rules as the source of truth:
+{hybrid_rule_excerpt(low)}
+"""
+    try:
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": inbound_text},
+            ],
+        )
+        data = json.loads(completion.choices[0].message.content)
+        answer = " ".join(str(data.get("answer") or "").split()).strip()
+        if not answer:
+            return None
+        resume = bool(data.get("resume_booking"))
+        np = " ".join(str(data.get("next_prompt") or "").split()).strip()
+        out_addr = data.get("address")
+        if isinstance(out_addr, str) and not is_plausible_address_text(out_addr):
+            out_addr = None
+        return {"answer": answer, "resume_booking": resume, "next_prompt": np, "address": out_addr}
+    except Exception as e:
+        print("[WARN] llm_trust_reply failed:", repr(e))
+        return None
+
 def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
@@ -3145,7 +3288,7 @@ def generate_reply_for_inbound(
         if sched.get("raw_address") and not model_addr:
             model_addr = sched["raw_address"]
 
-        if isinstance(model_addr, str) and len(model_addr.strip()) > 3:
+        if isinstance(model_addr, str) and len(model_addr.strip()) > 3 and is_plausible_address_text(model_addr):
             sched["raw_address"] = model_addr.strip()
 
         # ---------------------------------------------------
@@ -3938,1051 +4081,9 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
 
 
-
-# ---------------------------------------------------
-# RESPONSE BRAIN + MESSY VOICEMAIL + SLOT RECOVERY PATCH
-# ---------------------------------------------------
-
-_ORIG_CLEAN_TRANSCRIPT_TEXT = clean_transcript_text
-_ORIG_GENERATE_INITIAL_SMS = generate_initial_sms
-_ORIG_EXTRACT_POSSIBLE_PERSON_NAME = extract_possible_person_name
-_ORIG_LOOKS_LIKE_SLOT_PAYLOAD = looks_like_slot_payload
-_ORIG_SHOULD_SHORT_CIRCUIT_INTERRUPT = should_short_circuit_interrupt
-_ORIG_INTERRUPTION_ANSWER_AND_RETURN_PROMPT = interruption_answer_and_return_prompt
-_ORIG_CHOOSE_NEXT_PROMPT_FROM_STATE = choose_next_prompt_from_state
-_ORIG_ABSORB_OBVIOUS_BOOKING_DETAILS = absorb_obvious_booking_details
-_ORIG_MAYBE_CREATE_SQUARE_BOOKING = maybe_create_square_booking
-
-
-def _rb_loose(text: str) -> str:
-    text = (text or "").lower().replace("’", "'")
-    text = re.sub(r"[^a-z0-9@:/\.\-\s]", " ", text)
-    return " ".join(text.split())
-
-
-def _rb_contains_any(text: str, phrases: list[str]) -> bool:
-    low = _rb_loose(text)
-    return any(p in low for p in phrases)
-
-
-def clean_transcript_text(raw_text: str) -> str:
-    raw = (raw_text or "").strip()
-    if not raw:
-        return raw
-    try:
-        cleaned = _ORIG_CLEAN_TRANSCRIPT_TEXT(raw)
-    except Exception:
-        cleaned = raw
-
-    cleaned = re.sub(r"\b(um+|uh+|erm+|ah+)\b", " ", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b(like)\b", " ", cleaned, flags=re.I)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned or raw
-
-
-def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
-    txt = " ".join((text or "").strip().split())
-    if not txt:
-        return None, None
-
-    patterns = [
-        r"\bmy name is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
-        r"\bname is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
-        r"\bthis is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
-        r"\bit'?s\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?",
-        r"\bi am\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?=\s+(?:calling|looking|trying|needing|with|about|and|because|for)\b)",
-        r"\bi'?m\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?=\s+(?:calling|looking|trying|needing|with|about|and|because|for)\b)",
-    ]
-    stop_words = {
-        "looking", "calling", "trying", "needing", "need", "wanting", "want",
-        "with", "for", "about", "because", "regarding", "located", "living",
-        "from", "at", "in", "the", "a", "an", "electrician", "service"
-    }
-    for pat in patterns:
-        m = re.search(pat, txt, flags=re.I)
-        if not m:
-            continue
-        first = normalize_person_name(m.group(1) or "")
-        last = normalize_person_name(m.group(2) or "")
-        if not first or first.lower() in stop_words:
-            continue
-        if last and last.lower() in stop_words:
-            last = ""
-        return first or None, last or None
-    return _ORIG_EXTRACT_POSSIBLE_PERSON_NAME(txt)
-
-
-def _parse_messy_voicemail(cleaned_text: str) -> dict:
-    text = (cleaned_text or "").strip()
-    if not text:
-        return {
-            "category": "OTHER",
-            "appointment_type": "EVAL_195",
-            "detected_address": None,
-            "detected_date": None,
-            "detected_time": None,
-            "intent": "other",
-            "caller_first_name": None,
-            "caller_last_name": None,
-            "job_summary": None,
-        }
-
-    first, last = extract_possible_person_name(text)
-
-    detected_address = None
-    addr_match = re.search(
-        r"\b\d{1,6}\s+[A-Za-z0-9.'\- ]+\b(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|court|ct|circle|cir|boulevard|blvd|way|parkway|pkwy|terrace|ter)\b(?:[\s,]+[A-Za-z .'\-]+){0,3}",
-        text,
-        flags=re.I,
-    )
-    if addr_match:
-        detected_address = " ".join(addr_match.group(0).split())
-
-    low = _rb_loose(text)
-    emergency_phrases = [
-        "no power", "power out", "power outage", "burning smell", "sparking", "sparks",
-        "arcing", "hot panel", "buzzing", "water in panel", "breaker wont reset",
-        "breaker won't reset", "tree fell", "tree down", "service ripped", "line down",
-        "meter ripped", "smoke", "fire", "partial power", "half the house", "lights flicker"
-    ]
-    quote_phrases = ["quote", "estimate", "panel upgrade", "panel replacement", "service upgrade", "looking for pricing"]
-    inspect_phrases = ["inspection", "home inspection", "whole home inspection"]
-
-    intent = "other"
-    appointment_type = "EVAL_195"
-    category = "GENERAL"
-    if _rb_contains_any(low, emergency_phrases):
-        intent = "emergency"
-        appointment_type = "TROUBLESHOOT_395"
-        category = "EMERGENCY"
-    elif _rb_contains_any(low, inspect_phrases):
-        intent = "schedule"
-        appointment_type = "WHOLE_HOME_INSPECTION"
-        category = "INSPECTION"
-    elif _rb_contains_any(low, quote_phrases):
-        intent = "quote"
-        appointment_type = "EVAL_195"
-        category = "QUOTE"
-    elif any(x in low for x in ["come out", "come by", "need help", "need someone", "take a look", "look at", "schedule", "appointment"]):
-        intent = "schedule"
-        appointment_type = "EVAL_195"
-        category = "SERVICE"
-
-    detected_time = extract_explicit_time_from_text(text)
-    detected_date = salvage_relative_date_from_text(text)
-
-    summary_match = re.search(
-        r"(?:because|for|about|with|regarding)\s+(.{8,120})$",
-        text,
-        flags=re.I,
-    )
-    job_summary = summary_match.group(1).strip(" .,") if summary_match else None
-    if not job_summary:
-        if _rb_contains_any(low, emergency_phrases):
-            job_summary = "Possible urgent electrical issue"
-        elif _rb_contains_any(low, quote_phrases):
-            job_summary = "Customer looking for an electrical quote"
-        else:
-            job_summary = text[:120].strip()
-
-    return {
-        "category": category,
-        "appointment_type": appointment_type,
-        "detected_address": detected_address,
-        "detected_date": detected_date,
-        "detected_time": detected_time,
-        "intent": intent,
-        "caller_first_name": first,
-        "caller_last_name": last,
-        "job_summary": job_summary,
-    }
-
-
-def generate_initial_sms(cleaned_text: str) -> dict:
-    parsed = _parse_messy_voicemail(cleaned_text)
-    try:
-        llm = _ORIG_GENERATE_INITIAL_SMS(cleaned_text)
-    except Exception:
-        llm = {}
-
-    merged = {
-        "category": llm.get("category") or parsed.get("category") or "OTHER",
-        "appointment_type": llm.get("appointment_type") or parsed.get("appointment_type") or "EVAL_195",
-        "detected_address": llm.get("detected_address") or parsed.get("detected_address"),
-        "detected_date": llm.get("detected_date") or parsed.get("detected_date"),
-        "detected_time": llm.get("detected_time") or parsed.get("detected_time"),
-        "intent": llm.get("intent") or parsed.get("intent") or "other",
-        "caller_first_name": parsed.get("caller_first_name"),
-        "caller_last_name": parsed.get("caller_last_name"),
-        "job_summary": parsed.get("job_summary"),
-    }
-
-    low = _rb_loose(cleaned_text)
-    if _rb_contains_any(low, ["no power", "burning smell", "sparking", "tree down", "service ripped", "fire", "smoke", "water in panel"]):
-        merged["intent"] = "emergency"
-        merged["appointment_type"] = "TROUBLESHOOT_395"
-        merged["category"] = "EMERGENCY"
-
-    return merged
-
-
-def _response_brain_answer(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-    booked = bool(sched.get("booking_created") and sched.get("square_booking_id"))
-    if booked and not allow_post_booking:
-        return None
-
-    low = _rb_loose(inbound_text)
-    if not low:
-        return None
-
-    appt = (sched.get("appointment_type") or "").upper()
-    emergency = ("TROUBLESHOOT" in appt) or bool(sched.get("emergency_approved")) or bool(sched.get("awaiting_emergency_confirm"))
-    answer = None
-
-    if any(p in low for p in ["licensed", "insured"]):
-        answer = "Yes, we’re licensed and insured."
-    elif any(p in low for p in ["service area", "do you service", "do you come to", "work in "]):
-        answer = "Yes, we service Connecticut and Massachusetts."
-    elif any(p in low for p in ["permit", "permit required"]):
-        answer = "If anything needs a permit, we go over that during the visit."
-    elif any(p in low for p in ["cash", "card", "check", "payment", "pay by"]):
-        answer = "Card or cash after the visit is fine."
-    elif any(p in low for p in ["dog", "dogs", "pet", "pets"]):
-        answer = "That is fine. Just make sure we can safely get to the panel when we arrive."
-    elif any(p in low for p in ["on the way", "when close", "when youre close", "when you're close", "arrival window"]):
-        answer = "Yes, you’ll get a text when we’re on the way."
-    elif any(p in low for p in ["buy anything", "bring anything", "materials"]):
-        answer = "No, you do not need to buy anything ahead of time for the visit."
-    elif any(p in low for p in ["how long", "visit take", "how long is the visit"]):
-        answer = "Most visits are about an hour, depending on what you have going on."
-    elif any(p in low for p in ["free estimate", "estimate", "quote", "ballpark", "rough price", "firm number"]):
-        answer = "We handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
-        sched["price_disclosed"] = True
-    elif any(p in low for p in ["how much", "price", "cost", "195", "395", "service fee", "trip fee", "diagnostic fee"]):
-        if "TROUBLESHOOT" in appt:
-            answer = "The troubleshoot and repair visit is $395."
-        elif "INSPECTION" in appt:
-            answer = "Whole-home inspections are $395, and larger homes can run higher depending on square footage."
-        else:
-            answer = "The evaluation visit is $195."
-        sched["price_disclosed"] = True
-    elif any(p in low for p in ["go toward the project", "go towards the project", "credited back", "applied back", "deposit"]):
-        if "TROUBLESHOOT" in appt:
-            answer = "That covers the troubleshoot visit itself. If anything larger is needed, we go over that on site before anything moves forward."
-        else:
-            answer = "That covers the visit itself. If you move forward after that, we go over the next step in person."
-    elif any(p in low for p in ["available today", "availability", "how soon", "when can you come", "earliest", "soonest"]):
-        answer = "Once I have the booking details, I can get you on the schedule."
-    elif any(p in low for p in ["panel upgrade", "panel replacement", "service change"]):
-        answer = "Yes, we handle panel upgrades and replacements."
-    elif any(p in low for p in ["should i shut the power off", "should i turn it off", "is it safe", "can i flip the breaker", "can i reset it"]):
-        if emergency:
-            answer = "I would leave that alone for now and we’ll handle it when we get there."
-        else:
-            answer = "I would rather not troubleshoot that over text. We can take a look in person and make sure everything is safe."
-    elif any(p in low for p in ["do i need an electrician", "do you think its serious", "is this dangerous"]):
-        answer = "We would want to see it in person to say for sure, but we can take a look and make sure everything is safe."
-
-    if not answer:
-        return None
-
-    recompute_pending_step(profile, sched)
-    if booked:
-        return answer
-
-    next_prompt = _ORIG_CHOOSE_NEXT_PROMPT_FROM_STATE(conv, inbound_text="")
-    if next_prompt and next_prompt not in {"Okay.", "Okay", "Everything looks good here.", answer}:
-        return f"{answer} {next_prompt}"
-    return answer
-
-
-def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
-    rb = _response_brain_answer(conv, inbound_text, allow_post_booking=allow_post_booking)
-    if rb:
-        return rb
-    return _ORIG_INTERRUPTION_ANSWER_AND_RETURN_PROMPT(conv, inbound_text, allow_post_booking=allow_post_booking)
-
-
-def looks_like_slot_payload(inbound_text: str) -> bool:
-    txt = (inbound_text or "").strip()
-    low = _rb_loose(txt)
-    if not txt:
-        return False
-    if _ORIG_LOOKS_LIKE_SLOT_PAYLOAD(txt):
-        return True
-    if re.search(r"\b(?:after|around|before)\s+\d{1,2}(?::\d{2})?\b", low):
-        return True
-    if re.search(r"\b(?:noon|midnight)\b", low):
-        return True
-    if re.search(r"\b\d{1,6}\b", txt) and any(s in low for s in [" street", " st", " avenue", " ave", " road", " rd", " lane", " ln", " drive", " dr", " court", " ct", " boulevard", " blvd", " way", " parkway", " pkwy", " terrace", " ter"]):
-        return True
-    if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", txt, flags=re.I):
-        return True
-    return False
-
-
-def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
-    sched = conv.setdefault("sched", {})
-    if sched.get("booking_created") and sched.get("square_booking_id"):
-        return False
-    if looks_like_slot_payload(inbound_text):
-        return False
-    low = _rb_loose(inbound_text)
-    questionish = "?" in (inbound_text or "") or any(low.startswith(x) for x in ["can you", "do you", "is it", "are you", "what", "when", "how", "should i", "will you", "does it"]) 
-    if not questionish:
-        return False
-    return _response_brain_answer(conv, inbound_text) is not None or _ORIG_SHOULD_SHORT_CIRCUIT_INTERRUPT(conv, inbound_text)
-
-
-def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
-    _ORIG_ABSORB_OBVIOUS_BOOKING_DETAILS(conv, inbound_text)
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-    txt = (inbound_text or "").strip()
-    low = _rb_loose(txt)
-
-    if not sched.get("scheduled_time"):
-        if "noon" in low:
-            sched["scheduled_time"] = "12:00"
-        elif "midnight" in low:
-            sched["scheduled_time"] = "00:00"
-        else:
-            m = re.search(r"\bafter\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", low)
-            if m:
-                hh = int(m.group(1))
-                mm = int(m.group(2) or "00")
-                ap = (m.group(3) or "pm").lower()
-                if ap == "pm" and hh != 12:
-                    hh += 12
-                if ap == "am" and hh == 12:
-                    hh = 0
-                sched["scheduled_time"] = f"{hh:02d}:{mm:02d}"
-            elif any(p in low for p in ["this afternoon", "later today", "sometime this afternoon"]):
-                sched["scheduled_time"] = "13:00"
-            elif any(p in low for p in ["this morning", "later this morning"]):
-                sched["scheduled_time"] = "09:00"
-
-    if not sched.get("scheduled_date"):
-        d = salvage_relative_date_from_text(txt)
-        if d:
-            sched["scheduled_date"] = d
-
-    if not get_active_first_name(profile) or not get_active_last_name(profile):
-        first, last = extract_possible_person_name(txt)
-        if first and not get_active_first_name(profile):
-            profile["active_first_name"] = first
-            profile["first_name"] = first
-        if last and not get_active_last_name(profile):
-            profile["active_last_name"] = last
-            profile["last_name"] = last
-
-    email_match = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", txt, flags=re.I)
-    if email_match and not get_active_email(profile):
-        email = email_match.group(1).strip()
-        profile["active_email"] = email
-        profile["email"] = email
-
-    update_address_assembly_state(sched)
-    recompute_pending_step(profile, sched)
-
-
-def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-
-    if sched.get("slot_recovery_mode"):
-        day = sched.get("scheduled_date")
-        human_day = "that day"
-        try:
-            if isinstance(day, str) and re.match(r"^\d{4}-\d{2}-\d{2}$", day):
-                human_day = datetime.strptime(day, "%Y-%m-%d").strftime("%A, %B %d").replace(" 0", " ")
-        except Exception:
-            pass
-
-        low = _rb_loose(inbound_text)
-        if any(p in low for p in ["none", "none of those", "those dont work", "those don't work", "doesnt work", "doesn't work", "another day", "different day"]):
-            sched["scheduled_time"] = None
-            sched["scheduled_date"] = None
-            sched["slot_recovery_mode"] = False
-            sched["slot_recovery_count"] = int(sched.get("slot_recovery_count") or 0) + 1
-            recompute_pending_step(profile, sched)
-            return "No problem. What day works better for you?"
-
-        if sched.get("scheduled_date") and not sched.get("scheduled_time"):
-            return f"That time just got taken. What time on {human_day} works better for you?"
-        sched["slot_recovery_mode"] = False
-
-    step = sched.get("pending_step")
-    if step == "need_date":
-        options = ["What day works best for you?", "Which day works best for the visit?", "What day should I put this on?"]
-        return pick_variant_once(sched, "rb_need_date", options)
-    if step == "need_time":
-        options = ["What time works best for you?", "What time should I put you down for?", "What time works for the visit?"]
-        return pick_variant_once(sched, "rb_need_time", options)
-    if step == "need_name":
-        options = ["What is your first and last name?", "What name should I put on the appointment?", "What is your full name for the booking?"]
-        return pick_variant_once(sched, "rb_need_name", options)
-    if step == "need_email":
-        options = ["What is the best email address for the appointment?", "What email should I attach to the booking?", "What is the best email for the visit?"]
-        return pick_variant_once(sched, "rb_need_email", options)
-    return _ORIG_CHOOSE_NEXT_PROMPT_FROM_STATE(conv, inbound_text=inbound_text)
-
-
-def build_soft_rejection_reply(conv: dict, inbound_text: str) -> str | None:
-    sched = conv.setdefault("sched", {})
-    low = _rb_loose(inbound_text)
-    if sched.get("slot_recovery_mode") and any(p in low for p in ["none", "none of those", "those dont work", "those don't work", "different day", "another day"]):
-        sched["scheduled_time"] = None
-        sched["scheduled_date"] = None
-        sched["slot_recovery_mode"] = False
-        return "No problem. What day works better for you?"
-    return _ORIG_BUILD_SOFT_REJECTION_REPLY(conv, inbound_text) if '_ORIG_BUILD_SOFT_REJECTION_REPLY' in globals() else None
-
-
-_ORIG_BUILD_SOFT_REJECTION_REPLY = globals().get('_ORIG_BUILD_SOFT_REJECTION_REPLY', build_soft_rejection_reply)
-
-
-def maybe_create_square_booking(phone: str, convo: dict):
-    sched = convo.setdefault("sched", {})
-    profile = convo.setdefault("profile", {})
-    failed_key_before = sched.get("slot_failure_key")
-    try:
-        result = _ORIG_MAYBE_CREATE_SQUARE_BOOKING(phone, convo)
-    except Exception:
-        raise
-
-    # If booking succeeded, clear any stale recovery state.
-    if sched.get("booking_created") and sched.get("square_booking_id"):
-        for k in ["slot_recovery_mode", "slot_failure_key", "slot_recovery_count", "slot_failure_reason"]:
-            sched.pop(k, None)
-        return result
-
-    # If booking did not happen even though core fields exist, assume slot or API failure and move into recovery.
-    if sched.get("scheduled_date") and sched.get("scheduled_time") and sched.get("appointment_type") and sched.get("address_verified"):
-        failure_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
-        if failure_key != failed_key_before:
-            sched["slot_failure_key"] = failure_key
-            sched["slot_recovery_mode"] = True
-            sched["slot_failure_reason"] = "booking_failed_after_ready"
-            # Keep the date, force a fresh time.
-            sched["scheduled_time"] = None
-            sched["booking_created"] = False
-            sched["square_booking_id"] = None
-            recompute_pending_step(profile, sched)
-    return result
-
-
 # ---------------------------------------------------
 # Local Development Entrypoint
 # ---------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
-
-# ===================================================
-# PREVOLT PATCH V2 — CONVERSATION FLEX / PRICE REPETITION / QUESTION PRIORITY
-# ===================================================
-
-def _rb2_loose(s: str) -> str:
-    s = (s or '').lower().replace('’', "'")
-    s = re.sub(r"[^a-z0-9\s?]", ' ', s)
-    return ' '.join(s.split())
-
-
-def _rb2_contains_any(low: str, phrases: list[str]) -> bool:
-    return any(p in low for p in phrases)
-
-
-def _rb2_question_only(inbound_text: str) -> bool:
-    low = _rb2_loose(inbound_text)
-    if not low:
-        return False
-    if '?' in (inbound_text or ''):
-        return True
-    starters = [
-        'are you', 'do you', 'did you', 'can you', 'will you', 'what ', 'how ', 'when ',
-        'why ', 'is it', 'does it', 'should i', 'would you', 'could you'
-    ]
-    return any(low.startswith(x) for x in starters)
-
-
-def _rb2_is_soft_hesitation(inbound_text: str) -> bool:
-    low = _rb2_loose(inbound_text)
-    return _rb2_contains_any(low, [
-        'not going to book', 'not gonna book', 'i dont think so', "i don't think so",
-        'never mind', 'nevermind', 'ill think about it', "i'll think about it",
-        'let me think about it', 'not right now', 'maybe later', 'just checking',
-        'just curious', 'shopping around', 'getting prices', 'i need to think about it'
-    ])
-
-
-def looks_like_slot_payload(inbound_text: str) -> bool:
-    txt = (inbound_text or '').strip()
-    low = _rb2_loose(txt)
-    if not txt:
-        return False
-
-    # Question priority fix: licensing / pricing / service-area / reassurance questions
-    # must not get swallowed as slot payloads.
-    if _rb2_question_only(txt):
-        question_markers = [
-            'licensed', 'insured', 'service area', 'do you service', 'do you work', 'work in',
-            'come to', 'how much', 'price', 'cost', 'what does that include', 'what does the visit include',
-            'free estimate', 'estimate', 'quote', 'ballpark', 'permit', 'dog', 'pet', 'cash', 'card',
-            'payment', 'is it safe', 'can i flip the breaker', 'can i reset it', 'when close', 'on the way'
-        ]
-        if _rb2_contains_any(low, question_markers):
-            return False
-
-    if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", txt, flags=re.I):
-        return True
-    if re.search(r"\b\d{1,6}\b", txt) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
-        return True
-    if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", low, flags=re.I):
-        return True
-    if re.search(r"^\d{3,4}$", txt):
-        return True
-    if re.search(r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next monday|next tuesday|next wednesday|next thursday|next friday|next saturday|next sunday)\b", low):
-        return True
-    if len(txt.split()) <= 3 and re.fullmatch(r"[A-Za-z'\- ]+", txt) and not _rb2_question_only(txt):
-        return True
-    return False
-
-
-def _rb2_next_prompt(conv: dict, inbound_text: str = '') -> str | None:
-    sched = conv.setdefault('sched', {})
-    profile = conv.setdefault('profile', {})
-    recompute_pending_step(profile, sched)
-    if _rb2_is_soft_hesitation(inbound_text):
-        return None
-    nxt = _ORIG_CHOOSE_NEXT_PROMPT_FROM_STATE(conv, inbound_text='')
-    if not nxt or nxt in {'Okay.', 'Okay', 'Everything looks good here.'}:
-        return None
-    return nxt
-
-
-def _rb2_answer_for_question(conv: dict, inbound_text: str) -> str | None:
-    profile = conv.setdefault('profile', {})
-    sched = conv.setdefault('sched', {})
-    low = _rb2_loose(inbound_text)
-    if not low:
-        return None
-
-    appt = (sched.get('appointment_type') or '').upper()
-    emergency = ('TROUBLESHOOT' in appt) or bool(sched.get('emergency_approved')) or bool(sched.get('awaiting_emergency_confirm'))
-    price_disclosed = bool(sched.get('price_disclosed'))
-
-    answer = None
-    continue_booking = True
-
-    if _rb2_contains_any(low, ['licensed in ct', 'licensed in connecticut', 'licensed in ct?']):
-        answer = 'Yes, we are licensed in Connecticut.'
-    elif _rb2_contains_any(low, ['licensed', 'insured']):
-        answer = 'Yes, we are licensed and insured.'
-    elif _rb2_contains_any(low, ['do you even work in', 'do you work in', 'do you service', 'do you come to', 'service area']):
-        if 'windsor locks' in low:
-            answer = 'Yes, we work in Windsor Locks.'
-        elif 'connecticut' in low or 'massachusetts' in low or 'ct' in low or 'ma' in low:
-            answer = 'Yes, we service Connecticut and Massachusetts.'
-        else:
-            answer = 'Yes, we service Connecticut and Massachusetts.'
-    elif _rb2_contains_any(low, ['what does that include', 'what does the visit include', 'what is the 195 for', 'is the 195 just to come out', 'is 195 just to come out', 'just to come out', 'just to come']) :
-        if 'TROUBLESHOOT' in appt:
-            answer = 'The $395 troubleshoot visit covers coming out, diagnosing the issue, and handling minor repair work if it is something straightforward.'
-        elif 'INSPECTION' in appt:
-            answer = 'The inspection visit covers coming out, inspecting the home, and going over what we find.'
-        else:
-            answer = 'The $195 evaluation covers coming out, seeing the issue in person, and going over the next step with you.'
-        sched['price_disclosed'] = True
-    elif _rb2_contains_any(low, ['how much', 'price', 'cost', 'what do you charge', '195', '395', 'service fee', 'trip fee', 'diagnostic fee']):
-        if 'TROUBLESHOOT' in appt:
-            answer = 'The troubleshoot and repair visit is $395.'
-        elif 'INSPECTION' in appt:
-            answer = 'The inspection visit is $395.'
-        else:
-            answer = 'The evaluation visit is $195.'
-        sched['price_disclosed'] = True
-    elif _rb2_contains_any(low, ['free estimate', 'estimate', 'quote', 'ballpark', 'rough price', 'firm number']):
-        answer = 'We handle that with a $195 evaluation so we can see everything in person and give you a firm number.'
-        sched['price_disclosed'] = True
-    elif _rb2_contains_any(low, ['go toward the project', 'go towards the project', 'does that go toward', 'does it go toward', 'credited back', 'applied back', 'deposit']):
-        if 'TROUBLESHOOT' in appt:
-            answer = 'That covers the troubleshoot visit itself. If anything larger is needed, we go over it on site before anything moves forward.'
-        else:
-            answer = 'That covers the visit itself. If additional work is needed after that, we go over it in person.'
-    elif _rb2_contains_any(low, ['permit', 'permit required']):
-        answer = 'If anything needs a permit, we go over that during the visit.'
-    elif _rb2_contains_any(low, ['cash', 'card', 'check', 'payment', 'pay by']):
-        answer = 'Card or cash after the visit is fine.'
-    elif _rb2_contains_any(low, ['dog', 'dogs', 'pet', 'pets']):
-        answer = 'That is totally fine. Just make sure we can safely get to the panel when we arrive.'
-    elif _rb2_contains_any(low, ['on the way', 'when close', "when you're close", 'when youre close', 'arrival window', 'text when']):
-        answer = 'Yes, you will get a text when we are on the way.'
-    elif _rb2_contains_any(low, ['buy anything', 'bring anything', 'materials', 'do i need anything', 'should i buy']):
-        answer = 'No, you do not need to buy anything ahead of time for the visit.'
-    elif _rb2_contains_any(low, ['how long', 'visit take', 'how long is the visit']):
-        answer = 'Usually about an hour, depending on what you have going on.'
-    elif _rb2_contains_any(low, ['is it safe', 'can i flip the breaker', 'can i reset it', 'should i shut the power off', 'should i turn it off']):
-        if emergency:
-            answer = 'I would leave that alone for now and we can handle it when we get there.'
-        else:
-            answer = 'I would rather not troubleshoot that over text. We can take a look in person and make sure everything is safe.'
-    elif _rb2_contains_any(low, ['do i need an electrician', 'do you think its serious', 'is this dangerous']):
-        answer = 'We would want to see it in person to say for sure, but we can take a look and make sure everything is safe.'
-    elif _rb2_contains_any(low, ['panel upgrade', 'panel replacement', 'service change']):
-        answer = 'Yes, we handle panel upgrades and replacements.'
-    elif _rb2_contains_any(low, ['available today', 'availability', 'how soon', 'when can you come', 'earliest', 'soonest']):
-        answer = 'Once I have the booking details, I can get you on the schedule.'
-    elif _rb2_is_soft_hesitation(inbound_text):
-        continue_booking = False
-        answer = 'No problem at all. If you want to think it over or circle back later, just send a message and we can pick it back up.'
-
-    if not answer:
-        return None
-
-    # Do not re-insert pricing over and over once already disclosed, unless user explicitly asks pricing again.
-    if price_disclosed and sched.get('price_disclosed') and _rb2_contains_any(low, ['licensed', 'insured', 'do you work in', 'do you even work in', 'do you service', 'permit', 'dog', 'pets', 'payment', 'cash', 'card', 'how long', 'when close', 'on the way']):
-        pass
-
-    nxt = _rb2_next_prompt(conv, inbound_text=inbound_text) if continue_booking else None
-    if nxt:
-        return f'{answer} {nxt}'
-    return answer
-
-
-def _response_brain_answer(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
-    sched = conv.setdefault('sched', {})
-    booked = bool(sched.get('booking_created') and sched.get('square_booking_id'))
-    if booked and not allow_post_booking:
-        return None
-    ans = _rb2_answer_for_question(conv, inbound_text)
-    if ans:
-        return ans
-    return None
-
-
-def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
-    sched = conv.setdefault('sched', {})
-    if sched.get('booking_created') and sched.get('square_booking_id'):
-        return False
-    # Question priority fix.
-    if _rb2_question_only(inbound_text):
-        return _rb2_answer_for_question(conv, inbound_text) is not None
-    if looks_like_slot_payload(inbound_text):
-        return False
-    return _rb2_answer_for_question(conv, inbound_text) is not None or _ORIG_SHOULD_SHORT_CIRCUIT_INTERRUPT(conv, inbound_text)
-
-
-def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
-    rb = _rb2_answer_for_question(conv, inbound_text)
-    if rb:
-        return rb
-    return _ORIG_INTERRUPTION_ANSWER_AND_RETURN_PROMPT(conv, inbound_text, allow_post_booking=allow_post_booking)
-
-
-def build_soft_rejection_reply(conv: dict, inbound_text: str) -> str | None:
-    sched = conv.setdefault('sched', {})
-    low = _rb2_loose(inbound_text)
-
-    if _rb2_is_soft_hesitation(inbound_text):
-        sched['soft_rejection_open'] = True
-        sched['soft_rejection_state'] = 'paused_customer_hesitation'
-        sched['soft_rejection_ts'] = int(time.time())
-        return 'No problem at all. If you want to think it over or circle back later, just send a message and we can pick it back up.'
-
-    if sched.get('slot_recovery_mode') and _rb2_contains_any(low, ['none', 'none of those', "those don't work", 'those dont work', 'different day', 'another day']):
-        sched['scheduled_time'] = None
-        sched['scheduled_date'] = None
-        sched['slot_recovery_mode'] = False
-        return 'No problem. What day works better for you?'
-
-    return _ORIG_BUILD_SOFT_REJECTION_REPLY(conv, inbound_text) if '_ORIG_BUILD_SOFT_REJECTION_REPLY' in globals() else None
-
-
-def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | None:
-    low = _rb2_loose(inbound_text)
-    sched = conv.setdefault('sched', {})
-    if sched.get('soft_rejection_open') and _rb2_contains_any(low, ['book', 'schedule', 'lets do it', "let's do it", 'ready', 'okay lets', 'ok lets', 'tomorrow', 'today', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']):
-        sched['soft_rejection_open'] = False
-        sched['soft_rejection_state'] = None
-        recompute_pending_step(conv.setdefault('profile', {}), sched)
-        nxt = _rb2_next_prompt(conv, inbound_text=inbound_text)
-        if nxt:
-            return f'Okay. {nxt}'
-        return 'Okay.'
-    return _ORIG_MAYBE_RESUME_PAUSED_CONVERSATION(conv, inbound_text) if '_ORIG_MAYBE_RESUME_PAUSED_CONVERSATION' in globals() else None
-
-# keep latest override handles alive
-_ORIG_MAYBE_RESUME_PAUSED_CONVERSATION = globals().get('_ORIG_MAYBE_RESUME_PAUSED_CONVERSATION', maybe_resume_paused_conversation)
-
-
-# ===================================================
-# V3 TRUST + REASSURANCE + RAMBLING VOICEMAIL PATCHES
-# ===================================================
-try:
-    _ORIG_GENERATE_REPLY_FOR_INBOUND_V3 = generate_reply_for_inbound
-except Exception:
-    _ORIG_GENERATE_REPLY_FOR_INBOUND_V3 = None
-
-try:
-    _ORIG_GENERATE_INITIAL_SMS_V3 = generate_initial_sms
-except Exception:
-    _ORIG_GENERATE_INITIAL_SMS_V3 = None
-
-
-def _pv3_loose(s: str) -> str:
-    s = (s or '').lower().replace('’', "'")
-    s = re.sub(r'[^a-z0-9\s]', ' ', s)
-    return ' '.join(s.split())
-
-
-def _pv3_contains_any(low: str, phrases: list[str]) -> bool:
-    return any(p in low for p in phrases)
-
-
-def _pv3_known_address(profile: dict) -> str | None:
-    addrs = profile.get('addresses') or []
-    if not addrs:
-        return None
-    for addr in reversed(addrs):
-        if isinstance(addr, str) and addr.strip():
-            return addr.strip()
-    return None
-
-
-def _pv3_split_sentences(text: str) -> list[str]:
-    raw = re.split(r'(?<=[.!?])\s+', (text or '').strip())
-    return [x.strip() for x in raw if x and x.strip()]
-
-
-def _pv3_norm_sentence(s: str) -> str:
-    s = (s or '').strip().lower()
-    s = s.replace('’', "'")
-    s = re.sub(r'\s+', ' ', s)
-    return s
-
-
-def _pv3_dedupe_and_soften_price(text: str, appt_type: str = '') -> str:
-    parts = _pv3_split_sentences(text)
-    if not parts:
-        return (text or '').strip()
-
-    out = []
-    seen = set()
-    seen_eval_price = False
-    seen_tr_price = False
-
-    for part in parts:
-        n = _pv3_norm_sentence(part)
-        if not n or n in seen:
-            continue
-        seen.add(n)
-
-        if '$195' in part:
-            if seen_eval_price:
-                # Drop repetitive price-only followup sentences.
-                if _pv3_contains_any(n, ['evaluation visit is $195', 'service visit is $195', 'the $195 evaluation', '$195.']):
-                    continue
-            seen_eval_price = True
-
-        if '$395' in part:
-            if seen_tr_price:
-                if _pv3_contains_any(n, ['troubleshoot and repair visits are $395', '$395.']):
-                    continue
-            seen_tr_price = True
-
-        out.append(part)
-
-    cleaned = ' '.join(out).strip()
-    cleaned = re.sub(r'(\$195[^\$]{0,80}?)(\s+\1)+', r'\1', cleaned, flags=re.I)
-    cleaned = re.sub(r'(\$395[^\$]{0,80}?)(\s+\1)+', r'\1', cleaned, flags=re.I)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned
-
-
-def _pv3_extract_job_topics(text: str) -> list[str]:
-    low = _pv3_loose(text)
-    topics = []
-
-    def add(label: str, keys: list[str]):
-        if label not in topics and _pv3_contains_any(low, keys):
-            topics.append(label)
-
-    add('an outlet issue', ['outlet', 'plug', 'receptacle', 'gfci'])
-    add('an EV charger install', ['ev charger', 'car charger', 'tesla charger', 'level 2 charger'])
-    add('a panel upgrade', ['panel upgrade', 'panel replacement', 'service upgrade', 'new panel'])
-    add('a breaker issue', ['breaker keeps tripping', 'breaker trip', 'tripping breaker', 'breaker issue'])
-    add('a lighting job', ['light fixture', 'lighting', 'recessed light', 'can lights', 'lights installed'])
-    add('a switch issue', ['switch', 'dimmer'])
-    add('a no power problem', ['no power', 'power out', 'lost power'])
-    add('an inspection', ['inspection', 'whole home inspection', 'electrical inspection'])
-    add('a generator job', ['generator', 'interlock', 'transfer switch'])
-    add('a ceiling fan install', ['ceiling fan'])
-    add('a subpanel or feeder job', ['subpanel', 'feeder'])
-    add('a troubleshooting visit', ['troubleshoot', 'electrical issue', 'not working'])
-
-    return topics[:6]
-
-
-def _pv3_compose_job_summary(text: str) -> str | None:
-    topics = _pv3_extract_job_topics(text)
-    if not topics:
-        return None
-    if len(topics) == 1:
-        return f"It sounds like you're looking for help with {topics[0]}."
-    if len(topics) == 2:
-        return f"It sounds like you're looking for help with {topics[0]} and {topics[1]}."
-    return f"It sounds like you're looking for help with {', '.join(topics[:-1])}, and {topics[-1]}."
-
-
-def _pv3_hesitation_kind(text: str) -> str | None:
-    low = _pv3_loose(text)
-    if _pv3_contains_any(low, ['are you ai', 'is this ai', 'bot', 'robot', 'real person', 'human there']):
-        return 'ai'
-    if _pv3_contains_any(low, ['licensed', 'insured', 'license', 'insurance']):
-        return 'licensing'
-    if _pv3_contains_any(low, ['permit', 'permitted']):
-        return 'permit'
-    if _pv3_contains_any(low, ['how much', 'cost', 'price', '$195', '$395', 'too much', 'expensive', 'just to come out']):
-        return 'price'
-    if _pv3_contains_any(low, ['not sure', 'hmm im not sure', "i'm not sure", 'not comfortable', 'hesitant', 'not going to book', 'i do not want to book', "i'm not going to book", 'shopping around', 'just checking']):
-        return 'trust'
-    return None
-
-
-def _pv3_reassurance_reply(conv: dict, inbound_text: str) -> str | None:
-    low = _pv3_loose(inbound_text)
-    kind = _pv3_hesitation_kind(inbound_text)
-    sched = conv.setdefault('sched', {})
-
-    if kind == 'ai':
-        sched['soft_rejection_open'] = True
-        sched['soft_rejection_state'] = 'ai_hesitation'
-        return 'Totally fair. I can keep this simple by text and help you get the visit lined up without wasting your time. What would help you feel good about moving forward?'
-
-    if kind == 'licensing':
-        return 'Yes. We are licensed and insured. If that is the main concern, you are in good hands here.'
-
-    if kind == 'permit':
-        return 'That is a fair question. If anything needs a permit, we go over that with you before the work moves forward.'
-
-    if kind == 'price' and _pv3_contains_any(low, ['not sure', 'too much', 'expensive', 'just checking', 'shopping around']):
-        sched['soft_rejection_open'] = True
-        sched['soft_rejection_state'] = 'price_hesitation'
-        return 'No problem. A lot of people just want to understand what the visit actually covers before they commit. The visit is for us to come out, see everything in person, and go over the right next step with you.'
-
-    if kind == 'trust':
-        sched['soft_rejection_open'] = True
-        sched['soft_rejection_state'] = 'trust_hesitation'
-        return 'No problem. Usually when someone is not ready yet, they just want to make sure they feel comfortable first. Is the main hesitation the price, licensing and insurance, permits, or just wanting to know how the visit works?'
-
-    if _pv3_contains_any(low, ['what does the 195 include', 'what does the visit include', 'is that just to come out', 'just to come out']):
-        return 'The $195 visit covers coming out, seeing the issue in person, and going over the right next step with you.'
-
-    return None
-
-
-def _pv3_answer_for_message(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> tuple[str | None, bool]:
-    profile = conv.setdefault('profile', {})
-    sched = conv.setdefault('sched', {})
-    low = _pv3_loose(inbound_text)
-    if not low:
-        return None, True
-
-    # Emotional reassurance / objections first.
-    reassurance = _pv3_reassurance_reply(conv, inbound_text)
-    if reassurance:
-        if _pv3_hesitation_kind(inbound_text) in {'trust', 'price', 'ai'}:
-            return reassurance, False
-        return reassurance, True
-
-    answer = None
-    continue_booking = True
-
-    if _pv3_contains_any(low, ['licensed in ct', 'licensed in connecticut']):
-        answer = 'Yes. We are licensed and insured in Connecticut.'
-    elif _pv3_contains_any(low, ['licensed', 'insured', 'insurance']):
-        answer = 'Yes, we are licensed and insured.'
-    elif _pv3_contains_any(low, ['do you service', 'do you work in', 'do you even work in', 'come to windsor locks', 'service windsor locks']):
-        answer = 'Yes, we service Connecticut and Massachusetts, including Windsor Locks.'
-    elif _pv3_contains_any(low, ['what does the 195 include', 'what does the visit include', 'is that just to come out', 'just to come out']):
-        answer = 'The $195 visit covers coming out, seeing the issue in person, and going over the right next step with you.'
-    elif _pv3_contains_any(low, ['what happens after', 'next step after', 'then what']):
-        answer = 'Once we see everything in person, we can tell you the right next step and what it would take to move forward.'
-    elif _pv3_contains_any(low, ['do you do ev charger', 'ev charger', 'panel upgrade', 'outlet install', 'do you install outlets', 'do you do panel upgrades']):
-        answer = 'Yes, we handle that kind of work.'
-    elif _pv3_contains_any(low, ['free estimate', 'ballpark', 'rough price', 'quote from photos', 'can i send pictures']):
-        answer = 'You can absolutely send pictures, but we would still need to see it in person before giving a firm number.'
-    elif _pv3_contains_any(low, ['permit', 'permitted', 'do i need a permit']):
-        answer = 'If anything needs a permit, we go over that with you before the work moves forward.'
-    elif _pv3_contains_any(low, ['real person', 'are you ai', 'bot', 'robot', 'human there']):
-        answer = 'I can help you here by text and keep this simple for you.'
-        continue_booking = False
-    elif _pv3_contains_any(low, ['payment', 'card', 'cash', 'check', 'how do i pay']):
-        answer = 'Card or cash after the visit is fine.'
-    elif _pv3_contains_any(low, ['dogs', 'dog', 'pets', 'pet']):
-        answer = 'That is totally fine. We would just need safe access to the work area when we arrive.'
-    elif _pv3_contains_any(low, ['how long does the visit take', 'how long is the visit', 'visit take']):
-        answer = 'Usually about an hour, depending on what you have going on.'
-    elif _pv3_contains_any(low, ['is this dangerous', 'do you think its serious', 'should i flip the breaker', 'can i reset it', 'should i turn it off']):
-        answer = 'I would rather not try to diagnose that over text. We can take a look in person and make sure everything is safe.'
-    elif _pv3_contains_any(low, ['do you guarantee', 'warranty', 'stand behind your work']):
-        answer = 'We take the work seriously and we go over everything clearly once we see the job in person.'
-
-    if not answer:
-        return None, True
-    return answer, continue_booking
-
-
-def choose_next_prompt_from_state(conv: dict, inbound_text: str = '') -> str:
-    profile = conv.setdefault('profile', {})
-    sched = conv.setdefault('sched', {})
-    update_address_assembly_state(sched)
-    recompute_pending_step(profile, sched)
-
-    if sched.get('pending_step') == 'need_address' and not sched.get('raw_address'):
-        known = _pv3_known_address(profile)
-        if known:
-            sched['known_service_address'] = known
-            return f'Is this still for {known}, or is this a different address?'
-
-    return _ORIG_CHOOSE_NEXT_PROMPT_FROM_STATE(conv, inbound_text=inbound_text) if '_ORIG_CHOOSE_NEXT_PROMPT_FROM_STATE' in globals() else 'What day works best for you?'
-
-
-def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
-    sched = conv.setdefault('sched', {})
-    if sched.get('booking_created') and sched.get('square_booking_id'):
-        return False
-    answer, _ = _pv3_answer_for_message(conv, inbound_text)
-    if answer:
-        return True
-    if looks_like_slot_payload(inbound_text):
-        return False
-    return _ORIG_SHOULD_SHORT_CIRCUIT_INTERRUPT(conv, inbound_text) if '_ORIG_SHOULD_SHORT_CIRCUIT_INTERRUPT' in globals() else False
-
-
-def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
-    answer, continue_booking = _pv3_answer_for_message(conv, inbound_text, allow_post_booking=allow_post_booking)
-    if not answer:
-        return _ORIG_INTERRUPTION_ANSWER_AND_RETURN_PROMPT(conv, inbound_text, allow_post_booking=allow_post_booking) if '_ORIG_INTERRUPTION_ANSWER_AND_RETURN_PROMPT' in globals() else None
-    if continue_booking:
-        nxt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
-        if nxt and _pv3_norm_sentence(nxt) not in _pv3_norm_sentence(answer):
-            return f'{answer} {nxt}'
-    return answer
-
-
-def build_soft_rejection_reply(conv: dict, inbound_text: str) -> str | None:
-    sched = conv.setdefault('sched', {})
-    low = _pv3_loose(inbound_text)
-
-    if _pv3_contains_any(low, ['not going to book', 'not gonna book', 'hmm im not sure', "i'm not sure", 'not sure', 'shopping around', 'just checking', 'let me think about it']):
-        sched['soft_rejection_open'] = True
-        sched['soft_rejection_state'] = 'customer_not_ready'
-        sched['soft_rejection_ts'] = int(time.time())
-        return 'No problem at all. Before we close the door on it, what would help you feel comfortable moving forward. The price, licensing and insurance, permits, or just wanting to know how the visit works?'
-
-    if sched.get('slot_recovery_mode') and _pv3_contains_any(low, ['none', 'none of those', "those don't work", 'those dont work', 'different day', 'another day']):
-        sched['scheduled_time'] = None
-        sched['scheduled_date'] = None
-        sched['slot_recovery_mode'] = False
-        return 'No problem. What day works better for you?'
-
-    return _ORIG_BUILD_SOFT_REJECTION_REPLY(conv, inbound_text) if '_ORIG_BUILD_SOFT_REJECTION_REPLY' in globals() else None
-
-
-def maybe_resume_paused_conversation(conv: dict, inbound_text: str) -> str | None:
-    sched = conv.setdefault('sched', {})
-    low = _pv3_loose(inbound_text)
-    if sched.get('soft_rejection_open') and _pv3_contains_any(low, ['licensed', 'insured', 'permit', 'price', '195', '395', 'how the visit works', 'how it works']):
-        ans, _ = _pv3_answer_for_message(conv, inbound_text)
-        return ans
-    return _ORIG_MAYBE_RESUME_PAUSED_CONVERSATION(conv, inbound_text) if '_ORIG_MAYBE_RESUME_PAUSED_CONVERSATION' in globals() else None
-
-
-def generate_initial_sms(cleaned_text: str) -> dict:
-    base = _ORIG_GENERATE_INITIAL_SMS_V3(cleaned_text) if _ORIG_GENERATE_INITIAL_SMS_V3 else {
-        'category': 'OTHER', 'appointment_type': 'EVAL_195', 'detected_address': None,
-        'detected_date': None, 'detected_time': None, 'intent': 'other'
-    }
-    # Rambling voicemail extraction assist.
-    try:
-        base['job_topics'] = _pv3_extract_job_topics(cleaned_text)
-        name_guess = re.search(r"(?:this is|my name is|i am|i'm)\s+([A-Z][a-z]+)(?:\s+([A-Z][a-z]+))?", cleaned_text or '', flags=re.I)
-        if name_guess:
-            base['detected_first_name'] = name_guess.group(1)
-            if name_guess.group(2):
-                base['detected_last_name'] = name_guess.group(2)
-    except Exception:
-        pass
-    return base
-
-
-def generate_reply_for_inbound(cleaned_transcript, category, appointment_type, initial_sms, inbound_text, scheduled_date, scheduled_time, address) -> dict:
-    if not _ORIG_GENERATE_REPLY_FOR_INBOUND_V3:
-        return {'sms_body': 'How can I help?', 'scheduled_date': scheduled_date, 'scheduled_time': scheduled_time, 'address': address, 'booking_complete': False}
-
-    phone = (request.form.get('From', '') or '').replace('whatsapp:', '')
-    convo_key = phone or request.form.get('MessageSid') or request.form.get('SmsSid') or request.form.get('CallSid') or 'unknown'
-    conv = conversations.setdefault(convo_key, {})
-    profile = conv.setdefault('profile', {})
-    sched = conv.setdefault('sched', {})
-    profile.setdefault('addresses', [])
-    profile.setdefault('square_lookup_done', False)
-
-    # One-time repeat-customer hydrate so the first text can use the address on file.
-    if phone and not profile.get('square_lookup_done'):
-        try:
-            cust = square_lookup_customer_by_phone(phone)
-            if cust:
-                caddr = cust.get('address') or {}
-                line1 = (caddr.get('address_line_1') or '').strip()
-                city = (caddr.get('locality') or '').strip()
-                state = (caddr.get('administrative_district_level_1') or '').strip()
-                zipc = (caddr.get('postal_code') or '').strip()
-                if line1 and city and state:
-                    pretty = f'{line1}, {city}, {state} {zipc}'.strip()
-                    if pretty not in profile['addresses']:
-                        profile['addresses'].append(pretty)
-                if cust.get('given_name') and not profile.get('recognized_first_name'):
-                    profile['recognized_first_name'] = cust.get('given_name')
-                if cust.get('family_name') and not profile.get('recognized_last_name'):
-                    profile['recognized_last_name'] = cust.get('family_name')
-                if cust.get('email_address') and not profile.get('recognized_email'):
-                    profile['recognized_email'] = cust.get('email_address')
-        except Exception as e:
-            print('[WARN] pv3 square hydrate failed:', repr(e))
-        finally:
-            profile['square_lookup_done'] = True
-
-    result = _ORIG_GENERATE_REPLY_FOR_INBOUND_V3(cleaned_transcript, category, appointment_type, initial_sms, inbound_text, scheduled_date, scheduled_time, address)
-    sms = (result.get('sms_body') or '').strip()
-    appt = (sched.get('appointment_type') or appointment_type or '').upper()
-
-    # First text: reference the actual job topics from a rambling voicemail.
-    if not inbound_text.strip() and cleaned_transcript:
-        summary = _pv3_compose_job_summary(cleaned_transcript)
-        if summary and not sched.get('voicemail_job_summary_sent'):
-            if summary not in sms:
-                sms = f'{sms} {summary}'.strip()
-            sched['voicemail_job_summary_sent'] = True
-
-    # First text: if we know the likely customer address, ask to confirm it instead of asking again from scratch.
-    if ('house number and street name' in sms.lower() or 'what’s the address' in sms.lower() or "what's the address" in sms.lower()) and not sched.get('raw_address'):
-        known = _pv3_known_address(profile)
-        if known:
-            sched['known_service_address'] = known
-            sms = re.sub(r'What is the house number and street name in [^.?!]+[?.!]*', f'Is this still for {known}, or is this a different address?', sms, flags=re.I)
-            sms = re.sub(r'What[’\']?s the address[^.?!]*[?.!]*', f'Is this still for {known}, or is this a different address?', sms, flags=re.I)
-
-    # User hesitation: do not immediately push back into booking.
-    if inbound_text.strip():
-        reassure = _pv3_reassurance_reply(conv, inbound_text)
-        if reassure and _pv3_hesitation_kind(inbound_text) in {'trust', 'price', 'ai'}:
-            sms = reassure
-
-    sms = _pv3_dedupe_and_soften_price(sms, appt_type=appt)
-    result['sms_body'] = sms
-    return result
