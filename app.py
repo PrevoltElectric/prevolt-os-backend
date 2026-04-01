@@ -2,6 +2,8 @@ import os
 import json
 import time
 import uuid
+import random
+import threading
 from pathlib import Path
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
@@ -121,6 +123,60 @@ def home():
 # In-Memory Conversation Store
 # ---------------------------------------------------
 conversations = {}
+conversation_locks = {}
+conversation_locks_guard = threading.Lock()
+
+
+def get_conversation_lock(convo_key: str):
+    key = str(convo_key or "unknown")
+    with conversation_locks_guard:
+        lock = conversation_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            conversation_locks[key] = lock
+        return lock
+
+
+def append_inbound_history(conv: dict, inbound_text: str, now_ts: float | None = None) -> None:
+    if not inbound_text:
+        return
+    now_ts = now_ts or time.time()
+    hist = conv.setdefault("inbound_history", [])
+    norm = re.sub(r"\s+", " ", (inbound_text or "").strip())
+    if not norm:
+        return
+    hist.append({"ts": now_ts, "text": norm})
+    cutoff = now_ts - 1800
+    hist[:] = [x for x in hist[-25:] if float(x.get("ts") or 0) >= cutoff]
+
+
+def recent_inbound_window_text(conv: dict, seconds: int = 75, max_messages: int = 5) -> str:
+    hist = conv.get("inbound_history") or []
+    if not hist:
+        return ""
+    now_ts = time.time()
+    items = [h.get("text", "") for h in hist if (now_ts - float(h.get("ts") or 0)) <= seconds]
+    items = [x.strip() for x in items if x and x.strip()]
+    return " ".join(items[-max_messages:]).strip()
+
+
+def has_explicit_change_cue(text: str) -> bool:
+    low = _loose_text(text)
+    return any(p in low for p in [
+        "actually", "instead", "change it to", "make it", "use ", "different time",
+        "different date", "different address", "new address", "correction", "sorry",
+        "not that", "switch it to", "move it to", "reschedule", "update my"
+    ])
+
+
+def build_full_address_string(addr_struct: dict | None) -> str:
+    if not isinstance(addr_struct, dict):
+        return ""
+    return ", ".join([
+        (addr_struct.get("address_line_1") or "").strip(),
+        (addr_struct.get("locality") or "").strip(),
+        ((addr_struct.get("administrative_district_level_1") or "").strip() + " " + (addr_struct.get("postal_code") or "").strip()).strip(),
+    ]).strip(", ")
 
 
 # ---------------------------------------------------
@@ -1646,7 +1702,11 @@ def incoming_sms():
     # Deterministic slot capture before Step 4. This catches mixed real-world texts
     # like "2pm works and we have dogs" or "tomorrow at 1, my email is ..."
     try:
+        append_inbound_history(conv, inbound_text, now_ts=now_ts)
         absorb_obvious_booking_details(conv, inbound_text)
+        burst_text = recent_inbound_window_text(conv)
+        if burst_text and burst_text.strip() and burst_text.strip() != (inbound_text or "").strip():
+            absorb_obvious_booking_details(conv, burst_text)
     except Exception as e:
         print("[WARN] incoming_sms absorb details failed:", repr(e))
 
@@ -2617,30 +2677,34 @@ def salvage_relative_date_from_text(inbound_text: str) -> str | None:
     now_local = datetime.now(ZoneInfo("America/New_York")) if ZoneInfo else datetime.now()
     today = now_local.date()
 
-    if "today" in low:
+    if re.search(r"\btoday\b", low):
         return today.strftime("%Y-%m-%d")
-    if "tomorrow" in low:
+    if re.search(r"\btomorrow\b", low):
         return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    if re.search(r"\bday after tomorrow\b", low):
+        return (today + timedelta(days=2)).strftime("%Y-%m-%d")
 
     weekdays = {
-        "monday": 0,
-        "tuesday": 1,
-        "wednesday": 2,
-        "thursday": 3,
-        "friday": 4,
-        "saturday": 5,
-        "sunday": 6,
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
     }
     for name, idx in weekdays.items():
-        if f"next {name}" in low:
+        if re.search(rf"\bnext {name}\b", low):
             delta = (idx - today.weekday()) % 7
             if delta == 0:
                 delta = 7
             delta += 7
             return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
-        if re.search(rf"\b(?:this )?{name}\b", low):
+        if re.search(rf"\b(?:this|coming) {name}\b", low):
             delta = (idx - today.weekday()) % 7
             return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
+        if re.search(rf"\b{name}\b", low):
+            delta = (idx - today.weekday()) % 7
+            return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
+
+    m = re.search(r"\bin (\d{1,2}) days?\b", low)
+    if m:
+        return (today + timedelta(days=int(m.group(1)))).strftime("%Y-%m-%d")
 
     m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", low)
     if m:
@@ -2663,6 +2727,30 @@ def salvage_relative_date_from_text(inbound_text: str) -> str | None:
     return None
 
 
+def _extract_inline_address_candidate(text: str) -> str | None:
+    txt = (text or "").strip()
+    if not txt:
+        return None
+    m = re.search(
+        r"\b(\d{1,6}[A-Za-z]?\s+[A-Za-z0-9.'#\- ]+?\s(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b(?:[^.!?\n]*)?)",
+        txt,
+        flags=re.I,
+    )
+    return m.group(1).strip(" ,") if m else None
+
+
+def _extract_name_from_text(text: str) -> tuple[str | None, str | None]:
+    txt = (text or "").strip()
+    if not txt:
+        return None, None
+    m = re.search(r"\b(?:my name is|this is|name is|i am|i'm|im)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?", txt, flags=re.I)
+    if not m:
+        return None, None
+    first = normalize_person_name(m.group(1) or "")
+    last = normalize_person_name(m.group(2) or "")
+    return first or None, last or None
+
+
 def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
@@ -2670,67 +2758,75 @@ def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
     if not txt:
         return
 
-    low = txt.lower()
+    low = _loose_text(txt)
+    change_cue = has_explicit_change_cue(txt)
 
-    if not sched.get("scheduled_date"):
-        d = salvage_relative_date_from_text(txt)
-        if d:
-            sched["scheduled_date"] = d
+    parsed_date = salvage_relative_date_from_text(txt)
+    if parsed_date and (not sched.get("scheduled_date") or change_cue or sched.get("pending_step") == "need_date"):
+        sched["scheduled_date"] = parsed_date
 
-    if not sched.get("scheduled_time"):
-        t = extract_explicit_time_from_text(txt)
-        if t:
-            sched["scheduled_time"] = t
+    parsed_time = extract_explicit_time_from_text(txt)
+    if parsed_time and (not sched.get("scheduled_time") or change_cue or sched.get("pending_step") == "need_time"):
+        sched["scheduled_time"] = parsed_time
 
-    m_name = re.search(r"\b(?:my name is|this is|name is)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?", txt, flags=re.I)
-    if m_name:
-        first = normalize_person_name(m_name.group(1) or "")
-        last = normalize_person_name(m_name.group(2) or "")
-        if first:
-            profile["active_first_name"] = first
-            profile["first_name"] = first
-            if last:
-                profile["active_last_name"] = last
-                profile["last_name"] = last
-            profile["identity_source"] = "customer_provided"
+    first, last = _extract_name_from_text(txt)
+    if first and (not profile.get("active_first_name") or change_cue or sched.get("pending_step") == "need_name"):
+        profile["active_first_name"] = first
+        profile["first_name"] = first
+        profile["identity_source"] = "customer_provided"
+    if last and (not profile.get("active_last_name") or change_cue or sched.get("pending_step") == "need_name"):
+        profile["active_last_name"] = last
+        profile["last_name"] = last
 
     m_email = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", txt, flags=re.I)
-    if m_email:
+    if m_email and (not profile.get("active_email") or change_cue or sched.get("pending_step") == "need_email"):
         email = m_email.group(1).strip()
         profile["active_email"] = email
         profile["email"] = email
 
-    if not sched.get("raw_address"):
-        if re.search(r"\b\d{1,6}\b", txt) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
-            sched["raw_address"] = txt
-            try:
-                if txt not in profile.setdefault("addresses", []):
-                    profile["addresses"].append(txt)
-            except Exception:
-                pass
+    addr_candidate = _extract_inline_address_candidate(txt)
+    if addr_candidate and (not sched.get("raw_address") or change_cue or sched.get("pending_step") == "need_address"):
+        sched["raw_address"] = addr_candidate
+        profile.setdefault("addresses", [])
+        if addr_candidate not in profile["addresses"]:
+            profile["addresses"].append(addr_candidate)
+        sched["normalized_address"] = None
+        try:
+            try_early_address_normalize(sched)
+        except Exception:
+            pass
+
+    only_num = re.fullmatch(r"\s*(\d{1,6}[A-Za-z]?)\s*", txt)
+    if only_num and sched.get("address_missing") == "number":
+        num = only_num.group(1)
+        base = (sched.get("raw_address") or sched.get("address_candidate") or "").strip()
+        if base and not re.match(r"^\d{1,6}[A-Za-z]?\b", base):
+            sched["raw_address"] = f"{num} {base}".strip()
+            sched["normalized_address"] = None
             try:
                 try_early_address_normalize(sched)
             except Exception:
                 pass
 
-    if sched.get("address_missing") == "number":
-        only_num = re.fullmatch(r"\s*(\d{1,6})\s*", txt)
-        if only_num:
-            num = only_num.group(1)
-            base = (sched.get("raw_address") or sched.get("address_candidate") or "").strip()
-            if base and not re.match(r"^\d{1,6}\b", base):
-                sched["raw_address"] = f"{num} {base}".strip()
-                sched["normalized_address"] = None
-                try:
-                    try_early_address_normalize(sched)
-                except Exception:
-                    pass
+    if (sched.get("address_missing") in {"state", "confirm", "number"}) or re.fullmatch(r"(?:ct|connecticut|ma|massachusetts)", low or ""):
+        try:
+            apply_partial_address_reply(sched, txt)
+        except Exception:
+            pass
 
-    if (sched.get("address_missing") in {"state", "confirm"}) and low in {"ct", "connecticut", "ma", "massachusetts"}:
-        apply_partial_address_reply(sched, txt)
+    if change_cue and not addr_candidate:
+        alt = _extract_inline_address_candidate(re.sub(r"\b(?:use|instead|actually|change it to|move it to|new address|different address)\b", " ", txt, flags=re.I))
+        if alt:
+            sched["raw_address"] = alt
+            sched["normalized_address"] = None
+            try:
+                try_early_address_normalize(sched)
+            except Exception:
+                pass
 
     update_address_assembly_state(sched)
     recompute_pending_step(profile, sched)
+
 
 def detect_soft_rejection(inbound_text: str) -> str | None:
     low = _loose_text(inbound_text)
@@ -4176,9 +4272,16 @@ def is_weekend(date_str: str) -> bool:
 def maybe_create_square_booking(phone: str, convo: dict):
     import re
 
-    sched = convo.setdefault("sched", {})
-    profile = convo.setdefault("profile", {})
-    current_job = convo.setdefault("current_job", {})
+    lock = get_conversation_lock(phone or convo.get("_convo_key") or "unknown")
+    with lock:
+        sched = convo.setdefault("sched", {})
+        profile = convo.setdefault("profile", {})
+        current_job = convo.setdefault("current_job", {})
+
+        inflight_until = float(sched.get("booking_inflight_until") or 0)
+        if inflight_until and inflight_until > time.time():
+            return
+        sched["booking_inflight_until"] = time.time() + 20
 
     # Harden profile keys (prevents KeyError elsewhere)
     profile.setdefault("addresses", [])
@@ -4493,60 +4596,61 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     except Exception as e:
         print("[ERROR] Square exception:", repr(e))
-
+    finally:
+        try:
+            sched["booking_inflight_until"] = 0
+        except Exception:
+            pass
 
 
 def _build_regression_messages() -> list[str]:
-    base_times = ["2pm", "2:30 pm", "1500", "tomorrow", "today", "next friday"]
-    questions = [
-        "we have dogs is that okay",
+    slots = [
+        "2pm works and we have dogs",
+        "tomorrow at 1 and my email is amy@test.com",
+        "next friday at 3",
+        "1500 works",
+        "today",
+        "this friday 2:30 pm",
+        "actually make that 3pm instead",
+        "use 54 Bloomfield Ave Windsor CT instead",
+        "Dickerman Ave",
+        "54",
+        "Windsor CT",
+        "CT",
+        "my name is Kyle Prevost",
+        "this is Amy Jones",
+        "kyle@prevoltllc.com",
+        "no power right now",
+        "panel smells like smoke",
+        "sparks from the outlet",
+        "do you service Windsor Locks",
         "does the 195 go toward the work",
-        "do you service windsor locks",
         "can you text when close",
         "i need to ask my wife first",
+        "same address as last time",
+        "i already gave the address",
+        "use my work email instead test2@example.com",
     ]
     addresses = [
         "54 Bloomfield Ave Windsor CT",
         "12B Greenbrier Dr Enfield CT",
-        "Dickerman Ave",
-        "Windsor Locks",
         "125 West Rd gate code 1888",
+        "24 Main St Springfield MA",
     ]
-    names = [
-        "my name is Kyle Prevost",
-        "this is Amy Jones",
-        "name is Bob",
-        "amy.jones@email.com",
-        "kyle@prevoltllc.com",
-    ]
-
     out = []
-    for t in base_times:
-        for q in questions:
-            out.append(f"{t} works and {q}")
-    for a in addresses:
-        for t in base_times[:3]:
-            out.append(f"{a} and {t}")
-    for n in names:
-        for t in base_times[:4]:
-            out.append(f"{n} {t}")
-
-    extras = [
-        "yes", "no", "CT", "MA", "54", "tomorrow at 2pm and we have dogs",
-        "my name is Kyle Prevost and tomorrow at 2 works",
-        "12 main st windsor ct and my email is test@example.com",
-        "no power right now", "sparking panel", "panel smells like smoke",
-    ]
-    out.extend(extras)
-
+    for s in slots:
+        out.append(s)
+        for a in addresses:
+            out.append(f"{s} {a}")
     while len(out) < 500:
-        out.append(out[len(out) % len(out)])
+        out.append(random.choice(out))
+    random.Random(42).shuffle(out)
     return out[:500]
 
 
 def run_local_regression_smoke_tests() -> dict:
     samples = _build_regression_messages()
-    seed_conv = {
+    base_conv = {
         "profile": {
             "addresses": [], "past_jobs": [], "upcoming_appointment": None,
             "first_name": None, "last_name": None, "email": None,
@@ -4558,38 +4662,49 @@ def run_local_regression_smoke_tests() -> dict:
             "address_candidate": None, "address_verified": False, "address_missing": None, "address_parts": {},
         }
     }
-
-    captured_time = 0
-    captured_date = 0
-    captured_email = 0
-    captured_name = 0
-    captured_address = 0
+    stats = {
+        "cases": len(samples),
+        "captured_time": 0,
+        "captured_date": 0,
+        "captured_email": 0,
+        "captured_name": 0,
+        "captured_address": 0,
+        "change_updates": 0,
+        "burst_merge_hits": 0,
+    }
 
     for msg in samples:
-        conv = json.loads(json.dumps(seed_conv))
+        conv = json.loads(json.dumps(base_conv))
+        append_inbound_history(conv, msg, now_ts=time.time())
         absorb_obvious_booking_details(conv, msg)
         p = conv["profile"]
         s = conv["sched"]
         if extract_explicit_time_from_text(msg) and s.get("scheduled_time"):
-            captured_time += 1
+            stats["captured_time"] += 1
         if salvage_relative_date_from_text(msg) and s.get("scheduled_date"):
-            captured_date += 1
+            stats["captured_date"] += 1
         if "@" in msg and p.get("email"):
-            captured_email += 1
-        if re.search(r"\b(?:my name is|this is|name is)\b", msg, flags=re.I) and p.get("first_name"):
-            captured_name += 1
-        if re.search(r"\b\d{1,6}\b.*\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", msg, flags=re.I):
-            if s.get("raw_address"):
-                captured_address += 1
+            stats["captured_email"] += 1
+        if re.search(r"\b(?:my name is|this is|name is|i am|i'm|im)\b", msg, flags=re.I) and p.get("first_name"):
+            stats["captured_name"] += 1
+        if _extract_inline_address_candidate(msg) and s.get("raw_address"):
+            stats["captured_address"] += 1
 
-    return {
-        "cases": len(samples),
-        "captured_time": captured_time,
-        "captured_date": captured_date,
-        "captured_email": captured_email,
-        "captured_name": captured_name,
-        "captured_address": captured_address,
-    }
+    conv = json.loads(json.dumps(base_conv))
+    conv["sched"]["raw_address"] = "Dickerman Ave"
+    conv["sched"]["address_missing"] = "number"
+    absorb_obvious_booking_details(conv, "54")
+    if (conv["sched"].get("raw_address") or "").startswith("54 "):
+        stats["burst_merge_hits"] += 1
+
+    conv = json.loads(json.dumps(base_conv))
+    absorb_obvious_booking_details(conv, "tomorrow at 2pm")
+    old_time = conv["sched"].get("scheduled_time")
+    absorb_obvious_booking_details(conv, "actually make that 3pm instead")
+    if old_time != conv["sched"].get("scheduled_time") == "15:00":
+        stats["change_updates"] += 1
+
+    return stats
 
 
 # ---------------------------------------------------
