@@ -1501,12 +1501,23 @@ def _canonical_time_question(sched: dict) -> str:
 def _canonical_booking_issue_message(sched: dict) -> str:
     human_d, human_t = _human_day_and_time(sched)
     booking_result = (sched.get("booking_last_result") or "").strip().lower()
+    alt_text = _format_time_options_for_sms(sched.get('booking_alt_times') or [])
     if booking_result == "slot_unavailable":
+        if alt_text and human_t:
+            return f"I’m not seeing {human_t} open on {human_d}. I do have {alt_text} available. Which works best?"
+        if alt_text:
+            return f"I’m not seeing that time open on {human_d}. I do have {alt_text} available. Which works best?"
         if human_t:
             return f"I’m not seeing {human_t} open on {human_d}. What other time works for you that day?"
         return f"I’m not seeing that time open on {human_d}. What other time works for you that day?"
     if booking_result in {"availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
-        return f"That time did not lock into the calendar. What other time works on {human_d}?"
+        if alt_text:
+            if human_t:
+                return f"I couldn’t confirm {human_t} on {human_d}. I do have {alt_text} available. Which works best?"
+            return f"I couldn’t confirm that time on {human_d}. I do have {alt_text} available. Which works best?"
+        if human_t:
+            return f"I couldn’t confirm {human_t} on {human_d}. What other time works for you that day?"
+        return f"I couldn’t confirm that time on {human_d}. What other time works for you that day?"
     return ""
 
 def _authoritative_sms_override(current_sms: str, sched: dict, booking_created: bool) -> str:
@@ -1581,7 +1592,7 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
                 return "Just to confirm, is this address in Connecticut or Massachusetts?"
             if booking_result in {"slot_unavailable", "inactive_booking_status", "create_failed", "retrieve_failed", "availability_unknown", "exception"}:
                 return _canonical_booking_issue_message(sched)
-            return f"That time did not lock into the calendar. What other time works on {human_d}?"
+            return _canonical_booking_issue_message(sched) or f"I couldn’t confirm that time on {human_d}. What other time works for you that day?"
         return "Okay."
 
     return (conv.get("last_sms_body") or "Okay.").strip() or "Okay."
@@ -2828,6 +2839,12 @@ def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
     parsed_time = extract_explicit_time_from_text(txt)
     if parsed_time and (not sched.get("scheduled_time") or change_cue or sched.get("pending_step") == "need_time"):
         sched["scheduled_time"] = parsed_time
+
+    alt_times = list(sched.get('booking_alt_times') or [])
+    if alt_times and any(p in low for p in ['any time', 'anytime', 'whenever', 'whatever works', 'any works', 'anything open']):
+        sched['scheduled_time'] = alt_times[0]
+        sched['booking_last_result'] = None
+        sched['booking_last_error'] = None
 
     first, last = _extract_name_from_text(txt)
     if first and (not profile.get("active_first_name") or change_cue or sched.get("pending_step") == "need_name"):
@@ -4418,7 +4435,13 @@ def square_active_booking_status(status: str) -> bool:
 
 
 def square_search_exact_availability(scheduled_date: str, scheduled_time: str, variation_id: str, variation_version: int | None, team_member_id: str, location_id: str) -> dict:
-    """Search Square availability for the exact requested local slot."""
+    """Search Square availability for the requested local slot and collect same-day alternatives."""
+    def _to_utc(dt_str: str):
+        try:
+            return datetime.fromisoformat((dt_str or '').replace('Z', '+00:00')).astimezone(timezone.utc)
+        except Exception:
+            return None
+
     try:
         tz = ZoneInfo('America/New_York') if ZoneInfo else timezone.utc
         local_day = datetime.strptime(scheduled_date, '%Y-%m-%d').replace(tzinfo=tz)
@@ -4426,7 +4449,7 @@ def square_search_exact_availability(scheduled_date: str, scheduled_time: str, v
         range_end_local = range_start_local + timedelta(days=1)
         exact_start_utc = parse_local_datetime(scheduled_date, scheduled_time)
         if not exact_start_utc:
-            return {'ok': False, 'available': False, 'matched': None, 'error': 'invalid_start'}
+            return {'ok': False, 'available': False, 'matched': None, 'day_times': [], 'error': 'invalid_start'}
         payload = {
             'query': {
                 'filter': {
@@ -4447,12 +4470,12 @@ def square_search_exact_availability(scheduled_date: str, scheduled_time: str, v
         }
         resp = requests.post('https://connect.squareup.com/v2/bookings/availability/search', headers=square_headers(), json=payload, timeout=12)
         if resp.status_code not in (200, 201):
-            return {'ok': False, 'available': False, 'matched': None, 'error': f'http_{resp.status_code}:{resp.text[:300]}'}
+            return {'ok': False, 'available': False, 'matched': None, 'day_times': [], 'error': f'http_{resp.status_code}:{resp.text[:300]}'}
         data = resp.json() or {}
-        exact_iso = exact_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        desired_utc = exact_start_utc.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        matched = None
+        day_times = []
         for av in data.get('availabilities') or []:
-            if (av.get('start_at') or '').strip() != exact_iso:
-                continue
             if (av.get('location_id') or '').strip() != (location_id or '').strip():
                 continue
             segs = av.get('appointment_segments') or []
@@ -4463,10 +4486,18 @@ def square_search_exact_availability(scheduled_date: str, scheduled_time: str, v
                 continue
             if (seg0.get('service_variation_id') or '').strip() != (variation_id or '').strip():
                 continue
-            return {'ok': True, 'available': True, 'matched': av, 'error': None}
-        return {'ok': True, 'available': False, 'matched': None, 'error': None}
+            start_at_utc = _to_utc(av.get('start_at') or '')
+            if not start_at_utc:
+                continue
+            local_time = start_at_utc.astimezone(tz).strftime('%H:%M')
+            if local_time not in day_times:
+                day_times.append(local_time)
+            if start_at_utc.replace(second=0, microsecond=0) == desired_utc:
+                matched = av
+        day_times = sorted(day_times)
+        return {'ok': True, 'available': bool(matched), 'matched': matched, 'day_times': day_times, 'error': None}
     except Exception as e:
-        return {'ok': False, 'available': False, 'matched': None, 'error': repr(e)}
+        return {'ok': False, 'available': False, 'matched': None, 'day_times': [], 'error': repr(e)}
 
 
 def _human_day_and_time(sched: dict) -> tuple[str, str]:
@@ -4477,6 +4508,22 @@ def _human_day_and_time(sched: dict) -> tuple[str, str]:
         human_day = (sched.get('scheduled_date') or 'that day').strip()
     human_t = humanize_time(sched.get('scheduled_time') or '') or (sched.get('scheduled_time') or 'that time')
     return human_day, human_t
+
+
+def _format_time_options_for_sms(times: list[str] | None, *, limit: int = 3) -> str:
+    vals = []
+    for t in (times or []):
+        ht = humanize_time(t)
+        if ht and ht not in vals:
+            vals.append(ht)
+    vals = vals[:limit]
+    if not vals:
+        return ""
+    if len(vals) == 1:
+        return vals[0]
+    if len(vals) == 2:
+        return f"{vals[0]} or {vals[1]}"
+    return ", ".join(vals[:-1]) + f", or {vals[-1]}"
 
 # ---------------------------------------------------
 # Create Square Booking (Corrected + Step 5B Compatible) — PATCHED (requires house number)
@@ -4622,6 +4669,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
             return {'ok': False, 'result': 'customer_lookup_failed', 'message': None}
 
         av = square_search_exact_availability(scheduled_date, scheduled_time, variation_id, variation_version, SQUARE_TEAM_MEMBER_ID, SQUARE_LOCATION_ID)
+        sched['booking_alt_times'] = list(av.get('day_times') or [])
         if av.get('ok') and not av.get('available'):
             sched['booking_last_result'] = 'slot_unavailable'
             return {'ok': False, 'result': 'slot_unavailable', 'message': None}
@@ -4698,6 +4746,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
         sched['square_booking_id'] = booking_id
         sched['booking_last_result'] = 'booked'
         sched['booking_last_error'] = None
+        sched['booking_alt_times'] = []
         profile['upcoming_appointment'] = {
             'date': scheduled_date,
             'time': scheduled_time,
