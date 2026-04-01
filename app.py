@@ -618,6 +618,11 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     sched = conv.setdefault("sched", {})
     hydrate_square_profile_by_phone(profile, phone)
 
+    if not sched.get("appointment_type"):
+        inferred_appt = (conv.get("appointment_type") or classification.get("appointment_type") or "").strip()
+        if inferred_appt:
+            sched["appointment_type"] = inferred_appt
+
     first_name = (profile.get("active_first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
     intro = f"Hello {first_name}, you've reached Prevolt Electric. I'll help you here by text." if first_name else "You've reached Prevolt Electric. I'll help you here by text."
 
@@ -925,6 +930,8 @@ def voicemail_complete():
     conv["cleaned_transcript"] = cleaned
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
+    if classification.get("appointment_type"):
+        sched["appointment_type"] = classification.get("appointment_type")
     conv["task_topics"] = classification.get("task_topics") or []
     conv.setdefault("initial_sms", cleaned)
     if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
@@ -1582,6 +1589,12 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
             return humanize_question('That day looks full. What other day works best for you?')
 
     step = sched.get("pending_step")
+    if step == "need_appt_type":
+        appt = (conv.get("appointment_type") or sched.get("appointment_type") or "EVAL_195").strip()
+        if appt:
+            sched["appointment_type"] = appt
+            recompute_pending_step(profile, sched)
+            step = sched.get("pending_step")
     if step == "need_address":
         return build_address_prompt(sched)
     if step == "need_date":
@@ -2660,6 +2673,7 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             else:
                 answer = "The $195 covers the evaluation visit itself. If you decide to move forward after that, we go over the next step in person."
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
+            sched["appointment_type"] = sched.get("appointment_type") or "EVAL_195"
             answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
         elif "TROUBLESHOOT" in appt:
             answer = "The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site."
@@ -3642,6 +3656,10 @@ def generate_reply_for_inbound(
         if inbound_text and sched.get("awaiting_known_address_confirm") and sched.get("known_address_candidate"):
             candidate = (sched.get("known_address_candidate") or "").strip()
             if yes_text(inbound_text) or confirmation_accept_text(inbound_text):
+                if not sched.get("appointment_type"):
+                    inferred_appt = (conv.get("appointment_type") or appointment_type or "EVAL_195").strip()
+                    if inferred_appt:
+                        sched["appointment_type"] = inferred_appt
                 sched["raw_address"] = candidate
                 try:
                     result = normalize_address(candidate)
