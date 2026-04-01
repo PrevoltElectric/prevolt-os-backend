@@ -5176,3 +5176,79 @@ def maybe_create_square_booking(phone: str, convo: dict):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
+# ---------------------------------------------------
+# Reset Patch — final outbound override for booking failures / anytime replies
+# ---------------------------------------------------
+
+_orig_generate_reply_for_inbound_reset = generate_reply_for_inbound
+
+def generate_reply_for_inbound(cleaned_transcript, category, appointment_type, initial_sms, inbound_text, scheduled_date, scheduled_time, address):
+    result = _orig_generate_reply_for_inbound_reset(cleaned_transcript, category, appointment_type, initial_sms, inbound_text, scheduled_date, scheduled_time, address)
+    try:
+        phone = ((request.values.get('From') or '').replace('whatsapp:', '').strip())
+        conv = conversations.get(phone) or {}
+        sched = conv.setdefault('sched', {})
+        low = _loose_text(inbound_text or '')
+        any_time = any(p in low for p in ['any time', 'anytime', 'whenever', 'whatever works', 'anything open', 'any works'])
+        booking_result = (sched.get('booking_last_result') or '').strip().lower()
+        alt_times = _slot_candidates_excluding_failed(sched)
+        human_d, human_t = _human_day_and_time(sched)
+        alt_text = _format_time_options_for_sms(alt_times)
+
+        if any_time:
+            sched['booking_anytime_requested'] = True
+            sched['booking_created'] = False
+            sched['square_booking_id'] = None
+            if alt_text:
+                sched['scheduled_time'] = None
+                sched['pending_step'] = 'need_time'
+                sched['booking_force_another_day'] = False
+                result['sms_body'] = f"I do have {alt_text} open on {human_d}. Which works best?"
+            else:
+                sched['scheduled_time'] = None
+                sched['pending_step'] = 'need_date'
+                sched['booking_force_another_day'] = True
+                result['sms_body'] = f"{human_d} is full. What other day works best for you?"
+            result['booking_complete'] = False
+            result['scheduled_time'] = sched.get('scheduled_time')
+            result['scheduled_date'] = sched.get('scheduled_date')
+            result['address'] = sched.get('raw_address') or address
+            result['sms_body'] = _dedupe_sms_sentences(result['sms_body'])
+            return result
+
+        if booking_result in {'slot_unavailable', 'availability_unknown', 'create_failed', 'retrieve_failed', 'inactive_booking_status', 'exception'}:
+            sched['booking_created'] = False
+            sched['square_booking_id'] = None
+            if alt_text:
+                if human_t and human_t != 'that time':
+                    result['sms_body'] = f"{human_t} is not available on {human_d}. I do have {alt_text} open instead. Which works best?"
+                else:
+                    result['sms_body'] = f"That time is not available on {human_d}. I do have {alt_text} open instead. Which works best?"
+                sched['pending_step'] = 'need_time'
+            else:
+                if sched.get('booking_anytime_requested'):
+                    sched['scheduled_time'] = None
+                    sched['pending_step'] = 'need_date'
+                    sched['booking_force_another_day'] = True
+                    result['sms_body'] = f"{human_d} is full. What other day works best for you?"
+                else:
+                    if human_t and human_t != 'that time':
+                        result['sms_body'] = f"{human_t} is not available on {human_d}. What other time works for you that day?"
+                    else:
+                        result['sms_body'] = f"That time is not available on {human_d}. What other time works for you that day?"
+                    sched['pending_step'] = 'need_time'
+            result['booking_complete'] = False
+            result['scheduled_time'] = sched.get('scheduled_time')
+            result['scheduled_date'] = sched.get('scheduled_date')
+            result['address'] = sched.get('raw_address') or address
+            result['sms_body'] = _dedupe_sms_sentences(result['sms_body'])
+            return result
+
+        if result and isinstance(result, dict) and result.get('sms_body'):
+            result['sms_body'] = _dedupe_sms_sentences(result['sms_body'])
+        return result
+    except Exception as e:
+        print('[WARN] reset outbound override failed:', repr(e))
+        return result
+
