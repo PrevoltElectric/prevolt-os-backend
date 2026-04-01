@@ -3159,6 +3159,8 @@ def generate_reply_for_inbound(
             saved = _saved_address_for_town(profile, sched.get("raw_address") or "")
             if not saved:
                 return None
+            sched["awaiting_known_address_confirm"] = True
+            sched["known_address_candidate"] = saved
             return f"I have {saved} on file. Is this for that address?"
 
         # Helpers to capture name/email from inbound text
@@ -3214,6 +3216,8 @@ def generate_reply_for_inbound(
         # Ack memory
         sched.setdefault("last_ack_text", None)
         sched.setdefault("last_ack_ts", None)
+        sched.setdefault("awaiting_known_address_confirm", False)
+        sched.setdefault("known_address_candidate", None)
 
         # Human phrasing memory
         sched.setdefault("prompt_variants", {})
@@ -3534,6 +3538,46 @@ def generate_reply_for_inbound(
                         "address": sched.get("raw_address"),
                         "booking_complete": False
                     }
+
+        if inbound_text and sched.get("awaiting_known_address_confirm") and sched.get("known_address_candidate"):
+            candidate = (sched.get("known_address_candidate") or "").strip()
+            if yes_text(inbound_text) or confirmation_accept_text(inbound_text):
+                sched["raw_address"] = candidate
+                try:
+                    result = normalize_address(candidate)
+                    if isinstance(result, tuple) and len(result) >= 2:
+                        status, addr_struct = result[0], result[1]
+                        if status == "ok" and isinstance(addr_struct, dict):
+                            sched["normalized_address"] = addr_struct
+                    elif isinstance(result, dict):
+                        sched["normalized_address"] = result
+                except Exception as e:
+                    print("[WARN] known-address confirm normalize failed:", repr(e))
+                update_address_assembly_state(sched)
+                if not sched.get("address_verified"):
+                    sched["address_verified"] = True
+                    sched["address_missing"] = None
+                    sched["address_candidate"] = candidate
+                sched["awaiting_known_address_confirm"] = False
+                sched["known_address_candidate"] = None
+                recompute_pending_step(profile, sched)
+            elif no_text(inbound_text):
+                sched["awaiting_known_address_confirm"] = False
+                sched["known_address_candidate"] = None
+                sched["address_verified"] = False
+                if not sched.get("raw_address") or sched.get("raw_address") == candidate:
+                    sched["raw_address"] = None
+                sched["normalized_address"] = None
+                update_address_assembly_state(sched)
+                recompute_pending_step(profile, sched)
+                msg = _finalize_sms(build_address_prompt(sched), sched.get("appointment_type") or appointment_type or "EVAL_195", booking_created=False)
+                return {
+                    "sms_body": msg,
+                    "scheduled_date": sched.get("scheduled_date"),
+                    "scheduled_time": sched.get("scheduled_time"),
+                    "address": sched.get("raw_address"),
+                    "booking_complete": False
+                }
 
         # --------------------------------------
         # Emergency flow (2-step confirmation)
