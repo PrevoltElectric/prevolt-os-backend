@@ -755,6 +755,7 @@ def handle_call_selection():
     sched.setdefault("address_verified", False)
     sched.setdefault("appointment_type", None)
     sched.setdefault("booking_created", False)
+    sched.setdefault("booking_anytime_requested", False)
     sched.setdefault("name_engine_state", None)
     sched.setdefault("name_engine_prompted", False)
     sched.setdefault("name_engine_candidate_first", None)
@@ -788,6 +789,7 @@ def handle_call_selection():
     sched.setdefault("normalized_address", None)
     sched.setdefault("raw_address", None)
     sched.setdefault("booking_created", False)
+    sched.setdefault("booking_anytime_requested", False)
 
     # Address assembly state keys (so later helpers are safe)
     sched.setdefault("address_candidate", None)
@@ -1479,6 +1481,7 @@ def _sentence_fingerprint(s: str) -> str:
     return " ".join(s.split())
 
 def _dedupe_sms_sentences(text: str) -> str:
+    text = re.sub(r'(What time works best for you\?)(?:\s*)+', r'\1', text or '', flags=re.I)
     parts = _split_sms_sentences(text)
     out = []
     seen = set()
@@ -1504,17 +1507,21 @@ def _canonical_booking_issue_message(sched: dict) -> str:
     alt_text = _format_time_options_for_sms(sched.get('booking_alt_times') or [])
     if booking_result == "slot_unavailable":
         if alt_text and human_t:
-            return f"I’m not seeing {human_t} open on {human_d}. I do have {alt_text} available. Which works best?"
+            return f"We’re booked at {human_t} on {human_d}. I do have {alt_text} open. Which works best?"
         if alt_text:
-            return f"I’m not seeing that time open on {human_d}. I do have {alt_text} available. Which works best?"
+            return f"That time is booked on {human_d}. I do have {alt_text} open. Which works best?"
+        if sched.get('booking_anytime_requested'):
+            return f"We’re booked up on {human_d}. Would another day work better?"
         if human_t:
-            return f"I’m not seeing {human_t} open on {human_d}. What other time works for you that day?"
-        return f"I’m not seeing that time open on {human_d}. What other time works for you that day?"
+            return f"We’re booked at {human_t} on {human_d}. What other time works for you that day?"
+        return f"That time is booked on {human_d}. What other time works for you that day?"
     if booking_result in {"availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
         if alt_text:
             if human_t:
-                return f"I couldn’t confirm {human_t} on {human_d}. I do have {alt_text} available. Which works best?"
-            return f"I couldn’t confirm that time on {human_d}. I do have {alt_text} available. Which works best?"
+                return f"I couldn’t confirm {human_t} on {human_d}, but I do have {alt_text} open. Which works best?"
+            return f"I couldn’t confirm that time on {human_d}, but I do have {alt_text} open. Which works best?"
+        if sched.get('booking_anytime_requested'):
+            return f"I’m not seeing anything open on {human_d} right now. Would another day work better?"
         if human_t:
             return f"I couldn’t confirm {human_t} on {human_d}. What other time works for you that day?"
         return f"I couldn’t confirm that time on {human_d}. What other time works for you that day?"
@@ -1532,6 +1539,10 @@ def _authoritative_sms_override(current_sms: str, sched: dict, booking_created: 
     pending = (sched.get("pending_step") or "").strip().lower()
     low = _sentence_fingerprint(s)
     if pending == "need_time":
+        if booking_result in {"slot_unavailable", "availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
+            msg = _canonical_booking_issue_message(sched)
+            if msg:
+                return msg
         if "what time works" in low:
             return _canonical_time_question(sched)
     if pending == "need_date" and "what day works" in low:
@@ -1565,6 +1576,10 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
         "ill be home this afternoon", "today works", "i'm available today", "im available today"
     }
     provided_ambiguous_time = any(p in inbound_low for p in ambiguous_times | time_of_day_phrases)
+
+    if (sched.get('booking_last_result') or '').strip().lower() in {'slot_unavailable','availability_unknown','create_failed','retrieve_failed','inactive_booking_status','exception'}:
+        if sched.get('booking_anytime_requested') and not (sched.get('booking_alt_times') or []):
+            return humanize_question('That day looks full. What other day works best for you?')
 
     step = sched.get("pending_step")
     if step == "need_address":
@@ -2841,10 +2856,14 @@ def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
         sched["scheduled_time"] = parsed_time
 
     alt_times = list(sched.get('booking_alt_times') or [])
-    if alt_times and any(p in low for p in ['any time', 'anytime', 'whenever', 'whatever works', 'any works', 'anything open']):
-        sched['scheduled_time'] = alt_times[0]
-        sched['booking_last_result'] = None
-        sched['booking_last_error'] = None
+    if any(p in low for p in ['any time', 'anytime', 'whenever', 'whatever works', 'any works', 'anything open']):
+        sched['booking_anytime_requested'] = True
+        if alt_times:
+            sched['scheduled_time'] = alt_times[0]
+            sched['booking_last_result'] = None
+            sched['booking_last_error'] = None
+    else:
+        sched['booking_anytime_requested'] = False
 
     first, last = _extract_name_from_text(txt)
     if first and (not profile.get("active_first_name") or change_cue or sched.get("pending_step") == "need_name"):
@@ -4026,7 +4045,7 @@ def generate_reply_for_inbound(
 
                 attempt_result = (booking_attempt.get("result") or sched.get("booking_last_result") or "").strip().lower()
                 if attempt_result == "slot_unavailable":
-                    fallback = f"I’m not seeing {human_time} open on {human_day}. What other time works for you that day?"
+                    fallback = _canonical_booking_issue_message(sched) or f"We’re booked at {human_time} on {human_day}. What other time works for you that day?"
                     fallback = _finalize_sms(fallback, appt_type, booking_created=False)
                     return {
                         "sms_body": fallback,
@@ -4036,7 +4055,7 @@ def generate_reply_for_inbound(
                         "booking_complete": False
                     }
                 if attempt_result in {"availability_unknown", "create_failed", "retrieve_failed", "inactive_booking_status", "exception"}:
-                    fallback = f"That time did not lock into the calendar. What other time works on {human_day}?"
+                    fallback = _canonical_booking_issue_message(sched) or f"I couldn’t confirm that time on {human_day}. What other time works for you that day?"
                     fallback = _finalize_sms(fallback, appt_type, booking_created=False)
                     return {
                         "sms_body": fallback,
