@@ -1509,8 +1509,6 @@ def build_emergency_booking_followup_reply(conv: dict, booking_attempt=None) -> 
         msg = (booking_attempt or {}).get("message") or sched.get("last_slot_unavailable_message")
         if msg:
             return msg
-    if status == "same_day_emergency_unavailable":
-        return "This is still being treated as urgent, but Square is not giving me a clean same-day emergency slot to lock in automatically. Reply dispatch and I’ll keep this on today’s emergency board."
     if status in {"needs_state"}:
         return "Just to confirm, is this address in Connecticut or Massachusetts?"
     if status in {"missing_house_number", "address_not_verified", "address_incomplete", "address_normalization_failed", "normalize_exception", "missing_address"}:
@@ -1575,10 +1573,7 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
         return humanize_question("What is the best email address for the appointment?")
 
     # Emergency mode should follow the same one-piece-at-a-time path as normal booking.
-    # The only difference is the wording once booked and the preset same-day emergency slot.
-    if is_emergency and sched.get("emergency_approved") and not (sched.get("booking_created") and sched.get("square_booking_id")):
-        if emergency_ready_for_same_booking_path(conv):
-            return "Ready to book."
+    # Do not surface placeholder text like "Ready to book." back to the customer.
 
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
@@ -1993,6 +1988,33 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms town correction failed:", repr(e))
 
+    # Explicit emergency dispatch retry should attempt the Square booking path again,
+    # not fall through and surface a placeholder like "Ready to book.".
+    try:
+        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        inbound_norm = re.sub(r"\s+", " ", (inbound_text or "").strip().lower())
+        dispatch_retry_words = {"dispatch", "dispatch now", "send", "send now", "book", "book now", "go ahead", "try again"}
+        if emergency_thread and inbound_norm in dispatch_retry_words and not (sched.get("booking_created") and sched.get("square_booking_id")):
+            update_address_assembly_state(sched)
+            recompute_pending_step(profile, sched)
+            if emergency_ready_for_same_booking_path(conv):
+                booking_attempt = maybe_create_square_booking(phone, conv)
+                if sched.get("booking_created") and sched.get("square_booking_id"):
+                    reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
+                else:
+                    reply = build_emergency_booking_followup_reply(conv, booking_attempt)
+                reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = reply.strip()
+                tw = MessagingResponse()
+                tw.message(reply.strip())
+                return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms emergency dispatch retry fast-path failed:", repr(e))
+
     # Identity capture must not fall through into address parsing.
     try:
         update_address_assembly_state(sched)
@@ -2194,7 +2216,7 @@ def incoming_sms():
         print("[WARN] incoming_sms route-level emergency booking attempt failed:", repr(e))
 
     # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
-    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure.", "Dispatching now.", "Ready to book."}
+    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure.", "Dispatching now."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
 
@@ -5068,30 +5090,21 @@ def maybe_create_square_booking(phone: str, convo: dict):
     day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
     exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
 
-    # Emergency immediate-dispatch jobs should stay on TODAY.
-    # If Square cannot provide a clean same-day slot, do not silently roll the job to next week.
+    # Emergency immediate-dispatch jobs should first snap to the earliest real same-day Square availability.
+    # If Square does not expose one, we still attempt a same-day forced booking using the currently selected
+    # same-day slot instead of silently rolling the customer to another date.
     if not exact_avail and appointment_type == "TROUBLESHOOT_395":
         tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
         now_local = datetime.now(tz)
-        today_str = now_local.strftime("%Y-%m-%d")
-
-        # Emergency dispatch should always remain anchored to today.
-        if scheduled_date != today_str:
-            sched["scheduled_date"] = today_str
-            scheduled_date = today_str
-
         future_same_day = []
         for a in day_avails:
             try:
-                if (a.get("date") or "") != scheduled_date:
-                    continue
                 hh, mm = (a.get("time") or "").split(":")[:2]
                 slot_local = now_local.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
             except Exception:
                 continue
             if slot_local >= now_local:
                 future_same_day.append((slot_local, a))
-
         future_same_day.sort(key=lambda x: x[0])
         if future_same_day:
             exact_avail = future_same_day[0][1]
@@ -5100,22 +5113,23 @@ def maybe_create_square_booking(phone: str, convo: dict):
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
         else:
-            sched["awaiting_slot_offer_choice"] = False
-            sched["offered_slot_options"] = []
-            sched["last_slot_unavailable_message"] = (
-                "This is still being treated as urgent, but Square is not giving me a clean same-day emergency slot to lock in automatically. "
-                "Reply dispatch and I’ll keep this on today’s emergency board."
-            )
-            return {
-                "status": "same_day_emergency_unavailable",
-                "message": sched["last_slot_unavailable_message"],
-                "options": [],
-            }
+            forced_start = parse_local_datetime(scheduled_date, scheduled_time)
+            if forced_start:
+                exact_avail = {
+                    "date": scheduled_date,
+                    "time": scheduled_time,
+                    "start_at": forced_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "duration_minutes": 60,
+                    "service_variation_id": variation_id,
+                    "service_variation_version": variation_version,
+                    "team_member_id": SQUARE_TEAM_MEMBER_ID,
+                    "forced_same_day_emergency": True,
+                }
 
     if not exact_avail:
         same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
         rolled_slots = []
-        if appointment_type != "TROUBLESHOOT_395" and not same_day_options:
+        if not same_day_options:
             rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
 
         offered = same_day_options or rolled_slots
