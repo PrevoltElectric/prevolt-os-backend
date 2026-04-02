@@ -1572,13 +1572,11 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step == "need_email":
         return humanize_question("What is the best email address for the appointment?")
 
-    # Emergency immediate-dispatch threads must never fall into generic final confirmation.
+    # Emergency mode should follow the same one-piece-at-a-time path as normal booking.
+    # The only difference is the wording once booked and the preset same-day emergency slot.
     if is_emergency and sched.get("emergency_approved") and not (sched.get("booking_created") and sched.get("square_booking_id")):
-        # Never emit a fake dispatch status before a real Square booking exists.
-        # Route back into the concrete missing-piece prompt until the booking gate is truly satisfied.
         if emergency_ready_for_same_booking_path(conv):
             return "Ready to book."
-        return build_emergency_booking_followup_reply(conv)
 
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
@@ -1792,15 +1790,18 @@ def incoming_sms():
                 sched["pending_step"] = None
 
     # Emergency availability / dispatch questions must not get misread as address data.
+    # Important: emergency should only ask for dispatch after the address is fully normalized and verified,
+    # not off a partial raw-address candidate.
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
         emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
         if emergency_thread and is_emergency_availability_question(inbound_text):
             update_address_assembly_state(sched)
-            if not sched.get("raw_address"):
+            recompute_pending_step(profile, sched)
+            if not sched.get("address_verified"):
                 reply = build_address_prompt(sched)
-            elif sched.get("awaiting_emergency_confirm"):
-                reply = "Do you want us to dispatch someone now?"
+            elif sched.get("emergency_approved"):
+                reply = choose_next_prompt_from_state(conv, inbound_text="")
             else:
                 sched["awaiting_emergency_confirm"] = True
                 reply = (
@@ -1847,7 +1848,7 @@ def incoming_sms():
             update_address_assembly_state(sched)
             recompute_pending_step(profile, sched)
 
-            if not sched.get("raw_address"):
+            if not sched.get("address_verified"):
                 reply = build_address_prompt(sched)
             elif not (get_active_first_name(profile) and get_active_last_name(profile)):
                 reply = "What is your first and last name?"
@@ -1889,7 +1890,7 @@ def incoming_sms():
                 update_address_assembly_state(sched)
                 recompute_pending_step(profile, sched)
 
-                if not sched.get("raw_address"):
+                if not sched.get("address_verified"):
                     reply = build_address_prompt(sched)
                 elif not (get_active_first_name(profile) and get_active_last_name(profile)):
                     reply = "What is your first and last name?"
@@ -1925,7 +1926,8 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms emergency confirm fast-path failed:", repr(e))
 
-    # Emergency address capture must bind hard once the customer finally sends the street address.
+    # Emergency address capture should behave like normal booking:
+    # build the address one piece at a time, normalize it, and only then ask about dispatch.
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
         emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
@@ -1946,13 +1948,22 @@ def incoming_sms():
             sched["normalized_address"] = None
             try_early_address_normalize(sched)
             update_address_assembly_state(sched)
-            if sched.get("raw_address") and not sched.get("awaiting_emergency_confirm"):
-                sched["awaiting_emergency_confirm"] = True
-            reply = (
-                f"This looks urgent at {sched.get('raw_address')}. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
-                if sched.get("raw_address") else
-                "This looks urgent. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
-            )
+            recompute_pending_step(profile, sched)
+
+            if sched.get("address_verified"):
+                if sched.get("emergency_approved"):
+                    reply = choose_next_prompt_from_state(conv, inbound_text="")
+                else:
+                    sched["awaiting_emergency_confirm"] = True
+                    reply = (
+                        f"This looks urgent at {sched.get('raw_address')}. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
+                        if sched.get("raw_address") else
+                        "This looks urgent. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
+                    )
+            else:
+                sched["awaiting_emergency_confirm"] = False
+                reply = build_address_prompt(sched)
+
             reply = sanitize_sms_body(reply, booking_created=False)
             conv["last_inbound_sid"] = inbound_sid
             conv["last_inbound_fingerprint"] = inbound_fingerprint
