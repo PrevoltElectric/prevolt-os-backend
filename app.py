@@ -1729,6 +1729,33 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms emergency availability fast-path failed:", repr(e))
 
+    # Emergency address capture must bind hard once the customer finally sends the street address.
+    try:
+        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        inbound_addr_candidate = clean_leading_address_filler(inbound_text)
+        if emergency_thread and is_plausible_address_text(inbound_addr_candidate):
+            sched["raw_address"] = inbound_addr_candidate.strip()
+            try_early_address_normalize(sched)
+            update_address_assembly_state(sched)
+            if sched.get("raw_address") and not sched.get("awaiting_emergency_confirm"):
+                sched["awaiting_emergency_confirm"] = True
+            reply = (
+                f"This looks urgent at {sched.get('raw_address')}. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
+                if sched.get("raw_address") else
+                "This looks urgent. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
+            )
+            reply = sanitize_sms_body(reply, booking_created=False)
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply.strip()
+            tw = MessagingResponse()
+            tw.message(reply.strip())
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms emergency address fast-path failed:", repr(e))
+
     # Let the customer correct a bad town hint without restarting the address flow.
     try:
         maybe_apply_town_correction(conv, inbound_text)
@@ -2427,7 +2454,12 @@ def clean_leading_address_filler(text: str) -> str:
     txt = (text or "").strip()
     if not txt:
         return txt
-    cleaned = re.sub(r"^(?:it'?s|it is|im at|i'm at|my address is|address is|the address is)\s+", "", txt, flags=re.I).strip()
+    cleaned = re.sub(
+        r"^(?:it'?s|it is|im at|i'm at|i live at|we live at|my address is|address is|the address is|it would be|its at|it's at)\s+",
+        "",
+        txt,
+        flags=re.I,
+    ).strip()
     return cleaned or txt
 
 
