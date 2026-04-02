@@ -1446,6 +1446,32 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     update_address_assembly_state(sched)
     return True
 
+def build_emergency_booking_followup_reply(conv: dict, booking_attempt=None) -> str:
+    """Return the next concrete emergency message after a failed booking attempt.
+    Never claim dispatch unless Square actually created a booking."""
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    update_address_assembly_state(sched)
+    recompute_pending_step(profile, sched)
+
+    if sched.get("booking_created") and sched.get("square_booking_id"):
+        return "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
+
+    status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
+    if status == "slot_unavailable":
+        msg = (booking_attempt or {}).get("message") or sched.get("last_slot_unavailable_message")
+        if msg:
+            return msg
+    if status in {"needs_state"}:
+        return "Just to confirm, is this address in Connecticut or Massachusetts?"
+    if status in {"missing_house_number", "address_not_verified", "address_incomplete", "address_normalization_failed", "normalize_exception", "missing_address"}:
+        return build_address_prompt(sched)
+    if not (get_active_first_name(profile) and get_active_last_name(profile)):
+        return "What is your first and last name?"
+    if not get_active_email(profile):
+        return "What is the best email address for the appointment?"
+    return "I have everything I need. One thing failed on the booking side. Reply dispatch and I’ll keep pushing this through here by text."
+
 def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     """Single deterministic next-step selector. Python enforces state; SRBs drive prompt choice."""
     import re
@@ -1826,7 +1852,7 @@ def incoming_sms():
                     if sched.get("booking_created") and sched.get("square_booking_id"):
                         reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
                     elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
-                        reply = booking_attempt.get("message") or "We have your emergency request. We could not lock in the booking yet. I'll keep this moving here by text."
+                        reply = build_emergency_booking_followup_reply(conv, booking_attempt)
                     else:
                         update_address_assembly_state(sched)
                         recompute_pending_step(profile, sched)
@@ -1837,7 +1863,7 @@ def incoming_sms():
                         elif not get_active_email(profile):
                             reply = "What is the best email address for the appointment?"
                         else:
-                            reply = "We have your emergency request. We could not lock in the booking yet. I'll keep this moving here by text."
+                            reply = build_emergency_booking_followup_reply(conv, booking_attempt)
 
                 reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
                 conv["last_inbound_sid"] = inbound_sid
@@ -1917,7 +1943,7 @@ def incoming_sms():
                     if sched.get("booking_created") and sched.get("square_booking_id"):
                         reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
                     else:
-                        reply = "We have your emergency request. We could not lock in the booking yet. I'll keep this moving here by text."
+                        reply = build_emergency_booking_followup_reply(conv, booking_attempt)
                 else:
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
 
@@ -1945,7 +1971,7 @@ def incoming_sms():
                     elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
                         reply = booking_attempt.get("message")
                     else:
-                        reply = "We have your emergency request. We could not lock in the booking yet. I'll keep this moving here by text."
+                        reply = build_emergency_booking_followup_reply(conv, booking_attempt)
                 else:
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
 
