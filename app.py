@@ -3556,6 +3556,56 @@ def generate_reply_for_inbound(
         except Exception as e:
             print("[WARN] partial address merge patch failed:", repr(e))
 
+        # Deterministic emergency continuation. Once a real street address is supplied during
+        # an urgent thread, do not let the LLM flatten it back into just the town hint.
+        try:
+            current_raw_addr = (sched.get("raw_address") or "").strip()
+            has_numbered_street = bool(re.match(r"^\s*\d{1,6}", current_raw_addr)) and bool(re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", current_raw_addr, flags=re.I))
+            if EMERGENCY_CONTEXT_ACTIVE and has_numbered_street and not sched.get("emergency_approved") and not sched.get("awaiting_emergency_confirm"):
+                sched["appointment_type"] = "TROUBLESHOOT_395"
+                sched["pending_step"] = None
+                sched["awaiting_emergency_confirm"] = True
+                urgent_addr_sms = (
+                    f"This looks urgent at {current_raw_addr}. "
+                    "Troubleshoot and repair visits are $395. "
+                    "Do you want us to dispatch someone now?"
+                )
+                urgent_addr_sms = _finalize_sms(urgent_addr_sms, "TROUBLESHOOT_395", booking_created=False)
+                return {
+                    "sms_body": urgent_addr_sms,
+                    "scheduled_date": sched.get("scheduled_date"),
+                    "scheduled_time": sched.get("scheduled_time"),
+                    "address": current_raw_addr,
+                    "booking_complete": False
+                }
+
+            if sched.get("emergency_approved"):
+                active_first = (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or "").strip()
+                active_last = (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or "").strip()
+                active_email = (profile.get("active_email") or profile.get("email") or profile.get("recognized_email") or "").strip()
+                if not ((active_first and active_last) or profile.get("square_customer_id")):
+                    sched["pending_step"] = "need_name"
+                    need_name_sms = _finalize_sms("What is your first and last name for the appointment?", "TROUBLESHOOT_395", booking_created=False)
+                    return {
+                        "sms_body": need_name_sms,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+                if not (active_email or profile.get("square_customer_id")):
+                    sched["pending_step"] = "need_email"
+                    need_email_sms = _finalize_sms("What is the best email address for the appointment?", "TROUBLESHOOT_395", booking_created=False)
+                    return {
+                        "sms_body": need_email_sms,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+        except Exception as e:
+            print("[WARN] deterministic emergency continuation failed:", repr(e))
+
         # If the customer is accepting the last final confirmation, lock that immediately.
         current_final_key = None
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
@@ -3765,6 +3815,17 @@ def generate_reply_for_inbound(
             try:
                 booking_attempt = maybe_create_square_booking(phone, conv)
 
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "missing_contact":
+                    sched["pending_step"] = "need_email"
+                    missing_contact_sms = _finalize_sms("What is the best email address for the appointment?", appt_type, booking_created=False)
+                    return {
+                        "sms_body": missing_contact_sms,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+
                 if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                     unavailable_sms = booking_attempt.get("message") or choose_next_prompt_from_state(conv, inbound_text=inbound_text)
                     unavailable_sms = _finalize_sms(unavailable_sms, appt_type, booking_created=False)
@@ -3868,7 +3929,10 @@ def generate_reply_for_inbound(
                 if ready_for_booking_retry:
                     try:
                         booking_attempt = maybe_create_square_booking(phone, conv)
-                        if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
+                        if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "missing_contact":
+                            sms_body = "What is the best email address for the appointment?"
+                            sched["pending_step"] = "need_email"
+                        elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                             sms_body = booking_attempt.get("message") or "That time is already booked. Here are three other times that work."
                         elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
                             sms_body = "We typically schedule between 9am and 4pm. What time in that window works for you?"
@@ -4549,6 +4613,9 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     if not ((active_first and active_last) or profile.get("square_customer_id")):
         return {"status": "missing_identity"}
+
+    if not (active_email or profile.get("recognized_email") or profile.get("square_customer_id")):
+        return {"status": "missing_contact"}
 
     if sched.get("booking_created") and sched.get("square_booking_id"):
         return {"status": "already_booked"}
