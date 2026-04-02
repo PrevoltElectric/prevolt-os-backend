@@ -248,7 +248,9 @@ def recompute_pending_step(profile: dict, sched: dict) -> None:
 
     if not sched.get("appointment_type"):
         sched["pending_step"] = "need_appt_type"
-    elif not sched.get("raw_address") or not sched.get("address_verified"):
+    elif not sched.get("raw_address") or (
+        not sched.get("address_verified") and not sched.get("emergency_approved")
+    ):
         sched["pending_step"] = "need_address"
     elif not sched.get("scheduled_date"):
         sched["pending_step"] = "need_date"
@@ -1809,7 +1811,19 @@ def incoming_sms():
         emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
         inbound_addr_candidate = extract_inline_address_candidate(inbound_text)
         if emergency_thread and is_plausible_address_text(inbound_addr_candidate):
-            sched["raw_address"] = inbound_addr_candidate.strip()
+            new_addr = inbound_addr_candidate.strip()
+            existing_addr = (sched.get("raw_address") or "").strip()
+
+            if (
+                existing_addr
+                and not re.match(r"^\d{1,6}\b", existing_addr)
+                and re.match(r"^\d{1,6}\b", new_addr)
+            ):
+                sched["raw_address"] = f"{new_addr}, {existing_addr}".strip(" ,")
+            else:
+                sched["raw_address"] = new_addr
+
+            sched["normalized_address"] = None
             try_early_address_normalize(sched)
             update_address_assembly_state(sched)
             if sched.get("raw_address") and not sched.get("awaiting_emergency_confirm"):
@@ -1998,10 +2012,13 @@ def incoming_sms():
     sched["scheduled_time"] = reply.get("scheduled_time")
 
     if reply.get("address"):
-        sched["raw_address"] = reply["address"]
-        # addresses list is guaranteed above
-        if reply["address"] not in profile["addresses"]:
-            profile["addresses"].append(reply["address"])
+        candidate_addr = (reply["address"] or "").strip()
+        if is_plausible_address_text(candidate_addr):
+            sched["raw_address"] = candidate_addr
+            sched["normalized_address"] = None
+            # addresses list is guaranteed above
+            if candidate_addr not in profile["addresses"]:
+                profile["addresses"].append(candidate_addr)
 
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
