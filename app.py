@@ -720,7 +720,7 @@ def handle_call_selection():
             '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
             voice="Polly.Matthew-Neural"
         )
-        response.dial("+15555555555")  # replace with real number
+        response.dial("+18609701727")
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
@@ -1374,12 +1374,8 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step == "need_address":
         return build_address_prompt(sched)
     if step == "need_date":
-        if not sched.get("scheduled_time"):
-            return humanize_question("What day and time work best for you?")
         return humanize_question("What day works best for you?")
     if step == "need_time":
-        if not sched.get("scheduled_date"):
-            return humanize_question("What day and time work best for you?")
         if provided_ambiguous_time:
             if is_emergency:
                 now_hour = datetime.now(ZoneInfo("America/New_York")).hour if ZoneInfo else datetime.utcnow().hour
@@ -1395,10 +1391,8 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
             final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
-            if sched.get("last_final_confirmation_key") == final_key and (
-                sched.get("final_confirmation_sent") or sched.get("final_confirmation_accepted")
-            ):
-                return "Okay."
+            if sched.get("final_confirmation_accepted") and sched.get("last_final_confirmation_key") == final_key:
+                return "Everything looks good here."
             try:
                 if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
                     d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
@@ -3297,9 +3291,6 @@ def generate_reply_for_inbound(
                         s = _apply_intro_once(s)
                         s = _strip_ai_tells(s)
                         s = _shorten_texty(s)
-                    elif not sched.get("scheduled_date") and not sched.get("scheduled_time"):
-                        s = humanize_question("What day and time work best for you?")
-                        s = _apply_intro_once(s)
                     elif not sched.get("scheduled_date"):
                         s = humanize_question("What day works best for you?")
                         s = _apply_intro_once(s)
@@ -3318,9 +3309,6 @@ def generate_reply_for_inbound(
                     update_address_assembly_state(sched)
                     if not sched.get("address_verified"):
                         s = build_address_prompt(sched)
-                        s = _apply_intro_once(s)
-                    elif not sched.get("scheduled_date") and not sched.get("scheduled_time"):
-                        s = humanize_question("What day and time work best for you?")
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_date"):
                         s = humanize_question("What day works best for you?")
@@ -3413,6 +3401,16 @@ def generate_reply_for_inbound(
             sched["scheduled_date"] = today_date_str
             sched["scheduled_time"] = now_local.strftime("%H:%M")
             sched["pending_step"] = None
+            sched["final_confirmation_sent"] = False
+            sched["final_confirmation_accepted"] = False
+            sched["last_final_confirmation_key"] = None
+
+            # Emergency dispatch approvals should move straight toward a real booking.
+            # Best-effort normalize right away so we do not falsely sound confirmed.
+            try:
+                try_early_address_normalize(sched)
+            except Exception as e:
+                print("[WARN] emergency dispatch early normalize failed:", repr(e))
 
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
@@ -3627,11 +3625,6 @@ def generate_reply_for_inbound(
         if model_time:
             sched["scheduled_time"] = model_time
 
-        # CRITICAL: once new slot values are saved, recompute state immediately so
-        # the autobooking gate sees the updated step instead of a stale need_date / need_time.
-        update_address_assembly_state(sched)
-        recompute_pending_step(profile, sched)
-
         # Mid-flow customer interruptions: answer briefly, then return to the next step.
         # Run this AFTER model extraction so combined messages like
         # "Tuesdays usually work best. Is the $195 just to come out?" can
@@ -3724,31 +3717,63 @@ def generate_reply_for_inbound(
                         "booking_complete": False
                     }
 
-                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
-                    sched["final_confirmation_sent"] = False
-                    sched["final_confirmation_accepted"] = False
-                    sched["last_final_confirmation_key"] = None
-                    if sched.get("scheduled_date"):
-                        outside_sms = "We typically schedule between 9am and 4pm. What time in that window works for you?"
-                    else:
-                        outside_sms = "We typically schedule between 9am and 4pm. What day and time in that window work best for you?"
-                    outside_sms = _finalize_sms(outside_sms, appt_type, booking_created=False)
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") in {
+                    "address_not_verified",
+                    "missing_address",
+                    "needs_state",
+                    "address_normalization_failed",
+                    "address_incomplete",
+                    "missing_house_number"
+                }:
+                    update_address_assembly_state(sched)
+                    address_sms = build_address_prompt(sched)
+                    address_sms = _finalize_sms(address_sms, appt_type, booking_created=False)
                     return {
-                        "sms_body": outside_sms,
+                        "sms_body": address_sms,
                         "scheduled_date": sched.get("scheduled_date"),
                         "scheduled_time": sched.get("scheduled_time"),
                         "address": sched.get("raw_address"),
                         "booking_complete": False
                     }
 
-                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "weekend_blocked":
-                    sched["final_confirmation_sent"] = False
-                    sched["final_confirmation_accepted"] = False
-                    sched["last_final_confirmation_key"] = None
-                    weekend_sms = "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
-                    weekend_sms = _finalize_sms(weekend_sms, appt_type, booking_created=False)
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "missing_identity":
+                    identity_sms = "What is your first and last name?"
+                    identity_sms = _finalize_sms(identity_sms, appt_type, booking_created=False)
                     return {
-                        "sms_body": weekend_sms,
+                        "sms_body": identity_sms,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "customer_unavailable":
+                    email_sms = "What is the best email address for the appointment?"
+                    email_sms = _finalize_sms(email_sms, appt_type, booking_created=False)
+                    return {
+                        "sms_body": email_sms,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") in {"missing_fields", "unknown_appointment_type", "create_booking_failed", "retrieve_failed", "missing_booking_id", "missing_booking_version", "accept_failed", "accept_not_final", "square_exception", "normalize_exception"}:
+                    update_address_assembly_state(sched)
+                    recompute_pending_step(profile, sched)
+                    fallback_sms = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+                    if fallback_sms in {"Okay.", "Okay", "You're all set.", "Youre all set."}:
+                        if not sched.get("raw_address") or not sched.get("address_verified"):
+                            fallback_sms = build_address_prompt(sched)
+                        elif not ((get_active_first_name(profile) and get_active_last_name(profile)) or profile.get("square_customer_id")):
+                            fallback_sms = "What is your first and last name?"
+                        elif not (get_active_email(profile) or profile.get("square_customer_id")):
+                            fallback_sms = "What is the best email address for the appointment?"
+                        else:
+                            fallback_sms = "I have the emergency request. I just need one more detail before I can lock it in."
+                    fallback_sms = _finalize_sms(fallback_sms, appt_type, booking_created=False)
+                    return {
+                        "sms_body": fallback_sms,
                         "scheduled_date": sched.get("scheduled_date"),
                         "scheduled_time": sched.get("scheduled_time"),
                         "address": sched.get("raw_address"),
@@ -3787,44 +3812,6 @@ def generate_reply_for_inbound(
             update_address_assembly_state(sched)
             recompute_pending_step(profile, sched)
             sms_body = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
-
-            # If we already have a full slot and booking details but somehow fell through,
-            # do not send a dead-end "Okay.". Re-attempt the booking path once.
-            if sms_body in {"Okay.", "Okay", "ok", "ok."}:
-                has_identity_for_booking = bool(
-                    (get_active_first_name(profile) and get_active_last_name(profile))
-                    or profile.get("square_customer_id")
-                )
-                has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
-                ready_for_booking_retry = (
-                    bool(sched.get("scheduled_date")) and
-                    bool(sched.get("scheduled_time")) and
-                    bool(sched.get("address_verified")) and
-                    bool(sched.get("appointment_type")) and
-                    has_identity_for_booking and
-                    has_contact_for_booking and
-                    not sched.get("pending_step") and
-                    not sched.get("booking_created")
-                )
-                if ready_for_booking_retry:
-                    try:
-                        booking_attempt = maybe_create_square_booking(phone, conv)
-                        if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
-                            sms_body = booking_attempt.get("message") or "That time is already booked. Here are three other times that work."
-                        elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
-                            sms_body = "We typically schedule between 9am and 4pm. What time in that window works for you?"
-                        elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "weekend_blocked":
-                            sms_body = "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
-                        elif sched.get("booking_created") and sched.get("square_booking_id"):
-                            try:
-                                booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
-                                human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
-                            except Exception:
-                                human_day = sched.get("scheduled_date") or "that day"
-                            booked_time = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
-                            sms_body = f"You're all set for {human_day} at {booked_time}. We have you on the schedule."
-                    except Exception as e:
-                        print("[WARN] fallback booking retry failed:", repr(e))
 
         booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
         sms_body = _finalize_sms(sms_body, appt_type, booking_created=booking_created)
