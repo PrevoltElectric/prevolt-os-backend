@@ -584,6 +584,47 @@ def maybe_apply_town_correction(conv: dict, inbound_text: str) -> bool:
     return False
 
 
+def infer_address_town_hint(conv: dict) -> str | None:
+    """Best-effort town hint for partial street addresses in normal booking flow."""
+    try:
+        sched = conv.setdefault("sched", {})
+        raw = (sched.get("raw_address") or "").strip()
+        if raw and not re.match(r"^\d{1,6}\b", raw):
+            hint = _normalize_display_town_hint(raw).strip()
+            if hint and _looks_like_town_only_text(hint):
+                return hint
+
+        initial_sms = (conv.get("initial_sms") or "").strip()
+        if initial_sms:
+            m = re.search(r"\bin\s+([A-Za-z][A-Za-z .'-]{1,40})\?", initial_sms, flags=re.I)
+            if m:
+                hint = _normalize_display_town_hint(m.group(1)).strip(" .,?")
+                if hint and _looks_like_town_only_text(hint):
+                    return hint
+    except Exception:
+        return None
+    return None
+
+
+def merge_partial_address_with_town_hint(conv: dict, street_text: str) -> str:
+    """Attach a known town hint to a street-only reply so regular booking can normalize early."""
+    sched = conv.setdefault("sched", {})
+    street_text = " ".join((street_text or "").strip().split())
+    if not street_text:
+        return street_text
+    if "," in street_text:
+        return street_text
+    if re.search(r"\b(?:CT|MA|Connecticut|Massachusetts)\b", street_text, flags=re.I):
+        return street_text
+
+    town_hint = infer_address_town_hint(conv)
+    if not town_hint:
+        return street_text
+    if town_hint.lower() in street_text.lower():
+        return street_text
+    return f"{street_text}, {town_hint}"
+
+
 def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) -> str:
     """Build the very first outbound text after voicemail without relying on downstream reply routing."""
     profile = conv.setdefault("profile", {})
@@ -927,11 +968,6 @@ def voicemail_complete():
     if classification.get("intent") == "emergency":
         sched["appointment_type"] = "TROUBLESHOOT_395"
         sched["awaiting_emergency_confirm"] = True
-        sched["emergency_approved"] = False
-    else:
-        # Hard reset emergency-dispatch flags for non-emergency threads so
-        # normal bookings can never leak into the dispatch path.
-        sched["awaiting_emergency_confirm"] = False
         sched["emergency_approved"] = False
 
     # 4) Trigger First SMS using deterministic voicemail opener so task topics and known addresses land reliably
@@ -1540,7 +1576,7 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
 
     inbound_low = (inbound_text or "").strip().lower()
     appt = (sched.get("appointment_type") or "").upper()
-    is_emergency = bool(sched.get("emergency_approved")) or bool(sched.get("awaiting_emergency_confirm"))
+    is_emergency = ("TROUBLESHOOT" in appt) or bool(sched.get("emergency_approved")) or bool(sched.get("awaiting_emergency_confirm"))
 
     ambiguous_times = {
         "any time", "anytime", "whenever", "later", "sometime", "around",
@@ -1739,13 +1775,6 @@ def incoming_sms():
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
 
-    # Non-emergency threads must never fall into the dispatch path just because
-    # the appointment type happens to be troubleshoot. Dispatch mode is driven
-    # only by explicit emergency intent / confirmation flags.
-    if conv.get("category") != "EMERGENCY" and conv.get("appointment_type") != "TROUBLESHOOT_395" and sched.get("appointment_type") != "TROUBLESHOOT_395":
-        sched["awaiting_emergency_confirm"] = False
-        sched["emergency_approved"] = False
-
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
     appointment_type = sched.get("appointment_type")
@@ -1810,7 +1839,7 @@ def incoming_sms():
     # not off a partial raw-address candidate.
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
         if emergency_thread and is_emergency_availability_question(inbound_text):
             update_address_assembly_state(sched)
             recompute_pending_step(profile, sched)
@@ -1841,7 +1870,7 @@ def incoming_sms():
     # Emergency dispatch confirmation must never be parsed as address or town text.
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
         confirm_words = {"yes", "yeah", "yup", "ok", "okay", "sure", "send", "dispatch", "book", "do it", "now", "right away", "immediately", "asap", "yes please", "sure please", "please do", "send someone", "send someone now", "dispatch someone", "dispatch someone now", "book it", "go ahead"}
         decline_words = {"no", "nope", "not now", "later"}
         inbound_norm = re.sub(r"\s+", " ", (inbound_text or "").strip().lower())
@@ -1948,7 +1977,7 @@ def incoming_sms():
     # build the address one piece at a time, normalize it, and only then ask about dispatch.
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
         inbound_addr_candidate = extract_inline_address_candidate(inbound_text)
         if emergency_thread and is_plausible_address_text(inbound_addr_candidate):
             new_addr = inbound_addr_candidate.strip()
@@ -1994,6 +2023,47 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms emergency address fast-path failed:", repr(e))
 
+    # Normal booking address capture should also normalize early and preserve the town hint
+    # from the initial voicemail prompt so the address does not disappear later in the flow.
+    try:
+        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        inbound_addr_candidate = extract_inline_address_candidate(inbound_text)
+        if (not emergency_thread) and is_plausible_address_text(inbound_addr_candidate):
+            new_addr = merge_partial_address_with_town_hint(conv, inbound_addr_candidate.strip())
+            existing_addr = (sched.get("raw_address") or "").strip()
+
+            if existing_addr and not re.match(r"^\d{1,6}\b", existing_addr) and re.match(r"^\d{1,6}\b", new_addr):
+                sched["raw_address"] = merge_partial_address_with_town_hint(conv, f"{new_addr}, {existing_addr}".strip(" ,"))
+            else:
+                sched["raw_address"] = new_addr
+
+            sched["normalized_address"] = None
+            try_early_address_normalize(sched)
+            update_address_assembly_state(sched)
+            recompute_pending_step(profile, sched)
+
+            if sched.get("address_verified") and sched.get("pending_step") in {"need_address", None}:
+                if not sched.get("scheduled_date") and not sched.get("scheduled_time"):
+                    reply = humanize_question("What day and time work best for you?")
+                elif not sched.get("scheduled_date"):
+                    reply = humanize_question("What day works best for you?")
+                elif not sched.get("scheduled_time"):
+                    reply = humanize_question("What time works best for you?")
+                else:
+                    reply = choose_next_prompt_from_state(conv, inbound_text="")
+
+                reply = sanitize_sms_body(reply, booking_created=False)
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = reply.strip()
+                tw = MessagingResponse()
+                tw.message(reply.strip())
+                return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms normal address fast-path failed:", repr(e))
+
     # Let the customer correct a bad town hint without restarting the address flow.
     try:
         maybe_apply_town_correction(conv, inbound_text)
@@ -2004,7 +2074,7 @@ def incoming_sms():
     # not fall through and surface a placeholder like "Ready to book.".
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
         inbound_norm = re.sub(r"\s+", " ", (inbound_text or "").strip().lower())
         dispatch_retry_words = {"dispatch", "dispatch now", "send", "send now", "book", "book now", "go ahead", "try again"}
         if emergency_thread and inbound_norm in dispatch_retry_words and not (sched.get("booking_created") and sched.get("square_booking_id")):
@@ -2058,7 +2128,18 @@ def incoming_sms():
                     else:
                         reply = choose_next_prompt_from_state(conv, inbound_text="")
                 else:
-                    reply = choose_next_prompt_from_state(conv, inbound_text="")
+                    update_address_assembly_state(sched)
+                    recompute_pending_step(profile, sched)
+                    if not sched.get("pending_step") and sched.get("address_verified") and sched.get("scheduled_date") and sched.get("scheduled_time") and not sched.get("booking_created"):
+                        booking_attempt = maybe_create_square_booking(phone, conv)
+                        if sched.get("booking_created") and sched.get("square_booking_id"):
+                            reply = f"You’re booked for {humanize_time(sched.get('scheduled_time'))} on {sched.get('scheduled_date')}. We’ll text when we’re on the way."
+                        elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
+                            reply = booking_attempt.get("message")
+                        else:
+                            reply = choose_next_prompt_from_state(conv, inbound_text="")
+                    else:
+                        reply = choose_next_prompt_from_state(conv, inbound_text="")
 
                 reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
                 conv["last_inbound_sid"] = inbound_sid
@@ -2217,7 +2298,7 @@ def incoming_sms():
     # instead of surfacing a placeholder status line.
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
         if emergency_thread and emergency_ready_for_same_booking_path(conv):
             booking_attempt = maybe_create_square_booking(phone, conv)
             if sched.get("booking_created") and sched.get("square_booking_id"):
@@ -2226,6 +2307,29 @@ def incoming_sms():
                 next_prompt = build_emergency_booking_followup_reply(conv, booking_attempt)
     except Exception as e:
         print("[WARN] incoming_sms route-level emergency booking attempt failed:", repr(e))
+
+    # Normal booking threads that are ready should also create the Square booking here.
+    try:
+        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        regular_ready = bool(
+            (not emergency_thread)
+            and sched.get("address_verified")
+            and sched.get("scheduled_date")
+            and sched.get("scheduled_time")
+            and (get_active_first_name(profile) and get_active_last_name(profile))
+            and get_active_email(profile)
+            and not sched.get("pending_step")
+            and not sched.get("booking_created")
+        )
+        if regular_ready:
+            booking_attempt = maybe_create_square_booking(phone, conv)
+            if sched.get("booking_created") and sched.get("square_booking_id"):
+                sms_body = f"You’re booked for {humanize_time(sched.get('scheduled_time'))} on {sched.get('scheduled_date')}. We’ll text when we’re on the way."
+            elif isinstance(booking_attempt, dict) and booking_attempt.get("message") and sms_body in {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure.", "Dispatching now."}:
+                sms_body = booking_attempt.get("message")
+    except Exception as e:
+        print("[WARN] incoming_sms route-level regular booking attempt failed:", repr(e))
 
     # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure.", "Dispatching now."}
