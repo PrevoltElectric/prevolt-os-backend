@@ -248,9 +248,8 @@ def recompute_pending_step(profile: dict, sched: dict) -> None:
 
     if not sched.get("appointment_type"):
         sched["pending_step"] = "need_appt_type"
-    elif not sched.get("raw_address") or (
-        not sched.get("address_verified") and not sched.get("emergency_approved")
-    ):
+    elif not sched.get("raw_address") or not sched.get("address_verified"):
+        # Emergency jobs still require a verified address before they are booking-ready.
         sched["pending_step"] = "need_address"
     elif not sched.get("scheduled_date"):
         sched["pending_step"] = "need_date"
@@ -1575,9 +1574,11 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
 
     # Emergency immediate-dispatch threads must never fall into generic final confirmation.
     if is_emergency and sched.get("emergency_approved") and not (sched.get("booking_created") and sched.get("square_booking_id")):
-        if sched.get("raw_address") and get_active_first_name(profile) and get_active_last_name(profile) and get_active_email(profile):
-            return "Dispatching now."
-        return "Okay."
+        # Never emit a fake dispatch status before a real Square booking exists.
+        # Route back into the concrete missing-piece prompt until the booking gate is truly satisfied.
+        if emergency_ready_for_same_booking_path(conv):
+            return "Ready to book."
+        return build_emergency_booking_followup_reply(conv)
 
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
@@ -2151,8 +2152,22 @@ def incoming_sms():
     sms_body = (reply.get("sms_body") or "").strip()
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
+    # Emergency threads that are truly booking-ready should attempt the real Square booking here,
+    # instead of surfacing a placeholder status line.
+    try:
+        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        if emergency_thread and emergency_ready_for_same_booking_path(conv):
+            booking_attempt = maybe_create_square_booking(phone, conv)
+            if sched.get("booking_created") and sched.get("square_booking_id"):
+                next_prompt = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
+            else:
+                next_prompt = build_emergency_booking_followup_reply(conv, booking_attempt)
+    except Exception as e:
+        print("[WARN] incoming_sms route-level emergency booking attempt failed:", repr(e))
+
     # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
-    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
+    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure.", "Dispatching now.", "Ready to book."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
 
