@@ -900,27 +900,38 @@ def dedupe_repeated_sentences(s: str) -> str:
     if not s:
         return s
 
-    # Exact back-to-back duplicate sentence chunks.
     m = re.match(r'^(.*?[?.!])\s+\1$', s, flags=re.I)
     if m:
         return m.group(1).strip()
 
-    # Duplicate trailing question repeated twice.
     m = re.match(r'^(.*?)(What [^.?!]*\?)\s+\2$', s, flags=re.I)
     if m:
         return (m.group(1) + m.group(2)).strip()
 
+    s = re.sub(r'(?i)(\bwhat day and time work best for you\?)(?:\s+\1)+', r'\1', s)
+    s = re.sub(r'(?i)(\bwhat time works best for you\?)(?:\s+\1)+', r'\1', s)
+    s = re.sub(r'(?i)(\bwhat day works best for you\?)(?:\s+\1)+', r'\1', s)
+
     parts = re.split(r'(?<=[?.!])\s+', s)
     out = []
+    seen_questions = set()
     for part in parts:
         part = part.strip()
         if not part:
             continue
-        if out and out[-1].lower() == part.lower():
+        low = part.lower()
+        if out and out[-1].lower() == low:
             continue
+        if low in {
+            'what day and time work best for you?',
+            'what time works best for you?',
+            'what day works best for you?'
+        }:
+            if low in seen_questions:
+                continue
+            seen_questions.add(low)
         out.append(part)
     return " ".join(out).strip()
-
 
 def _next_available_non_emergency_slots(appointment_type: str, limit: int = 3) -> list[dict]:
     """Return the next few future weekday Square availabilities for non-emergency scheduling."""
@@ -2471,7 +2482,21 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked and not allow_post_booking:
         return None
 
-    # Let the LLM handle trust / hesitation / multi-question turns first.
+    answer = None
+
+    # Hard deterministic priority for availability-style questions.
+    # Do this BEFORE trust / LLM handling so "When can you come out?"
+    # never falls back into a generic scheduling question.
+    if any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
+        offered = _next_available_non_emergency_slots(sched.get("appointment_type") or "EVAL_195", limit=3)
+        if offered:
+            sched["awaiting_slot_offer_choice"] = True
+            sched["offered_slot_options"] = offered
+            sched["last_slot_unavailable_message"] = _format_next_available_slots_message(offered)
+            return dedupe_repeated_sentences(sched["last_slot_unavailable_message"])
+        return "The next availability opens once I can pull live slots. Reply with the day that works best for you."
+
+    # Let the LLM handle trust / hesitation / multi-question turns after deterministic cases.
     trust = llm_trust_reply(conv, inbound_text)
     if trust and trust.get("answer"):
         answer = trust["answer"].strip()
@@ -2480,10 +2505,8 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         if booked or sched.get("soft_rejection_open") or is_conversation_hesitation(inbound_text):
             resume = False
         if resume and next_prompt and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}:
-            return f"{answer} {next_prompt}"
-        return answer
-
-    answer = None
+            return dedupe_repeated_sentences(f"{answer} {next_prompt}")
+        return dedupe_repeated_sentences(answer)
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
         answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
     elif any(x in low for x in ["licensed", "license", "insured", "insurance"]):
@@ -2535,15 +2558,6 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         else:
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
-    elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        offered = _next_available_non_emergency_slots(sched.get("appointment_type") or "EVAL_195", limit=3)
-        if offered:
-            sched["awaiting_slot_offer_choice"] = True
-            sched["offered_slot_options"] = offered
-            sched["last_slot_unavailable_message"] = _format_next_available_slots_message(offered)
-            answer = sched["last_slot_unavailable_message"]
-        else:
-            answer = "Once I have the booking details, I can get you on the schedule."
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
