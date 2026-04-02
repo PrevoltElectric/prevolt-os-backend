@@ -894,6 +894,71 @@ def sanitize_sms_body(s: str, *, booking_created: bool) -> str:
     return s
 
 
+def dedupe_repeated_sentences(s: str) -> str:
+    """Collapse accidental duplicated sentences or repeated trailing prompts."""
+    s = " ".join((s or "").split()).strip()
+    if not s:
+        return s
+
+    # Exact back-to-back duplicate sentence chunks.
+    m = re.match(r'^(.*?[?.!])\s+\1$', s, flags=re.I)
+    if m:
+        return m.group(1).strip()
+
+    # Duplicate trailing question repeated twice.
+    m = re.match(r'^(.*?)(What [^.?!]*\?)\s+\2$', s, flags=re.I)
+    if m:
+        return (m.group(1) + m.group(2)).strip()
+
+    parts = re.split(r'(?<=[?.!])\s+', s)
+    out = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if out and out[-1].lower() == part.lower():
+            continue
+        out.append(part)
+    return " ".join(out).strip()
+
+
+def _next_available_non_emergency_slots(appointment_type: str, limit: int = 3) -> list[dict]:
+    """Return the next few future weekday Square availabilities for non-emergency scheduling."""
+    appt = (appointment_type or "EVAL_195").upper()
+    if "TROUBLESHOOT" in appt:
+        return []
+
+    tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+    today = datetime.now(tz).date()
+    out = []
+    seen = set()
+
+    for days_ahead in range(0, 14):
+        day = today + timedelta(days=days_ahead)
+        if day.weekday() >= 5:
+            continue
+        date_str = day.strftime("%Y-%m-%d")
+        avails = search_square_availability_for_day(date_str, appt)
+        for av in avails:
+            key = (av.get("date"), av.get("time"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(av)
+            if len(out) >= limit:
+                return out
+    return out[:limit]
+
+
+def _format_next_available_slots_message(slots: list[dict]) -> str | None:
+    if not slots:
+        return None
+    labels = []
+    for idx, slot in enumerate(slots[:3], start=1):
+        labels.append(f"{idx}) {slot.get('label') or _humanize_slot_label(slot.get('date'), slot.get('time'))}")
+    return "The next available times I have are " + "; ".join(labels) + ". Reply with 1, 2, or 3."
+
+
 # ---------------------------------------------------
 # build_system_prompt (RESTORED + PATCHED)
 # ---------------------------------------------------
@@ -2471,7 +2536,14 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
     elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        answer = "Once I have the booking details, I can get you on the schedule."
+        offered = _next_available_non_emergency_slots(sched.get("appointment_type") or "EVAL_195", limit=3)
+        if offered:
+            sched["awaiting_slot_offer_choice"] = True
+            sched["offered_slot_options"] = offered
+            sched["last_slot_unavailable_message"] = _format_next_available_slots_message(offered)
+            answer = sched["last_slot_unavailable_message"]
+        else:
+            answer = "Once I have the booking details, I can get you on the schedule."
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
@@ -2496,10 +2568,18 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         if not sched.get("pending_step") and sched.get("scheduled_date") and sched.get("scheduled_time"):
             return answer
 
+    if sched.get("awaiting_slot_offer_choice"):
+        return dedupe_repeated_sentences(answer)
+
     next_prompt = choose_next_prompt_from_state(conv, inbound_text="")
-    if next_prompt and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}:
-        return f"{answer} {next_prompt}"
-    return answer
+    if (
+        next_prompt
+        and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}
+        and "?" not in answer
+        and "Reply with 1, 2, or 3." not in answer
+    ):
+        return dedupe_repeated_sentences(f"{answer} {next_prompt}")
+    return dedupe_repeated_sentences(answer)
 
 def looks_like_slot_payload(inbound_text: str) -> bool:
     txt = (inbound_text or "").strip()
@@ -3355,6 +3435,7 @@ def generate_reply_for_inbound(
             # Final cleanup: ensure no em dash / spaced hyphen survives
             s = s.replace("—", ".").replace("–", ".").replace(" - ", " ")
             s = _norm(s)
+            s = dedupe_repeated_sentences(s)
 
             # Prevent repeating the exact same final ack text twice in a row
             if _is_ack_only(inbound_text):
