@@ -1374,8 +1374,6 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step == "need_address":
         return build_address_prompt(sched)
     if step == "need_date":
-        if not sched.get("scheduled_time"):
-            return humanize_question("What day and time work best for you?")
         return humanize_question("What day works best for you?")
     if step == "need_time":
         if provided_ambiguous_time:
@@ -3293,12 +3291,6 @@ def generate_reply_for_inbound(
                         s = _apply_intro_once(s)
                         s = _strip_ai_tells(s)
                         s = _shorten_texty(s)
-                    elif not sched.get("scheduled_date") and not sched.get("scheduled_time"):
-                        s = humanize_question("What day and time work best for you?")
-                        s = _apply_intro_once(s)
-                    elif not sched.get("scheduled_date") and not sched.get("scheduled_time"):
-                        s = humanize_question("What day and time work best for you?")
-                        s = _apply_intro_once(s)
                     elif not sched.get("scheduled_date"):
                         s = humanize_question("What day works best for you?")
                         s = _apply_intro_once(s)
@@ -3317,12 +3309,6 @@ def generate_reply_for_inbound(
                     update_address_assembly_state(sched)
                     if not sched.get("address_verified"):
                         s = build_address_prompt(sched)
-                        s = _apply_intro_once(s)
-                    elif not sched.get("scheduled_date") and not sched.get("scheduled_time"):
-                        s = humanize_question("What day and time work best for you?")
-                        s = _apply_intro_once(s)
-                    elif not sched.get("scheduled_date") and not sched.get("scheduled_time"):
-                        s = humanize_question("What day and time work best for you?")
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_date"):
                         s = humanize_question("What day works best for you?")
@@ -4232,18 +4218,23 @@ def _format_slot_offer_message(requested_date: str, requested_time: str, same_da
     requested_human = humanize_time(requested_time) if requested_time else "that time"
     if same_day_slots:
         labels = [humanize_time(s.get("time") or "") for s in same_day_slots]
-        lines = [f"{i + 1}. {label}" for i, label in enumerate(labels[:3])]
-        TEMP1
+        if len(labels) == 1:
+            opts = labels[0]
+        elif len(labels) == 2:
+            opts = f"{labels[0]} or {labels[1]}"
+        else:
+            opts = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+        return f"We’re booked at {requested_human}. I have {opts} open that day. Which one works best?"
 
     if rolled_slots:
         labels = [s.get("label") or _humanize_slot_label(s.get("date"), s.get("time")) for s in rolled_slots]
-        lines = [f"{i + 1}. {label}" for i, label in enumerate(labels[:3])]
-        return "\n".join([
-            "That day is full.",
-            "I have:",
-            *lines,
-            "Reply with 1, 2, or 3."
-        ])
+        if len(labels) == 1:
+            opts = labels[0]
+        elif len(labels) == 2:
+            opts = f"{labels[0]} or {labels[1]}"
+        else:
+            opts = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+        return f"That day is full. I have {opts}. Which one works best?"
 
     human_day = _humanize_date_for_sms(requested_date)
     return f"We’re fully booked for {human_day}. Would another day work?"
