@@ -553,6 +553,38 @@ def enrich_address_with_known_town(raw_address: str, initial_sms: str = "", clea
         return f"{raw}, {town}"
     return raw
 
+
+def normalize_address_with_context(raw_address: str, *context_texts: str):
+    raw = " ".join((raw_address or "").strip().split())
+    if not raw:
+        return "error", None
+
+    # First try the raw address as-is.
+    status, addr = normalize_address(raw)
+    if status == "ok" and isinstance(addr, dict):
+        return status, addr
+
+    town_hint = ""
+    for txt in context_texts:
+        town_hint = extract_town_hint_from_text(txt or "")
+        if town_hint:
+            break
+
+    best = None
+    for forced_state in ("CT", "MA"):
+        st, candidate = normalize_address(raw, forced_state=forced_state)
+        if st == "ok" and isinstance(candidate, dict):
+            if town_hint:
+                cand_city = (candidate.get("locality") or "").strip().lower()
+                if cand_city == town_hint.strip().lower():
+                    return st, candidate
+            if best is None:
+                best = (st, candidate)
+
+    if best:
+        return best
+    return status, addr
+
 def _looks_like_town_only_text(text: str) -> bool:
     txt = " ".join((text or "").replace(",", " ").split()).strip()
     if not txt:
@@ -999,6 +1031,9 @@ def voicemail_complete():
     # 4) Trigger First SMS using deterministic voicemail opener so task topics and known addresses land reliably
     try:
         initial_msg = build_initial_voicemail_sms(conv, classification, from_number)
+        conv["initial_outbound_sms"] = initial_msg
+        conv["last_sms_body"] = initial_msg
+        conv.setdefault("sched", {}).setdefault("address_prompt_context", initial_msg)
         send_sms(from_number, initial_msg)
     except Exception as e:
         print("[ERROR] voicemail_complete → initial sms:", repr(e))
@@ -1452,7 +1487,9 @@ def try_early_address_normalize(sched: dict) -> None:
         return
 
     try:
-        result = normalize_address(raw)
+        context_hint = sched.get("address_prompt_context") or ""
+        status, addr_struct = normalize_address_with_context(raw, context_hint)
+        result = (status, addr_struct)
     except Exception as e:
         print("[WARN] try_early_address_normalize normalize_address failed:", repr(e))
         return
@@ -1724,6 +1761,7 @@ def incoming_sms():
     # Initialize layers (HARDENED: never assume dict shape)
     # ---------------------------------------------------
     conv = conversations.setdefault(phone, {})
+    conv.setdefault("initial_outbound_sms", conv.get("last_sms_body") or "")
 
     # Twilio and WhatsApp can occasionally retry the same inbound webhook.
     # Guard both by inbound SID and by a short body fingerprint window.
@@ -2196,7 +2234,7 @@ def incoming_sms():
                 else:
                     sched["raw_address"] = enrich_address_with_known_town(
                         sched.get("raw_address") or "",
-                        conv.get("last_sms_body") or conv.get("initial_sms") or "",
+                        conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
                         conv.get("cleaned_transcript") or "",
                     )
                     try_early_address_normalize(sched)
@@ -2327,7 +2365,7 @@ def incoming_sms():
         if is_plausible_address_text(candidate_addr):
             merged_addr = enrich_address_with_known_town(
                 candidate_addr,
-                conv.get("last_sms_body") or conv.get("initial_sms") or "",
+                conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
                 conv.get("cleaned_transcript") or "",
             )
             existing_addr = (sched.get("raw_address") or "").strip()
@@ -2363,7 +2401,7 @@ def incoming_sms():
         elif (not emergency_thread) and (not sched.get("booking_created")):
             sched["raw_address"] = enrich_address_with_known_town(
                 sched.get("raw_address") or "",
-                conv.get("last_sms_body") or conv.get("initial_sms") or "",
+                conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
                 conv.get("cleaned_transcript") or "",
             )
             try_early_address_normalize(sched)
@@ -5355,7 +5393,12 @@ def maybe_create_square_booking(phone: str, convo: dict):
             return {"status": "missing_address"}
 
         try:
-            status, fresh = normalize_address(raw_address)
+            status, fresh = normalize_address_with_context(
+                raw_address,
+                convo.get("initial_outbound_sms") or "",
+                convo.get("cleaned_transcript") or "",
+                convo.get("initial_sms") or "",
+            )
         except Exception as e:
             print("[ERROR] normalize_address exception:", repr(e))
             return {"status": "normalize_exception"}
