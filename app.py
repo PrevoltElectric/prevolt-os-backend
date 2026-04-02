@@ -1394,23 +1394,14 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
 
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
-            final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
-            if sched.get("last_final_confirmation_key") == final_key and (
-                sched.get("final_confirmation_sent") or sched.get("final_confirmation_accepted")
-            ):
-                return "Okay."
-            try:
-                if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
-                    d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
-                    human_d = d.strftime("%A, %B %d").replace(" 0", " ")
-                else:
-                    human_d = (sched.get("scheduled_date") or "that day").strip()
-            except Exception:
-                human_d = (sched.get("scheduled_date") or "that day").strip()
-            human_t = humanize_time(sched.get("scheduled_time")) if sched.get("scheduled_time") else "that time"
-            sched["final_confirmation_sent"] = True
-            sched["last_final_confirmation_key"] = final_key
-            return f"Just to confirm, {human_d} at {human_t}. Is that still good?"
+            # Date and time are already locked in.
+            # Do not add a separate confirmation hop here.
+            # The flow should move straight into Square booking logic and only speak up
+            # if the slot is unavailable or after the appointment is actually booked.
+            sched["final_confirmation_sent"] = False
+            sched["final_confirmation_accepted"] = False
+            sched["last_final_confirmation_key"] = None
+            return "Okay."
         return "Okay."
 
     return (conv.get("last_sms_body") or "Okay.").strip() or "Okay."
