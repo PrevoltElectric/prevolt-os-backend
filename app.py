@@ -1374,8 +1374,12 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step == "need_address":
         return build_address_prompt(sched)
     if step == "need_date":
+        if not sched.get("scheduled_time"):
+            return humanize_question("What day and time work best for you?")
         return humanize_question("What day works best for you?")
     if step == "need_time":
+        if not sched.get("scheduled_date"):
+            return humanize_question("What day and time work best for you?")
         if provided_ambiguous_time:
             if is_emergency:
                 now_hour = datetime.now(ZoneInfo("America/New_York")).hour if ZoneInfo else datetime.utcnow().hour
@@ -1391,8 +1395,10 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
             final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
-            if sched.get("final_confirmation_accepted") and sched.get("last_final_confirmation_key") == final_key:
-                return "Everything looks good here."
+            if sched.get("last_final_confirmation_key") == final_key and (
+                sched.get("final_confirmation_sent") or sched.get("final_confirmation_accepted")
+            ):
+                return "Okay."
             try:
                 if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
                     d = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
@@ -3291,6 +3297,9 @@ def generate_reply_for_inbound(
                         s = _apply_intro_once(s)
                         s = _strip_ai_tells(s)
                         s = _shorten_texty(s)
+                    elif not sched.get("scheduled_date") and not sched.get("scheduled_time"):
+                        s = humanize_question("What day and time work best for you?")
+                        s = _apply_intro_once(s)
                     elif not sched.get("scheduled_date"):
                         s = humanize_question("What day works best for you?")
                         s = _apply_intro_once(s)
@@ -3309,6 +3318,9 @@ def generate_reply_for_inbound(
                     update_address_assembly_state(sched)
                     if not sched.get("address_verified"):
                         s = build_address_prompt(sched)
+                        s = _apply_intro_once(s)
+                    elif not sched.get("scheduled_date") and not sched.get("scheduled_time"):
+                        s = humanize_question("What day and time work best for you?")
                         s = _apply_intro_once(s)
                     elif not sched.get("scheduled_date"):
                         s = humanize_question("What day works best for you?")
@@ -3701,6 +3713,37 @@ def generate_reply_for_inbound(
                     unavailable_sms = _finalize_sms(unavailable_sms, appt_type, booking_created=False)
                     return {
                         "sms_body": unavailable_sms,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
+                    sched["final_confirmation_sent"] = False
+                    sched["final_confirmation_accepted"] = False
+                    sched["last_final_confirmation_key"] = None
+                    if sched.get("scheduled_date"):
+                        outside_sms = "We typically schedule between 9am and 4pm. What time in that window works for you?"
+                    else:
+                        outside_sms = "We typically schedule between 9am and 4pm. What day and time in that window work best for you?"
+                    outside_sms = _finalize_sms(outside_sms, appt_type, booking_created=False)
+                    return {
+                        "sms_body": outside_sms,
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "weekend_blocked":
+                    sched["final_confirmation_sent"] = False
+                    sched["final_confirmation_accepted"] = False
+                    sched["last_final_confirmation_key"] = None
+                    weekend_sms = "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
+                    weekend_sms = _finalize_sms(weekend_sms, appt_type, booking_created=False)
+                    return {
+                        "sms_body": weekend_sms,
                         "scheduled_date": sched.get("scheduled_date"),
                         "scheduled_time": sched.get("scheduled_time"),
                         "address": sched.get("raw_address"),
