@@ -1850,6 +1850,7 @@ def incoming_sms():
     sched.setdefault("address_missing", None)
     sched.setdefault("address_parts", {})
     sched.setdefault("verified_address_snapshot", None)
+    sched.setdefault("raw_address_snapshot", None)
 
     # Emergency flags (used by incoming_sms patch logic too)
     sched.setdefault("awaiting_emergency_confirm", False)
@@ -2075,6 +2076,7 @@ def incoming_sms():
                 sched["raw_address"] = new_addr
 
             sched["normalized_address"] = None
+            snapshot_raw_address(sched)
             try_early_address_normalize(sched)
             update_address_assembly_state(sched)
             recompute_pending_step(profile, sched)
@@ -2121,6 +2123,7 @@ def incoming_sms():
                 sched["raw_address"] = new_addr
 
             sched["normalized_address"] = None
+            snapshot_raw_address(sched)
             try_early_address_normalize(sched)
             update_address_assembly_state(sched)
             recompute_pending_step(profile, sched)
@@ -2238,6 +2241,7 @@ def incoming_sms():
                 email_val = email_match.group(0).strip()
                 profile["active_email"] = email_val
                 profile["email"] = profile.get("email") or email_val
+                restore_raw_address_snapshot(sched)
                 recompute_pending_step(profile, sched)
 
                 if sched.get("emergency_approved"):
@@ -2250,6 +2254,7 @@ def incoming_sms():
                     else:
                         reply = choose_next_prompt_from_state(conv, inbound_text="")
                 else:
+                    restore_raw_address_snapshot(sched)
                     sched["raw_address"] = canonicalize_address_candidate(sched.get("raw_address") or "")
                     sched["raw_address"] = enrich_address_with_known_town(
                         sched.get("raw_address") or "",
@@ -2268,6 +2273,8 @@ def incoming_sms():
                         print("[WARN] email-path normalize_address_with_context failed:", repr(e))
                     try_early_address_normalize(sched)
                     update_address_assembly_state(sched)
+                    if (sched.get("raw_address") or "") and re.match(r"^\d{1,6}\b", sched.get("raw_address") or "") and sched.get("address_missing") == "street":
+                        sched["address_missing"] = "confirm"
                     recompute_pending_step(profile, sched)
                     if not sched.get("pending_step") and sched.get("address_verified") and sched.get("scheduled_date") and sched.get("scheduled_time") and not sched.get("booking_created"):
                         booking_attempt = maybe_create_square_booking(phone, conv)
@@ -2407,6 +2414,7 @@ def incoming_sms():
             # addresses list is guaranteed above
             if merged_addr not in profile["addresses"]:
                 profile["addresses"].append(merged_addr)
+            snapshot_raw_address(sched)
 
     # Re-derive address assembly state after Step 4 updates
     try_early_address_normalize(sched)
@@ -2685,6 +2693,22 @@ def restore_verified_address_snapshot(sched: dict) -> None:
     if isinstance(snap_norm, dict) and not isinstance(sched.get("normalized_address"), dict):
         sched["normalized_address"] = copy.deepcopy(snap_norm)
 
+    update_address_assembly_state(sched)
+
+
+def snapshot_raw_address(sched: dict) -> None:
+    raw = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
+    if raw and re.match(r"^\d{1,6}\b", raw) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw, flags=re.I):
+        sched["raw_address_snapshot"] = raw
+
+
+def restore_raw_address_snapshot(sched: dict) -> None:
+    snap_raw = canonicalize_address_candidate((sched.get("raw_address_snapshot") or "").strip())
+    curr_raw = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
+    if snap_raw and (not curr_raw or is_likely_person_name_text(curr_raw)):
+        sched["raw_address"] = snap_raw
+        if not isinstance(sched.get("normalized_address"), dict):
+            sched["normalized_address"] = None
     update_address_assembly_state(sched)
 
 def last_prompt_asked_for_name(conv: dict) -> bool:
@@ -5312,9 +5336,11 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
+    restore_raw_address_snapshot(sched)
     raw_address = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
     if raw_address and raw_address != (sched.get("raw_address") or "").strip():
         sched["raw_address"] = raw_address
+    snapshot_raw_address(sched)
     appointment_type = sched.get("appointment_type")
 
     if not sched.get("address_verified"):
@@ -5437,6 +5463,9 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     if not _is_complete_norm(addr_struct):
         if not raw_address:
+            restore_raw_address_snapshot(sched)
+            raw_address = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
+        if not raw_address:
             sched["address_verified"] = False
             sched["address_missing"] = "street"
             return {"status": "missing_address"}
@@ -5462,7 +5491,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
         if status != "ok" or not isinstance(fresh, dict):
             print("[ERROR] Address normalization failed. status=", status)
             sched["address_verified"] = False
-            sched["address_missing"] = "confirm"
+            sched["address_missing"] = "confirm" if re.match(r"^\d{1,6}\b", raw_address or "") else "street"
             return {"status": "address_normalization_failed"}
 
         addr_struct = fresh
