@@ -1509,6 +1509,8 @@ def build_emergency_booking_followup_reply(conv: dict, booking_attempt=None) -> 
         msg = (booking_attempt or {}).get("message") or sched.get("last_slot_unavailable_message")
         if msg:
             return msg
+    if status == "same_day_emergency_unavailable":
+        return "This is still being treated as urgent, but Square is not giving me a clean same-day emergency slot to lock in automatically. Reply dispatch and I’ll keep this on today’s emergency board."
     if status in {"needs_state"}:
         return "Just to confirm, is this address in Connecticut or Massachusetts?"
     if status in {"missing_house_number", "address_not_verified", "address_incomplete", "address_normalization_failed", "normalize_exception", "missing_address"}:
@@ -5066,20 +5068,30 @@ def maybe_create_square_booking(phone: str, convo: dict):
     day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
     exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
 
-    # Emergency immediate-dispatch jobs should snap to the earliest real Square availability
-    # instead of failing because the current minute does not exactly match an open slot.
+    # Emergency immediate-dispatch jobs should stay on TODAY.
+    # If Square cannot provide a clean same-day slot, do not silently roll the job to next week.
     if not exact_avail and appointment_type == "TROUBLESHOOT_395":
         tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
         now_local = datetime.now(tz)
+        today_str = now_local.strftime("%Y-%m-%d")
+
+        # Emergency dispatch should always remain anchored to today.
+        if scheduled_date != today_str:
+            sched["scheduled_date"] = today_str
+            scheduled_date = today_str
+
         future_same_day = []
         for a in day_avails:
             try:
+                if (a.get("date") or "") != scheduled_date:
+                    continue
                 hh, mm = (a.get("time") or "").split(":")[:2]
                 slot_local = now_local.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
             except Exception:
                 continue
             if slot_local >= now_local:
                 future_same_day.append((slot_local, a))
+
         future_same_day.sort(key=lambda x: x[0])
         if future_same_day:
             exact_avail = future_same_day[0][1]
@@ -5088,18 +5100,22 @@ def maybe_create_square_booking(phone: str, convo: dict):
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
         else:
-            rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=1)
-            if rolled_slots:
-                exact_avail = rolled_slots[0]
-                sched["scheduled_date"] = exact_avail.get("date") or scheduled_date
-                sched["scheduled_time"] = exact_avail.get("time") or scheduled_time
-                scheduled_date = sched["scheduled_date"]
-                scheduled_time = sched["scheduled_time"]
+            sched["awaiting_slot_offer_choice"] = False
+            sched["offered_slot_options"] = []
+            sched["last_slot_unavailable_message"] = (
+                "This is still being treated as urgent, but Square is not giving me a clean same-day emergency slot to lock in automatically. "
+                "Reply dispatch and I’ll keep this on today’s emergency board."
+            )
+            return {
+                "status": "same_day_emergency_unavailable",
+                "message": sched["last_slot_unavailable_message"],
+                "options": [],
+            }
 
     if not exact_avail:
         same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
         rolled_slots = []
-        if not same_day_options:
+        if appointment_type != "TROUBLESHOOT_395" and not same_day_options:
             rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
 
         offered = same_day_options or rolled_slots
