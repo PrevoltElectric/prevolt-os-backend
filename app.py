@@ -495,6 +495,87 @@ def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
         profile["square_lookup_done"] = True
 
 
+def _normalize_display_town_hint(raw_text: str) -> str:
+    """Keep customer-facing town prompts grounded in the caller's wording.
+    We only apply a tiny alias map for repeated speech-to-text misses and otherwise
+    preserve the user's town text instead of inventing a different town."""
+    txt = " ".join((raw_text or "").replace(",", " ").split()).strip()
+    if not txt:
+        return ""
+    low = txt.lower().strip(" .?")
+    aliases = {
+        'winterlox': 'Windsor Locks',
+        'windsor lox': 'Windsor Locks',
+        'windsor locs': 'Windsor Locks',
+        'sims ferry': 'Simsbury',
+        'simsbussy': 'Simsbury',
+        'sims busy': 'Simsbury',
+        'north hampton': 'Northampton',
+        'north hampton mass': 'Northampton, Massachusetts',
+        'north hampton ma': 'Northampton, Massachusetts',
+    }
+    if low in aliases:
+        return aliases[low]
+    return txt
+
+
+def _looks_like_town_only_text(text: str) -> bool:
+    txt = " ".join((text or "").replace(",", " ").split()).strip()
+    if not txt:
+        return False
+    if re.search(r"\d", txt):
+        return False
+    street_words = r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)"
+    if re.search(street_words, txt, flags=re.I):
+        return False
+    return bool(re.search(r"[A-Za-z]", txt))
+
+
+def maybe_apply_town_correction(conv: dict, inbound_text: str) -> bool:
+    """Allow the customer to correct a bad town hint without restarting the flow."""
+    sched = conv.setdefault("sched", {})
+    txt = " ".join((inbound_text or "").replace(",", " ").split()).strip()
+    if not txt or not _looks_like_town_only_text(txt):
+        return False
+
+    current_raw = (sched.get("raw_address") or "").strip()
+    low = txt.lower()
+    correction_markers = (
+        'i live in ', 'im in ', "i'm in ", 'it is in ', "it's in ",
+        'the town is ', 'its in ', 'located in '
+    )
+    candidate = txt
+    for marker in correction_markers:
+        if low.startswith(marker):
+            candidate = txt[len(marker):].strip()
+            break
+    candidate = _normalize_display_town_hint(candidate).strip(' .?,')
+    if not candidate or not _looks_like_town_only_text(candidate):
+        return False
+
+    should_update = False
+    if not current_raw:
+        should_update = True
+    elif not re.match(r"^\d{1,6}", current_raw):
+        # We only overwrite town-only hints, never full street addresses.
+        should_update = True
+    elif sched.get("address_missing") in {"confirm", "street", None} and ('town' in low or 'live in' in low or 'in ' in low):
+        # Preserve the street and update only the locality tail when the customer corrects it.
+        base = current_raw.split(',')[0].strip()
+        sched['raw_address'] = f"{base}, {candidate}"
+        sched['normalized_address'] = None
+        update_address_assembly_state(sched)
+        return True
+
+    if should_update:
+        sched['raw_address'] = candidate
+        sched['normalized_address'] = None
+        update_address_assembly_state(sched)
+        return True
+
+    return False
+
+
 def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) -> str:
     """Build the very first outbound text after voicemail without relying on downstream reply routing."""
     profile = conv.setdefault("profile", {})
@@ -526,8 +607,7 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
             break
 
     raw_hint = (sched.get("raw_address") or classification.get("detected_address") or "").strip()
-    town_hint = raw_hint
-    town_hint_low = town_hint.lower()
+    town_hint = _normalize_display_town_hint(raw_hint)
 
     address_line = ""
     if saved_full:
@@ -720,7 +800,7 @@ def handle_call_selection():
             '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
             voice="Polly.Matthew-Neural"
         )
-        response.dial("+18609701727")
+        response.dial("+15555555555")  # replace with real number
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
@@ -892,82 +972,6 @@ def sanitize_sms_body(s: str, *, booking_created: bool) -> str:
         return "Thanks — got it."
 
     return s
-
-
-def dedupe_repeated_sentences(s: str) -> str:
-    """Collapse accidental duplicated sentences or repeated trailing prompts."""
-    s = " ".join((s or "").split()).strip()
-    if not s:
-        return s
-
-    m = re.match(r'^(.*?[?.!])\s+\1$', s, flags=re.I)
-    if m:
-        return m.group(1).strip()
-
-    m = re.match(r'^(.*?)(What [^.?!]*\?)\s+\2$', s, flags=re.I)
-    if m:
-        return (m.group(1) + m.group(2)).strip()
-
-    s = re.sub(r'(?i)(\bwhat day and time work best for you\?)(?:\s+\1)+', r'\1', s)
-    s = re.sub(r'(?i)(\bwhat time works best for you\?)(?:\s+\1)+', r'\1', s)
-    s = re.sub(r'(?i)(\bwhat day works best for you\?)(?:\s+\1)+', r'\1', s)
-
-    parts = re.split(r'(?<=[?.!])\s+', s)
-    out = []
-    seen_questions = set()
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        low = part.lower()
-        if out and out[-1].lower() == low:
-            continue
-        if low in {
-            'what day and time work best for you?',
-            'what time works best for you?',
-            'what day works best for you?'
-        }:
-            if low in seen_questions:
-                continue
-            seen_questions.add(low)
-        out.append(part)
-    return " ".join(out).strip()
-
-def _next_available_non_emergency_slots(appointment_type: str, limit: int = 3) -> list[dict]:
-    """Return the next few future weekday Square availabilities for non-emergency scheduling."""
-    appt = (appointment_type or "EVAL_195").upper()
-    if "TROUBLESHOOT" in appt:
-        return []
-
-    tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
-    today = datetime.now(tz).date()
-    out = []
-    seen = set()
-
-    for days_ahead in range(0, 14):
-        day = today + timedelta(days=days_ahead)
-        if day.weekday() >= 5:
-            continue
-        date_str = day.strftime("%Y-%m-%d")
-        avails = search_square_availability_for_day(date_str, appt)
-        for av in avails:
-            key = (av.get("date"), av.get("time"))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(av)
-            if len(out) >= limit:
-                return out
-    return out[:limit]
-
-
-def _format_next_available_slots_message(slots: list[dict]) -> str | None:
-    if not slots:
-        return None
-    labels = []
-    for idx, slot in enumerate(slots[:3], start=1):
-        labels.append(f"{idx}) {slot.get('label') or _humanize_slot_label(slot.get('date'), slot.get('time'))}")
-    return "The next available times I have are " + "; ".join(labels) + ". Reply with 1, 2, or 3."
 
 
 # ---------------------------------------------------
@@ -1673,6 +1677,12 @@ def incoming_sms():
                 sched["pending_step"] = "need_email"
             else:
                 sched["pending_step"] = None
+
+    # Let the customer correct a bad town hint without restarting the address flow.
+    try:
+        maybe_apply_town_correction(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms town correction failed:", repr(e))
 
     # Keep address state fresh (pre-Step4)
     update_address_assembly_state(sched)
@@ -2482,21 +2492,7 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked and not allow_post_booking:
         return None
 
-    answer = None
-
-    # Hard deterministic priority for availability-style questions.
-    # Do this BEFORE trust / LLM handling so "When can you come out?"
-    # never falls back into a generic scheduling question.
-    if any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        offered = _next_available_non_emergency_slots(sched.get("appointment_type") or "EVAL_195", limit=3)
-        if offered:
-            sched["awaiting_slot_offer_choice"] = True
-            sched["offered_slot_options"] = offered
-            sched["last_slot_unavailable_message"] = _format_next_available_slots_message(offered)
-            return dedupe_repeated_sentences(sched["last_slot_unavailable_message"])
-        return "The next availability opens once I can pull live slots. Reply with the day that works best for you."
-
-    # Let the LLM handle trust / hesitation / multi-question turns after deterministic cases.
+    # Let the LLM handle trust / hesitation / multi-question turns first.
     trust = llm_trust_reply(conv, inbound_text)
     if trust and trust.get("answer"):
         answer = trust["answer"].strip()
@@ -2505,8 +2501,10 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         if booked or sched.get("soft_rejection_open") or is_conversation_hesitation(inbound_text):
             resume = False
         if resume and next_prompt and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}:
-            return dedupe_repeated_sentences(f"{answer} {next_prompt}")
-        return dedupe_repeated_sentences(answer)
+            return f"{answer} {next_prompt}"
+        return answer
+
+    answer = None
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
         answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
     elif any(x in low for x in ["licensed", "license", "insured", "insurance"]):
@@ -2558,6 +2556,8 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         else:
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
+    elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
+        answer = "Once I have the booking details, I can get you on the schedule."
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
@@ -2582,18 +2582,10 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         if not sched.get("pending_step") and sched.get("scheduled_date") and sched.get("scheduled_time"):
             return answer
 
-    if sched.get("awaiting_slot_offer_choice"):
-        return dedupe_repeated_sentences(answer)
-
     next_prompt = choose_next_prompt_from_state(conv, inbound_text="")
-    if (
-        next_prompt
-        and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}
-        and "?" not in answer
-        and "Reply with 1, 2, or 3." not in answer
-    ):
-        return dedupe_repeated_sentences(f"{answer} {next_prompt}")
-    return dedupe_repeated_sentences(answer)
+    if next_prompt and next_prompt not in {"Okay.", "Okay", answer, "Everything looks good here."}:
+        return f"{answer} {next_prompt}"
+    return answer
 
 def looks_like_slot_payload(inbound_text: str) -> bool:
     txt = (inbound_text or "").strip()
@@ -3151,23 +3143,7 @@ def generate_reply_for_inbound(
             "hot panel", "burning smell", "main breaker", "melted",
             "shocked", "shock"
         ]
-        IMMEDIATE_DISPATCH_PHRASES = [
-            "immediately", "immediate", "right away", "right now", "asap",
-            "as soon as possible", "need somebody immediately", "need someone immediately",
-            "send somebody now", "send someone now", "dispatch somebody", "dispatch someone",
-            "come now", "come out now", "please come now", "need somebody now", "need someone now"
-        ]
         IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
-        IS_IMMEDIATE_REQUEST = any(p in inbound_lower for p in IMMEDIATE_DISPATCH_PHRASES)
-        EMERGENCY_CONTEXT_ACTIVE = bool(
-            IS_EMERGENCY
-            or sched.get("awaiting_emergency_confirm")
-            or sched.get("emergency_approved")
-            or (sched.get("appointment_type") == "TROUBLESHOOT_395")
-            or (appointment_type == "TROUBLESHOOT_395")
-            or (conv.get("appointment_type") == "TROUBLESHOOT_395")
-            or (conv.get("category") == "EMERGENCY")
-        )
 
         # Name engine gets first shot before the normal scheduler.
         name_engine_reply = handle_name_engine_response(conv, inbound_text)
@@ -3191,7 +3167,7 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # Post-booking handling
         # --------------------------------------
-        if not EMERGENCY_CONTEXT_ACTIVE:
+        if not IS_EMERGENCY:
             post_booking_reply = handle_post_booking(conv, inbound_text)
             if post_booking_reply is not None:
                 booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
@@ -3449,7 +3425,6 @@ def generate_reply_for_inbound(
             # Final cleanup: ensure no em dash / spaced hyphen survives
             s = s.replace("—", ".").replace("–", ".").replace(" - ", " ")
             s = _norm(s)
-            s = dedupe_repeated_sentences(s)
 
             # Prevent repeating the exact same final ack text twice in a row
             if _is_ack_only(inbound_text):
@@ -3479,25 +3454,9 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # Emergency flow (2-step confirmation)
         # --------------------------------------
-        EMERGENCY = EMERGENCY_CONTEXT_ACTIVE
+        EMERGENCY = IS_EMERGENCY
 
-        if sched.get("awaiting_emergency_confirm") and IS_IMMEDIATE_REQUEST and sched.get("raw_address"):
-            sched["emergency_approved"] = True
-            sched["awaiting_emergency_confirm"] = False
-            sched["appointment_type"] = "TROUBLESHOOT_395"
-            sched["scheduled_date"] = today_date_str
-            sched["scheduled_time"] = now_local.strftime("%H:%M")
-            sched["pending_step"] = None
-
-            emergency_slot = _pick_emergency_immediate_availability(today_date_str, "TROUBLESHOOT_395")
-            if emergency_slot:
-                sched["scheduled_date"] = emergency_slot.get("date") or today_date_str
-                sched["scheduled_time"] = emergency_slot.get("time") or sched["scheduled_time"]
-
-            scheduled_date = sched["scheduled_date"]
-            scheduled_time = sched["scheduled_time"]
-
-        if EMERGENCY_CONTEXT_ACTIVE and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
+        if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["awaiting_emergency_confirm"] = True
             sched["pending_step"] = None
@@ -3533,36 +3492,16 @@ def generate_reply_for_inbound(
 
         CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
 
-        if sched["awaiting_emergency_confirm"] and sched.get("raw_address"):
-            if any(p in inbound_lower for p in CONFIRM_PHRASES) or IS_IMMEDIATE_REQUEST:
-                sched["emergency_approved"] = True
-                sched["awaiting_emergency_confirm"] = False
-                sched["appointment_type"] = "TROUBLESHOOT_395"
-                sched["scheduled_date"] = today_date_str
-                sched["scheduled_time"] = now_local.strftime("%H:%M")
-                sched["pending_step"] = None
+        if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
+            sched["emergency_approved"] = True
+            sched["awaiting_emergency_confirm"] = False
+            sched["appointment_type"] = "TROUBLESHOOT_395"
+            sched["scheduled_date"] = today_date_str
+            sched["scheduled_time"] = now_local.strftime("%H:%M")
+            sched["pending_step"] = None
 
-                emergency_slot = _pick_emergency_immediate_availability(today_date_str, "TROUBLESHOOT_395")
-                if emergency_slot:
-                    sched["scheduled_date"] = emergency_slot.get("date") or today_date_str
-                    sched["scheduled_time"] = emergency_slot.get("time") or sched["scheduled_time"]
-
-                scheduled_date = sched["scheduled_date"]
-                scheduled_time = sched["scheduled_time"]
-            else:
-                msg = (
-                    f"This looks urgent at {sched.get('raw_address')}. "
-                    "Troubleshoot and repair visits are $395. "
-                    "Do you want us to dispatch someone now?"
-                )
-                msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
-                return {
-                    "sms_body": msg,
-                    "scheduled_date": None,
-                    "scheduled_time": None,
-                    "address": sched.get("raw_address"),
-                    "booking_complete": False
-                }
+            scheduled_date = sched["scheduled_date"]
+            scheduled_time = sched["scheduled_time"]
 
         # --------------------------------------
         # Appointment type fallback
@@ -3650,56 +3589,6 @@ def generate_reply_for_inbound(
                     recompute_pending_step(profile, sched)
         except Exception as e:
             print("[WARN] partial address merge patch failed:", repr(e))
-
-        # Deterministic emergency continuation. Once a real street address is supplied during
-        # an urgent thread, do not let the LLM flatten it back into just the town hint.
-        try:
-            current_raw_addr = (sched.get("raw_address") or "").strip()
-            has_numbered_street = bool(re.match(r"^\s*\d{1,6}", current_raw_addr)) and bool(re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", current_raw_addr, flags=re.I))
-            if EMERGENCY_CONTEXT_ACTIVE and has_numbered_street and not sched.get("emergency_approved") and not sched.get("awaiting_emergency_confirm"):
-                sched["appointment_type"] = "TROUBLESHOOT_395"
-                sched["pending_step"] = None
-                sched["awaiting_emergency_confirm"] = True
-                urgent_addr_sms = (
-                    f"This looks urgent at {current_raw_addr}. "
-                    "Troubleshoot and repair visits are $395. "
-                    "Do you want us to dispatch someone now?"
-                )
-                urgent_addr_sms = _finalize_sms(urgent_addr_sms, "TROUBLESHOOT_395", booking_created=False)
-                return {
-                    "sms_body": urgent_addr_sms,
-                    "scheduled_date": sched.get("scheduled_date"),
-                    "scheduled_time": sched.get("scheduled_time"),
-                    "address": current_raw_addr,
-                    "booking_complete": False
-                }
-
-            if sched.get("emergency_approved"):
-                active_first = (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or "").strip()
-                active_last = (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or "").strip()
-                active_email = (profile.get("active_email") or profile.get("email") or profile.get("recognized_email") or "").strip()
-                if not ((active_first and active_last) or profile.get("square_customer_id")):
-                    sched["pending_step"] = "need_name"
-                    need_name_sms = _finalize_sms("What is your first and last name for the appointment?", "TROUBLESHOOT_395", booking_created=False)
-                    return {
-                        "sms_body": need_name_sms,
-                        "scheduled_date": sched.get("scheduled_date"),
-                        "scheduled_time": sched.get("scheduled_time"),
-                        "address": sched.get("raw_address"),
-                        "booking_complete": False
-                    }
-                if not (active_email or profile.get("square_customer_id")):
-                    sched["pending_step"] = "need_email"
-                    need_email_sms = _finalize_sms("What is the best email address for the appointment?", "TROUBLESHOOT_395", booking_created=False)
-                    return {
-                        "sms_body": need_email_sms,
-                        "scheduled_date": sched.get("scheduled_date"),
-                        "scheduled_time": sched.get("scheduled_time"),
-                        "address": sched.get("raw_address"),
-                        "booking_complete": False
-                    }
-        except Exception as e:
-            print("[WARN] deterministic emergency continuation failed:", repr(e))
 
         # If the customer is accepting the last final confirmation, lock that immediately.
         current_final_key = None
@@ -3910,17 +3799,6 @@ def generate_reply_for_inbound(
             try:
                 booking_attempt = maybe_create_square_booking(phone, conv)
 
-                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "missing_contact":
-                    sched["pending_step"] = "need_email"
-                    missing_contact_sms = _finalize_sms("What is the best email address for the appointment?", appt_type, booking_created=False)
-                    return {
-                        "sms_body": missing_contact_sms,
-                        "scheduled_date": sched.get("scheduled_date"),
-                        "scheduled_time": sched.get("scheduled_time"),
-                        "address": sched.get("raw_address"),
-                        "booking_complete": False
-                    }
-
                 if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                     unavailable_sms = booking_attempt.get("message") or choose_next_prompt_from_state(conv, inbound_text=inbound_text)
                     unavailable_sms = _finalize_sms(unavailable_sms, appt_type, booking_created=False)
@@ -3973,17 +3851,10 @@ def generate_reply_for_inbound(
                     sched["final_confirmation_sent"] = False
                     sched["final_confirmation_accepted"] = False
                     sched["last_final_confirmation_key"] = None
-                    if appt_type == "TROUBLESHOOT_395" and sched.get("emergency_approved"):
-                        booked_sms = (
-                            f"You're all set for {human_day} at {human_time}. "
-                            "We have you on the schedule and should arrive within 1 to 2 hours. "
-                            "We will text when we're on the way."
-                        )
-                    else:
-                        booked_sms = (
-                            f"You're all set for {human_day} at {human_time}. "
-                            "We have you on the schedule."
-                        )
+                    booked_sms = (
+                        f"You're all set for {human_day} at {human_time}. "
+                        "We have you on the schedule."
+                    )
                     booked_sms = _finalize_sms(booked_sms, appt_type, booking_created=True)
                     return {
                         "sms_body": booked_sms,
@@ -4024,10 +3895,7 @@ def generate_reply_for_inbound(
                 if ready_for_booking_retry:
                     try:
                         booking_attempt = maybe_create_square_booking(phone, conv)
-                        if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "missing_contact":
-                            sms_body = "What is the best email address for the appointment?"
-                            sched["pending_step"] = "need_email"
-                        elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
+                        if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                             sms_body = booking_attempt.get("message") or "That time is already booked. Here are three other times that work."
                         elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
                             sms_body = "We typically schedule between 9am and 4pm. What time in that window works for you?"
@@ -4040,10 +3908,7 @@ def generate_reply_for_inbound(
                             except Exception:
                                 human_day = sched.get("scheduled_date") or "that day"
                             booked_time = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
-                            if appt_type == "TROUBLESHOOT_395" and sched.get("emergency_approved"):
-                                sms_body = f"You're all set for {human_day} at {booked_time}. We have you on the schedule and should arrive within 1 to 2 hours. We will text when we're on the way."
-                            else:
-                                sms_body = f"You're all set for {human_day} at {booked_time}. We have you on the schedule."
+                            sms_body = f"You're all set for {human_day} at {booked_time}. We have you on the schedule."
                     except Exception as e:
                         print("[WARN] fallback booking retry failed:", repr(e))
 
@@ -4626,47 +4491,6 @@ def is_weekend(date_str: str) -> bool:
         return False
 
 
-def _pick_emergency_immediate_availability(date_str: str, appointment_type: str) -> dict | None:
-    """
-    For immediate emergency dispatch, choose the earliest real Square availability
-    today that is still ahead of the current local time. Prefer a slot within 2 hours.
-    """
-    if appointment_type != "TROUBLESHOOT_395":
-        return None
-
-    avails = search_square_availability_for_day(date_str, appointment_type)
-    if not avails:
-        return None
-
-    tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
-    now_local = datetime.now(tz)
-    candidates = []
-
-    for av in avails:
-        try:
-            slot_dt = datetime.strptime(
-                f"{av.get('date')} {av.get('time')}",
-                "%Y-%m-%d %H:%M"
-            ).replace(tzinfo=tz)
-        except Exception:
-            continue
-
-        delta_min = int((slot_dt - now_local).total_seconds() // 60)
-        if delta_min >= 0:
-            candidates.append((delta_min, av))
-
-    if not candidates:
-        return None
-
-    within_window = [item for item in candidates if item[0] <= 120]
-    if within_window:
-        within_window.sort(key=lambda x: x[0])
-        return within_window[0][1]
-
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
-
-
 # ---------------------------------------------------
 # Create Square Booking (Corrected + Step 5B Compatible) — PATCHED (requires house number)
 #   ✅ Creates booking
@@ -4709,9 +4533,6 @@ def maybe_create_square_booking(phone: str, convo: dict):
     if not ((active_first and active_last) or profile.get("square_customer_id")):
         return {"status": "missing_identity"}
 
-    if not (active_email or profile.get("recognized_email") or profile.get("square_customer_id")):
-        return {"status": "missing_contact"}
-
     if sched.get("booking_created") and sched.get("square_booking_id"):
         return {"status": "already_booked"}
 
@@ -4750,14 +4571,6 @@ def maybe_create_square_booking(phone: str, convo: dict):
     # Preflight exact-slot availability lookup before attempting to book.
     day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
     exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
-
-    if not exact_avail and appointment_type == "TROUBLESHOOT_395" and sched.get("emergency_approved"):
-        exact_avail = _pick_emergency_immediate_availability(scheduled_date, appointment_type)
-        if exact_avail:
-            sched["scheduled_date"] = exact_avail.get("date") or scheduled_date
-            sched["scheduled_time"] = exact_avail.get("time") or scheduled_time
-            scheduled_date = sched["scheduled_date"]
-            scheduled_time = sched["scheduled_time"]
 
     if not exact_avail:
         same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
