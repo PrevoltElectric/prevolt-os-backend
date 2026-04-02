@@ -1731,6 +1731,7 @@ def incoming_sms():
     sched.setdefault("address_verified", False)
     sched.setdefault("address_missing", None)
     sched.setdefault("address_parts", {})
+    sched.setdefault("verified_address_snapshot", None)
 
     # Emergency flags (used by incoming_sms patch logic too)
     sched.setdefault("awaiting_emergency_confirm", False)
@@ -1789,6 +1790,12 @@ def incoming_sms():
             else:
                 sched["pending_step"] = None
 
+    # If a verified emergency address was already captured, keep it locked in.
+    try:
+        restore_verified_address_snapshot(sched)
+    except Exception as e:
+        print("[WARN] incoming_sms verified address restore failed:", repr(e))
+
     # Emergency availability / dispatch questions must not get misread as address data.
     # Important: emergency should only ask for dispatch after the address is fully normalized and verified,
     # not off a partial raw-address candidate.
@@ -1801,8 +1808,10 @@ def incoming_sms():
             if not sched.get("address_verified"):
                 reply = build_address_prompt(sched)
             elif sched.get("emergency_approved"):
+                snapshot_verified_address(sched)
                 reply = choose_next_prompt_from_state(conv, inbound_text="")
             else:
+                snapshot_verified_address(sched)
                 sched["awaiting_emergency_confirm"] = True
                 reply = (
                     f"This looks urgent at {sched.get('raw_address')}. "
@@ -1951,6 +1960,7 @@ def incoming_sms():
             recompute_pending_step(profile, sched)
 
             if sched.get("address_verified"):
+                snapshot_verified_address(sched)
                 if sched.get("emergency_approved"):
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
                 else:
@@ -1987,13 +1997,17 @@ def incoming_sms():
         recompute_pending_step(profile, sched)
         pending_now = sched.get("pending_step")
 
-        if pending_now == "need_name":
+        name_prompt_active = (pending_now == "need_name") or last_prompt_asked_for_name(conv)
+
+        if name_prompt_active:
+            restore_verified_address_snapshot(sched)
             first, last = looks_like_full_name_reply(inbound_text)
             if first and last:
                 profile["active_first_name"] = first
                 profile["active_last_name"] = last
                 profile["first_name"] = profile.get("first_name") or first
                 profile["last_name"] = profile.get("last_name") or last
+                restore_verified_address_snapshot(sched)
                 recompute_pending_step(profile, sched)
 
                 if not get_active_email(profile):
@@ -2365,6 +2379,40 @@ def get_active_last_name(profile: dict) -> str:
 
 def get_active_email(profile: dict) -> str:
     return (profile.get("active_email") or profile.get("email") or profile.get("recognized_email") or "").strip()
+
+def snapshot_verified_address(sched: dict) -> None:
+    import copy
+
+    update_address_assembly_state(sched)
+    norm = sched.get("normalized_address")
+    raw = (sched.get("raw_address") or "").strip()
+    if sched.get("address_verified") and raw and isinstance(norm, dict):
+        sched["verified_address_snapshot"] = {
+            "raw_address": raw,
+            "normalized_address": copy.deepcopy(norm),
+        }
+
+def restore_verified_address_snapshot(sched: dict) -> None:
+    import copy
+
+    snap = sched.get("verified_address_snapshot") or {}
+    if not isinstance(snap, dict):
+        return
+
+    snap_raw = (snap.get("raw_address") or "").strip()
+    snap_norm = snap.get("normalized_address")
+    curr_raw = (sched.get("raw_address") or "").strip()
+
+    if snap_raw and (not curr_raw or is_likely_person_name_text(curr_raw)):
+        sched["raw_address"] = snap_raw
+    if isinstance(snap_norm, dict) and not isinstance(sched.get("normalized_address"), dict):
+        sched["normalized_address"] = copy.deepcopy(snap_norm)
+
+    update_address_assembly_state(sched)
+
+def last_prompt_asked_for_name(conv: dict) -> bool:
+    last_sms = ((conv or {}).get("last_sms_body") or "").strip().lower()
+    return "first and last name" in last_sms
 
 def get_display_first_name(profile: dict) -> str:
     return (
