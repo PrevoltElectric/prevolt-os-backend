@@ -1733,11 +1733,16 @@ def incoming_sms():
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
         emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
-        confirm_words = {"yes", "yeah", "yup", "ok", "okay", "sure", "send", "dispatch", "book", "do it", "now", "right away", "immediately", "asap"}
+        confirm_words = {"yes", "yeah", "yup", "ok", "okay", "sure", "send", "dispatch", "book", "do it", "now", "right away", "immediately", "asap", "yes please", "sure please", "please do", "send someone", "send someone now", "dispatch someone", "dispatch someone now", "book it", "go ahead"}
         decline_words = {"no", "nope", "not now", "later"}
         inbound_norm = re.sub(r"\s+", " ", (inbound_text or "").strip().lower())
-        is_confirm_only = inbound_norm in confirm_words
-        is_decline_only = inbound_norm in decline_words
+        is_confirm_only = (
+            inbound_norm in confirm_words
+            or confirmation_accept_text(inbound_text)
+            or bool(re.fullmatch(r"(?:yes|yeah|yep|ok|okay|sure)(?: please)?", inbound_norm))
+            or bool(re.fullmatch(r"(?:send|dispatch|book)(?: someone)?(?: now)?", inbound_norm))
+        )
+        is_decline_only = inbound_norm in decline_words or bool(re.fullmatch(r"(?:no|nope)(?: thanks)?", inbound_norm))
 
         if emergency_thread and sched.get("awaiting_emergency_confirm") and is_confirm_only:
             sched["emergency_approved"] = True
