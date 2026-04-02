@@ -1208,6 +1208,46 @@ def pick_variant_once(sched: dict, label: str, options: list[str]) -> str:
     return chosen
 
 
+def is_likely_person_name_text(text: str) -> bool:
+    txt = " ".join((text or "").strip().split())
+    if not txt:
+        return False
+    if re.search(r"\d", txt):
+        return False
+    if re.search(r"\b(ct|connecticut|ma|massachusetts)\b", txt, flags=re.I):
+        return False
+    if re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", txt, flags=re.I):
+        return False
+    parts = [p for p in re.split(r"\s+", txt) if p]
+    if not 1 <= len(parts) <= 3:
+        return False
+    common_non_names = {"address", "dispatch", "email", "street", "name", "yes", "no", "okay", "ok"}
+    lowered = {p.lower() for p in parts}
+    if lowered & common_non_names:
+        return False
+    return all(re.fullmatch(r"[A-Za-z][A-Za-z'\-]{1,}", p) for p in parts)
+
+def emergency_ready_for_same_booking_path(conv: dict) -> bool:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    update_address_assembly_state(sched)
+    recompute_pending_step(profile, sched)
+    has_identity_for_booking = bool(
+        (get_active_first_name(profile) and get_active_last_name(profile))
+        or profile.get("square_customer_id")
+    )
+    has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+    return bool(
+        sched.get("scheduled_date") and
+        sched.get("scheduled_time") and
+        sched.get("address_verified") and
+        sched.get("appointment_type") and
+        has_identity_for_booking and
+        has_contact_for_booking and
+        not sched.get("pending_step") and
+        not sched.get("booking_created")
+    )
+
 # ---------------------------------------------------
 # Address Prompt Builder (Step 4) — HUMAN + DETERMINISTIC VARIATION
 # ---------------------------------------------------
@@ -1220,6 +1260,14 @@ def build_address_prompt(sched: dict) -> str:
 
     missing = (sched.get("address_missing") or "").strip().lower()
     candidate = (sched.get("address_candidate") or sched.get("raw_address") or "").strip()
+    if is_likely_person_name_text(candidate):
+        candidate = ""
+        if is_likely_person_name_text(sched.get("address_candidate") or ""):
+            sched["address_candidate"] = None
+        if is_likely_person_name_text(sched.get("raw_address") or ""):
+            sched["raw_address"] = None
+            sched["normalized_address"] = None
+            update_address_assembly_state(sched)
     parts = sched.get("address_parts") or {}
 
     norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
@@ -1465,6 +1513,11 @@ def build_emergency_booking_followup_reply(conv: dict, booking_attempt=None) -> 
     if status in {"needs_state"}:
         return "Just to confirm, is this address in Connecticut or Massachusetts?"
     if status in {"missing_house_number", "address_not_verified", "address_incomplete", "address_normalization_failed", "normalize_exception", "missing_address"}:
+        if is_likely_person_name_text((sched.get("raw_address") or "")) or is_likely_person_name_text((sched.get("address_candidate") or "")):
+            sched["raw_address"] = None
+            sched["address_candidate"] = None
+            sched["normalized_address"] = None
+            update_address_assembly_state(sched)
         return build_address_prompt(sched)
     if not (get_active_first_name(profile) and get_active_last_name(profile)):
         return "What is your first and last name?"
@@ -1800,22 +1853,16 @@ def incoming_sms():
             elif not get_active_email(profile):
                 reply = "What is the best email address for the appointment?"
             else:
-                booking_attempt = maybe_create_square_booking(phone, conv)
-                if sched.get("booking_created") and sched.get("square_booking_id"):
-                    reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-                elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
-                    reply = booking_attempt.get("message") or "We have your emergency request. What is the best email address for the appointment?"
+                if emergency_ready_for_same_booking_path(conv):
+                    booking_attempt = maybe_create_square_booking(phone, conv)
+                    if sched.get("booking_created") and sched.get("square_booking_id"):
+                        reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
+                    else:
+                        reply = build_emergency_booking_followup_reply(conv, booking_attempt)
                 else:
                     update_address_assembly_state(sched)
                     recompute_pending_step(profile, sched)
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
-                    if not reply or reply.strip().lower() in {"okay.", "okay", "ok", "ok."}:
-                        if not (get_active_first_name(profile) and get_active_last_name(profile)):
-                            reply = "What is your first and last name?"
-                        elif not get_active_email(profile):
-                            reply = "What is the best email address for the appointment?"
-                        else:
-                            reply = "What is the best email address for the appointment?"
 
             reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
             conv["last_inbound_sid"] = inbound_sid
@@ -1848,11 +1895,12 @@ def incoming_sms():
                 elif not get_active_email(profile):
                     reply = "What is the best email address for the appointment?"
                 else:
-                    booking_attempt = maybe_create_square_booking(phone, conv)
-                    if sched.get("booking_created") and sched.get("square_booking_id"):
-                        reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-                    elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
-                        reply = build_emergency_booking_followup_reply(conv, booking_attempt)
+                    if emergency_ready_for_same_booking_path(conv):
+                        booking_attempt = maybe_create_square_booking(phone, conv)
+                        if sched.get("booking_created") and sched.get("square_booking_id"):
+                            reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
+                        else:
+                            reply = build_emergency_booking_followup_reply(conv, booking_attempt)
                     else:
                         update_address_assembly_state(sched)
                         recompute_pending_step(profile, sched)
@@ -1863,7 +1911,7 @@ def incoming_sms():
                         elif not get_active_email(profile):
                             reply = "What is the best email address for the appointment?"
                         else:
-                            reply = build_emergency_booking_followup_reply(conv, booking_attempt)
+                            reply = choose_next_prompt_from_state(conv, inbound_text="")
 
                 reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
                 conv["last_inbound_sid"] = inbound_sid
@@ -1939,11 +1987,14 @@ def incoming_sms():
                 if not get_active_email(profile):
                     reply = "What is the best email address for the appointment?"
                 elif sched.get("emergency_approved"):
-                    booking_attempt = maybe_create_square_booking(phone, conv)
-                    if sched.get("booking_created") and sched.get("square_booking_id"):
-                        reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
+                    if emergency_ready_for_same_booking_path(conv):
+                        booking_attempt = maybe_create_square_booking(phone, conv)
+                        if sched.get("booking_created") and sched.get("square_booking_id"):
+                            reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
+                        else:
+                            reply = build_emergency_booking_followup_reply(conv, booking_attempt)
                     else:
-                        reply = build_emergency_booking_followup_reply(conv, booking_attempt)
+                        reply = choose_next_prompt_from_state(conv, inbound_text="")
                 else:
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
 
@@ -1965,13 +2016,14 @@ def incoming_sms():
                 recompute_pending_step(profile, sched)
 
                 if sched.get("emergency_approved"):
-                    booking_attempt = maybe_create_square_booking(phone, conv)
-                    if sched.get("booking_created") and sched.get("square_booking_id"):
-                        reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-                    elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
-                        reply = booking_attempt.get("message")
+                    if emergency_ready_for_same_booking_path(conv):
+                        booking_attempt = maybe_create_square_booking(phone, conv)
+                        if sched.get("booking_created") and sched.get("square_booking_id"):
+                            reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
+                        else:
+                            reply = build_emergency_booking_followup_reply(conv, booking_attempt)
                     else:
-                        reply = build_emergency_booking_followup_reply(conv, booking_attempt)
+                        reply = choose_next_prompt_from_state(conv, inbound_text="")
                 else:
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
 
@@ -4156,7 +4208,7 @@ def generate_reply_for_inbound(
             not sched.get("booking_created")
         )
 
-        if ready_for_booking or (EMERGENCY and has_identity_for_booking):
+        if ready_for_booking:
             try:
                 booking_attempt = maybe_create_square_booking(phone, conv)
 
