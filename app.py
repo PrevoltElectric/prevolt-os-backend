@@ -542,8 +542,22 @@ def extract_town_hint_from_text(text: str) -> str:
     return ""
 
 
-def enrich_address_with_known_town(raw_address: str, initial_sms: str = "", cleaned_transcript: str = "") -> str:
+def canonicalize_address_candidate(raw_address: str) -> str:
     raw = " ".join((raw_address or "").strip().split())
+    if not raw:
+        return raw
+    try:
+        cleaned = clean_leading_address_filler(raw)
+        if cleaned:
+            raw = " ".join(cleaned.strip().split())
+    except Exception:
+        pass
+    raw = re.sub(r"^(?:it'?s|its|i am at|i'm at|im at|my address is|address is)\s+(?=\d)", "", raw, flags=re.I).strip()
+    return raw
+
+
+def enrich_address_with_known_town(raw_address: str, initial_sms: str = "", cleaned_transcript: str = "") -> str:
+    raw = canonicalize_address_candidate(raw_address)
     if not raw:
         return raw
     if "," in raw:
@@ -1470,7 +1484,9 @@ def try_early_address_normalize(sched: dict) -> None:
     if sched.get("address_verified"):
         return
 
-    raw = (sched.get("raw_address") or "").strip()
+    raw = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
+    if raw and raw != (sched.get("raw_address") or "").strip():
+        sched["raw_address"] = raw
     if not raw:
         return
 
@@ -1843,6 +1859,8 @@ def incoming_sms():
     category = conv.get("category")
     appointment_type = sched.get("appointment_type")
     initial_sms = conv.get("initial_sms")
+    if conv.get("initial_outbound_sms"):
+        sched["address_prompt_context"] = conv.get("initial_outbound_sms")
 
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
@@ -2232,6 +2250,7 @@ def incoming_sms():
                     else:
                         reply = choose_next_prompt_from_state(conv, inbound_text="")
                 else:
+                    sched["raw_address"] = canonicalize_address_candidate(sched.get("raw_address") or "")
                     sched["raw_address"] = enrich_address_with_known_town(
                         sched.get("raw_address") or "",
                         conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
@@ -2361,7 +2380,7 @@ def incoming_sms():
         sched["scheduled_time"] = reply.get("scheduled_time")
 
     if reply.get("address"):
-        candidate_addr = (reply["address"] or "").strip()
+        candidate_addr = canonicalize_address_candidate((reply["address"] or "").strip())
         if is_plausible_address_text(candidate_addr):
             merged_addr = enrich_address_with_known_town(
                 candidate_addr,
@@ -5283,9 +5302,22 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
-    raw_address = (sched.get("raw_address") or "").strip()
+    raw_address = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
+    if raw_address and raw_address != (sched.get("raw_address") or "").strip():
+        sched["raw_address"] = raw_address
     appointment_type = sched.get("appointment_type")
 
+    if not sched.get("address_verified"):
+        try:
+            sched["raw_address"] = enrich_address_with_known_town(
+                sched.get("raw_address") or "",
+                convo.get("initial_outbound_sms") or sched.get("address_prompt_context") or convo.get("initial_sms") or "",
+                convo.get("cleaned_transcript") or "",
+            )
+            try_early_address_normalize(sched)
+            update_address_assembly_state(sched)
+        except Exception as e:
+            print("[WARN] maybe_create_square_booking address enrich failed:", repr(e))
     if not sched.get("address_verified"):
         return {"status": "address_not_verified"}
 
