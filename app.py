@@ -2256,6 +2256,16 @@ def incoming_sms():
                         conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
                         conv.get("cleaned_transcript") or "",
                     )
+                    try:
+                        st_ctx, addr_ctx = normalize_address_with_context(
+                            sched.get("raw_address") or "",
+                            conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
+                            conv.get("cleaned_transcript") or "",
+                        )
+                        if st_ctx == "ok" and isinstance(addr_ctx, dict):
+                            sched["normalized_address"] = addr_ctx
+                    except Exception as e:
+                        print("[WARN] email-path normalize_address_with_context failed:", repr(e))
                     try_early_address_normalize(sched)
                     update_address_assembly_state(sched)
                     recompute_pending_step(profile, sched)
@@ -5314,6 +5324,13 @@ def maybe_create_square_booking(phone: str, convo: dict):
                 convo.get("initial_outbound_sms") or sched.get("address_prompt_context") or convo.get("initial_sms") or "",
                 convo.get("cleaned_transcript") or "",
             )
+            st_ctx, addr_ctx = normalize_address_with_context(
+                sched.get("raw_address") or "",
+                convo.get("initial_outbound_sms") or sched.get("address_prompt_context") or convo.get("initial_sms") or "",
+                convo.get("cleaned_transcript") or "",
+            )
+            if st_ctx == "ok" and isinstance(addr_ctx, dict):
+                sched["normalized_address"] = addr_ctx
             try_early_address_normalize(sched)
             update_address_assembly_state(sched)
         except Exception as e:
