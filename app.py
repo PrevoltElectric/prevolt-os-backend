@@ -2182,6 +2182,13 @@ def incoming_sms():
     if sms_body in generic_fillers:
         sms_body = next_prompt
 
+    sms_body = postprocess_sms(
+        sms_body,
+        inbound_text,
+        sched,
+        booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id"))
+    )
+
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
     conv["last_inbound_fingerprint_ts"] = now_ts
@@ -5090,7 +5097,8 @@ def maybe_create_square_booking(phone: str, convo: dict):
             return {"status": "normalize_exception"}
 
         if status == "needs_state":
-            send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
+            # Do not fire an out-of-band SMS from inside the booking helper.
+            # Let the caller route return a single deterministic reply.
             sched["address_verified"] = False
             sched["address_missing"] = "state"
             return {"status": "needs_state"}
