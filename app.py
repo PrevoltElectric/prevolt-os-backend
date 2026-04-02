@@ -449,7 +449,12 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 # Initial Voicemail SMS Builder (deterministic first text)
 # ---------------------------------------------------
 def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
-    """Best-effort one-time Square hydrate for repeat callers before the first text goes out."""
+    """Best-effort one-time Square hydrate for repeat callers before the first text goes out.
+
+    Important identity rule:
+    - A phone-number match is only a recognized prior customer hint.
+    - It must NOT blindly become the active caller identity before the current voicemail is resolved.
+    """
     profile.setdefault("addresses", [])
     profile.setdefault("square_lookup_done", False)
     profile.setdefault("square_customer_id", None)
@@ -472,9 +477,11 @@ def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
             profile["recognized_last_name"] = cust.get("family_name")
             profile["recognized_email"] = cust.get("email_address")
 
-            if not profile.get("active_first_name") and cust.get("given_name"):
+            # Do not blindly promote the old Square customer into the active caller.
+            # Only fill active identity if absolutely nothing current exists yet.
+            if not profile.get("active_first_name") and not profile.get("voicemail_first_name") and cust.get("given_name"):
                 profile["active_first_name"] = cust.get("given_name")
-            if not profile.get("active_last_name") and cust.get("family_name"):
+            if not profile.get("active_last_name") and not profile.get("voicemail_last_name") and cust.get("family_name"):
                 profile["active_last_name"] = cust.get("family_name")
             if not profile.get("active_email") and cust.get("email_address"):
                 profile["active_email"] = cust.get("email_address")
@@ -582,7 +589,9 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     sched = conv.setdefault("sched", {})
     hydrate_square_profile_by_phone(profile, phone)
 
-    first_name = (profile.get("active_first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
+    # Use the current voicemail name first when we have one.
+    # This prevents stale shared-number names from leaking into the first text.
+    first_name = (profile.get("voicemail_first_name") or profile.get("active_first_name") or profile.get("recognized_first_name") or "").strip()
     intro = f"Hello {first_name}, you've reached Prevolt Electric. I'll help you here by text." if first_name else "You've reached Prevolt Electric. I'll help you here by text."
 
     topics = conv.get("task_topics") or classification.get("task_topics") or []
@@ -884,11 +893,20 @@ def voicemail_complete():
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
     conv["task_topics"] = classification.get("task_topics") or []
-    conv.setdefault("initial_sms", cleaned)
-    if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
-        profile["voicemail_first_name"] = classification.get("detected_first_name")
-    if classification.get("detected_last_name") and not profile.get("voicemail_last_name"):
-        profile["voicemail_last_name"] = classification.get("detected_last_name")
+    conv["initial_sms"] = cleaned
+
+    # Every new voicemail should refresh the current-caller hint for this thread.
+    # Do not preserve an old voicemail name from a prior test or prior caller.
+    profile["voicemail_first_name"] = classification.get("detected_first_name") or None
+    profile["voicemail_last_name"] = classification.get("detected_last_name") or None
+
+    # If the current voicemail clearly names a different person than the phone match,
+    # let the current voicemail drive the greeting and next-step identity resolution.
+    if profile.get("voicemail_first_name"):
+        profile["active_first_name"] = profile.get("voicemail_first_name")
+        if profile.get("voicemail_last_name"):
+            profile["active_last_name"] = profile.get("voicemail_last_name")
+        profile["identity_source"] = "voicemail_first_name"
 
     if classification.get("detected_date"):
         sched["scheduled_date"] = classification["detected_date"]
@@ -1507,6 +1525,11 @@ def incoming_sms():
     convo_key   = phone or inbound_sid or request.form.get("CallSid") or "unknown"
     inbound_low  = inbound_text.lower().strip()
 
+    cleaned_addr_text = clean_leading_address_filler(inbound_text)
+    if cleaned_addr_text != inbound_text and is_plausible_address_text(cleaned_addr_text):
+        inbound_text = cleaned_addr_text
+        inbound_low = inbound_text.lower().strip()
+
     # SECRET RESET COMMAND
     if inbound_low == "mobius1":
         conversations[convo_key] = {
@@ -1677,6 +1700,34 @@ def incoming_sms():
                 sched["pending_step"] = "need_email"
             else:
                 sched["pending_step"] = None
+
+    # Emergency availability / dispatch questions must not get misread as address data.
+    try:
+        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
+        if emergency_thread and is_emergency_availability_question(inbound_text):
+            update_address_assembly_state(sched)
+            if not sched.get("raw_address"):
+                reply = build_address_prompt(sched)
+            elif sched.get("awaiting_emergency_confirm"):
+                reply = "Do you want us to dispatch someone now?"
+            else:
+                sched["awaiting_emergency_confirm"] = True
+                reply = (
+                    f"This looks urgent at {sched.get('raw_address')}. "
+                    "Troubleshoot and repair visits are $395. "
+                    "Do you want us to dispatch someone now?"
+                )
+            reply = sanitize_sms_body(reply, booking_created=False)
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply.strip()
+            tw = MessagingResponse()
+            tw.message(reply.strip())
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms emergency availability fast-path failed:", repr(e))
 
     # Let the customer correct a bad town hint without restarting the address flow.
     try:
@@ -2371,6 +2422,27 @@ def is_plausible_address_text(text: str) -> bool:
     return False
 
 
+
+def clean_leading_address_filler(text: str) -> str:
+    txt = (text or "").strip()
+    if not txt:
+        return txt
+    cleaned = re.sub(r"^(?:it'?s|it is|im at|i'm at|my address is|address is|the address is)\s+", "", txt, flags=re.I).strip()
+    return cleaned or txt
+
+
+def is_emergency_availability_question(text: str) -> bool:
+    low = _loose_text(text)
+    if not low:
+        return False
+    markers = [
+        "how soon", "when can you come", "when can you come out", "come out", "come sooner",
+        "soonest", "earliest", "how fast", "how quickly", "can you come now", "can you get here",
+        "dispatch", "send someone", "right away", "immediately", "asap"
+    ]
+    return any(m in low for m in markers)
+
+
 def is_conversation_hesitation(text: str) -> bool:
     low = _loose_text(text)
     markers = [
@@ -2557,6 +2629,8 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
     elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
+        if "TROUBLESHOOT" in (sched.get("appointment_type") or "").upper() or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
+            return None
         answer = "Once I have the booking details, I can get you on the schedule."
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
@@ -3490,7 +3564,7 @@ def generate_reply_for_inbound(
                 "booking_complete": False
             }
 
-        CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
+        CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it", "now", "right away", "immediately", "asap", "send someone", "dispatch"]
 
         if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
             sched["emergency_approved"] = True
