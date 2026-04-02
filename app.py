@@ -1792,16 +1792,53 @@ def incoming_sms():
             tw.message(reply.strip())
             return Response(str(tw), mimetype="text/xml")
 
-        if emergency_thread and sched.get("awaiting_emergency_confirm") and is_decline_only:
-            reply = "Okay. What time works for you?"
-            reply = sanitize_sms_body(reply, booking_created=False)
-            conv["last_inbound_sid"] = inbound_sid
-            conv["last_inbound_fingerprint"] = inbound_fingerprint
-            conv["last_inbound_fingerprint_ts"] = now_ts
-            conv["last_sms_body"] = reply.strip()
-            tw = MessagingResponse()
-            tw.message(reply.strip())
-            return Response(str(tw), mimetype="text/xml")
+        if emergency_thread and sched.get("final_confirmation_sent") and confirmation_accept_text(inbound_text):
+            current_final_key = None
+            if sched.get("scheduled_date") and sched.get("scheduled_time"):
+                current_final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
+
+            if current_final_key and sched.get("last_final_confirmation_key") == current_final_key:
+                sched["final_confirmation_accepted"] = True
+                sched["final_confirmation_sent"] = False
+                sched["awaiting_emergency_confirm"] = False
+                sched["emergency_approved"] = True
+                sched["appointment_type"] = "TROUBLESHOOT_395"
+
+                update_address_assembly_state(sched)
+                recompute_pending_step(profile, sched)
+
+                if not sched.get("raw_address"):
+                    reply = build_address_prompt(sched)
+                elif not (get_active_first_name(profile) and get_active_last_name(profile)):
+                    reply = "What is your first and last name?"
+                elif not get_active_email(profile):
+                    reply = "What is the best email address for the appointment?"
+                else:
+                    booking_attempt = maybe_create_square_booking(phone, conv)
+                    if sched.get("booking_created") and sched.get("square_booking_id"):
+                        reply = "You're all set. We’ll head that way and should arrive within 1 to 2 hours. We’ll text when we’re on the way."
+                    elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
+                        reply = booking_attempt.get("message") or "We have your emergency request and are working through it now."
+                    else:
+                        update_address_assembly_state(sched)
+                        recompute_pending_step(profile, sched)
+                        if not sched.get("raw_address"):
+                            reply = build_address_prompt(sched)
+                        elif not (get_active_first_name(profile) and get_active_last_name(profile)):
+                            reply = "What is your first and last name?"
+                        elif not get_active_email(profile):
+                            reply = "What is the best email address for the appointment?"
+                        else:
+                            reply = "We have your emergency request and are working through it now."
+
+                reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = reply.strip()
+                tw = MessagingResponse()
+                tw.message(reply.strip())
+                return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms emergency confirm fast-path failed:", repr(e))
 
