@@ -633,7 +633,9 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     price_line = ""
     appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
     if appt_type == "TROUBLESHOOT_395":
-        price_line = " Troubleshoot and repair visits are $395."
+        # Emergency opener should not front-load pricing.
+        # We disclose price once, after we have the full street address and are asking about dispatch.
+        price_line = ""
     elif appt_type == "WHOLE_HOME_INSPECTION":
         price_line = " Home inspections are $395."
     else:
@@ -1824,7 +1826,7 @@ def incoming_sms():
                     if sched.get("booking_created") and sched.get("square_booking_id"):
                         reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
                     elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
-                        reply = booking_attempt.get("message") or "We have your emergency request. We’re dispatching someone now and will text when we’re on the way."
+                        reply = booking_attempt.get("message") or "We have your emergency request. We could not lock in the booking yet. I'll keep this moving here by text."
                     else:
                         update_address_assembly_state(sched)
                         recompute_pending_step(profile, sched)
@@ -1835,7 +1837,7 @@ def incoming_sms():
                         elif not get_active_email(profile):
                             reply = "What is the best email address for the appointment?"
                         else:
-                            reply = "We have your emergency request. We’re dispatching someone now and will text when we’re on the way."
+                            reply = "We have your emergency request. We could not lock in the booking yet. I'll keep this moving here by text."
 
                 reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
                 conv["last_inbound_sid"] = inbound_sid
@@ -1915,7 +1917,7 @@ def incoming_sms():
                     if sched.get("booking_created") and sched.get("square_booking_id"):
                         reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
                     else:
-                        reply = "We have your emergency request. We’re dispatching someone now and will text when we’re on the way."
+                        reply = "We have your emergency request. We could not lock in the booking yet. I'll keep this moving here by text."
                 else:
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
 
@@ -1943,7 +1945,7 @@ def incoming_sms():
                     elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
                         reply = booking_attempt.get("message")
                     else:
-                        reply = "We have your emergency request. We’re dispatching someone now and will text when we’re on the way."
+                        reply = "We have your emergency request. We could not lock in the booking yet. I'll keep this moving here by text."
                 else:
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
 
