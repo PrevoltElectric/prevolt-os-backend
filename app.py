@@ -3057,7 +3057,23 @@ def generate_reply_for_inbound(
             "hot panel", "burning smell", "main breaker", "melted",
             "shocked", "shock"
         ]
+        IMMEDIATE_DISPATCH_PHRASES = [
+            "immediately", "immediate", "right away", "right now", "asap",
+            "as soon as possible", "need somebody immediately", "need someone immediately",
+            "send somebody now", "send someone now", "dispatch somebody", "dispatch someone",
+            "come now", "come out now", "please come now", "need somebody now", "need someone now"
+        ]
         IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
+        IS_IMMEDIATE_REQUEST = any(p in inbound_lower for p in IMMEDIATE_DISPATCH_PHRASES)
+        EMERGENCY_CONTEXT_ACTIVE = bool(
+            IS_EMERGENCY
+            or sched.get("awaiting_emergency_confirm")
+            or sched.get("emergency_approved")
+            or (sched.get("appointment_type") == "TROUBLESHOOT_395")
+            or (appointment_type == "TROUBLESHOOT_395")
+            or (conv.get("appointment_type") == "TROUBLESHOOT_395")
+            or (conv.get("category") == "EMERGENCY")
+        )
 
         # Name engine gets first shot before the normal scheduler.
         name_engine_reply = handle_name_engine_response(conv, inbound_text)
@@ -3081,7 +3097,7 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # Post-booking handling
         # --------------------------------------
-        if not IS_EMERGENCY:
+        if not EMERGENCY_CONTEXT_ACTIVE:
             post_booking_reply = handle_post_booking(conv, inbound_text)
             if post_booking_reply is not None:
                 booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
@@ -3368,9 +3384,25 @@ def generate_reply_for_inbound(
         # --------------------------------------
         # Emergency flow (2-step confirmation)
         # --------------------------------------
-        EMERGENCY = IS_EMERGENCY
+        EMERGENCY = EMERGENCY_CONTEXT_ACTIVE
 
-        if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
+        if sched.get("awaiting_emergency_confirm") and IS_IMMEDIATE_REQUEST and sched.get("raw_address"):
+            sched["emergency_approved"] = True
+            sched["awaiting_emergency_confirm"] = False
+            sched["appointment_type"] = "TROUBLESHOOT_395"
+            sched["scheduled_date"] = today_date_str
+            sched["scheduled_time"] = now_local.strftime("%H:%M")
+            sched["pending_step"] = None
+
+            emergency_slot = _pick_emergency_immediate_availability(today_date_str, "TROUBLESHOOT_395")
+            if emergency_slot:
+                sched["scheduled_date"] = emergency_slot.get("date") or today_date_str
+                sched["scheduled_time"] = emergency_slot.get("time") or sched["scheduled_time"]
+
+            scheduled_date = sched["scheduled_date"]
+            scheduled_time = sched["scheduled_time"]
+
+        if EMERGENCY_CONTEXT_ACTIVE and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["awaiting_emergency_confirm"] = True
             sched["pending_step"] = None
@@ -3406,21 +3438,36 @@ def generate_reply_for_inbound(
 
         CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
 
-        if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
-            sched["emergency_approved"] = True
-            sched["awaiting_emergency_confirm"] = False
-            sched["appointment_type"] = "TROUBLESHOOT_395"
-            sched["scheduled_date"] = today_date_str
-            sched["scheduled_time"] = now_local.strftime("%H:%M")
-            sched["pending_step"] = None
+        if sched["awaiting_emergency_confirm"] and sched.get("raw_address"):
+            if any(p in inbound_lower for p in CONFIRM_PHRASES) or IS_IMMEDIATE_REQUEST:
+                sched["emergency_approved"] = True
+                sched["awaiting_emergency_confirm"] = False
+                sched["appointment_type"] = "TROUBLESHOOT_395"
+                sched["scheduled_date"] = today_date_str
+                sched["scheduled_time"] = now_local.strftime("%H:%M")
+                sched["pending_step"] = None
 
-            emergency_slot = _pick_emergency_immediate_availability(today_date_str, "TROUBLESHOOT_395")
-            if emergency_slot:
-                sched["scheduled_date"] = emergency_slot.get("date") or today_date_str
-                sched["scheduled_time"] = emergency_slot.get("time") or sched["scheduled_time"]
+                emergency_slot = _pick_emergency_immediate_availability(today_date_str, "TROUBLESHOOT_395")
+                if emergency_slot:
+                    sched["scheduled_date"] = emergency_slot.get("date") or today_date_str
+                    sched["scheduled_time"] = emergency_slot.get("time") or sched["scheduled_time"]
 
-            scheduled_date = sched["scheduled_date"]
-            scheduled_time = sched["scheduled_time"]
+                scheduled_date = sched["scheduled_date"]
+                scheduled_time = sched["scheduled_time"]
+            else:
+                msg = (
+                    f"This looks urgent at {sched.get('raw_address')}. "
+                    "Troubleshoot and repair visits are $395. "
+                    "Do you want us to dispatch someone now?"
+                )
+                msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
+                return {
+                    "sms_body": msg,
+                    "scheduled_date": None,
+                    "scheduled_time": None,
+                    "address": sched.get("raw_address"),
+                    "booking_complete": False
+                }
 
         # --------------------------------------
         # Appointment type fallback
