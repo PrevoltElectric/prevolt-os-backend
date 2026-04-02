@@ -1492,6 +1492,12 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step == "need_email":
         return humanize_question("What is the best email address for the appointment?")
 
+    # Emergency immediate-dispatch threads must never fall into generic final confirmation.
+    if is_emergency and sched.get("emergency_approved") and not (sched.get("booking_created") and sched.get("square_booking_id")):
+        if sched.get("raw_address") and get_active_first_name(profile) and get_active_last_name(profile) and get_active_email(profile):
+            return "Dispatching now."
+        return "Okay."
+
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
             final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
@@ -1768,7 +1774,7 @@ def incoming_sms():
             else:
                 booking_attempt = maybe_create_square_booking(phone, conv)
                 if sched.get("booking_created") and sched.get("square_booking_id"):
-                    reply = "You're all set. We’ll head that way and should arrive within 1 to 2 hours. We’ll text when we’re on the way."
+                    reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
                 elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                     reply = booking_attempt.get("message") or "We have your emergency request. What is the best email address for the appointment?"
                 else:
@@ -1816,9 +1822,9 @@ def incoming_sms():
                 else:
                     booking_attempt = maybe_create_square_booking(phone, conv)
                     if sched.get("booking_created") and sched.get("square_booking_id"):
-                        reply = "You're all set. We’ll head that way and should arrive within 1 to 2 hours. We’ll text when we’re on the way."
+                        reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
                     elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
-                        reply = booking_attempt.get("message") or "We have your emergency request and are working through it now."
+                        reply = booking_attempt.get("message") or "We have your emergency request. We’re dispatching someone now and will text when we’re on the way."
                     else:
                         update_address_assembly_state(sched)
                         recompute_pending_step(profile, sched)
@@ -1829,7 +1835,7 @@ def incoming_sms():
                         elif not get_active_email(profile):
                             reply = "What is the best email address for the appointment?"
                         else:
-                            reply = "We have your emergency request and are working through it now."
+                            reply = "We have your emergency request. We’re dispatching someone now and will text when we’re on the way."
 
                 reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
                 conv["last_inbound_sid"] = inbound_sid
@@ -1907,9 +1913,9 @@ def incoming_sms():
                 elif sched.get("emergency_approved"):
                     booking_attempt = maybe_create_square_booking(phone, conv)
                     if sched.get("booking_created") and sched.get("square_booking_id"):
-                        reply = "You're all set. We’ll head that way and should arrive within 1 to 2 hours. We’ll text when we’re on the way."
+                        reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
                     else:
-                        reply = choose_next_prompt_from_state(conv, inbound_text="") or "What is the best email address for the appointment?"
+                        reply = "We have your emergency request. We’re dispatching someone now and will text when we’re on the way."
                 else:
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
 
@@ -1933,11 +1939,11 @@ def incoming_sms():
                 if sched.get("emergency_approved"):
                     booking_attempt = maybe_create_square_booking(phone, conv)
                     if sched.get("booking_created") and sched.get("square_booking_id"):
-                        reply = "You're all set. We’ll head that way and should arrive within 1 to 2 hours. We’ll text when we’re on the way."
+                        reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
                     elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
                         reply = booking_attempt.get("message")
                     else:
-                        reply = choose_next_prompt_from_state(conv, inbound_text="") or "You're all set."
+                        reply = "We have your emergency request. We’re dispatching someone now and will text when we’re on the way."
                 else:
                     reply = choose_next_prompt_from_state(conv, inbound_text="")
 
@@ -4898,6 +4904,36 @@ def maybe_create_square_booking(phone: str, convo: dict):
     # Preflight exact-slot availability lookup before attempting to book.
     day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
     exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
+
+    # Emergency immediate-dispatch jobs should snap to the earliest real Square availability
+    # instead of failing because the current minute does not exactly match an open slot.
+    if not exact_avail and appointment_type == "TROUBLESHOOT_395":
+        tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+        now_local = datetime.now(tz)
+        future_same_day = []
+        for a in day_avails:
+            try:
+                hh, mm = (a.get("time") or "").split(":")[:2]
+                slot_local = now_local.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+            except Exception:
+                continue
+            if slot_local >= now_local:
+                future_same_day.append((slot_local, a))
+        future_same_day.sort(key=lambda x: x[0])
+        if future_same_day:
+            exact_avail = future_same_day[0][1]
+            sched["scheduled_date"] = exact_avail.get("date") or scheduled_date
+            sched["scheduled_time"] = exact_avail.get("time") or scheduled_time
+            scheduled_date = sched["scheduled_date"]
+            scheduled_time = sched["scheduled_time"]
+        else:
+            rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=1)
+            if rolled_slots:
+                exact_avail = rolled_slots[0]
+                sched["scheduled_date"] = exact_avail.get("date") or scheduled_date
+                sched["scheduled_time"] = exact_avail.get("time") or scheduled_time
+                scheduled_date = sched["scheduled_date"]
+                scheduled_time = sched["scheduled_time"]
 
     if not exact_avail:
         same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
