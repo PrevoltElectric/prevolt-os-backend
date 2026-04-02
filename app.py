@@ -527,6 +527,32 @@ def _normalize_display_town_hint(raw_text: str) -> str:
     return txt
 
 
+
+
+def extract_town_hint_from_text(text: str) -> str:
+    txt = " ".join((text or "").split())
+    if not txt:
+        return ""
+    m = re.search(r"house number and street name in\s+([A-Za-z .'-]+)\?", txt, flags=re.I)
+    if m:
+        return _normalize_display_town_hint(m.group(1).strip())
+    m = re.search(r"\bin\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\?", txt)
+    if m:
+        return _normalize_display_town_hint(m.group(1).strip())
+    return ""
+
+
+def enrich_address_with_known_town(raw_address: str, initial_sms: str = "", cleaned_transcript: str = "") -> str:
+    raw = " ".join((raw_address or "").strip().split())
+    if not raw:
+        return raw
+    if "," in raw:
+        return raw
+    town = extract_town_hint_from_text(initial_sms) or extract_town_hint_from_text(cleaned_transcript)
+    if town and re.match(r"^\d{1,6}\b", raw):
+        return f"{raw}, {town}"
+    return raw
+
 def _looks_like_town_only_text(text: str) -> bool:
     txt = " ".join((text or "").replace(",", " ").split()).strip()
     if not txt:
@@ -2168,7 +2194,24 @@ def incoming_sms():
                     else:
                         reply = choose_next_prompt_from_state(conv, inbound_text="")
                 else:
-                    reply = choose_next_prompt_from_state(conv, inbound_text="")
+                    sched["raw_address"] = enrich_address_with_known_town(
+                        sched.get("raw_address") or "",
+                        conv.get("last_sms_body") or conv.get("initial_sms") or "",
+                        conv.get("cleaned_transcript") or "",
+                    )
+                    try_early_address_normalize(sched)
+                    update_address_assembly_state(sched)
+                    recompute_pending_step(profile, sched)
+                    if not sched.get("pending_step") and sched.get("address_verified") and sched.get("scheduled_date") and sched.get("scheduled_time") and not sched.get("booking_created"):
+                        booking_attempt = maybe_create_square_booking(phone, conv)
+                        if sched.get("booking_created") and sched.get("square_booking_id"):
+                            reply = f"You’re booked for {humanize_time(sched.get('scheduled_time'))} on {sched.get('scheduled_date')}. We’ll text when we’re on the way."
+                        elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
+                            reply = booking_attempt.get("message")
+                        else:
+                            reply = choose_next_prompt_from_state(conv, inbound_text="")
+                    else:
+                        reply = choose_next_prompt_from_state(conv, inbound_text="")
 
                 reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
                 conv["last_inbound_sid"] = inbound_sid
@@ -2274,19 +2317,32 @@ def incoming_sms():
     )
 
     # SAVE STEP 4 RESULTS
-    sched["scheduled_date"] = reply.get("scheduled_date")
-    sched["scheduled_time"] = reply.get("scheduled_time")
+    if reply.get("scheduled_date"):
+        sched["scheduled_date"] = reply.get("scheduled_date")
+    if reply.get("scheduled_time"):
+        sched["scheduled_time"] = reply.get("scheduled_time")
 
     if reply.get("address"):
         candidate_addr = (reply["address"] or "").strip()
         if is_plausible_address_text(candidate_addr):
-            sched["raw_address"] = candidate_addr
-            sched["normalized_address"] = None
+            merged_addr = enrich_address_with_known_town(
+                candidate_addr,
+                conv.get("last_sms_body") or conv.get("initial_sms") or "",
+                conv.get("cleaned_transcript") or "",
+            )
+            existing_addr = (sched.get("raw_address") or "").strip()
+            # Never downgrade an existing fuller address to a shorter street-only one.
+            if existing_addr and "," in existing_addr and "," not in merged_addr and re.match(r"^\d{1,6}\b", merged_addr):
+                merged_addr = existing_addr
+            sched["raw_address"] = merged_addr
+            if merged_addr != existing_addr:
+                sched["normalized_address"] = None
             # addresses list is guaranteed above
-            if candidate_addr not in profile["addresses"]:
-                profile["addresses"].append(candidate_addr)
+            if merged_addr not in profile["addresses"]:
+                profile["addresses"].append(merged_addr)
 
     # Re-derive address assembly state after Step 4 updates
+    try_early_address_normalize(sched)
     update_address_assembly_state(sched)
 
     recompute_pending_step(profile, sched)
@@ -2294,8 +2350,7 @@ def incoming_sms():
     sms_body = (reply.get("sms_body") or "").strip()
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
-    # Emergency threads that are truly booking-ready should attempt the real Square booking here,
-    # instead of surfacing a placeholder status line.
+    # Booking-ready threads should attempt the real Square booking here instead of drifting.
     try:
         appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
         emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
@@ -2305,8 +2360,23 @@ def incoming_sms():
                 next_prompt = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
             else:
                 next_prompt = build_emergency_booking_followup_reply(conv, booking_attempt)
+        elif (not emergency_thread) and (not sched.get("booking_created")):
+            sched["raw_address"] = enrich_address_with_known_town(
+                sched.get("raw_address") or "",
+                conv.get("last_sms_body") or conv.get("initial_sms") or "",
+                conv.get("cleaned_transcript") or "",
+            )
+            try_early_address_normalize(sched)
+            update_address_assembly_state(sched)
+            recompute_pending_step(profile, sched)
+            if (not sched.get("pending_step")) and sched.get("address_verified") and sched.get("scheduled_date") and sched.get("scheduled_time"):
+                booking_attempt = maybe_create_square_booking(phone, conv)
+                if sched.get("booking_created") and sched.get("square_booking_id"):
+                    next_prompt = f"You’re booked for {humanize_time(sched.get('scheduled_time'))} on {sched.get('scheduled_date')}. We’ll text when we’re on the way."
+                elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
+                    next_prompt = booking_attempt.get("message")
     except Exception as e:
-        print("[WARN] incoming_sms route-level emergency booking attempt failed:", repr(e))
+        print("[WARN] incoming_sms route-level booking attempt failed:", repr(e))
 
     # Normal booking threads that are ready should also create the Square booking here.
     try:
