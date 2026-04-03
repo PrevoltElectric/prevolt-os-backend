@@ -1762,6 +1762,13 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # Route-level last-name salvage before Step 4.
+    try:
+        if maybe_capture_last_name_only(profile, sched, inbound_text):
+            recompute_pending_step(profile, sched)
+    except Exception as e:
+        print("[WARN] incoming_sms last-name salvage failed:", repr(e))
+
     # Deterministic fast path for pure interruption questions.
     # This prevents price / payment / permit questions from getting lost
     # behind the address collector when the inbound does not contain a new slot value.
@@ -2177,6 +2184,58 @@ def normalize_person_name(s: str) -> str:
     if not s:
         return ""
     return " ".join(p[:1].upper() + p[1:].lower() for p in s.split())
+
+def maybe_capture_last_name_only(profile: dict, sched: dict, inbound_text: str) -> bool:
+    """
+    Route-level salvage:
+    If first name is already known, last name is still missing, and the customer
+    replies with a simple last-name-looking token, persist it before Step 4.
+    """
+    if (sched.get("pending_step") or "").strip().lower() != "need_name":
+        return False
+
+    first_name = get_active_first_name(profile)
+    last_name = get_active_last_name(profile)
+    if not first_name or last_name:
+        return False
+
+    cleaned = re.sub(r"[^A-Za-z'\- ]", " ", inbound_text or "").strip()
+    parts = [p for p in cleaned.split() if p]
+    if not parts:
+        return False
+
+    low = " ".join(parts).lower().strip()
+    blocked = {
+        "yes", "no", "okay", "ok", "thanks", "thank you", "yep", "yeah", "sure",
+        "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday", "friday",
+        "saturday", "sunday", "morning", "afternoon", "evening", "noon", "midday"
+    }
+    if low in blocked:
+        return False
+
+    # Common real-world rescue:
+    # "Smith"
+    # "my last name is Smith"
+    # "it is Smith"
+    candidate = None
+    if len(parts) == 1:
+        candidate = parts[0]
+    else:
+        m = re.search(r"\b(?:last name is|lastname is|my last name is|it is|its|it's)\s+([A-Za-z][A-Za-z'\-]{1,})\b", cleaned, flags=re.I)
+        if m:
+            candidate = m.group(1)
+        elif len(parts) <= 3 and parts[-1].lower() not in {"name", "last", "is", "my", "it"}:
+            candidate = parts[-1]
+
+    candidate = normalize_person_name(candidate or "")
+    if not candidate:
+        return False
+
+    profile["active_last_name"] = candidate
+    profile["last_name"] = candidate
+    if not profile.get("identity_source"):
+        profile["identity_source"] = "customer_provided_last_name"
+    return True
 
 def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
     """
