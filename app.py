@@ -1308,7 +1308,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
 
     # State-only reply like 'CT'
     if not city and state:
-        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)", raw, flags=re.I):
+        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)\b", raw, flags=re.I):
             merged = f"{raw}, {state}"
         else:
             merged = f"{raw}, {state}"
@@ -1316,7 +1316,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     elif city:
         base = raw
         # If raw already ends with the same city/state, do nothing.
-        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?", raw, flags=re.I):
+        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?\b", raw, flags=re.I):
             merged = raw if not state else re.sub(r",\s*([A-Za-z .'-]+)(?:,\s*(CT|MA))?$", rf", {city}, {state}", raw, flags=re.I)
         else:
             merged = f"{base}, {city}" + (f", {state}" if state else "")
@@ -1326,15 +1326,23 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     sched["raw_address"] = re.sub(r"\s+,", ",", merged).strip(" ,")
 
     # Best effort normalization immediately so the thread advances instead of re-asking.
-    forced_state = state if state in {"CT", "MA"} else None
+    states_to_try = [state] if state in {"CT", "MA"} else [None, "CT", "MA"]
     try:
-        result = normalize_address(sched["raw_address"], forced_state=forced_state)
-        if isinstance(result, tuple) and len(result) >= 2:
-            status, addr_struct = result[0], result[1]
-            if status == "ok" and isinstance(addr_struct, dict):
-                sched["normalized_address"] = addr_struct
-        elif isinstance(result, dict):
-            sched["normalized_address"] = result
+        for forced_state in states_to_try:
+            candidate_raw = sched["raw_address"]
+            if city and not state and forced_state in {"CT", "MA"} and not re.search(r",\s*(CT|MA)\b", candidate_raw, flags=re.I):
+                candidate_raw = f"{candidate_raw}, {forced_state}"
+            result = normalize_address(candidate_raw, forced_state=forced_state if forced_state in {"CT", "MA"} else None)
+            if isinstance(result, tuple) and len(result) >= 2:
+                status, addr_struct = result[0], result[1]
+                if status == "ok" and isinstance(addr_struct, dict):
+                    sched["raw_address"] = candidate_raw
+                    sched["normalized_address"] = addr_struct
+                    break
+            elif isinstance(result, dict):
+                sched["raw_address"] = candidate_raw
+                sched["normalized_address"] = result
+                break
     except Exception as e:
         print("[WARN] apply_partial_address_reply normalize failed:", repr(e))
 
@@ -1425,6 +1433,86 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
         return "Okay."
 
     return (conv.get("last_sms_body") or "Okay.").strip() or "Okay."
+
+def _set_emergency_dispatch_slot(sched: dict) -> None:
+    tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+    now_local = datetime.now(tz)
+    dispatch_dt = now_local + timedelta(hours=1)
+    minute = dispatch_dt.minute
+    if minute == 0:
+        rounded_dt = dispatch_dt.replace(second=0, microsecond=0)
+    elif minute <= 30:
+        rounded_dt = dispatch_dt.replace(minute=30, second=0, microsecond=0)
+    else:
+        rounded_dt = (dispatch_dt + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    sched["scheduled_date"] = rounded_dt.strftime("%Y-%m-%d")
+    sched["scheduled_time"] = rounded_dt.strftime("%H:%M")
+    sched["appointment_type"] = "TROUBLESHOOT_395"
+    sched["emergency_approved"] = True
+    sched["awaiting_emergency_confirm"] = False
+    sched["price_disclosed"] = True
+
+
+def _emergency_dispatch_confirmation(sched: dict) -> str:
+    try:
+        booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+        human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
+    except Exception:
+        human_day = sched.get("scheduled_date") or "today"
+    booked_time = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
+    return f"Emergency dispatch is confirmed for {human_day} at {booked_time}. We have you on the schedule."
+
+
+def handle_emergency_route(phone: str, conv: dict, inbound_text: str) -> str | None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    inbound_low = (inbound_text or "").strip().lower()
+    appt_upper = (sched.get("appointment_type") or "").upper()
+    is_emergency = (
+        "TROUBLESHOOT" in appt_upper
+        or bool(sched.get("awaiting_emergency_confirm"))
+        or bool(sched.get("emergency_approved"))
+    )
+    if not is_emergency:
+        return None
+
+    confirm_phrases = {"yes", "yeah", "yep", "yup", "ok", "okay", "sure", "book", "send", "do it", "dispatch", "come now", "now", "immediately", "asap", "yes please"}
+
+    if sched.get("awaiting_emergency_confirm") and ("395" in inbound_low and any(w in inbound_low for w in ["what", "cover", "include", "why"])):
+        return "The $395 covers a full troubleshoot and repair visit where we diagnose and fix the issue during the same visit whenever possible. Do you want us to dispatch someone now?"
+
+    if sched.get("awaiting_emergency_confirm") and any(p in inbound_low for p in confirm_phrases):
+        _set_emergency_dispatch_slot(sched)
+
+    if sched.get("emergency_approved"):
+        update_address_assembly_state(sched)
+        recompute_pending_step(profile, sched)
+
+        if not sched.get("address_verified"):
+            return build_address_prompt(sched)
+
+        if not (get_active_first_name(profile) and get_active_last_name(profile)):
+            return "What is your first and last name?"
+
+        if not get_active_email(profile):
+            return "What is the best email address for the appointment?"
+
+        booking_attempt = maybe_create_square_booking(phone, conv)
+        if isinstance(booking_attempt, dict):
+            status = booking_attempt.get("status")
+            if status == "already_booked" and sched.get("square_booking_id"):
+                return _emergency_dispatch_confirmation(sched)
+            if status in {"address_not_verified", "missing_address", "address_incomplete", "missing_house_number", "needs_state", "address_normalization_failed"}:
+                update_address_assembly_state(sched)
+                return build_address_prompt(sched)
+
+        if sched.get("booking_created") and sched.get("square_booking_id"):
+            return _emergency_dispatch_confirmation(sched)
+
+        return "What is the best email address for the appointment?" if not get_active_email(profile) else "What is your first and last name?"
+
+    return None
+
 
 # ---------------------------------------------------
 # Incoming SMS (B-3 State Machine, Option A)
@@ -1624,6 +1712,22 @@ def incoming_sms():
         apply_partial_address_reply(sched, inbound_text)
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
+
+    # Hard emergency lane. Once emergency is active, do not let the flow drift back into regular scheduling.
+    try:
+        emergency_reply = handle_emergency_route(phone, conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms emergency route failed:", repr(e))
+        emergency_reply = None
+
+    if emergency_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = emergency_reply.strip()
+        tw = MessagingResponse()
+        tw.message(emergency_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
 
     if "195" in inbound_low and ("what" in inbound_low or "cover" in inbound_low or "include" in inbound_low):
         tw = MessagingResponse()
@@ -3955,7 +4059,7 @@ def generate_reply_for_inbound(
                     not sched.get("pending_step") and
                     not sched.get("booking_created")
                 )
-                if ready_for_booking_retry:
+                if ready_for_booking_retry and not EMERGENCY:
                     try:
                         booking_attempt = maybe_create_square_booking(phone, conv)
                         if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
