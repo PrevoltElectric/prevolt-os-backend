@@ -164,6 +164,32 @@ def humanize_time(t: str) -> str:
         hh12 = 12
     return f"{hh12}:{mm:02d} {ap}"
 
+def compute_emergency_dispatch_slot(now_local=None, lead_minutes: int = 60, round_minutes: int = 30) -> tuple[str, str]:
+    """Return a same-day emergency dispatch slot roughly one hour out, rounded up cleanly."""
+    if now_local is None:
+        now_local = datetime.now(ZoneInfo("America/New_York")) if ZoneInfo else datetime.utcnow()
+    target = now_local + timedelta(minutes=lead_minutes)
+    minute = target.minute
+    rem = minute % round_minutes
+    if rem:
+        target = target + timedelta(minutes=(round_minutes - rem))
+    target = target.replace(second=0, microsecond=0)
+    return target.strftime("%Y-%m-%d"), target.strftime("%H:%M")
+
+
+def is_emergency_immediate_request(text: str) -> bool:
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    phrases = [
+        "now", "right now", "asap", "immediately", "send someone", "send somebody",
+        "come now", "come asap", "today asap", "as soon as possible", "dispatch now",
+        "need somebody today", "need someone today", "need somebody out today", "need someone out today",
+        "i'm here now", "im here now", "i'm home now", "im home now", "waiting", "standing by"
+    ]
+    return any(p in s for p in phrases)
+
+
 def extract_explicit_time_from_text(text: str) -> str | None:
     """
     Pull an explicit time out of a mixed customer message.
@@ -538,20 +564,43 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     else:
         address_line = " What is the address for the visit?"
 
-    # Emergency opener is different from normal booking:
-    # do NOT lead with pricing, and do NOT disturb the normal booking opener.
-    price_line = ""
     appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
+
+    # Emergency opener must NOT look like the normal booking flow.
     if appt_type == "TROUBLESHOOT_395":
-        price_line = ""
-    elif appt_type == "WHOLE_HOME_INSPECTION":
+        if raw_hint:
+            sched["raw_address"] = raw_hint
+            try:
+                try_early_address_normalize(sched)
+            except Exception:
+                pass
+        if sched.get("raw_address") and sched.get("address_verified"):
+            sms = (
+                intro + task_line +
+                f" This looks urgent at {sched.get('raw_address')}. We can send someone now and arrival is usually within 1 to 2 hours. "
+                "Do you want us to dispatch someone now?"
+            ).strip()
+            sched["awaiting_emergency_confirm"] = True
+            sched["pending_step"] = None
+            sched["intro_sent"] = True
+            sched["price_disclosed"] = False
+            return re.sub(r"\s+", " ", sms).strip()
+
+        sms = (intro + task_line + address_line).strip()
+        sched["intro_sent"] = True
+        sched["price_disclosed"] = False
+        return re.sub(r"\s+", " ", sms).strip()
+
+    # Non-emergency flows keep the existing price behavior.
+    price_line = ""
+    if appt_type == "WHOLE_HOME_INSPECTION":
         price_line = " Home inspections are $395."
     else:
         price_line = " Our evaluation visit is $195."
 
     sms = (intro + task_line + address_line + price_line).strip()
     sched["intro_sent"] = True
-    sched["price_disclosed"] = bool(price_line)
+    sched["price_disclosed"] = True
     return re.sub(r"\s+", " ", sms).strip()
 
 # ---------------------------------------------------
@@ -1357,6 +1406,9 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     inbound_low = (inbound_text or "").strip().lower()
     appt = (sched.get("appointment_type") or "").upper()
     is_emergency = ("TROUBLESHOOT" in appt) or bool(sched.get("emergency_approved")) or bool(sched.get("awaiting_emergency_confirm"))
+
+    if is_emergency and sched.get("address_verified") and not sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
+        return "This looks urgent. We can send someone now and arrival is usually within 1 to 2 hours. Do you want us to dispatch someone now?"
 
     ambiguous_times = {
         "any time", "anytime", "whenever", "later", "sometime", "around",
@@ -3051,14 +3103,26 @@ def generate_reply_for_inbound(
 
         # Hazard detection must override post-booking mode.
         EMERGENCY_KEYWORDS = [
-            "tree fell", "tree down", "power line", "lines down",
-            "service ripped", "sparking", "burning", "fire",
-            "smoke", "no power", "power outage", "water pouring",
+            "tree fell", "tree down", "power line", "power lines", "lines down",
+            "service ripped", "service wire", "service wires", "service wires down",
+            "service cable", "mast ripped", "weatherhead", "meter ripped",
+            "sparking", "burning", "fire", "smoke", "smoking",
+            "no power", "power outage", "outage", "water pouring",
             "water in panel", "panel has water", "arcing", "buzzing",
             "hot panel", "burning smell", "main breaker", "melted",
             "shocked", "shock"
         ]
-        IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
+        keyword_emergency = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
+        sticky_emergency = bool(
+            (sched.get("appointment_type") or "").upper() == "TROUBLESHOOT_395"
+            or (appointment_type or "").upper() == "TROUBLESHOOT_395"
+            or (conv.get("appointment_type") or "").upper() == "TROUBLESHOOT_395"
+            or bool(sched.get("awaiting_emergency_confirm"))
+            or bool(sched.get("emergency_approved"))
+            or bool(conv.get("category") == "EMERGENCY")
+            or bool((category or "").upper() == "EMERGENCY")
+        )
+        IS_EMERGENCY = bool(keyword_emergency or sticky_emergency)
 
         # Name engine gets first shot before the normal scheduler.
         name_engine_reply = handle_name_engine_response(conv, inbound_text)
@@ -3271,6 +3335,9 @@ def generate_reply_for_inbound(
             return _norm(s)
 
         def _maybe_price_once(s: str, appt_type_local: str) -> str:
+            # Emergency should not lead with pricing or inject it during dispatch collection.
+            if (appt_type_local or "").upper() == "TROUBLESHOOT_395":
+                return _norm(s)
             if not sched.get("price_disclosed"):
                 try:
                     s = apply_price_injection(appt_type_local, s)
@@ -3373,16 +3440,10 @@ def generate_reply_for_inbound(
 
         if IS_EMERGENCY and not sched["awaiting_emergency_confirm"] and not sched["emergency_approved"]:
             sched["appointment_type"] = "TROUBLESHOOT_395"
-            sched["awaiting_emergency_confirm"] = True
             sched["pending_step"] = None
 
-            if sched.get("raw_address"):
-                try:
-                    try_early_address_normalize(sched)
-                except Exception:
-                    pass
-
             if not sched.get("raw_address"):
+                sched["awaiting_emergency_confirm"] = False
                 known_q = _known_address_question()
                 if known_q:
                     msg = f"This sounds urgent. {known_q}"
@@ -3397,11 +3458,30 @@ def generate_reply_for_inbound(
                     "booking_complete": False
                 }
 
-            msg = (
-                f"This sounds urgent at {sched.get('raw_address')}. "
-                "We can send someone now and arrival is usually within 1 to 2 hours. "
-                "Do you want us to dispatch someone now?"
-            )
+            try:
+                try_early_address_normalize(sched)
+            except Exception:
+                pass
+            update_address_assembly_state(sched)
+
+            if sched.get("address_verified"):
+                sched["awaiting_emergency_confirm"] = True
+                msg = (
+                    f"This looks urgent at {sched.get('raw_address')}. "
+                    "We can send someone now and arrival is usually within 1 to 2 hours. "
+                    "Do you want us to dispatch someone now?"
+                )
+                msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
+                return {
+                    "sms_body": msg,
+                    "scheduled_date": None,
+                    "scheduled_time": None,
+                    "address": sched.get("raw_address"),
+                    "booking_complete": False
+                }
+
+            sched["awaiting_emergency_confirm"] = False
+            msg = build_address_prompt(sched)
             msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
             return {
                 "sms_body": msg,
@@ -3413,28 +3493,18 @@ def generate_reply_for_inbound(
 
         CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
 
-        if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
+        if sched["awaiting_emergency_confirm"] and (any(p in inbound_lower for p in CONFIRM_PHRASES) or is_emergency_immediate_request(inbound_text)):
             sched["emergency_approved"] = True
             sched["awaiting_emergency_confirm"] = False
             sched["appointment_type"] = "TROUBLESHOOT_395"
-            dispatch_dt = (now_local + timedelta(hours=1)).replace(second=0, microsecond=0)
-            if dispatch_dt.minute not in (0, 30):
-                if dispatch_dt.minute < 30:
-                    dispatch_dt = dispatch_dt.replace(minute=30)
-                else:
-                    dispatch_dt = (dispatch_dt + timedelta(hours=1)).replace(minute=0)
-            sched["scheduled_date"] = dispatch_dt.strftime("%Y-%m-%d")
-            sched["scheduled_time"] = dispatch_dt.strftime("%H:%M")
+            dispatch_date, dispatch_time = compute_emergency_dispatch_slot(now_local)
+            sched["scheduled_date"] = dispatch_date
+            sched["scheduled_time"] = dispatch_time
             sched["pending_step"] = None
-            sched["final_confirmation_sent"] = True
-            sched["final_confirmation_accepted"] = True
-            sched["last_final_confirmation_key"] = f"{sched['scheduled_date']}|{sched['scheduled_time']}"
-            sched["price_disclosed"] = True
-            if sched.get("raw_address"):
-                try:
-                    try_early_address_normalize(sched)
-                except Exception:
-                    pass
+            try:
+                try_early_address_normalize(sched)
+            except Exception:
+                pass
 
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
@@ -4505,9 +4575,8 @@ def maybe_create_square_booking(phone: str, convo: dict):
         return {"status": "square_not_configured"}
 
     # Preflight exact-slot availability lookup before attempting to book.
-    # Emergency dispatch bypasses Square availability checks and uses the same
-    # booking creation pipeline with the caller-approved dispatch time.
     exact_avail = None
+    day_avails = []
     if appointment_type != "TROUBLESHOOT_395":
         day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
         exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
@@ -4533,9 +4602,15 @@ def maybe_create_square_booking(phone: str, convo: dict):
                 "options": offered,
             }
     else:
-        sched["awaiting_slot_offer_choice"] = False
-        sched["offered_slot_options"] = []
-        sched["last_slot_unavailable_message"] = None
+        exact_avail = {
+            "date": scheduled_date,
+            "time": scheduled_time,
+            "start_at": parse_local_datetime(scheduled_date, scheduled_time).strftime("%Y-%m-%dT%H:%M:%SZ") if parse_local_datetime(scheduled_date, scheduled_time) else None,
+            "duration_minutes": 60,
+            "service_variation_id": variation_id,
+            "service_variation_version": variation_version,
+            "team_member_id": SQUARE_TEAM_MEMBER_ID,
+        }
 
     addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
 
@@ -4604,7 +4679,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
         ).strip()
 
         travel_minutes = compute_travel_time_minutes(origin, destination)
-        if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES:
+        if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES and appointment_type != "TROUBLESHOOT_395":
             print("[BLOCKED] Travel too long.")
             return {"status": "travel_too_long"}
 
