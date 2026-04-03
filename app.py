@@ -1556,6 +1556,13 @@ def incoming_sms():
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
 
+    if inbound_low in ["yes", "yes please", "yeah", "yep", "sure"]:
+        if sched.get("pending_step"):
+            next_prompt = choose_next_prompt_from_state(conv, inbound_text="")
+            tw = MessagingResponse()
+            tw.message(next_prompt)
+            return Response(str(tw), mimetype="text/xml")
+
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
     appointment_type = sched.get("appointment_type")
@@ -1618,6 +1625,16 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    if "195" in inbound_low and ("what" in inbound_low or "cover" in inbound_low or "include" in inbound_low):
+        tw = MessagingResponse()
+        tw.message("The $195 covers a full on-site evaluation of the issue, identifying the root cause, and providing a clear plan and price to complete the work.")
+        return Response(str(tw), mimetype="text/xml")
+
+    if "395" in inbound_low and ("what" in inbound_low or "cover" in inbound_low or "include" in inbound_low):
+        tw = MessagingResponse()
+        tw.message("The $395 covers a full troubleshoot and repair visit where we diagnose and fix the issue during the same visit whenever possible.")
+        return Response(str(tw), mimetype="text/xml")
+
     # Deterministic fast path for pure interruption questions.
     # This prevents price / payment / permit questions from getting lost
     # behind the address collector when the inbound does not contain a new slot value.
@@ -1637,7 +1654,7 @@ def incoming_sms():
                 (get_active_first_name(profile) and get_active_last_name(profile))
                 or profile.get("square_customer_id")
             )
-            has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+            has_contact_for_booking = bool(get_active_email(profile))
             appt_upper = (sched.get("appointment_type") or "").upper()
             emergency_mode = (
                 "TROUBLESHOOT" in appt_upper
@@ -1770,7 +1787,7 @@ def incoming_sms():
         (get_active_first_name(profile) and get_active_last_name(profile))
         or profile.get("square_customer_id")
     )
-    has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+    has_contact_for_booking = bool(get_active_email(profile))
     appt_upper = (sched.get("appointment_type") or "").upper()
     emergency_mode = (
         "TROUBLESHOOT" in appt_upper
@@ -1788,6 +1805,9 @@ def incoming_sms():
         not sched.get("pending_step") and
         not sched.get("booking_created")
     )
+
+    if not sched.get("address_verified"):
+        sms_body = build_address_prompt(sched)
 
     if ready_for_route_booking and not emergency_mode:
         try:
@@ -1818,7 +1838,7 @@ def incoming_sms():
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
     # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
-    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
+    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure.", "You're all set.", "You’re all set.", "Your all set."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
 
@@ -3798,7 +3818,7 @@ def generate_reply_for_inbound(
             (get_active_first_name(profile) and get_active_last_name(profile))
             or profile.get("square_customer_id")
         )
-        has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+        has_contact_for_booking = bool(get_active_email(profile))
 
         # If the same slot is already saved as the upcoming appointment, do not try to recreate it.
         upcoming = profile.get("upcoming_appointment") or {}
@@ -3924,7 +3944,7 @@ def generate_reply_for_inbound(
                     (get_active_first_name(profile) and get_active_last_name(profile))
                     or profile.get("square_customer_id")
                 )
-                has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+                has_contact_for_booking = bool(get_active_email(profile))
                 ready_for_booking_retry = (
                     bool(sched.get("scheduled_date")) and
                     bool(sched.get("scheduled_time")) and
