@@ -4515,6 +4515,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     # Preflight exact-slot availability lookup before attempting to book.
     # Emergency dispatch uses the same Square booking pipeline but does not offer alternate slots.
+    exact_avail = {}
     if appointment_type != "TROUBLESHOOT_395":
         day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
         exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
