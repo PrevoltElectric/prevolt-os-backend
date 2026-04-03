@@ -1,8 +1,8 @@
 import os
 import json
+import sqlite3
 import time
 import uuid
-import sqlite3
 from pathlib import Path
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
@@ -101,136 +101,6 @@ def load_rule_matrix_text() -> str:
 
 RULE_MATRIX_TEXT = load_rule_matrix_text()
 
-MONITOR_DB_PATH = os.environ.get("PREVOLT_MONITOR_DB_PATH", "/tmp/prevolt_monitor.db")
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _safe_monitor_json(value):
-    try:
-        return json.dumps(value, ensure_ascii=False, default=str)
-    except Exception:
-        return json.dumps({"repr": repr(value)}, ensure_ascii=False)
-
-def init_monitor_db() -> None:
-    try:
-        db_path = Path(MONITOR_DB_PATH)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_path))
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS monitor_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                level TEXT NOT NULL DEFAULT 'info',
-                convo_key TEXT,
-                phone TEXT,
-                payload_json TEXT
-            )
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_monitor_events_ts ON monitor_events(ts DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_monitor_events_phone ON monitor_events(phone)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_monitor_events_convo_key ON monitor_events(convo_key)")
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("[WARN] monitor db init failed:", repr(e))
-
-def log_event(event_type: str, *, convo_key: str | None = None, phone: str | None = None, payload: dict | None = None, level: str = "info") -> None:
-    try:
-        conn = sqlite3.connect(MONITOR_DB_PATH)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO monitor_events (ts, event_type, level, convo_key, phone, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                _utc_now_iso(),
-                (event_type or "").strip() or "UNKNOWN",
-                (level or "info").strip() or "info",
-                (convo_key or "").strip() or None,
-                (phone or "").replace("whatsapp:", "").strip() or None,
-                _safe_monitor_json(payload or {}),
-            ),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("[WARN] log_event failed:", repr(e))
-
-def log_sms_out_event(phone: str, body: str, *, convo_key: str | None = None, source: str = "sms") -> None:
-    log_event(
-        "SMS_OUT",
-        convo_key=convo_key or phone,
-        phone=phone,
-        payload={
-            "source": source,
-            "body": (body or "")[:2000],
-        },
-    )
-
-def read_monitor_events(limit: int = 100, phone: str | None = None) -> list[dict]:
-    try:
-        conn = sqlite3.connect(MONITOR_DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        if phone:
-            cur.execute(
-                "SELECT id, ts, event_type, level, convo_key, phone, payload_json FROM monitor_events WHERE phone = ? ORDER BY id DESC LIMIT ?",
-                ((phone or "").replace("whatsapp:", "").strip(), max(1, min(int(limit), 500))),
-            )
-        else:
-            cur.execute(
-                "SELECT id, ts, event_type, level, convo_key, phone, payload_json FROM monitor_events ORDER BY id DESC LIMIT ?",
-                (max(1, min(int(limit), 500)),),
-            )
-        rows = cur.fetchall()
-        conn.close()
-        out = []
-        for row in rows:
-            payload_json = row["payload_json"] or "{}"
-            try:
-                payload = json.loads(payload_json)
-            except Exception:
-                payload = {"raw": payload_json}
-            out.append({
-                "id": row["id"],
-                "ts": row["ts"],
-                "event_type": row["event_type"],
-                "level": row["level"],
-                "convo_key": row["convo_key"],
-                "phone": row["phone"],
-                "payload": payload,
-            })
-        return out
-    except Exception as e:
-        print("[WARN] read_monitor_events failed:", repr(e))
-        return []
-
-def read_monitor_conversations(limit: int = 100) -> list[dict]:
-    events = list(reversed(read_monitor_events(limit=2000)))
-    grouped = {}
-    for ev in events:
-        key = ev.get("phone") or ev.get("convo_key") or f"unknown:{ev.get('id')}"
-        slot = grouped.setdefault(key, {
-            "phone": ev.get("phone"),
-            "convo_key": ev.get("convo_key"),
-            "last_ts": ev.get("ts"),
-            "last_event_type": ev.get("event_type"),
-            "event_count": 0,
-            "last_payload": ev.get("payload") or {},
-        })
-        slot["event_count"] += 1
-        slot["last_ts"] = ev.get("ts")
-        slot["last_event_type"] = ev.get("event_type")
-        slot["last_payload"] = ev.get("payload") or {}
-    items = list(grouped.values())
-    items.sort(key=lambda x: x.get("last_ts") or "", reverse=True)
-    return items[:max(1, min(int(limit), 500))]
-
-init_monitor_db()
-
 
 # -------------------------------
 # Small shared helpers
@@ -247,30 +117,111 @@ app = Flask(__name__)
 def home():
     return "Prevolt OS running", 200
 
-@app.route("/monitor/events", methods=["GET"])
-def monitor_events():
-    try:
-        limit = int(request.args.get("limit", 100) or 100)
-    except Exception:
-        limit = 100
-    phone = (request.args.get("phone") or "").replace("whatsapp:", "").strip() or None
-    data = read_monitor_events(limit=limit, phone=phone)
-    return Response(json.dumps({"events": data}, ensure_ascii=False), mimetype="application/json")
-
-@app.route("/monitor/conversations", methods=["GET"])
-def monitor_conversations():
-    try:
-        limit = int(request.args.get("limit", 100) or 100)
-    except Exception:
-        limit = 100
-    data = read_monitor_conversations(limit=limit)
-    return Response(json.dumps({"conversations": data}, ensure_ascii=False), mimetype="application/json")
-
 
 # ---------------------------------------------------
 # In-Memory Conversation Store
 # ---------------------------------------------------
 conversations = {}
+
+MONITOR_DB_PATH = os.environ.get("PREVOLT_MONITOR_DB_PATH", "/tmp/prevolt_monitor.db")
+
+def _monitor_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _monitor_connect():
+    conn = sqlite3.connect(MONITOR_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_monitor_db() -> None:
+    try:
+        with _monitor_connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitor_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    phone TEXT,
+                    payload_json TEXT
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_monitor_events_ts ON monitor_events(ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_monitor_events_phone ON monitor_events(phone)")
+    except Exception as e:
+        print("[WARN] monitor db init failed:", repr(e))
+
+def _safe_monitor_text(value, limit: int = 280) -> str:
+    s = str(value or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    if len(s) > limit:
+        s = s[:limit - 3].rstrip() + "..."
+    return s
+
+def _monitor_state_label(conv: dict) -> str:
+    sched = (conv or {}).get("sched") or {}
+    appt = (sched.get("appointment_type") or "").upper()
+    if sched.get("booking_created") and sched.get("square_booking_id"):
+        return "booked"
+    if "TROUBLESHOOT" in appt or sched.get("emergency_approved") or sched.get("awaiting_emergency_confirm"):
+        return "emergency"
+    step = (sched.get("pending_step") or "").strip().lower()
+    mapping = {
+        "need_address": "waiting_for_address",
+        "need_date": "waiting_for_date",
+        "need_time": "waiting_for_time",
+        "need_name": "waiting_for_name",
+        "need_email": "waiting_for_email",
+    }
+    return mapping.get(step, "active")
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    conv = conv or {}
+    profile = conv.get("profile") or {}
+    sched = conv.get("sched") or {}
+    first = (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
+    last = (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or profile.get("voicemail_last_name") or "").strip()
+    name = " ".join([p for p in [first, last] if p]).strip()
+    address = (sched.get("raw_address") or "").strip()
+    return {
+        "phone": phone or "",
+        "name": name,
+        "address": address,
+        "scheduled_date": sched.get("scheduled_date"),
+        "scheduled_time": sched.get("scheduled_time"),
+        "appointment_type": sched.get("appointment_type"),
+        "state": _monitor_state_label(conv),
+        "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")),
+        "square_booking_id": sched.get("square_booking_id"),
+        "pending_step": sched.get("pending_step"),
+        "last_sms_body": conv.get("last_sms_body"),
+        "updated_at": _monitor_now_iso(),
+    }
+
+def log_event(event_type: str, phone: str = "", payload: dict | None = None, conv: dict | None = None) -> None:
+    try:
+        init_monitor_db()
+        base_payload = dict(payload or {})
+        if conv is not None:
+            base_payload.setdefault("state", _monitor_state_label(conv))
+            base_payload.setdefault("snapshot", _conversation_snapshot(phone, conv))
+        with _monitor_connect() as conn:
+            conn.execute(
+                "INSERT INTO monitor_events (ts, event_type, phone, payload_json) VALUES (?, ?, ?, ?)",
+                (_monitor_now_iso(), event_type, phone or "", json.dumps(base_payload, ensure_ascii=False)),
+            )
+    except Exception as e:
+        print("[WARN] monitor log_event failed:", repr(e))
+
+def _monitor_booking_return(phone: str, status: str, payload: dict, convo: dict | None = None) -> dict:
+    try:
+        log_event("BOOKING_RESULT", phone, {"status": status, **(payload or {})}, convo)
+    except Exception:
+        pass
+    return payload
+
+init_monitor_db()
 
 
 # ---------------------------------------------------
@@ -386,15 +337,10 @@ def send_sms(to_number: str, body: str) -> None:
             to=sms_to
         )
         print("[SMS] Sent SID:", msg.sid, "to", sms_to)
-        log_event(
-            "SMS_OUT",
-            convo_key=sms_to,
-            phone=sms_to,
-            payload={"source": "send_sms", "sid": getattr(msg, "sid", None), "body": (body or "")[:2000]},
-        )
+        log_event("SMS_OUT", sms_to, {"sid": getattr(msg, "sid", None), "body": _safe_monitor_text(body)})
     except Exception as e:
         print("[ERROR] SMS send failed:", repr(e))
-        log_event("SMS_OUT_FAILED", convo_key=(to_number or "").replace("whatsapp:", "").strip(), phone=to_number, payload={"body": (body or "")[:2000], "error": repr(e)}, level="error")
+        log_event("SMS_OUT_FAILED", (to_number or "").replace("whatsapp:", "").strip(), {"body": _safe_monitor_text(body), "error": repr(e)})
 
 
 
@@ -715,8 +661,10 @@ def incoming_call():
     from twilio.twiml.voice_response import Gather, VoiceResponse
 
     response = VoiceResponse()
-    phone = (request.form.get("From") or request.args.get("From") or "").replace("whatsapp:", "").strip()
-    log_event("CALL_INCOMING", convo_key=phone or (request.form.get("CallSid") or request.args.get("CallSid") or "call:unknown"), phone=phone, payload={"call_sid": request.form.get("CallSid") or request.args.get("CallSid")})
+    try:
+        log_event("CALL_IN", (request.form.get("From") or request.args.get("From") or "").replace("whatsapp:", "").strip(), {"call_sid": request.form.get("CallSid") or request.args.get("CallSid")})
+    except Exception:
+        pass
 
     gather = Gather(
         num_digits=1,
@@ -758,7 +706,11 @@ def handle_call_selection():
     digit = request.form.get("Digits", "")
     phone = request.form.get("From", "")
     response = VoiceResponse()
-    log_event("CALL_MENU_SELECTION", convo_key=phone.strip() or (request.form.get("CallSid", "") or "call:unknown"), phone=phone, payload={"digit": digit, "call_sid": request.form.get("CallSid")})
+
+    try:
+        log_event("CALL_MENU_SELECTION", (phone or "").replace("whatsapp:", "").strip(), {"digit": digit, "call_sid": request.form.get("CallSid")})
+    except Exception:
+        pass
 
     
     # ---------------------------------------------------
@@ -902,7 +854,6 @@ def voicemail_complete():
     from_number   = request.form.get("From", "").replace("whatsapp:", "")
 
     resp = VoiceResponse()
-    log_event("VOICEMAIL_RECEIVED", convo_key=from_number or "unknown", phone=from_number, payload={"recording_url": recording_url, "call_sid": request.form.get("CallSid")})
 
     if not recording_url:
         resp.say("We did not receive a recording. Goodbye.")
@@ -912,14 +863,12 @@ def voicemail_complete():
     try:
         transcript = transcribe_recording(recording_url)
         cleaned    = clean_transcript_text(transcript)
-        log_event("VOICEMAIL_TRANSCRIBED", convo_key=from_number or "unknown", phone=from_number, payload={"transcript": (transcript or "")[:4000], "cleaned": (cleaned or "")[:4000]})
     except Exception as e:
         print("[ERROR] voicemail_complete transcription:", repr(e))
         cleaned = ""
 
     # 2) Classification
     classification = generate_initial_sms(cleaned)
-    log_event("VOICEMAIL_CLASSIFIED", convo_key=from_number or "unknown", phone=from_number, payload={"classification": classification})
 
     # 3) Save to memory
     conv = conversations.setdefault(from_number, {})
@@ -987,6 +936,17 @@ def voicemail_complete():
         sched["appointment_type"] = "TROUBLESHOOT_395"
         sched["awaiting_emergency_confirm"] = True
         sched["emergency_approved"] = False
+
+    try:
+        log_event("VOICEMAIL_CAPTURED", from_number, {
+            "category": classification.get("category"),
+            "appointment_type": classification.get("appointment_type"),
+            "intent": classification.get("intent"),
+            "task_topics": classification.get("task_topics") or [],
+            "transcript": _safe_monitor_text(cleaned, 500),
+        }, conv)
+    except Exception:
+        pass
 
     # 4) Trigger First SMS using deterministic voicemail opener so task topics and known addresses land reliably
     try:
@@ -1600,7 +1560,11 @@ def incoming_sms():
     inbound_sid = request.form.get("MessageSid") or request.form.get("SmsSid") or ""
     convo_key   = phone or inbound_sid or request.form.get("CallSid") or "unknown"
     inbound_low  = inbound_text.lower().strip()
-    log_event("SMS_IN", convo_key=convo_key, phone=phone, payload={"sid": inbound_sid, "body": (inbound_text or "")[:2000]})
+
+    try:
+        log_event("SMS_IN", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
+    except Exception:
+        pass
 
     # SECRET RESET COMMAND
     if inbound_low == "mobius1":
@@ -1637,7 +1601,6 @@ def incoming_sms():
             }
         }
         resp = MessagingResponse()
-        log_sms_out_event(phone or convo_key, "✔ Memory reset complete for this number.", convo_key=convo_key, source="incoming_sms")
         resp.message("✔ Memory reset complete for this number.")
         return Response(str(resp), mimetype="text/xml")
 
@@ -1652,7 +1615,6 @@ def incoming_sms():
     now_ts = time.time()
     if inbound_sid and conv.get("last_inbound_sid") == inbound_sid and conv.get("last_sms_body"):
         tw = MessagingResponse()
-        log_sms_out_event(phone or convo_key, conv.get("last_sms_body"), convo_key=convo_key, source="incoming_sms_retry")
         tw.message(conv.get("last_sms_body"))
         return Response(str(tw), mimetype="text/xml")
     if (
@@ -1663,7 +1625,6 @@ def incoming_sms():
         and conv.get("last_sms_body")
     ):
         tw = MessagingResponse()
-        log_sms_out_event(phone or convo_key, conv.get("last_sms_body"), convo_key=convo_key, source="incoming_sms_retry")
         tw.message(conv.get("last_sms_body"))
         return Response(str(tw), mimetype="text/xml")
 
@@ -1845,8 +1806,11 @@ def incoming_sms():
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
         conv["last_sms_body"] = fast_interrupt.strip()
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(fast_interrupt)}, conv)
+        except Exception:
+            pass
         tw = MessagingResponse()
-        log_sms_out_event(phone or convo_key, fast_interrupt.strip(), convo_key=convo_key, source="incoming_sms")
         tw.message(fast_interrupt.strip())
         return Response(str(tw), mimetype="text/xml")
 
@@ -1862,8 +1826,11 @@ def incoming_sms():
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
         conv["last_sms_body"] = soft_reject_reply.strip()
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(soft_reject_reply)}, conv)
+        except Exception:
+            pass
         tw = MessagingResponse()
-        log_sms_out_event(phone or convo_key, soft_reject_reply.strip(), convo_key=convo_key, source="incoming_sms")
         tw.message(soft_reject_reply.strip())
         return Response(str(tw), mimetype="text/xml")
 
@@ -1881,8 +1848,11 @@ def incoming_sms():
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
         conv["last_sms_body"] = resumed_reply.strip()
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(resumed_reply)}, conv)
+        except Exception:
+            pass
         tw = MessagingResponse()
-        log_sms_out_event(phone or convo_key, resumed_reply.strip(), convo_key=convo_key, source="incoming_sms")
         tw.message(resumed_reply.strip())
         return Response(str(tw), mimetype="text/xml")
 
@@ -1898,8 +1868,11 @@ def incoming_sms():
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
         conv["last_sms_body"] = post_booking_reply.strip()
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(post_booking_reply)}, conv)
+        except Exception:
+            pass
         tw = MessagingResponse()
-        log_sms_out_event(phone or convo_key, post_booking_reply.strip(), convo_key=convo_key, source="incoming_sms")
         tw.message(post_booking_reply.strip())
         return Response(str(tw), mimetype="text/xml")
 
@@ -1997,9 +1970,12 @@ def incoming_sms():
     conv["last_inbound_fingerprint"] = inbound_fingerprint
     conv["last_inbound_fingerprint_ts"] = now_ts
     conv["last_sms_body"] = sms_body
+    try:
+        log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(sms_body)}, conv)
+    except Exception:
+        pass
 
     tw = MessagingResponse()
-    log_sms_out_event(phone or convo_key, sms_body, convo_key=convo_key, source="incoming_sms")
     tw.message(sms_body)
     return Response(str(tw), mimetype="text/xml")
 
@@ -4717,6 +4693,10 @@ def is_weekend(date_str: str) -> bool:
 #   ✅ Prevents stale booking flags from causing ghost confirmations
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict):
+    try:
+        log_event("BOOKING_ATTEMPT", phone, {}, convo)
+    except Exception:
+        pass
     import re
 
     sched = convo.setdefault("sched", {})
@@ -4748,10 +4728,10 @@ def maybe_create_square_booking(phone: str, convo: dict):
     profile["email"] = active_email
 
     if not ((active_first and active_last) or profile.get("square_customer_id")):
-        return _booking_return({"status": "missing_identity"})
+        return {"status": "missing_identity"}
 
     if sched.get("booking_created") and sched.get("square_booking_id"):
-        return _booking_return({"status": "already_booked"})
+        return {"status": "already_booked"}
 
     sched["booking_created"] = False
     sched["square_booking_id"] = None
@@ -4762,28 +4742,28 @@ def maybe_create_square_booking(phone: str, convo: dict):
     appointment_type = sched.get("appointment_type")
 
     if not sched.get("address_verified"):
-        return _booking_return({"status": "address_not_verified"})
+        return {"status": "address_not_verified"}
 
     if not (scheduled_date and scheduled_time and appointment_type):
-        return _booking_return({"status": "missing_fields"})
+        return {"status": "missing_fields"}
 
     variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
     if not variation_id:
         print("[ERROR] Unknown appt_type:", appointment_type)
-        return _booking_return({"status": "unknown_appointment_type"})
+        return {"status": "unknown_appointment_type"}
 
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
         print("[BLOCKED] Weekend not allowed for non-emergency.")
-        return _booking_return({"status": "weekend_blocked"})
+        return _monitor_booking_return(phone, "weekend_blocked", {"status": "weekend_blocked"}, convo)
 
     if appointment_type != "TROUBLESHOOT_395":
         if not is_within_normal_hours(scheduled_time):
             print("[BLOCKED] Time outside 9–4")
-            return _booking_return({"status": "outside_hours"})
+            return _monitor_booking_return(phone, "outside_hours", {"status": "outside_hours"}, convo)
 
     if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
         print("[ERROR] Square not configured.")
-        return _booking_return({"status": "square_not_configured"})
+        return {"status": "square_not_configured"}
 
     # Preflight exact-slot availability lookup before attempting to book.
     # Emergency dispatch uses the same Square booking pipeline but does not offer alternate slots.
@@ -4807,11 +4787,11 @@ def maybe_create_square_booking(phone: str, convo: dict):
                 same_day_options,
                 rolled_slots
             )
-            return _booking_return({
+            return {
                 "status": "slot_unavailable",
                 "message": sched["last_slot_unavailable_message"],
                 "options": offered,
-            })
+            }
 
     addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
 
@@ -4832,25 +4812,25 @@ def maybe_create_square_booking(phone: str, convo: dict):
         if not raw_address:
             sched["address_verified"] = False
             sched["address_missing"] = "street"
-            return _booking_return({"status": "missing_address"})
+            return {"status": "missing_address"}
 
         try:
             status, fresh = normalize_address(raw_address)
         except Exception as e:
             print("[ERROR] normalize_address exception:", repr(e))
-            return _booking_return({"status": "normalize_exception"})
+            return {"status": "normalize_exception"}
 
         if status == "needs_state":
             send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
             sched["address_verified"] = False
             sched["address_missing"] = "state"
-            return _booking_return({"status": "needs_state"})
+            return {"status": "needs_state"}
 
         if status != "ok" or not isinstance(fresh, dict):
             print("[ERROR] Address normalization failed. status=", status)
             sched["address_verified"] = False
             sched["address_missing"] = "confirm"
-            return _booking_return({"status": "address_normalization_failed"})
+            return {"status": "address_normalization_failed"}
 
         addr_struct = fresh
         sched["normalized_address"] = addr_struct
@@ -4859,13 +4839,13 @@ def maybe_create_square_booking(phone: str, convo: dict):
         print("[ERROR] Normalized address missing required fields.")
         sched["address_verified"] = False
         sched["address_missing"] = "confirm"
-        return _booking_return({"status": "address_incomplete"})
+        return {"status": "address_incomplete"}
 
     line1 = (addr_struct.get("address_line_1") or "").strip()
     if not _has_house_number(line1):
         sched["address_verified"] = False
         sched["address_missing"] = "number"
-        return _booking_return({"status": "missing_house_number"})
+        return {"status": "missing_house_number"}
 
     booking_address = dict(addr_struct)
     booking_address.pop("country", None)
@@ -4882,17 +4862,17 @@ def maybe_create_square_booking(phone: str, convo: dict):
         travel_minutes = compute_travel_time_minutes(origin, destination)
         if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES:
             print("[BLOCKED] Travel too long.")
-            return _booking_return({"status": "travel_too_long"})
+            return {"status": "travel_too_long"}
 
     customer_id = square_create_or_get_customer(phone, profile, addr_struct)
     if not customer_id:
         print("[ERROR] Can't create/fetch customer.")
-        return _booking_return({"status": "customer_unavailable"})
+        return {"status": "customer_unavailable"}
 
     start_at_utc = parse_local_datetime(scheduled_date, scheduled_time)
     if not start_at_utc:
         print("[ERROR] Invalid start time.")
-        return _booking_return({"status": "invalid_start_time"})
+        return {"status": "invalid_start_time"}
 
     booking_nonce = (sched.get("booking_attempt_nonce") or "").strip()
     if not booking_nonce:
@@ -4939,7 +4919,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
         )
         if resp.status_code not in (200, 201):
             print("[ERROR] Square booking failed:", resp.status_code, resp.text)
-            return _booking_return({"status": "create_booking_failed", "http_status": resp.status_code, "body": resp.text})
+            return {"status": "create_booking_failed", "http_status": resp.status_code, "body": resp.text}
 
         data = resp.json()
         booking = data.get("booking") or {}
@@ -4947,7 +4927,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
         if not booking_id:
             print("[ERROR] booking_id missing. payload=", data)
-            return _booking_return({"status": "missing_booking_id"})
+            return {"status": "missing_booking_id"}
 
         r2 = requests.get(
             f"https://connect.squareup.com/v2/bookings/{booking_id}",
@@ -4956,7 +4936,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
         )
         if r2.status_code not in (200, 201):
             print("[ERROR] retrieve booking failed:", r2.status_code, r2.text)
-            return _booking_return({"status": "retrieve_failed", "http_status": r2.status_code, "body": r2.text})
+            return {"status": "retrieve_failed", "http_status": r2.status_code, "body": r2.text}
 
         b2 = (r2.json() or {}).get("booking") or {}
         status = (b2.get("status") or "").upper()
@@ -4983,7 +4963,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
             sched["booking_created"] = False
             sched["square_booking_id"] = None
             sched["booking_attempt_nonce"] = str(uuid.uuid4())
-            return _booking_return({"status": "stale_cancelled"})
+            return _monitor_booking_return(phone, "stale_cancelled", {"status": "stale_cancelled"}, convo)
 
         # Do not attempt to update booking.status here.
         # The current Square response is showing booking.status as read-only on update,
@@ -5014,12 +4994,77 @@ def maybe_create_square_booking(phone: str, convo: dict):
             })
 
         print("[SUCCESS] Booking created and accepted:", booking_id)
-        return _booking_return({"status": "booked", "booking_id": booking_id})
+        return _monitor_booking_return(phone, "booked", {"status": "booked", "booking_id": booking_id}, convo)
 
     except Exception as e:
         print("[ERROR] Square exception:", repr(e))
-        return _booking_return({"status": "square_exception", "detail": repr(e)})
+        return _monitor_booking_return(phone, "square_exception", {"status": "square_exception", "detail": repr(e)}, convo)
 
+
+
+@app.route("/monitor/health", methods=["GET"])
+def monitor_health():
+    return {"ok": True}, 200
+
+
+@app.route("/monitor/events", methods=["GET"])
+def monitor_events():
+    init_monitor_db()
+    limit_raw = request.args.get("limit", "250")
+    phone = (request.args.get("phone") or "").replace("whatsapp:", "").strip()
+    try:
+        limit = max(1, min(1000, int(limit_raw)))
+    except Exception:
+        limit = 250
+
+    query = "SELECT id, ts, event_type, phone, payload_json FROM monitor_events"
+    params = []
+    if phone:
+        query += " WHERE phone = ?"
+        params.append(phone)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    items = []
+    try:
+        with _monitor_connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        for row in rows:
+            payload = {}
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except Exception:
+                payload = {}
+            items.append({
+                "id": row["id"],
+                "ts": row["ts"],
+                "event_type": row["event_type"],
+                "phone": row["phone"],
+                "payload": payload,
+            })
+    except Exception as e:
+        return {"ok": False, "error": repr(e), "items": []}, 500
+
+    return {"ok": True, "items": items}, 200
+
+
+@app.route("/monitor/conversations", methods=["GET"])
+def monitor_conversations():
+    items = []
+    for phone, conv in conversations.items():
+        if not isinstance(conv, dict):
+            continue
+        try:
+            items.append(_conversation_snapshot(phone, conv))
+        except Exception:
+            continue
+
+    items.sort(key=lambda x: (
+        0 if x.get("state") == "emergency" else 1,
+        0 if x.get("booking_created") else 1,
+        x.get("phone") or "",
+    ))
+    return {"ok": True, "items": items}, 200
 
 
 # ---------------------------------------------------
