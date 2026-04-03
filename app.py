@@ -1716,16 +1716,24 @@ def incoming_sms():
 
     recompute_pending_step(profile, sched)
 
-    # Route-level autobooking safeguard:
-    # If Step 4 successfully captured a full regular booking slot but fell through with a generic
-    # or looping prompt, try the Square booking pipeline here before sending the SMS.
     sms_body = (reply.get("sms_body") or "").strip()
+
+    # Regular-booking hard guard:
+    # If Step 4 has already captured a full slot + identity + contact + verified address,
+    # attempt the normal Square booking path immediately before asking anything again.
     has_identity_for_booking = bool(
         (get_active_first_name(profile) and get_active_last_name(profile))
         or profile.get("square_customer_id")
     )
     has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
-    ready_for_booking_now = (
+    appt_upper = (sched.get("appointment_type") or "").upper()
+    emergency_mode = (
+        "TROUBLESHOOT" in appt_upper
+        or bool(sched.get("emergency_approved"))
+        or bool(sched.get("awaiting_emergency_confirm"))
+    )
+
+    ready_for_route_booking = (
         bool(sched.get("scheduled_date")) and
         bool(sched.get("scheduled_time")) and
         bool(sched.get("address_verified")) and
@@ -1736,13 +1744,17 @@ def incoming_sms():
         not sched.get("booking_created")
     )
 
-    if ready_for_booking_now:
+    if ready_for_route_booking and not emergency_mode:
         try:
             booking_attempt = maybe_create_square_booking(phone, conv)
+
             if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                 sms_body = booking_attempt.get("message") or "That time is already booked. Here are three other times that work."
             elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
-                sms_body = "We typically schedule between 9am and 4pm. What time in that window works for you?"
+                if sched.get("scheduled_date"):
+                    sms_body = "We typically schedule between 9am and 4pm. What time in that window works for you?"
+                else:
+                    sms_body = "We typically schedule between 9am and 4pm. What day and time in that window work best for you?"
             elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "weekend_blocked":
                 sms_body = "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
             elif sched.get("booking_created") and sched.get("square_booking_id"):
@@ -1754,7 +1766,7 @@ def incoming_sms():
                 booked_time = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
                 sms_body = f"You're all set for {human_day} at {booked_time}. We have you on the schedule."
         except Exception as e:
-            print("[WARN] route-level booking safeguard failed:", repr(e))
+            print("[WARN] route-level booking attempt failed:", repr(e))
 
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
