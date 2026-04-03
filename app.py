@@ -4750,35 +4750,11 @@ def maybe_create_square_booking(phone: str, convo: dict):
             "team_member_id": tm
         })
 
+        # Do not attempt to update booking.status here.
+        # The current Square response is showing booking.status as read-only on update,
+        # which turns a successful create into a false failure at the very end.
         if status not in ("ACCEPTED", "CONFIRMED"):
-            if version is None:
-                print("[ERROR] booking version missing; cannot accept.")
-                return {"status": "missing_booking_version"}
-
-            accept_payload = {
-                "booking": {
-                    "version": version,
-                    "status": "ACCEPTED",
-                }
-            }
-
-            r3 = requests.put(
-                f"https://connect.squareup.com/v2/bookings/{booking_id}",
-                headers=square_headers(),
-                json=accept_payload,
-                timeout=12,
-            )
-            if r3.status_code not in (200, 201):
-                print("[ERROR] accept booking failed:", r3.status_code, r3.text)
-                return {"status": "accept_failed", "http_status": r3.status_code, "body": r3.text}
-
-            b3 = (r3.json() or {}).get("booking") or {}
-            status2 = (b3.get("status") or "").upper()
-            print("[DEBUG] booking accepted:", {"id": booking_id, "status": status2})
-
-            if status2 not in ("ACCEPTED", "CONFIRMED"):
-                print("[ERROR] booking did not end in ACCEPTED/CONFIRMED. status=", status2)
-                return {"status": "accept_not_final"}
+            print("[WARN] booking retrieved with non-final status; proceeding without status update:", status)
 
         sched["booking_created"] = True
         sched["square_booking_id"] = booking_id
