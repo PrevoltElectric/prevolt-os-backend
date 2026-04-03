@@ -1716,7 +1716,46 @@ def incoming_sms():
 
     recompute_pending_step(profile, sched)
 
+    # Route-level autobooking safeguard:
+    # If Step 4 successfully captured a full regular booking slot but fell through with a generic
+    # or looping prompt, try the Square booking pipeline here before sending the SMS.
     sms_body = (reply.get("sms_body") or "").strip()
+    has_identity_for_booking = bool(
+        (get_active_first_name(profile) and get_active_last_name(profile))
+        or profile.get("square_customer_id")
+    )
+    has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+    ready_for_booking_now = (
+        bool(sched.get("scheduled_date")) and
+        bool(sched.get("scheduled_time")) and
+        bool(sched.get("address_verified")) and
+        bool(sched.get("appointment_type")) and
+        has_identity_for_booking and
+        has_contact_for_booking and
+        not sched.get("pending_step") and
+        not sched.get("booking_created")
+    )
+
+    if ready_for_booking_now:
+        try:
+            booking_attempt = maybe_create_square_booking(phone, conv)
+            if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
+                sms_body = booking_attempt.get("message") or "That time is already booked. Here are three other times that work."
+            elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
+                sms_body = "We typically schedule between 9am and 4pm. What time in that window works for you?"
+            elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "weekend_blocked":
+                sms_body = "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
+            elif sched.get("booking_created") and sched.get("square_booking_id"):
+                try:
+                    booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+                    human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
+                except Exception:
+                    human_day = sched.get("scheduled_date") or "that day"
+                booked_time = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
+                sms_body = f"You're all set for {human_day} at {booked_time}. We have you on the schedule."
+        except Exception as e:
+            print("[WARN] route-level booking safeguard failed:", repr(e))
+
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
     # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
