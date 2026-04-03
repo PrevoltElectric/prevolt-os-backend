@@ -3407,11 +3407,18 @@ def generate_reply_for_inbound(
         CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
 
         if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
+            rounded_now = now_local.replace(second=0, microsecond=0)
+            minute_mod = rounded_now.minute % 30
+            if minute_mod:
+                rounded_now = rounded_now + timedelta(minutes=(30 - minute_mod))
+            elif rounded_now <= now_local:
+                rounded_now = rounded_now + timedelta(minutes=30)
+
             sched["emergency_approved"] = True
             sched["awaiting_emergency_confirm"] = False
             sched["appointment_type"] = "TROUBLESHOOT_395"
-            sched["scheduled_date"] = today_date_str
-            sched["scheduled_time"] = now_local.strftime("%H:%M")
+            sched["scheduled_date"] = rounded_now.strftime("%Y-%m-%d")
+            sched["scheduled_time"] = rounded_now.strftime("%H:%M")
             sched["pending_step"] = None
 
             scheduled_date = sched["scheduled_date"]
@@ -4483,29 +4490,48 @@ def maybe_create_square_booking(phone: str, convo: dict):
         return {"status": "square_not_configured"}
 
     # Preflight exact-slot availability lookup before attempting to book.
-    day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
-    exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
-
-    if not exact_avail:
-        same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
-        rolled_slots = []
-        if not same_day_options:
-            rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
-
-        offered = same_day_options or rolled_slots
-        sched["awaiting_slot_offer_choice"] = True if offered else False
-        sched["offered_slot_options"] = offered
-        sched["last_slot_unavailable_message"] = _format_slot_offer_message(
-            scheduled_date,
-            scheduled_time,
-            same_day_options,
-            rolled_slots
+    # Emergency dispatch must not get kicked into the normal fallback-slot flow.
+    # For TROUBLESHOOT_395 dispatches, book the requested rounded time directly
+    # and let Square create the customer-location booking without forcing an
+    # exact availability match first.
+    skip_availability_preflight = bool(
+        appointment_type == "TROUBLESHOOT_395" and (
+            sched.get("emergency_approved")
+            or sched.get("immediate_dispatch_mode")
+            or sched.get("dispatch_now")
         )
-        return {
-            "status": "slot_unavailable",
-            "message": sched["last_slot_unavailable_message"],
-            "options": offered,
-        }
+    )
+
+    day_avails = []
+    exact_avail = {}
+    if not skip_availability_preflight:
+        day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
+        exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
+
+        if not exact_avail:
+            same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
+            rolled_slots = []
+            if not same_day_options:
+                rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
+
+            offered = same_day_options or rolled_slots
+            sched["awaiting_slot_offer_choice"] = True if offered else False
+            sched["offered_slot_options"] = offered
+            sched["last_slot_unavailable_message"] = _format_slot_offer_message(
+                scheduled_date,
+                scheduled_time,
+                same_day_options,
+                rolled_slots
+            )
+            return {
+                "status": "slot_unavailable",
+                "message": sched["last_slot_unavailable_message"],
+                "options": offered,
+            }
+    else:
+        sched["awaiting_slot_offer_choice"] = False
+        sched["offered_slot_options"] = []
+        sched["last_slot_unavailable_message"] = None
 
     addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
 
