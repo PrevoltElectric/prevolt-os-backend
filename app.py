@@ -2460,13 +2460,16 @@ Return strict JSON with keys:
 
 Priorities:
 - answer the customer's actual question naturally
+- sound like a real electrical contractor handling scheduling by text
 - protect Prevolt's interests
-- keep trust high
+- build trust without overselling
 - never sound robotic
 - never invent license numbers, policy numbers, addresses, permits, or legal promises
 - never restate price unless the user is actively asking about price in this message
+- when the user asks reassurance questions, answer them directly first
 - if the customer is still deciding, do NOT force the booking flow
-- if the customer is cooperative and the trust question is answered, you may gently return to the next missing booking step
+- only return to the booking step if the customer sounds ready to continue
+- never force the booking flow after a trust question
 - never turn the customer's question into an address or rewrite the question as an address
 - do not output paragraphs
 - one clean text
@@ -2515,7 +2518,6 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked and not allow_post_booking:
         return None
 
-    # Let the LLM handle trust / hesitation / multi-question turns first.
     trust = llm_trust_reply(conv, inbound_text)
     if trust and trust.get("answer"):
         answer = trust["answer"].strip()
@@ -2528,23 +2530,34 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         return answer
 
     answer = None
+
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
-        answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
+        answer = "Yes, that is fine. Just make sure we can safely access the work area when we arrive."
+
     elif any(x in low for x in ["licensed", "license", "insured", "insurance"]):
         if "copy" in low or "certificate" in low or "proof" in low:
-            answer = "We can provide insurance documentation when the visit is moving forward."
+            answer = "Yes. We can provide insurance documentation when the job is moving forward."
         else:
             answer = "Yes, we're licensed and insured."
+
     elif any(x in low for x in ["where are you located", "where are you guys located", "where are you based", "where are you out of"]):
-        answer = "We service Connecticut and Massachusetts."
+        answer = "We're a local electrical contractor serving Connecticut and Massachusetts."
+
+    elif any(x in low for x in ["real person", "is this ai", "are you ai"]):
+        answer = "You're texting with Prevolt Electric's scheduling system, and it's here to get your visit handled correctly."
+
     elif any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you re close", "when you're close", "when youre close"]):
         answer = "Yes, you'll get a text when we're on the way."
+
     elif any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
         answer = "No, you do not need to buy anything ahead of time for the visit."
+
     elif any(x in low for x in ["permit", "permit required"]):
-        answer = "If anything needs a permit, we'll go over that during the visit."
+        answer = "If anything requires a permit, we'll go over that on site once we see exactly what is there."
+
     elif any(x in low for x in ["card", "cash", "check", "payment", "pay by", "how do i pay"]):
         answer = "Card or cash after the visit is fine."
+
     elif any(x in low for x in [
         "how much", "price", "cost", "$195", "$395", "195", "395",
         "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee",
@@ -2565,11 +2578,11 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             "deposit", "credited back", "applied back"
         ]):
             if "TROUBLESHOOT" in appt:
-                answer = "The $395 covers the troubleshoot and repair visit itself. If larger repair work is needed, we go over that separately on site first."
+                answer = "The $395 covers the troubleshoot and repair visit itself. If larger repair work is needed, we would go over that separately on site first."
             elif "INSPECTION" in appt:
-                answer = "The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately."
+                answer = "The inspection fee covers the inspection visit itself. If additional work is needed after that, we would go over it separately."
             else:
-                answer = "The $195 covers the evaluation visit itself. If you decide to move forward after that, we go over the next step in person."
+                answer = "The $195 covers the evaluation visit itself. If more work is needed after that, we would go over the next step in person."
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
             answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
         elif "TROUBLESHOOT" in appt:
@@ -2579,14 +2592,19 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         else:
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
+
     elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        answer = "Once I have the booking details, I can get you on the schedule."
+        answer = "Once I have the visit details, I can get you on the schedule."
+
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
+
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
         answer = "Yes, we handle panel upgrades and replacements."
+
     elif "favorite color" in low:
         answer = "Let's keep it on the visit details."
+
     elif any(x in low for x in ["roll me over", "pick me up", "carry me"]):
         answer = "We handle the electrical work itself. If someone needs to help with access, just make sure that is covered when we come out."
 
