@@ -517,52 +517,41 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
             joined = ", ".join(topics[:-1]) + f", and {topics[-1]}"
         task_line = f" It sounds like you're looking for help with {joined}."
 
+    # Prefer a real full saved address if available.
     saved_full = None
     for a in profile.get("addresses") or []:
         a = (a or "").strip()
-        if re.match(r"^\d{1,6}\b", a):
+        if re.match(r"^\d{1,6}", a):
             saved_full = a
             break
 
     raw_hint = (sched.get("raw_address") or classification.get("detected_address") or "").strip()
-
-    if (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper() == "TROUBLESHOOT_395":
-        if saved_full or raw_hint:
-            dispatch_address = saved_full or raw_hint
-            sms = (
-                intro
-                + task_line
-                + f" This sounds urgent at {dispatch_address}."
-                + " We can send someone now and arrival is usually within 1 to 2 hours."
-                + " Troubleshoot and repair visits are $395."
-                + " Do you want us to dispatch someone now?"
-            ).strip()
-            sched["intro_sent"] = True
-            sched["price_disclosed"] = True
-            return re.sub(r"\s+", " ", sms).strip()
-
-        sms = (intro + task_line + " What is the address for the visit?").strip()
-        sched["intro_sent"] = True
-        sched["price_disclosed"] = False
-        return re.sub(r"\s+", " ", sms).strip()
+    town_hint = raw_hint
+    town_hint_low = town_hint.lower()
 
     address_line = ""
     if saved_full:
+        # If a town hint exists and conflicts, still confirm the actual saved full address.
         address_line = f" I have {saved_full} on file. Is this for that address?"
-    elif raw_hint and not re.match(r"^\d{1,6}\b", raw_hint):
-        address_line = f" What is the house number and street name in {raw_hint}?"
+    elif town_hint and not re.match(r"^\d{1,6}", town_hint):
+        address_line = f" What is the house number and street name in {town_hint}?"
     else:
         address_line = " What is the address for the visit?"
 
+    # Emergency opener is different from normal booking:
+    # do NOT lead with pricing, and do NOT disturb the normal booking opener.
+    price_line = ""
     appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
-    if appt_type == "WHOLE_HOME_INSPECTION":
+    if appt_type == "TROUBLESHOOT_395":
+        price_line = ""
+    elif appt_type == "WHOLE_HOME_INSPECTION":
         price_line = " Home inspections are $395."
     else:
         price_line = " Our evaluation visit is $195."
 
     sms = (intro + task_line + address_line + price_line).strip()
     sched["intro_sent"] = True
-    sched["price_disclosed"] = True
+    sched["price_disclosed"] = bool(price_line)
     return re.sub(r"\s+", " ", sms).strip()
 
 # ---------------------------------------------------
@@ -830,11 +819,6 @@ def voicemail_complete():
         sched["raw_address"] = classification["detected_address"]
 
     # Refresh address assembly state (safe if normalized/raw changed)
-    update_address_assembly_state(sched)
-    try:
-        try_early_address_normalize(sched)
-    except Exception as e:
-        print("[WARN] voicemail_complete early normalize failed:", repr(e))
     update_address_assembly_state(sched)
 
     # --------------------------------------
@@ -3392,11 +3376,11 @@ def generate_reply_for_inbound(
             sched["awaiting_emergency_confirm"] = True
             sched["pending_step"] = None
 
-            try:
-                try_early_address_normalize(sched)
-            except Exception as e:
-                print("[WARN] emergency early normalize failed:", repr(e))
-            update_address_assembly_state(sched)
+            if sched.get("raw_address"):
+                try:
+                    try_early_address_normalize(sched)
+                except Exception:
+                    pass
 
             if not sched.get("raw_address"):
                 known_q = _known_address_question()
@@ -3413,11 +3397,9 @@ def generate_reply_for_inbound(
                     "booking_complete": False
                 }
 
-            sched["price_disclosed"] = True
             msg = (
-                f"This looks urgent at {sched.get('raw_address')}. "
+                f"This sounds urgent at {sched.get('raw_address')}. "
                 "We can send someone now and arrival is usually within 1 to 2 hours. "
-                "Troubleshoot and repair visits are $395. "
                 "Do you want us to dispatch someone now?"
             )
             msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
@@ -3432,26 +3414,27 @@ def generate_reply_for_inbound(
         CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
 
         if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
-            dispatch_eta = now_local + timedelta(hours=1)
-            dispatch_eta = dispatch_eta.replace(second=0, microsecond=0)
-            minute_mod = dispatch_eta.minute % 30
-            if minute_mod:
-                dispatch_eta = dispatch_eta + timedelta(minutes=(30 - minute_mod))
-
             sched["emergency_approved"] = True
             sched["awaiting_emergency_confirm"] = False
-            sched["dispatch_now"] = True
-            sched["immediate_dispatch_mode"] = True
             sched["appointment_type"] = "TROUBLESHOOT_395"
-            sched["scheduled_date"] = dispatch_eta.strftime("%Y-%m-%d")
-            sched["scheduled_time"] = dispatch_eta.strftime("%H:%M")
+            dispatch_dt = (now_local + timedelta(hours=1)).replace(second=0, microsecond=0)
+            if dispatch_dt.minute not in (0, 30):
+                if dispatch_dt.minute < 30:
+                    dispatch_dt = dispatch_dt.replace(minute=30)
+                else:
+                    dispatch_dt = (dispatch_dt + timedelta(hours=1)).replace(minute=0)
+            sched["scheduled_date"] = dispatch_dt.strftime("%Y-%m-%d")
+            sched["scheduled_time"] = dispatch_dt.strftime("%H:%M")
             sched["pending_step"] = None
-
-            try:
-                try_early_address_normalize(sched)
-            except Exception as e:
-                print("[WARN] emergency confirm normalize failed:", repr(e))
-            update_address_assembly_state(sched)
+            sched["final_confirmation_sent"] = True
+            sched["final_confirmation_accepted"] = True
+            sched["last_final_confirmation_key"] = f"{sched['scheduled_date']}|{sched['scheduled_time']}"
+            sched["price_disclosed"] = True
+            if sched.get("raw_address"):
+                try:
+                    try_early_address_normalize(sched)
+                except Exception:
+                    pass
 
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
@@ -4522,29 +4505,37 @@ def maybe_create_square_booking(phone: str, convo: dict):
         return {"status": "square_not_configured"}
 
     # Preflight exact-slot availability lookup before attempting to book.
-    day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
-    exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
+    # Emergency dispatch bypasses Square availability checks and uses the same
+    # booking creation pipeline with the caller-approved dispatch time.
+    exact_avail = None
+    if appointment_type != "TROUBLESHOOT_395":
+        day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
+        exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
 
-    if not exact_avail:
-        same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
-        rolled_slots = []
-        if not same_day_options:
-            rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
+        if not exact_avail:
+            same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
+            rolled_slots = []
+            if not same_day_options:
+                rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
 
-        offered = same_day_options or rolled_slots
-        sched["awaiting_slot_offer_choice"] = True if offered else False
-        sched["offered_slot_options"] = offered
-        sched["last_slot_unavailable_message"] = _format_slot_offer_message(
-            scheduled_date,
-            scheduled_time,
-            same_day_options,
-            rolled_slots
-        )
-        return {
-            "status": "slot_unavailable",
-            "message": sched["last_slot_unavailable_message"],
-            "options": offered,
-        }
+            offered = same_day_options or rolled_slots
+            sched["awaiting_slot_offer_choice"] = True if offered else False
+            sched["offered_slot_options"] = offered
+            sched["last_slot_unavailable_message"] = _format_slot_offer_message(
+                scheduled_date,
+                scheduled_time,
+                same_day_options,
+                rolled_slots
+            )
+            return {
+                "status": "slot_unavailable",
+                "message": sched["last_slot_unavailable_message"],
+                "options": offered,
+            }
+    else:
+        sched["awaiting_slot_offer_choice"] = False
+        sched["offered_slot_options"] = []
+        sched["last_slot_unavailable_message"] = None
 
     addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
 
