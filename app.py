@@ -249,7 +249,6 @@ def recompute_pending_step(profile: dict, sched: dict) -> None:
     if not sched.get("appointment_type"):
         sched["pending_step"] = "need_appt_type"
     elif not sched.get("raw_address") or not sched.get("address_verified"):
-        # Emergency jobs still require a verified address before they are booking-ready.
         sched["pending_step"] = "need_address"
     elif not sched.get("scheduled_date"):
         sched["pending_step"] = "need_date"
@@ -450,12 +449,7 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 # Initial Voicemail SMS Builder (deterministic first text)
 # ---------------------------------------------------
 def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
-    """Best-effort one-time Square hydrate for repeat callers before the first text goes out.
-
-    Important identity rule:
-    - A phone-number match is only a recognized prior customer hint.
-    - It must NOT blindly become the active caller identity before the current voicemail is resolved.
-    """
+    """Best-effort one-time Square hydrate for repeat callers before the first text goes out."""
     profile.setdefault("addresses", [])
     profile.setdefault("square_lookup_done", False)
     profile.setdefault("square_customer_id", None)
@@ -478,11 +472,9 @@ def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
             profile["recognized_last_name"] = cust.get("family_name")
             profile["recognized_email"] = cust.get("email_address")
 
-            # Do not blindly promote the old Square customer into the active caller.
-            # Only fill active identity if absolutely nothing current exists yet.
-            if not profile.get("active_first_name") and not profile.get("voicemail_first_name") and cust.get("given_name"):
+            if not profile.get("active_first_name") and cust.get("given_name"):
                 profile["active_first_name"] = cust.get("given_name")
-            if not profile.get("active_last_name") and not profile.get("voicemail_last_name") and cust.get("family_name"):
+            if not profile.get("active_last_name") and cust.get("family_name"):
                 profile["active_last_name"] = cust.get("family_name")
             if not profile.get("active_email") and cust.get("email_address"):
                 profile["active_email"] = cust.get("email_address")
@@ -503,209 +495,13 @@ def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
         profile["square_lookup_done"] = True
 
 
-def _normalize_display_town_hint(raw_text: str) -> str:
-    """Keep customer-facing town prompts grounded in the caller's wording.
-    We only apply a tiny alias map for repeated speech-to-text misses and otherwise
-    preserve the user's town text instead of inventing a different town."""
-    txt = " ".join((raw_text or "").replace(",", " ").split()).strip()
-    if not txt:
-        return ""
-    low = txt.lower().strip(" .?")
-    aliases = {
-        'winterlox': 'Windsor Locks',
-        'windsor lox': 'Windsor Locks',
-        'windsor locs': 'Windsor Locks',
-        'sims ferry': 'Simsbury',
-        'simsbussy': 'Simsbury',
-        'sims busy': 'Simsbury',
-        'north hampton': 'Northampton',
-        'north hampton mass': 'Northampton, Massachusetts',
-        'north hampton ma': 'Northampton, Massachusetts',
-    }
-    if low in aliases:
-        return aliases[low]
-    return txt
-
-
-
-
-def extract_town_hint_from_text(text: str) -> str:
-    txt = " ".join((text or "").split())
-    if not txt:
-        return ""
-    m = re.search(r"house number and street name in\s+([A-Za-z .'-]+)\?", txt, flags=re.I)
-    if m:
-        return _normalize_display_town_hint(m.group(1).strip())
-    m = re.search(r"\bin\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\?", txt)
-    if m:
-        return _normalize_display_town_hint(m.group(1).strip())
-    return ""
-
-
-def canonicalize_address_candidate(raw_address: str) -> str:
-    raw = " ".join((raw_address or "").strip().split())
-    if not raw:
-        return raw
-    try:
-        cleaned = clean_leading_address_filler(raw)
-        if cleaned:
-            raw = " ".join(cleaned.strip().split())
-    except Exception:
-        pass
-    raw = re.sub(r"^(?:it'?s|its|i am at|i'm at|im at|my address is|address is)\s+(?=\d)", "", raw, flags=re.I).strip()
-    return raw
-
-
-def enrich_address_with_known_town(raw_address: str, initial_sms: str = "", cleaned_transcript: str = "") -> str:
-    raw = canonicalize_address_candidate(raw_address)
-    if not raw:
-        return raw
-    if "," in raw:
-        return raw
-    town = extract_town_hint_from_text(initial_sms) or extract_town_hint_from_text(cleaned_transcript)
-    if town and re.match(r"^\d{1,6}\b", raw):
-        return f"{raw}, {town}"
-    return raw
-
-
-def normalize_address_with_context(raw_address: str, *context_texts: str):
-    raw = " ".join((raw_address or "").strip().split())
-    if not raw:
-        return "error", None
-
-    # First try the raw address as-is.
-    status, addr = normalize_address(raw)
-    if status == "ok" and isinstance(addr, dict):
-        return status, addr
-
-    town_hint = ""
-    for txt in context_texts:
-        town_hint = extract_town_hint_from_text(txt or "")
-        if town_hint:
-            break
-
-    best = None
-    for forced_state in ("CT", "MA"):
-        st, candidate = normalize_address(raw, forced_state=forced_state)
-        if st == "ok" and isinstance(candidate, dict):
-            if town_hint:
-                cand_city = (candidate.get("locality") or "").strip().lower()
-                if cand_city == town_hint.strip().lower():
-                    return st, candidate
-            if best is None:
-                best = (st, candidate)
-
-    if best:
-        return best
-    return status, addr
-
-def _looks_like_town_only_text(text: str) -> bool:
-    txt = " ".join((text or "").replace(",", " ").split()).strip()
-    if not txt:
-        return False
-    if re.search(r"\d", txt):
-        return False
-    street_words = r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)"
-    if re.search(street_words, txt, flags=re.I):
-        return False
-    return bool(re.search(r"[A-Za-z]", txt))
-
-
-def maybe_apply_town_correction(conv: dict, inbound_text: str) -> bool:
-    """Allow the customer to correct a bad town hint without restarting the flow."""
-    sched = conv.setdefault("sched", {})
-    txt = " ".join((inbound_text or "").replace(",", " ").split()).strip()
-    if not txt or not _looks_like_town_only_text(txt):
-        return False
-
-    current_raw = (sched.get("raw_address") or "").strip()
-    low = txt.lower()
-    correction_markers = (
-        'i live in ', 'im in ', "i'm in ", 'it is in ', "it's in ",
-        'the town is ', 'its in ', 'located in '
-    )
-    candidate = txt
-    for marker in correction_markers:
-        if low.startswith(marker):
-            candidate = txt[len(marker):].strip()
-            break
-    candidate = _normalize_display_town_hint(candidate).strip(' .?,')
-    if not candidate or not _looks_like_town_only_text(candidate):
-        return False
-
-    should_update = False
-    if not current_raw:
-        should_update = True
-    elif not re.match(r"^\d{1,6}", current_raw):
-        # We only overwrite town-only hints, never full street addresses.
-        should_update = True
-    elif sched.get("address_missing") in {"confirm", "street", None} and ('town' in low or 'live in' in low or 'in ' in low):
-        # Preserve the street and update only the locality tail when the customer corrects it.
-        base = current_raw.split(',')[0].strip()
-        sched['raw_address'] = f"{base}, {candidate}"
-        sched['normalized_address'] = None
-        update_address_assembly_state(sched)
-        return True
-
-    if should_update:
-        sched['raw_address'] = candidate
-        sched['normalized_address'] = None
-        update_address_assembly_state(sched)
-        return True
-
-    return False
-
-
-def infer_address_town_hint(conv: dict) -> str | None:
-    """Best-effort town hint for partial street addresses in normal booking flow."""
-    try:
-        sched = conv.setdefault("sched", {})
-        raw = (sched.get("raw_address") or "").strip()
-        if raw and not re.match(r"^\d{1,6}\b", raw):
-            hint = _normalize_display_town_hint(raw).strip()
-            if hint and _looks_like_town_only_text(hint):
-                return hint
-
-        initial_sms = (conv.get("initial_sms") or "").strip()
-        if initial_sms:
-            m = re.search(r"\bin\s+([A-Za-z][A-Za-z .'-]{1,40})\?", initial_sms, flags=re.I)
-            if m:
-                hint = _normalize_display_town_hint(m.group(1)).strip(" .,?")
-                if hint and _looks_like_town_only_text(hint):
-                    return hint
-    except Exception:
-        return None
-    return None
-
-
-def merge_partial_address_with_town_hint(conv: dict, street_text: str) -> str:
-    """Attach a known town hint to a street-only reply so regular booking can normalize early."""
-    sched = conv.setdefault("sched", {})
-    street_text = " ".join((street_text or "").strip().split())
-    if not street_text:
-        return street_text
-    if "," in street_text:
-        return street_text
-    if re.search(r"\b(?:CT|MA|Connecticut|Massachusetts)\b", street_text, flags=re.I):
-        return street_text
-
-    town_hint = infer_address_town_hint(conv)
-    if not town_hint:
-        return street_text
-    if town_hint.lower() in street_text.lower():
-        return street_text
-    return f"{street_text}, {town_hint}"
-
-
 def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) -> str:
     """Build the very first outbound text after voicemail without relying on downstream reply routing."""
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
     hydrate_square_profile_by_phone(profile, phone)
 
-    # Use the current voicemail name first when we have one.
-    # This prevents stale shared-number names from leaking into the first text.
-    first_name = (profile.get("voicemail_first_name") or profile.get("active_first_name") or profile.get("recognized_first_name") or "").strip()
+    first_name = (profile.get("active_first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
     intro = f"Hello {first_name}, you've reached Prevolt Electric. I'll help you here by text." if first_name else "You've reached Prevolt Electric. I'll help you here by text."
 
     topics = conv.get("task_topics") or classification.get("task_topics") or []
@@ -730,7 +526,8 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
             break
 
     raw_hint = (sched.get("raw_address") or classification.get("detected_address") or "").strip()
-    town_hint = _normalize_display_town_hint(raw_hint)
+    town_hint = raw_hint
+    town_hint_low = town_hint.lower()
 
     address_line = ""
     if saved_full:
@@ -745,9 +542,7 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     price_line = ""
     appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
     if appt_type == "TROUBLESHOOT_395":
-        # Emergency opener should not front-load pricing.
-        # We disclose price once, after we have the full street address and are asking about dispatch.
-        price_line = ""
+        price_line = " Troubleshoot and repair visits are $395."
     elif appt_type == "WHOLE_HOME_INSPECTION":
         price_line = " Home inspections are $395."
     else:
@@ -1009,20 +804,11 @@ def voicemail_complete():
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
     conv["task_topics"] = classification.get("task_topics") or []
-    conv["initial_sms"] = cleaned
-
-    # Every new voicemail should refresh the current-caller hint for this thread.
-    # Do not preserve an old voicemail name from a prior test or prior caller.
-    profile["voicemail_first_name"] = classification.get("detected_first_name") or None
-    profile["voicemail_last_name"] = classification.get("detected_last_name") or None
-
-    # If the current voicemail clearly names a different person than the phone match,
-    # let the current voicemail drive the greeting and next-step identity resolution.
-    if profile.get("voicemail_first_name"):
-        profile["active_first_name"] = profile.get("voicemail_first_name")
-        if profile.get("voicemail_last_name"):
-            profile["active_last_name"] = profile.get("voicemail_last_name")
-        profile["identity_source"] = "voicemail_first_name"
+    conv.setdefault("initial_sms", cleaned)
+    if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
+        profile["voicemail_first_name"] = classification.get("detected_first_name")
+    if classification.get("detected_last_name") and not profile.get("voicemail_last_name"):
+        profile["voicemail_last_name"] = classification.get("detected_last_name")
 
     if classification.get("detected_date"):
         sched["scheduled_date"] = classification["detected_date"]
@@ -1045,9 +831,6 @@ def voicemail_complete():
     # 4) Trigger First SMS using deterministic voicemail opener so task topics and known addresses land reliably
     try:
         initial_msg = build_initial_voicemail_sms(conv, classification, from_number)
-        conv["initial_outbound_sms"] = initial_msg
-        conv["last_sms_body"] = initial_msg
-        conv.setdefault("sched", {}).setdefault("address_prompt_context", initial_msg)
         send_sms(from_number, initial_msg)
     except Exception as e:
         print("[ERROR] voicemail_complete → initial sms:", repr(e))
@@ -1323,46 +1106,6 @@ def pick_variant_once(sched: dict, label: str, options: list[str]) -> str:
     return chosen
 
 
-def is_likely_person_name_text(text: str) -> bool:
-    txt = " ".join((text or "").strip().split())
-    if not txt:
-        return False
-    if re.search(r"\d", txt):
-        return False
-    if re.search(r"\b(ct|connecticut|ma|massachusetts)\b", txt, flags=re.I):
-        return False
-    if re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", txt, flags=re.I):
-        return False
-    parts = [p for p in re.split(r"\s+", txt) if p]
-    if not 1 <= len(parts) <= 3:
-        return False
-    common_non_names = {"address", "dispatch", "email", "street", "name", "yes", "no", "okay", "ok"}
-    lowered = {p.lower() for p in parts}
-    if lowered & common_non_names:
-        return False
-    return all(re.fullmatch(r"[A-Za-z][A-Za-z'\-]{1,}", p) for p in parts)
-
-def emergency_ready_for_same_booking_path(conv: dict) -> bool:
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-    update_address_assembly_state(sched)
-    recompute_pending_step(profile, sched)
-    has_identity_for_booking = bool(
-        (get_active_first_name(profile) and get_active_last_name(profile))
-        or profile.get("square_customer_id")
-    )
-    has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
-    return bool(
-        sched.get("scheduled_date") and
-        sched.get("scheduled_time") and
-        sched.get("address_verified") and
-        sched.get("appointment_type") and
-        has_identity_for_booking and
-        has_contact_for_booking and
-        not sched.get("pending_step") and
-        not sched.get("booking_created")
-    )
-
 # ---------------------------------------------------
 # Address Prompt Builder (Step 4) — HUMAN + DETERMINISTIC VARIATION
 # ---------------------------------------------------
@@ -1375,14 +1118,6 @@ def build_address_prompt(sched: dict) -> str:
 
     missing = (sched.get("address_missing") or "").strip().lower()
     candidate = (sched.get("address_candidate") or sched.get("raw_address") or "").strip()
-    if is_likely_person_name_text(candidate):
-        candidate = ""
-        if is_likely_person_name_text(sched.get("address_candidate") or ""):
-            sched["address_candidate"] = None
-        if is_likely_person_name_text(sched.get("raw_address") or ""):
-            sched["raw_address"] = None
-            sched["normalized_address"] = None
-            update_address_assembly_state(sched)
     parts = sched.get("address_parts") or {}
 
     norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
@@ -1484,9 +1219,7 @@ def try_early_address_normalize(sched: dict) -> None:
     if sched.get("address_verified"):
         return
 
-    raw = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
-    if raw and raw != (sched.get("raw_address") or "").strip():
-        sched["raw_address"] = raw
+    raw = (sched.get("raw_address") or "").strip()
     if not raw:
         return
 
@@ -1503,9 +1236,7 @@ def try_early_address_normalize(sched: dict) -> None:
         return
 
     try:
-        context_hint = sched.get("address_prompt_context") or ""
-        status, addr_struct = normalize_address_with_context(raw, context_hint)
-        result = (status, addr_struct)
+        result = normalize_address(raw)
     except Exception as e:
         print("[WARN] try_early_address_normalize normalize_address failed:", repr(e))
         return
@@ -1613,37 +1344,6 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     update_address_assembly_state(sched)
     return True
 
-def build_emergency_booking_followup_reply(conv: dict, booking_attempt=None) -> str:
-    """Return the next concrete emergency message after a failed booking attempt.
-    Never claim dispatch unless Square actually created a booking."""
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-    update_address_assembly_state(sched)
-    recompute_pending_step(profile, sched)
-
-    if sched.get("booking_created") and sched.get("square_booking_id"):
-        return "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-
-    status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
-    if status == "slot_unavailable":
-        msg = (booking_attempt or {}).get("message") or sched.get("last_slot_unavailable_message")
-        if msg:
-            return msg
-    if status in {"needs_state"}:
-        return "Just to confirm, is this address in Connecticut or Massachusetts?"
-    if status in {"missing_house_number", "address_not_verified", "address_incomplete", "address_normalization_failed", "normalize_exception", "missing_address"}:
-        if is_likely_person_name_text((sched.get("raw_address") or "")) or is_likely_person_name_text((sched.get("address_candidate") or "")):
-            sched["raw_address"] = None
-            sched["address_candidate"] = None
-            sched["normalized_address"] = None
-            update_address_assembly_state(sched)
-        return build_address_prompt(sched)
-    if not (get_active_first_name(profile) and get_active_last_name(profile)):
-        return "What is your first and last name?"
-    if not get_active_email(profile):
-        return "What is the best email address for the appointment?"
-    return "I have everything I need. One thing failed on the booking side. Reply dispatch and I’ll keep pushing this through here by text."
-
 def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     """Single deterministic next-step selector. Python enforces state; SRBs drive prompt choice."""
     import re
@@ -1692,9 +1392,6 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step == "need_email":
         return humanize_question("What is the best email address for the appointment?")
 
-    # Emergency mode should follow the same one-piece-at-a-time path as normal booking.
-    # Do not surface placeholder text like "Ready to book." back to the customer.
-
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
             final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
@@ -1729,11 +1426,6 @@ def incoming_sms():
     inbound_sid = request.form.get("MessageSid") or request.form.get("SmsSid") or ""
     convo_key   = phone or inbound_sid or request.form.get("CallSid") or "unknown"
     inbound_low  = inbound_text.lower().strip()
-
-    cleaned_addr_text = clean_leading_address_filler(inbound_text)
-    if cleaned_addr_text != inbound_text and is_plausible_address_text(cleaned_addr_text):
-        inbound_text = cleaned_addr_text
-        inbound_low = inbound_text.lower().strip()
 
     # SECRET RESET COMMAND
     if inbound_low == "mobius1":
@@ -1777,7 +1469,6 @@ def incoming_sms():
     # Initialize layers (HARDENED: never assume dict shape)
     # ---------------------------------------------------
     conv = conversations.setdefault(phone, {})
-    conv.setdefault("initial_outbound_sms", conv.get("last_sms_body") or "")
 
     # Twilio and WhatsApp can occasionally retry the same inbound webhook.
     # Guard both by inbound SID and by a short body fingerprint window.
@@ -1849,8 +1540,6 @@ def incoming_sms():
     sched.setdefault("address_verified", False)
     sched.setdefault("address_missing", None)
     sched.setdefault("address_parts", {})
-    sched.setdefault("verified_address_snapshot", None)
-    sched.setdefault("raw_address_snapshot", None)
 
     # Emergency flags (used by incoming_sms patch logic too)
     sched.setdefault("awaiting_emergency_confirm", False)
@@ -1860,8 +1549,6 @@ def incoming_sms():
     category = conv.get("category")
     appointment_type = sched.get("appointment_type")
     initial_sms = conv.get("initial_sms")
-    if conv.get("initial_outbound_sms"):
-        sched["address_prompt_context"] = conv.get("initial_outbound_sms")
 
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
@@ -1910,393 +1597,6 @@ def incoming_sms():
                 sched["pending_step"] = "need_email"
             else:
                 sched["pending_step"] = None
-
-    # If a verified emergency address was already captured, keep it locked in.
-    try:
-        restore_verified_address_snapshot(sched)
-    except Exception as e:
-        print("[WARN] incoming_sms verified address restore failed:", repr(e))
-
-    # Emergency availability / dispatch questions must not get misread as address data.
-    # Important: emergency should only ask for dispatch after the address is fully normalized and verified,
-    # not off a partial raw-address candidate.
-    try:
-        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
-        if emergency_thread and is_emergency_availability_question(inbound_text):
-            update_address_assembly_state(sched)
-            recompute_pending_step(profile, sched)
-            if not sched.get("address_verified"):
-                reply = build_address_prompt(sched)
-            elif sched.get("emergency_approved"):
-                snapshot_verified_address(sched)
-                reply = choose_next_prompt_from_state(conv, inbound_text="")
-            else:
-                snapshot_verified_address(sched)
-                sched["awaiting_emergency_confirm"] = True
-                reply = (
-                    f"This looks urgent at {sched.get('raw_address')}. "
-                    "Troubleshoot and repair visits are $395. "
-                    "Do you want us to dispatch someone now?"
-                )
-            reply = sanitize_sms_body(reply, booking_created=False)
-            conv["last_inbound_sid"] = inbound_sid
-            conv["last_inbound_fingerprint"] = inbound_fingerprint
-            conv["last_inbound_fingerprint_ts"] = now_ts
-            conv["last_sms_body"] = reply.strip()
-            tw = MessagingResponse()
-            tw.message(reply.strip())
-            return Response(str(tw), mimetype="text/xml")
-    except Exception as e:
-        print("[WARN] incoming_sms emergency availability fast-path failed:", repr(e))
-
-    # Emergency dispatch confirmation must never be parsed as address or town text.
-    try:
-        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
-        confirm_words = {"yes", "yeah", "yup", "ok", "okay", "sure", "send", "dispatch", "book", "do it", "now", "right away", "immediately", "asap", "yes please", "sure please", "please do", "send someone", "send someone now", "dispatch someone", "dispatch someone now", "book it", "go ahead"}
-        decline_words = {"no", "nope", "not now", "later"}
-        inbound_norm = re.sub(r"\s+", " ", (inbound_text or "").strip().lower())
-        is_confirm_only = (
-            inbound_norm in confirm_words
-            or confirmation_accept_text(inbound_text)
-            or bool(re.fullmatch(r"(?:yes|yeah|yep|ok|okay|sure)(?: please)?", inbound_norm))
-            or bool(re.fullmatch(r"(?:send|dispatch|book)(?: someone)?(?: now)?", inbound_norm))
-        )
-        is_decline_only = inbound_norm in decline_words or bool(re.fullmatch(r"(?:no|nope)(?: thanks)?", inbound_norm))
-
-        if emergency_thread and sched.get("awaiting_emergency_confirm") and is_confirm_only:
-            sched["emergency_approved"] = True
-            sched["awaiting_emergency_confirm"] = False
-            sched["appointment_type"] = "TROUBLESHOOT_395"
-
-            tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
-            now_local = datetime.now(tz)
-            sched["scheduled_date"] = now_local.strftime("%Y-%m-%d")
-            sched["scheduled_time"] = now_local.strftime("%H:%M")
-
-            update_address_assembly_state(sched)
-            recompute_pending_step(profile, sched)
-
-            if not sched.get("address_verified"):
-                reply = build_address_prompt(sched)
-            elif not (get_active_first_name(profile) and get_active_last_name(profile)):
-                reply = "What is your first and last name?"
-            elif not get_active_email(profile):
-                reply = "What is the best email address for the appointment?"
-            else:
-                if emergency_ready_for_same_booking_path(conv):
-                    booking_attempt = maybe_create_square_booking(phone, conv)
-                    if sched.get("booking_created") and sched.get("square_booking_id"):
-                        reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-                    else:
-                        reply = build_emergency_booking_followup_reply(conv, booking_attempt)
-                else:
-                    update_address_assembly_state(sched)
-                    recompute_pending_step(profile, sched)
-                    reply = choose_next_prompt_from_state(conv, inbound_text="")
-
-            reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
-            conv["last_inbound_sid"] = inbound_sid
-            conv["last_inbound_fingerprint"] = inbound_fingerprint
-            conv["last_inbound_fingerprint_ts"] = now_ts
-            conv["last_sms_body"] = reply.strip()
-            tw = MessagingResponse()
-            tw.message(reply.strip())
-            return Response(str(tw), mimetype="text/xml")
-
-        if emergency_thread and sched.get("final_confirmation_sent") and confirmation_accept_text(inbound_text):
-            current_final_key = None
-            if sched.get("scheduled_date") and sched.get("scheduled_time"):
-                current_final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
-
-            if current_final_key and sched.get("last_final_confirmation_key") == current_final_key:
-                sched["final_confirmation_accepted"] = True
-                sched["final_confirmation_sent"] = False
-                sched["awaiting_emergency_confirm"] = False
-                sched["emergency_approved"] = True
-                sched["appointment_type"] = "TROUBLESHOOT_395"
-
-                update_address_assembly_state(sched)
-                recompute_pending_step(profile, sched)
-
-                if not sched.get("address_verified"):
-                    reply = build_address_prompt(sched)
-                elif not (get_active_first_name(profile) and get_active_last_name(profile)):
-                    reply = "What is your first and last name?"
-                elif not get_active_email(profile):
-                    reply = "What is the best email address for the appointment?"
-                else:
-                    if emergency_ready_for_same_booking_path(conv):
-                        booking_attempt = maybe_create_square_booking(phone, conv)
-                        if sched.get("booking_created") and sched.get("square_booking_id"):
-                            reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-                        else:
-                            reply = build_emergency_booking_followup_reply(conv, booking_attempt)
-                    else:
-                        update_address_assembly_state(sched)
-                        recompute_pending_step(profile, sched)
-                        if not sched.get("raw_address"):
-                            reply = build_address_prompt(sched)
-                        elif not (get_active_first_name(profile) and get_active_last_name(profile)):
-                            reply = "What is your first and last name?"
-                        elif not get_active_email(profile):
-                            reply = "What is the best email address for the appointment?"
-                        else:
-                            reply = choose_next_prompt_from_state(conv, inbound_text="")
-
-                reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
-                conv["last_inbound_sid"] = inbound_sid
-                conv["last_inbound_fingerprint"] = inbound_fingerprint
-                conv["last_inbound_fingerprint_ts"] = now_ts
-                conv["last_sms_body"] = reply.strip()
-                tw = MessagingResponse()
-                tw.message(reply.strip())
-                return Response(str(tw), mimetype="text/xml")
-    except Exception as e:
-        print("[WARN] incoming_sms emergency confirm fast-path failed:", repr(e))
-
-    # Emergency address capture should behave like normal booking:
-    # build the address one piece at a time, normalize it, and only then ask about dispatch.
-    try:
-        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
-        inbound_addr_candidate = extract_inline_address_candidate(inbound_text)
-        if emergency_thread and is_plausible_address_text(inbound_addr_candidate):
-            new_addr = inbound_addr_candidate.strip()
-            existing_addr = (sched.get("raw_address") or "").strip()
-
-            if (
-                existing_addr
-                and not re.match(r"^\d{1,6}\b", existing_addr)
-                and re.match(r"^\d{1,6}\b", new_addr)
-            ):
-                sched["raw_address"] = f"{new_addr}, {existing_addr}".strip(" ,")
-            else:
-                sched["raw_address"] = new_addr
-
-            sched["normalized_address"] = None
-            snapshot_raw_address(sched)
-            try_early_address_normalize(sched)
-            update_address_assembly_state(sched)
-            recompute_pending_step(profile, sched)
-
-            if sched.get("address_verified"):
-                snapshot_verified_address(sched)
-                if sched.get("emergency_approved"):
-                    reply = choose_next_prompt_from_state(conv, inbound_text="")
-                else:
-                    sched["awaiting_emergency_confirm"] = True
-                    reply = (
-                        f"This looks urgent at {sched.get('raw_address')}. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
-                        if sched.get("raw_address") else
-                        "This looks urgent. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
-                    )
-            else:
-                sched["awaiting_emergency_confirm"] = False
-                reply = build_address_prompt(sched)
-
-            reply = sanitize_sms_body(reply, booking_created=False)
-            conv["last_inbound_sid"] = inbound_sid
-            conv["last_inbound_fingerprint"] = inbound_fingerprint
-            conv["last_inbound_fingerprint_ts"] = now_ts
-            conv["last_sms_body"] = reply.strip()
-            tw = MessagingResponse()
-            tw.message(reply.strip())
-            return Response(str(tw), mimetype="text/xml")
-    except Exception as e:
-        print("[WARN] incoming_sms emergency address fast-path failed:", repr(e))
-
-    # Normal booking address capture should also normalize early and preserve the town hint
-    # from the initial voicemail prompt so the address does not disappear later in the flow.
-    try:
-        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
-        inbound_addr_candidate = extract_inline_address_candidate(inbound_text)
-        if (not emergency_thread) and is_plausible_address_text(inbound_addr_candidate):
-            new_addr = merge_partial_address_with_town_hint(conv, inbound_addr_candidate.strip())
-            existing_addr = (sched.get("raw_address") or "").strip()
-
-            if existing_addr and not re.match(r"^\d{1,6}\b", existing_addr) and re.match(r"^\d{1,6}\b", new_addr):
-                sched["raw_address"] = merge_partial_address_with_town_hint(conv, f"{new_addr}, {existing_addr}".strip(" ,"))
-            else:
-                sched["raw_address"] = new_addr
-
-            sched["normalized_address"] = None
-            snapshot_raw_address(sched)
-            try_early_address_normalize(sched)
-            update_address_assembly_state(sched)
-            recompute_pending_step(profile, sched)
-
-            if sched.get("address_verified") and sched.get("pending_step") in {"need_address", None}:
-                if not sched.get("scheduled_date") and not sched.get("scheduled_time"):
-                    reply = humanize_question("What day and time work best for you?")
-                elif not sched.get("scheduled_date"):
-                    reply = humanize_question("What day works best for you?")
-                elif not sched.get("scheduled_time"):
-                    reply = humanize_question("What time works best for you?")
-                else:
-                    reply = choose_next_prompt_from_state(conv, inbound_text="")
-
-                reply = sanitize_sms_body(reply, booking_created=False)
-                conv["last_inbound_sid"] = inbound_sid
-                conv["last_inbound_fingerprint"] = inbound_fingerprint
-                conv["last_inbound_fingerprint_ts"] = now_ts
-                conv["last_sms_body"] = reply.strip()
-                tw = MessagingResponse()
-                tw.message(reply.strip())
-                return Response(str(tw), mimetype="text/xml")
-    except Exception as e:
-        print("[WARN] incoming_sms normal address fast-path failed:", repr(e))
-
-    # Let the customer correct a bad town hint without restarting the address flow.
-    try:
-        maybe_apply_town_correction(conv, inbound_text)
-    except Exception as e:
-        print("[WARN] incoming_sms town correction failed:", repr(e))
-
-    # Explicit emergency dispatch retry should attempt the Square booking path again,
-    # not fall through and surface a placeholder like "Ready to book.".
-    try:
-        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
-        inbound_norm = re.sub(r"\s+", " ", (inbound_text or "").strip().lower())
-        dispatch_retry_words = {"dispatch", "dispatch now", "send", "send now", "book", "book now", "go ahead", "try again"}
-        if emergency_thread and inbound_norm in dispatch_retry_words and not (sched.get("booking_created") and sched.get("square_booking_id")):
-            update_address_assembly_state(sched)
-            recompute_pending_step(profile, sched)
-            if emergency_ready_for_same_booking_path(conv):
-                booking_attempt = maybe_create_square_booking(phone, conv)
-                if sched.get("booking_created") and sched.get("square_booking_id"):
-                    reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-                else:
-                    reply = build_emergency_booking_followup_reply(conv, booking_attempt)
-                reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
-                conv["last_inbound_sid"] = inbound_sid
-                conv["last_inbound_fingerprint"] = inbound_fingerprint
-                conv["last_inbound_fingerprint_ts"] = now_ts
-                conv["last_sms_body"] = reply.strip()
-                tw = MessagingResponse()
-                tw.message(reply.strip())
-                return Response(str(tw), mimetype="text/xml")
-    except Exception as e:
-        print("[WARN] incoming_sms emergency dispatch retry fast-path failed:", repr(e))
-
-    # Identity capture must not fall through into address parsing.
-    try:
-        update_address_assembly_state(sched)
-        recompute_pending_step(profile, sched)
-        pending_now = sched.get("pending_step")
-
-        name_prompt_active = (pending_now == "need_name") or last_prompt_asked_for_name(conv)
-
-        if name_prompt_active:
-            restore_verified_address_snapshot(sched)
-            first, last = looks_like_full_name_reply(inbound_text)
-            if first and last:
-                profile["active_first_name"] = first
-                profile["active_last_name"] = last
-                profile["first_name"] = profile.get("first_name") or first
-                profile["last_name"] = profile.get("last_name") or last
-                restore_verified_address_snapshot(sched)
-                recompute_pending_step(profile, sched)
-
-                if not get_active_email(profile):
-                    reply = "What is the best email address for the appointment?"
-                elif sched.get("emergency_approved"):
-                    if emergency_ready_for_same_booking_path(conv):
-                        booking_attempt = maybe_create_square_booking(phone, conv)
-                        if sched.get("booking_created") and sched.get("square_booking_id"):
-                            reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-                        else:
-                            reply = build_emergency_booking_followup_reply(conv, booking_attempt)
-                    else:
-                        reply = choose_next_prompt_from_state(conv, inbound_text="")
-                else:
-                    update_address_assembly_state(sched)
-                    recompute_pending_step(profile, sched)
-                    if not sched.get("pending_step") and sched.get("address_verified") and sched.get("scheduled_date") and sched.get("scheduled_time") and not sched.get("booking_created"):
-                        booking_attempt = maybe_create_square_booking(phone, conv)
-                        if sched.get("booking_created") and sched.get("square_booking_id"):
-                            reply = f"You’re booked for {humanize_time(sched.get('scheduled_time'))} on {sched.get('scheduled_date')}. We’ll text when we’re on the way."
-                        elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
-                            reply = booking_attempt.get("message")
-                        else:
-                            reply = choose_next_prompt_from_state(conv, inbound_text="")
-                    else:
-                        reply = choose_next_prompt_from_state(conv, inbound_text="")
-
-                reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
-                conv["last_inbound_sid"] = inbound_sid
-                conv["last_inbound_fingerprint"] = inbound_fingerprint
-                conv["last_inbound_fingerprint_ts"] = now_ts
-                conv["last_sms_body"] = reply.strip()
-                tw = MessagingResponse()
-                tw.message(reply.strip())
-                return Response(str(tw), mimetype="text/xml")
-
-        if pending_now == "need_email":
-            email_match = re.search(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", inbound_text or "", flags=re.I)
-            if email_match:
-                email_val = email_match.group(0).strip()
-                profile["active_email"] = email_val
-                profile["email"] = profile.get("email") or email_val
-                restore_raw_address_snapshot(sched)
-                recompute_pending_step(profile, sched)
-
-                if sched.get("emergency_approved"):
-                    if emergency_ready_for_same_booking_path(conv):
-                        booking_attempt = maybe_create_square_booking(phone, conv)
-                        if sched.get("booking_created") and sched.get("square_booking_id"):
-                            reply = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-                        else:
-                            reply = build_emergency_booking_followup_reply(conv, booking_attempt)
-                    else:
-                        reply = choose_next_prompt_from_state(conv, inbound_text="")
-                else:
-                    restore_raw_address_snapshot(sched)
-                    sched["raw_address"] = canonicalize_address_candidate(sched.get("raw_address") or "")
-                    sched["raw_address"] = enrich_address_with_known_town(
-                        sched.get("raw_address") or "",
-                        conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
-                        conv.get("cleaned_transcript") or "",
-                    )
-                    try:
-                        st_ctx, addr_ctx = normalize_address_with_context(
-                            sched.get("raw_address") or "",
-                            conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
-                            conv.get("cleaned_transcript") or "",
-                        )
-                        if st_ctx == "ok" and isinstance(addr_ctx, dict):
-                            sched["normalized_address"] = addr_ctx
-                    except Exception as e:
-                        print("[WARN] email-path normalize_address_with_context failed:", repr(e))
-                    try_early_address_normalize(sched)
-                    update_address_assembly_state(sched)
-                    if (sched.get("raw_address") or "") and re.match(r"^\d{1,6}\b", sched.get("raw_address") or "") and sched.get("address_missing") == "street":
-                        sched["address_missing"] = "confirm"
-                    recompute_pending_step(profile, sched)
-                    if not sched.get("pending_step") and sched.get("address_verified") and sched.get("scheduled_date") and sched.get("scheduled_time") and not sched.get("booking_created"):
-                        booking_attempt = maybe_create_square_booking(phone, conv)
-                        if sched.get("booking_created") and sched.get("square_booking_id"):
-                            reply = f"You’re booked for {humanize_time(sched.get('scheduled_time'))} on {sched.get('scheduled_date')}. We’ll text when we’re on the way."
-                        elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
-                            reply = booking_attempt.get("message")
-                        else:
-                            reply = choose_next_prompt_from_state(conv, inbound_text="")
-                    else:
-                        reply = choose_next_prompt_from_state(conv, inbound_text="")
-
-                reply = sanitize_sms_body(reply, booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
-                conv["last_inbound_sid"] = inbound_sid
-                conv["last_inbound_fingerprint"] = inbound_fingerprint
-                conv["last_inbound_fingerprint_ts"] = now_ts
-                conv["last_sms_body"] = reply.strip()
-                tw = MessagingResponse()
-                tw.message(reply.strip())
-                return Response(str(tw), mimetype="text/xml")
-    except Exception as e:
-        print("[WARN] incoming_sms identity fast-path failed:", repr(e))
 
     # Keep address state fresh (pre-Step4)
     update_address_assembly_state(sched)
@@ -2391,33 +1691,16 @@ def incoming_sms():
     )
 
     # SAVE STEP 4 RESULTS
-    if reply.get("scheduled_date"):
-        sched["scheduled_date"] = reply.get("scheduled_date")
-    if reply.get("scheduled_time"):
-        sched["scheduled_time"] = reply.get("scheduled_time")
+    sched["scheduled_date"] = reply.get("scheduled_date")
+    sched["scheduled_time"] = reply.get("scheduled_time")
 
     if reply.get("address"):
-        candidate_addr = canonicalize_address_candidate((reply["address"] or "").strip())
-        if is_plausible_address_text(candidate_addr):
-            merged_addr = enrich_address_with_known_town(
-                candidate_addr,
-                conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
-                conv.get("cleaned_transcript") or "",
-            )
-            existing_addr = (sched.get("raw_address") or "").strip()
-            # Never downgrade an existing fuller address to a shorter street-only one.
-            if existing_addr and "," in existing_addr and "," not in merged_addr and re.match(r"^\d{1,6}\b", merged_addr):
-                merged_addr = existing_addr
-            sched["raw_address"] = merged_addr
-            if merged_addr != existing_addr:
-                sched["normalized_address"] = None
-            # addresses list is guaranteed above
-            if merged_addr not in profile["addresses"]:
-                profile["addresses"].append(merged_addr)
-            snapshot_raw_address(sched)
+        sched["raw_address"] = reply["address"]
+        # addresses list is guaranteed above
+        if reply["address"] not in profile["addresses"]:
+            profile["addresses"].append(reply["address"])
 
     # Re-derive address assembly state after Step 4 updates
-    try_early_address_normalize(sched)
     update_address_assembly_state(sched)
 
     recompute_pending_step(profile, sched)
@@ -2425,68 +1708,10 @@ def incoming_sms():
     sms_body = (reply.get("sms_body") or "").strip()
     next_prompt = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
-    # Booking-ready threads should attempt the real Square booking here instead of drifting.
-    try:
-        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = ("TROUBLESHOOT" in appt_now) or bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
-        if emergency_thread and emergency_ready_for_same_booking_path(conv):
-            booking_attempt = maybe_create_square_booking(phone, conv)
-            if sched.get("booking_created") and sched.get("square_booking_id"):
-                next_prompt = "We are dispatching someone now. Estimated time of arrival is 1 to 2 hours. We’ll text when we’re on the way."
-            else:
-                next_prompt = build_emergency_booking_followup_reply(conv, booking_attempt)
-        elif (not emergency_thread) and (not sched.get("booking_created")):
-            sched["raw_address"] = enrich_address_with_known_town(
-                sched.get("raw_address") or "",
-                conv.get("initial_outbound_sms") or conv.get("last_sms_body") or conv.get("initial_sms") or "",
-                conv.get("cleaned_transcript") or "",
-            )
-            try_early_address_normalize(sched)
-            update_address_assembly_state(sched)
-            recompute_pending_step(profile, sched)
-            if (not sched.get("pending_step")) and sched.get("address_verified") and sched.get("scheduled_date") and sched.get("scheduled_time"):
-                booking_attempt = maybe_create_square_booking(phone, conv)
-                if sched.get("booking_created") and sched.get("square_booking_id"):
-                    next_prompt = f"You’re booked for {humanize_time(sched.get('scheduled_time'))} on {sched.get('scheduled_date')}. We’ll text when we’re on the way."
-                elif isinstance(booking_attempt, dict) and booking_attempt.get("message"):
-                    next_prompt = booking_attempt.get("message")
-    except Exception as e:
-        print("[WARN] incoming_sms route-level booking attempt failed:", repr(e))
-
-    # Normal booking threads that are ready should also create the Square booking here.
-    try:
-        appt_now = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-        emergency_thread = bool(sched.get("awaiting_emergency_confirm")) or bool(sched.get("emergency_approved"))
-        regular_ready = bool(
-            (not emergency_thread)
-            and sched.get("address_verified")
-            and sched.get("scheduled_date")
-            and sched.get("scheduled_time")
-            and (get_active_first_name(profile) and get_active_last_name(profile))
-            and get_active_email(profile)
-            and not sched.get("pending_step")
-            and not sched.get("booking_created")
-        )
-        if regular_ready:
-            booking_attempt = maybe_create_square_booking(phone, conv)
-            if sched.get("booking_created") and sched.get("square_booking_id"):
-                sms_body = f"You’re booked for {humanize_time(sched.get('scheduled_time'))} on {sched.get('scheduled_date')}. We’ll text when we’re on the way."
-            elif isinstance(booking_attempt, dict) and booking_attempt.get("message") and sms_body in {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure.", "Dispatching now."}:
-                sms_body = booking_attempt.get("message")
-    except Exception as e:
-        print("[WARN] incoming_sms route-level regular booking attempt failed:", repr(e))
-
     # Route-level guardrail: only override when Step 4 returned a stall / generic filler.
-    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure.", "Dispatching now."}
+    generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
-
-    sms_body = postprocess_sms(
-        sms_body,
-        inbound_text,
-        sched,
-        booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id"))
-    )
 
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
@@ -2664,56 +1889,6 @@ def get_active_last_name(profile: dict) -> str:
 
 def get_active_email(profile: dict) -> str:
     return (profile.get("active_email") or profile.get("email") or profile.get("recognized_email") or "").strip()
-
-def snapshot_verified_address(sched: dict) -> None:
-    import copy
-
-    update_address_assembly_state(sched)
-    norm = sched.get("normalized_address")
-    raw = (sched.get("raw_address") or "").strip()
-    if sched.get("address_verified") and raw and isinstance(norm, dict):
-        sched["verified_address_snapshot"] = {
-            "raw_address": raw,
-            "normalized_address": copy.deepcopy(norm),
-        }
-
-def restore_verified_address_snapshot(sched: dict) -> None:
-    import copy
-
-    snap = sched.get("verified_address_snapshot") or {}
-    if not isinstance(snap, dict):
-        return
-
-    snap_raw = (snap.get("raw_address") or "").strip()
-    snap_norm = snap.get("normalized_address")
-    curr_raw = (sched.get("raw_address") or "").strip()
-
-    if snap_raw and (not curr_raw or is_likely_person_name_text(curr_raw)):
-        sched["raw_address"] = snap_raw
-    if isinstance(snap_norm, dict) and not isinstance(sched.get("normalized_address"), dict):
-        sched["normalized_address"] = copy.deepcopy(snap_norm)
-
-    update_address_assembly_state(sched)
-
-
-def snapshot_raw_address(sched: dict) -> None:
-    raw = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
-    if raw and re.match(r"^\d{1,6}\b", raw) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw, flags=re.I):
-        sched["raw_address_snapshot"] = raw
-
-
-def restore_raw_address_snapshot(sched: dict) -> None:
-    snap_raw = canonicalize_address_candidate((sched.get("raw_address_snapshot") or "").strip())
-    curr_raw = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
-    if snap_raw and (not curr_raw or is_likely_person_name_text(curr_raw)):
-        sched["raw_address"] = snap_raw
-        if not isinstance(sched.get("normalized_address"), dict):
-            sched["normalized_address"] = None
-    update_address_assembly_state(sched)
-
-def last_prompt_asked_for_name(conv: dict) -> bool:
-    last_sms = ((conv or {}).get("last_sms_body") or "").strip().lower()
-    return "first and last name" in last_sms
 
 def get_display_first_name(profile: dict) -> str:
     return (
@@ -3110,60 +2285,6 @@ def is_plausible_address_text(text: str) -> bool:
     return False
 
 
-
-def clean_leading_address_filler(text: str) -> str:
-    txt = (text or "").strip()
-    if not txt:
-        return txt
-    cleaned = re.sub(
-        r"^(?:it'?s|it is|im at|i'm at|i live at|we live at|my address is|address is|the address is|it would be|its at|it's at)\s+",
-        "",
-        txt,
-        flags=re.I,
-    ).strip()
-    return cleaned or txt
-
-
-def extract_inline_address_candidate(text: str) -> str:
-    txt = clean_leading_address_filler(text)
-    if not txt:
-        return txt
-    txt = re.split(
-        r"(?:how soon|when can you come(?: out)?|can you come(?: out)?|what day|what time|do you have availability|availability|available|earliest|soonest)|\?",
-        txt,
-        maxsplit=1,
-        flags=re.I,
-    )[0].strip(" ,.")
-    return txt or clean_leading_address_filler(text)
-
-
-def looks_like_full_name_reply(text: str) -> tuple[str | None, str | None]:
-    txt = " ".join((text or "").strip().split())
-    if not txt or "@" in txt or "?" in txt or any(ch.isdigit() for ch in txt):
-        return None, None
-    if ADDRESS_WORD_RE.search(txt.lower()):
-        return None, None
-    txt = re.sub(r"^(?:my name is|name is|this is)\s+", "", txt, flags=re.I).strip()
-    parts = [p for p in re.split(r"\s+", txt) if p]
-    if len(parts) != 2:
-        return None, None
-    if not all(re.fullmatch(r"[A-Za-z][A-Za-z'\-]{1,}", p) for p in parts):
-        return None, None
-    return normalize_person_name(parts[0]), normalize_person_name(parts[1])
-
-
-def is_emergency_availability_question(text: str) -> bool:
-    low = _loose_text(text)
-    if not low:
-        return False
-    markers = [
-        "how soon", "when can you come", "when can you come out", "come out", "come sooner",
-        "soonest", "earliest", "how fast", "how quickly", "can you come now", "can you get here",
-        "dispatch", "send someone", "right away", "immediately", "asap"
-    ]
-    return any(m in low for m in markers)
-
-
 def is_conversation_hesitation(text: str) -> bool:
     low = _loose_text(text)
     markers = [
@@ -3350,8 +2471,6 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
     elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        if "TROUBLESHOOT" in (sched.get("appointment_type") or "").upper() or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
-            return None
         answer = "Once I have the booking details, I can get you on the schedule."
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
@@ -4285,7 +3404,7 @@ def generate_reply_for_inbound(
                 "booking_complete": False
             }
 
-        CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it", "now", "right away", "immediately", "asap", "send someone", "dispatch"]
+        CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
 
         if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
             sched["emergency_approved"] = True
@@ -4590,7 +3709,7 @@ def generate_reply_for_inbound(
             not sched.get("booking_created")
         )
 
-        if ready_for_booking:
+        if ready_for_booking or (EMERGENCY and has_identity_for_booking):
             try:
                 booking_attempt = maybe_create_square_booking(phone, conv)
 
@@ -5336,31 +4455,9 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
-    restore_raw_address_snapshot(sched)
-    raw_address = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
-    if raw_address and raw_address != (sched.get("raw_address") or "").strip():
-        sched["raw_address"] = raw_address
-    snapshot_raw_address(sched)
+    raw_address = (sched.get("raw_address") or "").strip()
     appointment_type = sched.get("appointment_type")
 
-    if not sched.get("address_verified"):
-        try:
-            sched["raw_address"] = enrich_address_with_known_town(
-                sched.get("raw_address") or "",
-                convo.get("initial_outbound_sms") or sched.get("address_prompt_context") or convo.get("initial_sms") or "",
-                convo.get("cleaned_transcript") or "",
-            )
-            st_ctx, addr_ctx = normalize_address_with_context(
-                sched.get("raw_address") or "",
-                convo.get("initial_outbound_sms") or sched.get("address_prompt_context") or convo.get("initial_sms") or "",
-                convo.get("cleaned_transcript") or "",
-            )
-            if st_ctx == "ok" and isinstance(addr_ctx, dict):
-                sched["normalized_address"] = addr_ctx
-            try_early_address_normalize(sched)
-            update_address_assembly_state(sched)
-        except Exception as e:
-            print("[WARN] maybe_create_square_booking address enrich failed:", repr(e))
     if not sched.get("address_verified"):
         return {"status": "address_not_verified"}
 
@@ -5388,42 +4485,6 @@ def maybe_create_square_booking(phone: str, convo: dict):
     # Preflight exact-slot availability lookup before attempting to book.
     day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
     exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
-
-    # Emergency immediate-dispatch jobs should first snap to the earliest real same-day Square availability.
-    # If Square does not expose one, we still attempt a same-day forced booking using the currently selected
-    # same-day slot instead of silently rolling the customer to another date.
-    if not exact_avail and appointment_type == "TROUBLESHOOT_395":
-        tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
-        now_local = datetime.now(tz)
-        future_same_day = []
-        for a in day_avails:
-            try:
-                hh, mm = (a.get("time") or "").split(":")[:2]
-                slot_local = now_local.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-            except Exception:
-                continue
-            if slot_local >= now_local:
-                future_same_day.append((slot_local, a))
-        future_same_day.sort(key=lambda x: x[0])
-        if future_same_day:
-            exact_avail = future_same_day[0][1]
-            sched["scheduled_date"] = exact_avail.get("date") or scheduled_date
-            sched["scheduled_time"] = exact_avail.get("time") or scheduled_time
-            scheduled_date = sched["scheduled_date"]
-            scheduled_time = sched["scheduled_time"]
-        else:
-            forced_start = parse_local_datetime(scheduled_date, scheduled_time)
-            if forced_start:
-                exact_avail = {
-                    "date": scheduled_date,
-                    "time": scheduled_time,
-                    "start_at": forced_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "duration_minutes": 60,
-                    "service_variation_id": variation_id,
-                    "service_variation_version": variation_version,
-                    "team_member_id": SQUARE_TEAM_MEMBER_ID,
-                    "forced_same_day_emergency": True,
-                }
 
     if not exact_avail:
         same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
@@ -5463,27 +4524,18 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     if not _is_complete_norm(addr_struct):
         if not raw_address:
-            restore_raw_address_snapshot(sched)
-            raw_address = canonicalize_address_candidate((sched.get("raw_address") or "").strip())
-        if not raw_address:
             sched["address_verified"] = False
             sched["address_missing"] = "street"
             return {"status": "missing_address"}
 
         try:
-            status, fresh = normalize_address_with_context(
-                raw_address,
-                convo.get("initial_outbound_sms") or "",
-                convo.get("cleaned_transcript") or "",
-                convo.get("initial_sms") or "",
-            )
+            status, fresh = normalize_address(raw_address)
         except Exception as e:
             print("[ERROR] normalize_address exception:", repr(e))
             return {"status": "normalize_exception"}
 
         if status == "needs_state":
-            # Do not fire an out-of-band SMS from inside the booking helper.
-            # Let the caller route return a single deterministic reply.
+            send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
             sched["address_verified"] = False
             sched["address_missing"] = "state"
             return {"status": "needs_state"}
@@ -5491,7 +4543,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
         if status != "ok" or not isinstance(fresh, dict):
             print("[ERROR] Address normalization failed. status=", status)
             sched["address_verified"] = False
-            sched["address_missing"] = "confirm" if re.match(r"^\d{1,6}\b", raw_address or "") else "street"
+            sched["address_missing"] = "confirm"
             return {"status": "address_normalization_failed"}
 
         addr_struct = fresh
