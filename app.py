@@ -272,6 +272,7 @@ def extract_explicit_time_from_text(text: str) -> str | None:
       - "2pm and I have dogs is that ok" -> "14:00"
       - "around 2:30 pm" -> "14:30"
       - "1500" -> "15:00"
+      - "midday" or "noon" -> "12:00"
     Returns None for vague phrases like "this afternoon" or "later".
     """
     import re
@@ -279,6 +280,9 @@ def extract_explicit_time_from_text(text: str) -> str | None:
     s = (text or "").strip().lower()
     if not s:
         return None
+
+    if re.search(r"\b(noon|midday)\b", s):
+        return "12:00"
 
     m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m', s, flags=re.I)
     if m:
@@ -303,6 +307,14 @@ def extract_explicit_time_from_text(text: str) -> str | None:
         mm = int(raw[2:])
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
+
+    m = re.search(r'(\d{1,2})', s)
+    if m:
+        hh = int(m.group(1))
+        if 1 <= hh <= 12:
+            if hh == 12:
+                return "12:00"
+            return f"{hh:02d}:00"
 
     return None
 
@@ -1522,6 +1534,10 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
             return humanize_question("What time works for you?")
         return humanize_question("What time works best for you?")
     if step == "need_name":
+        first_name = get_active_first_name(profile)
+        last_name = get_active_last_name(profile)
+        if first_name and not last_name:
+            return humanize_question(f"{first_name}, what is your last name?")
         return humanize_question("What is your first and last name?")
     if step == "need_email":
         return humanize_question("What is the best email address for the appointment?")
