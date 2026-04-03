@@ -1,6 +1,5 @@
 import os
 import json
-import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -123,106 +122,6 @@ def home():
 # ---------------------------------------------------
 conversations = {}
 
-MONITOR_DB_PATH = os.environ.get("PREVOLT_MONITOR_DB_PATH", "/tmp/prevolt_monitor.db")
-
-def _monitor_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _monitor_connect():
-    conn = sqlite3.connect(MONITOR_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_monitor_db() -> None:
-    try:
-        with _monitor_connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS monitor_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    phone TEXT,
-                    payload_json TEXT
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_monitor_events_ts ON monitor_events(ts DESC)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_monitor_events_phone ON monitor_events(phone)")
-    except Exception as e:
-        print("[WARN] monitor db init failed:", repr(e))
-
-def _safe_monitor_text(value, limit: int = 280) -> str:
-    s = str(value or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    if len(s) > limit:
-        s = s[:limit - 3].rstrip() + "..."
-    return s
-
-def _monitor_state_label(conv: dict) -> str:
-    sched = (conv or {}).get("sched") or {}
-    appt = (sched.get("appointment_type") or "").upper()
-    if sched.get("booking_created") and sched.get("square_booking_id"):
-        return "booked"
-    if "TROUBLESHOOT" in appt or sched.get("emergency_approved") or sched.get("awaiting_emergency_confirm"):
-        return "emergency"
-    step = (sched.get("pending_step") or "").strip().lower()
-    mapping = {
-        "need_address": "waiting_for_address",
-        "need_date": "waiting_for_date",
-        "need_time": "waiting_for_time",
-        "need_name": "waiting_for_name",
-        "need_email": "waiting_for_email",
-    }
-    return mapping.get(step, "active")
-
-def _conversation_snapshot(phone: str, conv: dict) -> dict:
-    conv = conv or {}
-    profile = conv.get("profile") or {}
-    sched = conv.get("sched") or {}
-    first = (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
-    last = (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or profile.get("voicemail_last_name") or "").strip()
-    name = " ".join([p for p in [first, last] if p]).strip()
-    address = (sched.get("raw_address") or "").strip()
-    return {
-        "phone": phone or "",
-        "name": name,
-        "address": address,
-        "scheduled_date": sched.get("scheduled_date"),
-        "scheduled_time": sched.get("scheduled_time"),
-        "appointment_type": sched.get("appointment_type"),
-        "state": _monitor_state_label(conv),
-        "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")),
-        "square_booking_id": sched.get("square_booking_id"),
-        "pending_step": sched.get("pending_step"),
-        "last_sms_body": conv.get("last_sms_body"),
-        "updated_at": _monitor_now_iso(),
-    }
-
-def log_event(event_type: str, phone: str = "", payload: dict | None = None, conv: dict | None = None) -> None:
-    try:
-        init_monitor_db()
-        base_payload = dict(payload or {})
-        if conv is not None:
-            base_payload.setdefault("state", _monitor_state_label(conv))
-            base_payload.setdefault("snapshot", _conversation_snapshot(phone, conv))
-        with _monitor_connect() as conn:
-            conn.execute(
-                "INSERT INTO monitor_events (ts, event_type, phone, payload_json) VALUES (?, ?, ?, ?)",
-                (_monitor_now_iso(), event_type, phone or "", json.dumps(base_payload, ensure_ascii=False)),
-            )
-    except Exception as e:
-        print("[WARN] monitor log_event failed:", repr(e))
-
-def _monitor_booking_return(phone: str, status: str, payload: dict, convo: dict | None = None) -> dict:
-    try:
-        log_event("BOOKING_RESULT", phone, {"status": status, **(payload or {})}, convo)
-    except Exception:
-        pass
-    return payload
-
-init_monitor_db()
-
 
 # ---------------------------------------------------
 # WhatsApp SMS Helper (Testing Path Only)
@@ -272,7 +171,6 @@ def extract_explicit_time_from_text(text: str) -> str | None:
       - "2pm and I have dogs is that ok" -> "14:00"
       - "around 2:30 pm" -> "14:30"
       - "1500" -> "15:00"
-      - "midday" or "noon" -> "12:00"
     Returns None for vague phrases like "this afternoon" or "later".
     """
     import re
@@ -280,9 +178,6 @@ def extract_explicit_time_from_text(text: str) -> str | None:
     s = (text or "").strip().lower()
     if not s:
         return None
-
-    if re.search(r"\b(noon|midday)\b", s):
-        return "12:00"
 
     m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m', s, flags=re.I)
     if m:
@@ -307,14 +202,6 @@ def extract_explicit_time_from_text(text: str) -> str | None:
         mm = int(raw[2:])
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
-
-    m = re.search(r'(\d{1,2})', s)
-    if m:
-        hh = int(m.group(1))
-        if 1 <= hh <= 12:
-            if hh == 12:
-                return "12:00"
-            return f"{hh:02d}:00"
 
     return None
 
@@ -349,10 +236,8 @@ def send_sms(to_number: str, body: str) -> None:
             to=sms_to
         )
         print("[SMS] Sent SID:", msg.sid, "to", sms_to)
-        log_event("SMS_OUT", sms_to, {"sid": getattr(msg, "sid", None), "body": _safe_monitor_text(body)})
     except Exception as e:
         print("[ERROR] SMS send failed:", repr(e))
-        log_event("SMS_OUT_FAILED", (to_number or "").replace("whatsapp:", "").strip(), {"body": _safe_monitor_text(body), "error": repr(e)})
 
 
 
@@ -673,10 +558,6 @@ def incoming_call():
     from twilio.twiml.voice_response import Gather, VoiceResponse
 
     response = VoiceResponse()
-    try:
-        log_event("CALL_IN", (request.form.get("From") or request.args.get("From") or "").replace("whatsapp:", "").strip(), {"call_sid": request.form.get("CallSid") or request.args.get("CallSid")})
-    except Exception:
-        pass
 
     gather = Gather(
         num_digits=1,
@@ -718,11 +599,6 @@ def handle_call_selection():
     digit = request.form.get("Digits", "")
     phone = request.form.get("From", "")
     response = VoiceResponse()
-
-    try:
-        log_event("CALL_MENU_SELECTION", (phone or "").replace("whatsapp:", "").strip(), {"digit": digit, "call_sid": request.form.get("CallSid")})
-    except Exception:
-        pass
 
     
     # ---------------------------------------------------
@@ -948,17 +824,6 @@ def voicemail_complete():
         sched["appointment_type"] = "TROUBLESHOOT_395"
         sched["awaiting_emergency_confirm"] = True
         sched["emergency_approved"] = False
-
-    try:
-        log_event("VOICEMAIL_CAPTURED", from_number, {
-            "category": classification.get("category"),
-            "appointment_type": classification.get("appointment_type"),
-            "intent": classification.get("intent"),
-            "task_topics": classification.get("task_topics") or [],
-            "transcript": _safe_monitor_text(cleaned, 500),
-        }, conv)
-    except Exception:
-        pass
 
     # 4) Trigger First SMS using deterministic voicemail opener so task topics and known addresses land reliably
     try:
@@ -1534,10 +1399,6 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
             return humanize_question("What time works for you?")
         return humanize_question("What time works best for you?")
     if step == "need_name":
-        first_name = get_active_first_name(profile)
-        last_name = get_active_last_name(profile)
-        if first_name and not last_name:
-            return humanize_question(f"{first_name}, what is your last name?")
         return humanize_question("What is your first and last name?")
     if step == "need_email":
         return humanize_question("What is the best email address for the appointment?")
@@ -1576,11 +1437,6 @@ def incoming_sms():
     inbound_sid = request.form.get("MessageSid") or request.form.get("SmsSid") or ""
     convo_key   = phone or inbound_sid or request.form.get("CallSid") or "unknown"
     inbound_low  = inbound_text.lower().strip()
-
-    try:
-        log_event("SMS_IN", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
-    except Exception:
-        pass
 
     # SECRET RESET COMMAND
     if inbound_low == "mobius1":
@@ -1762,13 +1618,6 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
-    # Route-level last-name salvage before Step 4.
-    try:
-        if maybe_capture_last_name_only(profile, sched, inbound_text):
-            recompute_pending_step(profile, sched)
-    except Exception as e:
-        print("[WARN] incoming_sms last-name salvage failed:", repr(e))
-
     # Deterministic fast path for pure interruption questions.
     # This prevents price / payment / permit questions from getting lost
     # behind the address collector when the inbound does not contain a new slot value.
@@ -1829,10 +1678,6 @@ def incoming_sms():
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
         conv["last_sms_body"] = fast_interrupt.strip()
-        try:
-            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(fast_interrupt)}, conv)
-        except Exception:
-            pass
         tw = MessagingResponse()
         tw.message(fast_interrupt.strip())
         return Response(str(tw), mimetype="text/xml")
@@ -1849,10 +1694,6 @@ def incoming_sms():
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
         conv["last_sms_body"] = soft_reject_reply.strip()
-        try:
-            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(soft_reject_reply)}, conv)
-        except Exception:
-            pass
         tw = MessagingResponse()
         tw.message(soft_reject_reply.strip())
         return Response(str(tw), mimetype="text/xml")
@@ -1871,10 +1712,6 @@ def incoming_sms():
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
         conv["last_sms_body"] = resumed_reply.strip()
-        try:
-            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(resumed_reply)}, conv)
-        except Exception:
-            pass
         tw = MessagingResponse()
         tw.message(resumed_reply.strip())
         return Response(str(tw), mimetype="text/xml")
@@ -1891,10 +1728,6 @@ def incoming_sms():
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
         conv["last_sms_body"] = post_booking_reply.strip()
-        try:
-            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(post_booking_reply)}, conv)
-        except Exception:
-            pass
         tw = MessagingResponse()
         tw.message(post_booking_reply.strip())
         return Response(str(tw), mimetype="text/xml")
@@ -1993,10 +1826,6 @@ def incoming_sms():
     conv["last_inbound_fingerprint"] = inbound_fingerprint
     conv["last_inbound_fingerprint_ts"] = now_ts
     conv["last_sms_body"] = sms_body
-    try:
-        log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(sms_body)}, conv)
-    except Exception:
-        pass
 
     tw = MessagingResponse()
     tw.message(sms_body)
@@ -2184,58 +2013,6 @@ def normalize_person_name(s: str) -> str:
     if not s:
         return ""
     return " ".join(p[:1].upper() + p[1:].lower() for p in s.split())
-
-def maybe_capture_last_name_only(profile: dict, sched: dict, inbound_text: str) -> bool:
-    """
-    Route-level salvage:
-    If first name is already known, last name is still missing, and the customer
-    replies with a simple last-name-looking token, persist it before Step 4.
-    """
-    if (sched.get("pending_step") or "").strip().lower() != "need_name":
-        return False
-
-    first_name = get_active_first_name(profile)
-    last_name = get_active_last_name(profile)
-    if not first_name or last_name:
-        return False
-
-    cleaned = re.sub(r"[^A-Za-z'\- ]", " ", inbound_text or "").strip()
-    parts = [p for p in cleaned.split() if p]
-    if not parts:
-        return False
-
-    low = " ".join(parts).lower().strip()
-    blocked = {
-        "yes", "no", "okay", "ok", "thanks", "thank you", "yep", "yeah", "sure",
-        "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday", "friday",
-        "saturday", "sunday", "morning", "afternoon", "evening", "noon", "midday"
-    }
-    if low in blocked:
-        return False
-
-    # Common real-world rescue:
-    # "Smith"
-    # "my last name is Smith"
-    # "it is Smith"
-    candidate = None
-    if len(parts) == 1:
-        candidate = parts[0]
-    else:
-        m = re.search(r"\b(?:last name is|lastname is|my last name is|it is|its|it's)\s+([A-Za-z][A-Za-z'\-]{1,})\b", cleaned, flags=re.I)
-        if m:
-            candidate = m.group(1)
-        elif len(parts) <= 3 and parts[-1].lower() not in {"name", "last", "is", "my", "it"}:
-            candidate = parts[-1]
-
-    candidate = normalize_person_name(candidate or "")
-    if not candidate:
-        return False
-
-    profile["active_last_name"] = candidate
-    profile["last_name"] = candidate
-    if not profile.get("identity_source"):
-        profile["identity_source"] = "customer_provided_last_name"
-    return True
 
 def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
     """
@@ -2683,13 +2460,16 @@ Return strict JSON with keys:
 
 Priorities:
 - answer the customer's actual question naturally
+- sound like a real electrical contractor handling scheduling by text
 - protect Prevolt's interests
-- keep trust high
+- build trust without overselling
 - never sound robotic
 - never invent license numbers, policy numbers, addresses, permits, or legal promises
 - never restate price unless the user is actively asking about price in this message
+- when the user asks reassurance questions, answer them directly first
 - if the customer is still deciding, do NOT force the booking flow
-- if the customer is cooperative and the trust question is answered, you may gently return to the next missing booking step
+- only return to the booking step if the customer sounds ready to continue
+- never force the booking flow after a trust question
 - never turn the customer's question into an address or rewrite the question as an address
 - do not output paragraphs
 - one clean text
@@ -2738,7 +2518,6 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked and not allow_post_booking:
         return None
 
-    # Let the LLM handle trust / hesitation / multi-question turns first.
     trust = llm_trust_reply(conv, inbound_text)
     if trust and trust.get("answer"):
         answer = trust["answer"].strip()
@@ -2751,23 +2530,34 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         return answer
 
     answer = None
+
     if any(x in low for x in ["dog", "dogs", "pet", "pets"]):
-        answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
+        answer = "Yes, that is fine. Just make sure we can safely access the work area when we arrive."
+
     elif any(x in low for x in ["licensed", "license", "insured", "insurance"]):
         if "copy" in low or "certificate" in low or "proof" in low:
-            answer = "We can provide insurance documentation when the visit is moving forward."
+            answer = "Yes. We can provide insurance documentation when the job is moving forward."
         else:
             answer = "Yes, we're licensed and insured."
+
     elif any(x in low for x in ["where are you located", "where are you guys located", "where are you based", "where are you out of"]):
-        answer = "We service Connecticut and Massachusetts."
+        answer = "We're a local electrical contractor serving Connecticut and Massachusetts."
+
+    elif any(x in low for x in ["real person", "is this ai", "are you ai"]):
+        answer = "You're texting with Prevolt Electric's scheduling system, and it's here to get your visit handled correctly."
+
     elif any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you re close", "when you're close", "when youre close"]):
         answer = "Yes, you'll get a text when we're on the way."
+
     elif any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
         answer = "No, you do not need to buy anything ahead of time for the visit."
+
     elif any(x in low for x in ["permit", "permit required"]):
-        answer = "If anything needs a permit, we'll go over that during the visit."
+        answer = "If anything requires a permit, we'll go over that on site once we see exactly what is there."
+
     elif any(x in low for x in ["card", "cash", "check", "payment", "pay by", "how do i pay"]):
         answer = "Card or cash after the visit is fine."
+
     elif any(x in low for x in [
         "how much", "price", "cost", "$195", "$395", "195", "395",
         "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee",
@@ -2788,11 +2578,11 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             "deposit", "credited back", "applied back"
         ]):
             if "TROUBLESHOOT" in appt:
-                answer = "The $395 covers the troubleshoot and repair visit itself. If larger repair work is needed, we go over that separately on site first."
+                answer = "The $395 covers the troubleshoot and repair visit itself. If larger repair work is needed, we would go over that separately on site first."
             elif "INSPECTION" in appt:
-                answer = "The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately."
+                answer = "The inspection fee covers the inspection visit itself. If additional work is needed after that, we would go over it separately."
             else:
-                answer = "The $195 covers the evaluation visit itself. If you decide to move forward after that, we go over the next step in person."
+                answer = "The $195 covers the evaluation visit itself. If more work is needed after that, we would go over the next step in person."
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
             answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
         elif "TROUBLESHOOT" in appt:
@@ -2802,14 +2592,19 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         else:
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
+
     elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        answer = "Once I have the booking details, I can get you on the schedule."
+        answer = "Once I have the visit details, I can get you on the schedule."
+
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
+
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
         answer = "Yes, we handle panel upgrades and replacements."
+
     elif "favorite color" in low:
         answer = "Let's keep it on the visit details."
+
     elif any(x in low for x in ["roll me over", "pick me up", "carry me"]):
         answer = "We handle the electrical work itself. If someone needs to help with access, just make sure that is covered when we come out."
 
@@ -4768,10 +4563,6 @@ def is_weekend(date_str: str) -> bool:
 #   ✅ Prevents stale booking flags from causing ghost confirmations
 # ---------------------------------------------------
 def maybe_create_square_booking(phone: str, convo: dict):
-    try:
-        log_event("BOOKING_ATTEMPT", phone, {}, convo)
-    except Exception:
-        pass
     import re
 
     sched = convo.setdefault("sched", {})
@@ -4829,12 +4620,12 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
         print("[BLOCKED] Weekend not allowed for non-emergency.")
-        return _monitor_booking_return(phone, "weekend_blocked", {"status": "weekend_blocked"}, convo)
+        return {"status": "weekend_blocked"}
 
     if appointment_type != "TROUBLESHOOT_395":
         if not is_within_normal_hours(scheduled_time):
             print("[BLOCKED] Time outside 9–4")
-            return _monitor_booking_return(phone, "outside_hours", {"status": "outside_hours"}, convo)
+            return {"status": "outside_hours"}
 
     if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
         print("[ERROR] Square not configured.")
@@ -5038,7 +4829,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
             sched["booking_created"] = False
             sched["square_booking_id"] = None
             sched["booking_attempt_nonce"] = str(uuid.uuid4())
-            return _monitor_booking_return(phone, "stale_cancelled", {"status": "stale_cancelled"}, convo)
+            return {"status": "stale_cancelled"}
 
         # Do not attempt to update booking.status here.
         # The current Square response is showing booking.status as read-only on update,
@@ -5069,77 +4860,12 @@ def maybe_create_square_booking(phone: str, convo: dict):
             })
 
         print("[SUCCESS] Booking created and accepted:", booking_id)
-        return _monitor_booking_return(phone, "booked", {"status": "booked", "booking_id": booking_id}, convo)
+        return {"status": "booked", "booking_id": booking_id}
 
     except Exception as e:
         print("[ERROR] Square exception:", repr(e))
-        return _monitor_booking_return(phone, "square_exception", {"status": "square_exception", "detail": repr(e)}, convo)
+        return {"status": "square_exception", "detail": repr(e)}
 
-
-
-@app.route("/monitor/health", methods=["GET"])
-def monitor_health():
-    return {"ok": True}, 200
-
-
-@app.route("/monitor/events", methods=["GET"])
-def monitor_events():
-    init_monitor_db()
-    limit_raw = request.args.get("limit", "250")
-    phone = (request.args.get("phone") or "").replace("whatsapp:", "").strip()
-    try:
-        limit = max(1, min(1000, int(limit_raw)))
-    except Exception:
-        limit = 250
-
-    query = "SELECT id, ts, event_type, phone, payload_json FROM monitor_events"
-    params = []
-    if phone:
-        query += " WHERE phone = ?"
-        params.append(phone)
-    query += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
-
-    items = []
-    try:
-        with _monitor_connect() as conn:
-            rows = conn.execute(query, params).fetchall()
-        for row in rows:
-            payload = {}
-            try:
-                payload = json.loads(row["payload_json"] or "{}")
-            except Exception:
-                payload = {}
-            items.append({
-                "id": row["id"],
-                "ts": row["ts"],
-                "event_type": row["event_type"],
-                "phone": row["phone"],
-                "payload": payload,
-            })
-    except Exception as e:
-        return {"ok": False, "error": repr(e), "items": []}, 500
-
-    return {"ok": True, "items": items}, 200
-
-
-@app.route("/monitor/conversations", methods=["GET"])
-def monitor_conversations():
-    items = []
-    for phone, conv in conversations.items():
-        if not isinstance(conv, dict):
-            continue
-        try:
-            items.append(_conversation_snapshot(phone, conv))
-        except Exception:
-            continue
-
-    items.sort(key=lambda x: (
-        0 if x.get("state") == "emergency" else 1,
-        0 if x.get("booking_created") else 1,
-        x.get("phone") or "",
-    ))
-    return {"ok": True, "items": items}, 200
 
 
 # ---------------------------------------------------
