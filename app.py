@@ -538,19 +538,21 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     else:
         address_line = " What is the address for the visit?"
 
-    # Only inject price once in the first outbound text.
+    # Emergency flow should not lead with price. We gather the details first,
+    # then disclose pricing right before dispatch / booking.
     price_line = ""
     appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
-    if appt_type == "TROUBLESHOOT_395":
-        price_line = " Troubleshoot and repair visits are $395."
-    elif appt_type == "WHOLE_HOME_INSPECTION":
+    if appt_type == "WHOLE_HOME_INSPECTION":
         price_line = " Home inspections are $395."
-    else:
+    elif appt_type != "TROUBLESHOOT_395":
         price_line = " Our evaluation visit is $195."
 
     sms = (intro + task_line + address_line + price_line).strip()
     sched["intro_sent"] = True
-    sched["price_disclosed"] = True
+    if appt_type == "TROUBLESHOOT_395":
+        sched["price_disclosed"] = False
+    else:
+        sched["price_disclosed"] = True
     return re.sub(r"\s+", " ", sms).strip()
 
 # ---------------------------------------------------
@@ -827,6 +829,16 @@ def voicemail_complete():
         sched["appointment_type"] = "TROUBLESHOOT_395"
         sched["awaiting_emergency_confirm"] = True
         sched["emergency_approved"] = False
+        sched["dispatch_now"] = False
+        sched["immediate_dispatch_mode"] = False
+
+        # Best-effort early normalization so emergency mode preserves any
+        # address captured in the voicemail instead of re-losing it later.
+        try:
+            if sched.get("raw_address"):
+                try_early_address_normalize(sched)
+        except Exception as e:
+            print("[WARN] emergency voicemail early normalize failed:", repr(e))
 
     # 4) Trigger First SMS using deterministic voicemail opener so task topics and known addresses land reliably
     try:
@@ -3374,32 +3386,45 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["awaiting_emergency_confirm"] = True
             sched["pending_step"] = None
+            sched.setdefault("dispatch_now", False)
+            sched.setdefault("immediate_dispatch_mode", False)
 
-            if not sched.get("raw_address"):
+            # Emergency mode should keep and normalize any address already captured.
+            try:
+                if sched.get("raw_address"):
+                    try_early_address_normalize(sched)
+            except Exception as e:
+                print("[WARN] emergency pre-dispatch normalize failed:", repr(e))
+
+            update_address_assembly_state(sched)
+
+            if not sched.get("raw_address") or not sched.get("address_verified"):
                 known_q = _known_address_question()
-                if known_q:
+                if known_q and sched.get("address_verified"):
                     msg = f"This sounds urgent. {known_q}"
                 else:
                     msg = "This sounds urgent. " + build_address_prompt(sched)
-                msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
+                msg = _apply_intro_once(msg)
+                msg = _strip_ai_tells(msg)
+                msg = _shorten_texty(msg)
                 return {
                     "sms_body": msg,
-                    "scheduled_date": None,
-                    "scheduled_time": None,
-                    "address": None,
+                    "scheduled_date": sched.get("scheduled_date"),
+                    "scheduled_time": sched.get("scheduled_time"),
+                    "address": sched.get("raw_address"),
                     "booking_complete": False
                 }
 
             msg = (
                 f"This looks urgent at {sched.get('raw_address')}. "
-                "Troubleshoot and repair visits are $395. "
+                "We can send someone now and arrival is usually about 1 to 2 hours. "
                 "Do you want us to dispatch someone now?"
             )
             msg = _finalize_sms(msg, "TROUBLESHOOT_395", booking_created=False)
             return {
                 "sms_body": msg,
-                "scheduled_date": None,
-                "scheduled_time": None,
+                "scheduled_date": sched.get("scheduled_date"),
+                "scheduled_time": sched.get("scheduled_time"),
                 "address": sched.get("raw_address"),
                 "booking_complete": False
             }
@@ -3407,19 +3432,28 @@ def generate_reply_for_inbound(
         CONFIRM_PHRASES = ["yes", "yeah", "yup", "ok", "okay", "sure", "book", "send", "do it"]
 
         if sched["awaiting_emergency_confirm"] and any(p in inbound_lower for p in CONFIRM_PHRASES):
-            rounded_now = now_local.replace(second=0, microsecond=0)
-            minute_mod = rounded_now.minute % 30
+            dispatch_dt = now_local + timedelta(hours=1)
+            dispatch_dt = dispatch_dt.replace(second=0, microsecond=0)
+            minute_mod = dispatch_dt.minute % 5
             if minute_mod:
-                rounded_now = rounded_now + timedelta(minutes=(30 - minute_mod))
-            elif rounded_now <= now_local:
-                rounded_now = rounded_now + timedelta(minutes=30)
+                dispatch_dt = dispatch_dt + timedelta(minutes=(5 - minute_mod))
 
             sched["emergency_approved"] = True
             sched["awaiting_emergency_confirm"] = False
             sched["appointment_type"] = "TROUBLESHOOT_395"
-            sched["scheduled_date"] = rounded_now.strftime("%Y-%m-%d")
-            sched["scheduled_time"] = rounded_now.strftime("%H:%M")
+            sched["dispatch_now"] = True
+            sched["immediate_dispatch_mode"] = True
+            sched["scheduled_date"] = dispatch_dt.strftime("%Y-%m-%d")
+            sched["scheduled_time"] = dispatch_dt.strftime("%H:%M")
             sched["pending_step"] = None
+
+            # Lock in any emergency address we already have before moving deeper.
+            try:
+                if sched.get("raw_address"):
+                    try_early_address_normalize(sched)
+            except Exception as e:
+                print("[WARN] emergency approval normalize failed:", repr(e))
+            update_address_assembly_state(sched)
 
             scheduled_date = sched["scheduled_date"]
             scheduled_time = sched["scheduled_time"]
@@ -4600,7 +4634,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
         ).strip()
 
         travel_minutes = compute_travel_time_minutes(origin, destination)
-        if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES:
+        if travel_minutes and travel_minutes > MAX_TRAVEL_MINUTES and appointment_type != "TROUBLESHOOT_395":
             print("[BLOCKED] Travel too long.")
             return {"status": "travel_too_long"}
 
