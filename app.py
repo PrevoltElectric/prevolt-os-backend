@@ -1629,6 +1629,51 @@ def incoming_sms():
         print("[WARN] incoming_sms fast interrupt failed:", repr(e))
 
     if fast_interrupt:
+        try:
+            update_address_assembly_state(sched)
+            recompute_pending_step(profile, sched)
+
+            has_identity_for_booking = bool(
+                (get_active_first_name(profile) and get_active_last_name(profile))
+                or profile.get("square_customer_id")
+            )
+            has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+            appt_upper = (sched.get("appointment_type") or "").upper()
+            emergency_mode = (
+                "TROUBLESHOOT" in appt_upper
+                or bool(sched.get("emergency_approved"))
+                or bool(sched.get("awaiting_emergency_confirm"))
+            )
+
+            ready_after_interrupt = (
+                bool(sched.get("scheduled_date")) and
+                bool(sched.get("scheduled_time")) and
+                bool(sched.get("address_verified")) and
+                bool(sched.get("appointment_type")) and
+                has_identity_for_booking and
+                has_contact_for_booking and
+                not sched.get("pending_step") and
+                not sched.get("booking_created")
+            )
+
+            if ready_after_interrupt and not emergency_mode:
+                booking_attempt = maybe_create_square_booking(phone, conv)
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "stale_cancelled":
+                    booking_attempt = maybe_create_square_booking(phone, conv)
+
+                if sched.get("booking_created") and sched.get("square_booking_id"):
+                    try:
+                        booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+                        human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
+                    except Exception:
+                        human_day = sched.get("scheduled_date") or "that day"
+                    booked_time = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
+                    fast_interrupt = f"{fast_interrupt.strip()} You're all set for {human_day} at {booked_time}. We have you on the schedule."
+                elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
+                    fast_interrupt = f"{fast_interrupt.strip()} {booking_attempt.get('message') or ''}".strip()
+        except Exception as e:
+            print("[WARN] fast interrupt immediate booking failed:", repr(e))
+
         conv["last_inbound_sid"] = inbound_sid
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
@@ -1747,6 +1792,8 @@ def incoming_sms():
     if ready_for_route_booking and not emergency_mode:
         try:
             booking_attempt = maybe_create_square_booking(phone, conv)
+            if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "stale_cancelled":
+                booking_attempt = maybe_create_square_booking(phone, conv)
 
             if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                 sms_body = booking_attempt.get("message") or "That time is already booked. Here are three other times that work."
@@ -4464,6 +4511,8 @@ def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
     sched["final_confirmation_sent"] = False
     sched["final_confirmation_accepted"] = False
     sched["last_final_confirmation_key"] = None
+    sched["slot_choice_locked"] = True
+    sched["booking_attempt_nonce"] = str(uuid.uuid4())
     return True
 
 
@@ -4673,10 +4722,15 @@ def maybe_create_square_booking(phone: str, convo: dict):
         print("[ERROR] Invalid start time.")
         return {"status": "invalid_start_time"}
 
+    booking_nonce = (sched.get("booking_attempt_nonce") or "").strip()
+    if not booking_nonce:
+        booking_nonce = "base"
+
     idempotency_key = (
         f"prevolt-{phone}-{scheduled_date}-{scheduled_time}-{appointment_type}-"
         f"{(addr_struct.get('address_line_1') or '').strip()}-"
-        f"{(addr_struct.get('postal_code') or '').strip()}"
+        f"{(addr_struct.get('postal_code') or '').strip()}-"
+        f"{booking_nonce}"
     )
 
     booking_payload = {
@@ -4749,6 +4803,15 @@ def maybe_create_square_booking(phone: str, convo: dict):
             "location_id": b2.get("location_id"),
             "team_member_id": tm
         })
+
+        # If Square gives back a cancelled booking record for this idempotency key,
+        # treat it as stale and do not mark the booking as created.
+        if status == "CANCELLED_BY_CUSTOMER":
+            print("[WARN] stale cancelled booking returned by Square; forcing fresh booking attempt")
+            sched["booking_created"] = False
+            sched["square_booking_id"] = None
+            sched["booking_attempt_nonce"] = str(uuid.uuid4())
+            return {"status": "stale_cancelled"}
 
         # Do not attempt to update booking.status here.
         # The current Square response is showing booking.status as read-only on update,
