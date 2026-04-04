@@ -1900,6 +1900,16 @@ def incoming_sms():
         return Response(str(tw), mimetype="text/xml")
 
     # ---------------------------------------------------
+    # Pre-Step4 salvage: always absorb obvious slot payloads so
+    # explicit replies like "next Friday at 2pm" are stored before
+    # any LLM call. This prevents date/time loops.
+    # ---------------------------------------------------
+    try:
+        absorb_obvious_booking_details(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms absorb obvious booking details failed:", repr(e))
+
+    # ---------------------------------------------------
     # Run Step 4
     # ---------------------------------------------------
     reply = generate_reply_for_inbound(
@@ -1914,8 +1924,10 @@ def incoming_sms():
     )
 
     # SAVE STEP 4 RESULTS
-    sched["scheduled_date"] = reply.get("scheduled_date")
-    sched["scheduled_time"] = reply.get("scheduled_time")
+    if reply.get("scheduled_date"):
+        sched["scheduled_date"] = reply.get("scheduled_date")
+    if reply.get("scheduled_time"):
+        sched["scheduled_time"] = reply.get("scheduled_time")
 
     if reply.get("address"):
         sched["raw_address"] = reply["address"]
@@ -1928,7 +1940,7 @@ def incoming_sms():
 
     recompute_pending_step(profile, sched)
 
-    sms_body = (reply.get("sms_body") or "").strip()
+    sms_body = collapse_duplicate_sms((reply.get("sms_body") or "").strip())
 
     # Regular-booking hard guard:
     # If Step 4 has already captured a full slot + identity + contact + verified address,
@@ -2016,6 +2028,24 @@ ACK_PHRASES = {
 
 def _norm_text(s: str) -> str:
     return " ".join((s or "").strip().split())
+
+def collapse_duplicate_sms(text: str) -> str:
+    text = " ".join((text or "").split()).strip()
+    if not text:
+        return text
+
+    # Exact repeated whole-string halves
+    half = len(text) // 2
+    if len(text) % 2 == 0 and text[:half].strip() == text[half:].strip():
+        return text[:half].strip()
+
+    # Repeated sentence blocks
+    parts = [p.strip() for p in re.split(r'(?<=[?.!])\s+', text) if p.strip()]
+    out = []
+    for p in parts:
+        if not out or out[-1].lower() != p.lower():
+            out.append(p)
+    return " ".join(out).strip()
 
 def is_ack_message(inbound_text: str) -> bool:
     t = _norm_text(inbound_text).lower()
@@ -4180,6 +4210,7 @@ def generate_reply_for_inbound(
 
         booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
         sms_body = _finalize_sms(sms_body, appt_type, booking_created=booking_created)
+        sms_body = collapse_duplicate_sms(sms_body)
 
         return {
             "sms_body": sms_body,
