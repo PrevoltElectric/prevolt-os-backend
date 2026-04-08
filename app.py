@@ -813,7 +813,7 @@ def handle_call_selection():
             '<speak>'
                 '<prosody rate="95%">'
                     'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
-                    'Please leave your name, towm name, and a brief description of what you need help with.<break time="0.6s"/>'
+                    'Please leave your name, address, and a brief description of what you need help with.<break time="0.6s"/>'
                     'We will text you shortly.'
                 '</prosody>'
             '</speak>',
