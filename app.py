@@ -841,7 +841,7 @@ def handle_call_selection():
             '<speak><prosody rate="90%">Connecting you now.</prosody></speak>',
             voice="Polly.Matthew-Neural"
         )
-        response.dial("+15555555555")  # replace with real number
+        response.dial("+18609701727")  # replace with real number
         return Response(str(response), mimetype="text/xml")
 
     # -----------------------------
