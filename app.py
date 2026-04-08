@@ -632,22 +632,27 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
             joined = ", ".join(topics[:-1]) + f", and {topics[-1]}"
         task_line = f" It sounds like you're looking for help with {joined}."
 
+    def starts_with_house_number(value: str) -> bool:
+        value = (value or "").strip()
+        return bool(re.match(r"^\d{1,6}\b", value))
+
     saved_full = None
     for a in profile.get("addresses") or []:
         a = (a or "").strip()
-        if re.match(r"^\d{1,6}", a):
+        if starts_with_house_number(a):
             saved_full = a
             break
 
     raw_hint = (sched.get("raw_address") or classification.get("detected_address") or "").strip()
-    town_hint = raw_hint
     appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
 
     address_line = ""
     if saved_full:
         address_line = f" I have {saved_full} on file. Is this for that address?"
-    elif town_hint and not re.match(r"^\d{1,6}", town_hint):
-        address_line = f" What is the house number and street name in {town_hint}?"
+    elif raw_hint and starts_with_house_number(raw_hint):
+        address_line = f" I have {raw_hint} for the visit. Is that correct?"
+    elif raw_hint:
+        address_line = f" What is the house number and street name in {raw_hint}?"
     else:
         address_line = " What is the address for the visit?"
 
