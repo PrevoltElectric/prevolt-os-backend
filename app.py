@@ -284,23 +284,23 @@ def extract_explicit_time_from_text(text: str) -> str | None:
     if re.search(r"\b(noon|midday)\b", s):
         return "12:00"
 
-    m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m', s, flags=re.I)
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m\b", s, flags=re.I)
     if m:
         hh = int(m.group(1))
-        mm = int(m.group(2) or '00')
+        mm = int(m.group(2) or "00")
         ap = m.group(3).lower()
         if hh == 12:
             hh = 0
-        if ap == 'p':
+        if ap == "p":
             hh += 12
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
-    m = re.search(r'([01]?\d|2[0-3]):([0-5]\d)', s)
+    m = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", s)
     if m:
         return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
 
-    m = re.search(r'(\d{3,4})', s)
+    m = re.search(r"\b(\d{3,4})\b", s)
     if m:
         raw = m.group(1).zfill(4)
         hh = int(raw[:2])
@@ -308,7 +308,7 @@ def extract_explicit_time_from_text(text: str) -> str | None:
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
-    m = re.search(r'(\d{1,2})', s)
+    m = re.search(r"\b(\d{1,2})\b", s)
     if m:
         hh = int(m.group(1))
         if 1 <= hh <= 12:
@@ -1572,20 +1572,28 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
 
     city, state = extract_city_state_from_reply(inbound)
 
+    pieces = [p.strip() for p in raw.split(",") if p.strip()]
+    last_piece = pieces[-1] if pieces else ""
+    second_last_piece = pieces[-2] if len(pieces) >= 2 else ""
+
     # State-only reply like 'CT'
     if not city and state:
-        if re.search(r",\s*[A-Za-z .'-]+$", raw) and not re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA)", raw, flags=re.I):
-            merged = f"{raw}, {state}"
+        if re.fullmatch(r"CT|MA", last_piece, flags=re.I):
+            merged = ", ".join(pieces[:-1] + [state])
         else:
-            merged = f"{raw}, {state}"
+            merged = raw + f", {state}"
     # City + optional state reply
     elif city:
-        base = raw
-        # If raw already ends with the same city/state, do nothing.
-        if re.search(rf",\s*{re.escape(city)}(?:,\s*(CT|MA))?", raw, flags=re.I):
-            merged = raw if not state else re.sub(r",\s*([A-Za-z .'-]+)(?:,\s*(CT|MA))?$", rf", {city}, {state}", raw, flags=re.I)
+        # If the raw address already ends with the same city, keep it as-is.
+        if last_piece.lower() == city.lower() or second_last_piece.lower() == city.lower():
+            merged = raw
+            if state:
+                if re.fullmatch(r"CT|MA", last_piece, flags=re.I):
+                    merged = ", ".join(pieces[:-1] + [state])
+                elif not re.fullmatch(r"CT|MA", last_piece, flags=re.I):
+                    merged = raw if last_piece.lower() == city.lower() else raw + f", {state}"
         else:
-            merged = f"{base}, {city}" + (f", {state}" if state else "")
+            merged = f"{raw}, {city}" + (f", {state}" if state else "")
     else:
         return False
 
@@ -2964,7 +2972,15 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
     elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        answer = "Once I have the booking details, I can get you on the schedule."
+        recompute_pending_step(profile, sched)
+        if (sched.get("pending_step") or "").strip().lower() == "need_date" and not sched.get("scheduled_time"):
+            answer = "What day and time work best for you?"
+        elif (sched.get("pending_step") or "").strip().lower() == "need_date":
+            answer = "What day works best for you?"
+        elif (sched.get("pending_step") or "").strip().lower() == "need_time":
+            answer = "What time works best for you?"
+        else:
+            answer = "Once I have the booking details, I can get you on the schedule."
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
