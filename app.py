@@ -5266,6 +5266,45 @@ def maybe_create_square_booking(phone: str, convo: dict):
         line1 = (line1 or "").strip()
         return bool(re.match(r"^\d{1,6}\b", line1))
 
+    def _fallback_struct_from_raw(raw: str) -> dict | None:
+        raw = " ".join((raw or "").strip().split())
+        if not raw:
+            return None
+
+        m = re.search(
+            r"^\s*(?P<line1>\d{1,6}[^,]+?),\s*(?P<city>[A-Za-z][A-Za-z .'-]+?),\s*(?P<state>CT|Connecticut|MA|Mass|Mass\.|Massachusetts)\s+(?P<zip>\d{5}(?:-\d{4})?)\s*$",
+            raw,
+            flags=re.I,
+        )
+        if not m:
+            return None
+
+        state_raw = (m.group("state") or "").strip().lower().rstrip('.')
+        state_map = {
+            "ct": "CT",
+            "connecticut": "CT",
+            "ma": "MA",
+            "mass": "MA",
+            "massachusetts": "MA",
+        }
+        state_abbr = state_map.get(state_raw)
+        if not state_abbr:
+            return None
+
+        line1 = (m.group("line1") or "").strip()
+        city = (m.group("city") or "").strip()
+        zipc = (m.group("zip") or "").strip()
+        if not (line1 and city and zipc and _has_house_number(line1)):
+            return None
+
+        return {
+            "address_line_1": line1,
+            "locality": city,
+            "administrative_district_level_1": state_abbr,
+            "postal_code": zipc,
+            "country": "US",
+        }
+
     if not _is_complete_norm(addr_struct):
         if not raw_address:
             sched["address_verified"] = False
@@ -5276,28 +5315,40 @@ def maybe_create_square_booking(phone: str, convo: dict):
             status, fresh = normalize_address(raw_address)
         except Exception as e:
             print("[ERROR] normalize_address exception:", repr(e))
-            return {"status": "normalize_exception"}
+            status, fresh = "error", None
 
-        if status == "needs_state":
+        fallback_struct = _fallback_struct_from_raw(raw_address)
+
+        if status == "needs_state" and not fallback_struct:
             send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
             sched["address_verified"] = False
             sched["address_missing"] = "state"
             return {"status": "needs_state"}
 
         if status != "ok" or not isinstance(fresh, dict):
-            print("[ERROR] Address normalization failed. status=", status)
-            sched["address_verified"] = False
-            sched["address_missing"] = "confirm"
-            return {"status": "address_normalization_failed"}
+            if fallback_struct:
+                print("[WARN] Address normalization failed; using confirmed raw address fallback.")
+                fresh = fallback_struct
+                status = "ok_fallback"
+            else:
+                print("[ERROR] Address normalization failed. status=", status)
+                sched["address_verified"] = False
+                sched["address_missing"] = "confirm"
+                return {"status": "address_normalization_failed"}
 
         addr_struct = fresh
         sched["normalized_address"] = addr_struct
 
     if not _is_complete_norm(addr_struct):
-        print("[ERROR] Normalized address missing required fields.")
-        sched["address_verified"] = False
-        sched["address_missing"] = "confirm"
-        return {"status": "address_incomplete"}
+        fallback_struct = _fallback_struct_from_raw(raw_address)
+        if fallback_struct:
+            addr_struct = fallback_struct
+            sched["normalized_address"] = addr_struct
+        else:
+            print("[ERROR] Normalized address missing required fields.")
+            sched["address_verified"] = False
+            sched["address_missing"] = "confirm"
+            return {"status": "address_incomplete"}
 
     line1 = (addr_struct.get("address_line_1") or "").strip()
     if not _has_house_number(line1):
