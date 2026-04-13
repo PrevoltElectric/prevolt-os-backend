@@ -4878,7 +4878,32 @@ def parse_local_datetime(date_str: str, time_str: str):
 # ---------------------------------------------------
 # Appointment Type → Square Variation Mapping
 # ---------------------------------------------------
+def canonicalize_appointment_type(appt: str) -> str | None:
+    if not appt:
+        return None
+
+    raw = str(appt).strip()
+    if not raw:
+        return None
+
+    up = raw.upper()
+
+    if "INSPECTION" in up:
+        return "WHOLE_HOME_INSPECTION"
+    if "TROUBLESHOOT" in up or "REPAIR" in up or "EMERGENCY" in up:
+        return "TROUBLESHOOT_395"
+    if "EVAL" in up:
+        return "EVAL_195"
+
+    # Human labels that should never break booking.
+    if up in {"SERVICE CALL", "SERVICE", "CALL", "STANDARD SERVICE CALL", "ELECTRICAL SERVICE CALL"}:
+        return "EVAL_195"
+
+    return raw
+
+
 def map_appointment_type_to_variation(appt: str):
+    appt = canonicalize_appointment_type(appt)
     if not appt:
         return None, None
 
@@ -5197,7 +5222,9 @@ def maybe_create_square_booking(phone: str, convo: dict):
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
     raw_address = (sched.get("raw_address") or "").strip()
-    appointment_type = sched.get("appointment_type")
+    appointment_type = canonicalize_appointment_type(sched.get("appointment_type"))
+    if appointment_type and appointment_type != sched.get("appointment_type"):
+        sched["appointment_type"] = appointment_type
 
     if not sched.get("address_verified"):
         return {"status": "address_not_verified"}
