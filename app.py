@@ -1908,6 +1908,30 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms last-name salvage failed:", repr(e))
 
+    # Direct availability questions should return real next slots before any generic interruption handling.
+    try:
+        if is_next_available_request(inbound_text):
+            slot_options = get_next_available_slots((sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195"), limit=3)
+            if slot_options:
+                sched["awaiting_slot_offer_choice"] = True
+                sched["offered_slot_options"] = slot_options
+                sched["last_slot_unavailable_message"] = format_next_available_slots_message(slot_options)
+                sched["booking_created"] = False
+                sched["square_booking_id"] = None
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = sched["last_slot_unavailable_message"]
+                try:
+                    log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(sched["last_slot_unavailable_message"])}, conv)
+                except Exception:
+                    pass
+                tw = MessagingResponse()
+                tw.message(sched["last_slot_unavailable_message"])
+                return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms next available handling failed:", repr(e))
+
     # Deterministic fast path for pure interruption questions.
     # This prevents price / payment / permit questions from getting lost
     # behind the address collector when the inbound does not contain a new slot value.
@@ -2018,30 +2042,6 @@ def incoming_sms():
         tw.message(resumed_reply.strip())
         return Response(str(tw), mimetype="text/xml")
 
-    # Direct availability questions should return real next slots.
-    try:
-        if is_next_available_request(inbound_text):
-            slot_options = get_next_available_slots((sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195"), limit=3)
-            if slot_options:
-                sched["awaiting_slot_offer_choice"] = True
-                sched["offered_slot_options"] = slot_options
-                sched["last_slot_unavailable_message"] = format_next_available_slots_message(slot_options)
-                sched["booking_created"] = False
-                sched["square_booking_id"] = None
-                conv["last_inbound_sid"] = inbound_sid
-                conv["last_inbound_fingerprint"] = inbound_fingerprint
-                conv["last_inbound_fingerprint_ts"] = now_ts
-                conv["last_sms_body"] = sched["last_slot_unavailable_message"]
-                try:
-                    log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(sched["last_slot_unavailable_message"])}, conv)
-                except Exception:
-                    pass
-                tw = MessagingResponse()
-                tw.message(sched["last_slot_unavailable_message"])
-                return Response(str(tw), mimetype="text/xml")
-    except Exception as e:
-        print("[WARN] incoming_sms next available handling failed:", repr(e))
-
     # Post-booking questions should answer cleanly without reopening the booking flow.
     try:
         post_booking_reply = handle_post_booking_question(conv, inbound_text)
@@ -2093,10 +2093,17 @@ def incoming_sms():
         sched["scheduled_time"] = reply.get("scheduled_time")
 
     if reply.get("address"):
-        sched["raw_address"] = reply["address"]
-        # addresses list is guaranteed above
-        if reply["address"] not in profile["addresses"]:
-            profile["addresses"].append(reply["address"])
+        candidate_address = str(reply["address"] or "").strip()
+        existing_address = str(sched.get("raw_address") or "").strip()
+        if not (
+            yes_text(inbound_text)
+            and existing_address
+            and (candidate_address == f"{existing_address}, Yes" or candidate_address == f"{existing_address} Yes")
+        ):
+            sched["raw_address"] = candidate_address
+            # addresses list is guaranteed above
+            if candidate_address and candidate_address not in profile["addresses"]:
+                profile["addresses"].append(candidate_address)
 
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
@@ -3062,6 +3069,8 @@ def should_short_circuit_interrupt(conv: dict, inbound_text: str) -> bool:
         return False
     low = _loose_text(inbound_text)
     if not low:
+        return False
+    if is_next_available_request(inbound_text):
         return False
     if _question_count(inbound_text) or is_conversation_hesitation(inbound_text):
         return True
@@ -4787,6 +4796,11 @@ def is_next_available_request(inbound_text: str) -> bool:
         "when is your next available time",
         "what do you have open",
         "what do you have available",
+        "when can you come out next",
+        "when can you come next",
+        "when can you come out",
+        "when can you come",
+        "next available slot",
     ]
     return any(p in low for p in patterns)
 
