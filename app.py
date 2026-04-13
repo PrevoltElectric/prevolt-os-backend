@@ -1596,9 +1596,7 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step is None and not (sched.get("booking_created") and sched.get("square_booking_id")):
         if sched.get("scheduled_date") and sched.get("scheduled_time"):
             final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
-            if sched.get("last_final_confirmation_key") == final_key and (
-                sched.get("final_confirmation_sent") or sched.get("final_confirmation_accepted")
-            ):
+            if sched.get("last_final_confirmation_key") == final_key and sched.get("final_confirmation_sent"):
                 return "Okay."
             try:
                 if isinstance(sched.get("scheduled_date"), str) and re.match(r"^\d{4}-\d{2}-\d{2}$", sched["scheduled_date"]):
@@ -1818,29 +1816,6 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
-    # Direct next-available questions should bypass name correction parsing entirely.
-    try:
-        if any(x in _loose_text(inbound_text) for x in ["availability", "available", "how soon", "earliest", "soonest", "when can you come", "when can you come out"]):
-            direct_next_available = handle_next_available_question(conv)
-        else:
-            direct_next_available = None
-    except Exception as e:
-        print("[WARN] incoming_sms direct next available failed:", repr(e))
-        direct_next_available = None
-
-    if direct_next_available:
-        conv["last_inbound_sid"] = inbound_sid
-        conv["last_inbound_fingerprint"] = inbound_fingerprint
-        conv["last_inbound_fingerprint_ts"] = now_ts
-        conv["last_sms_body"] = direct_next_available.strip()
-        try:
-            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(direct_next_available)}, conv)
-        except Exception:
-            pass
-        tw = MessagingResponse()
-        tw.message(direct_next_available.strip())
-        return Response(str(tw), mimetype="text/xml")
-
     # Route-level explicit name correction before Step 4.
     try:
         corrected_name_reply = maybe_capture_explicit_name_correction(profile, sched, inbound_text)
@@ -1977,6 +1952,84 @@ def incoming_sms():
         tw = MessagingResponse()
         tw.message(resumed_reply.strip())
         return Response(str(tw), mimetype="text/xml")
+
+    # Immediate final-confirmation acceptance path.
+    # If the customer replies yes to the final slot confirmation, do not let the
+    # thread fall through to a generic "Okay." response. Attempt booking now.
+    try:
+        current_final_key = None
+        if sched.get("scheduled_date") and sched.get("scheduled_time"):
+            current_final_key = f"{sched.get('scheduled_date')}|{sched.get('scheduled_time')}"
+
+        is_final_accept = (
+            bool(sched.get("final_confirmation_sent"))
+            and not bool(sched.get("booking_created"))
+            and bool(current_final_key)
+            and sched.get("last_final_confirmation_key") == current_final_key
+            and confirmation_accept_text(inbound_text)
+        )
+
+        if is_final_accept:
+            sched["final_confirmation_accepted"] = True
+            update_address_assembly_state(sched)
+            recompute_pending_step(profile, sched)
+
+            has_identity_for_booking = bool(
+                (get_active_first_name(profile) and get_active_last_name(profile))
+                or profile.get("square_customer_id")
+            )
+            has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+            ready_for_final_booking = (
+                bool(sched.get("scheduled_date")) and
+                bool(sched.get("scheduled_time")) and
+                bool(sched.get("address_verified")) and
+                bool(sched.get("appointment_type")) and
+                has_identity_for_booking and
+                has_contact_for_booking and
+                not sched.get("booking_created")
+            )
+
+            if ready_for_final_booking:
+                booking_attempt = maybe_create_square_booking(phone, conv)
+                if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "stale_cancelled":
+                    booking_attempt = maybe_create_square_booking(phone, conv)
+
+                if sched.get("booking_created") and sched.get("square_booking_id"):
+                    try:
+                        booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+                        human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
+                    except Exception:
+                        human_day = sched.get("scheduled_date") or "that day"
+                    booked_time = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
+                    final_sms = f"You're all set for {human_day} at {booked_time}. We have you on the schedule."
+                elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
+                    final_sms = booking_attempt.get("message") or "That time is already booked. Here are three other times that work."
+                elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
+                    final_sms = "We typically schedule between 9am and 4pm. What time in that window works for you?"
+                elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "weekend_blocked":
+                    final_sms = "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
+                else:
+                    # We accepted the confirmation but booking is still not complete.
+                    # Give the next concrete prompt instead of a dead-end acknowledgement.
+                    recompute_pending_step(profile, sched)
+                    final_sms = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+            else:
+                # Missing something needed for booking. Ask for the missing atom.
+                final_sms = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = final_sms.strip()
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(final_sms)}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(final_sms.strip())
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms final confirmation booking failed:", repr(e))
 
     # Post-booking questions should answer cleanly without reopening the booking flow.
     try:
@@ -2337,63 +2390,33 @@ def maybe_capture_explicit_name_correction(profile: dict, sched: dict, inbound_t
     if not txt:
         return None
 
-    low = txt.lower()
-
-    # Hard guard: never treat availability or other generic questions as name corrections.
-    if "?" in txt and not any(k in low for k in ["my name is", "call me", "not my name", "wrong name", "you kept calling", "you called me", "it's ", "its "]):
-        return None
-
-    # Only enter this parser when the text actually looks like a name correction.
-    correction_markers = [
-        "my name is", "call me", "not my name", "wrong name", "you kept calling", "you called me",
-        "that is not my name", "thats not my name", "it is ", "it's ", "its "
-    ]
-    if not any(marker in low for marker in correction_markers):
-        return None
-
-    stop_words = {
-        "your", "you", "when", "what", "where", "why", "how", "next", "available", "appointment",
-        "address", "time", "day", "today", "tomorrow", "soonest", "earliest", "service", "visit"
-    }
-
     patterns = [
         r"\bmy name is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
-        r"\bcall me\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
-        r"\byou kept calling me\s+([A-Za-z][A-Za-z'\-]{1,})\b",
-        r"\byou called me\s+([A-Za-z][A-Za-z'\-]{1,})\b",
-        r"\b(?:that'?s|that is) not my name\s*[,. ]*\b(?:it'?s|it is|its)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
-        r"\b(?:it'?s|it is|its)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\s+not\s+([A-Za-z][A-Za-z'\-]{1,})\b",
+        r"\bi am\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
+        r"\bit'?s\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
     ]
 
     first = last = wrong = None
-    for idx, pat in enumerate(patterns):
+    for pat in patterns:
         m = re.search(pat, txt, flags=re.I)
         if m:
-            if idx in {0, 1}:
-                first = normalize_person_name(m.group(1) or "")
-                last = normalize_person_name(m.group(2) or "")
-                wrong = normalize_person_name(m.group(3) or "") if m.lastindex and m.lastindex >= 3 else ""
-            elif idx in {2, 3}:
-                wrong = normalize_person_name(m.group(1) or "")
-            elif idx == 4:
-                first = normalize_person_name(m.group(1) or "")
-                last = normalize_person_name(m.group(2) or "")
-            elif idx == 5:
-                first = normalize_person_name(m.group(1) or "")
-                last = normalize_person_name(m.group(2) or "")
-                wrong = normalize_person_name(m.group(3) or "")
+            first = normalize_person_name(m.group(1) or "")
+            last = normalize_person_name(m.group(2) or "")
+            wrong = normalize_person_name(m.group(3) or "")
             break
 
-    if first and first.lower() in stop_words:
-        return None
-    if last and last.lower() in stop_words:
-        last = ""
-
-    old_first = normalize_person_name(get_active_first_name(profile) or profile.get("voicemail_first_name") or "")
-    old_last = normalize_person_name(get_active_last_name(profile) or profile.get("voicemail_last_name") or "")
+    if not first:
+        m = re.search(r"\b(?:not|not\s+the\s+name\s+)?([A-Za-z][A-Za-z'\-]{1,})\s*,?\s*(?:it'?s|is)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\b", txt, flags=re.I)
+        if m:
+            wrong = normalize_person_name(m.group(1) or "")
+            first = normalize_person_name(m.group(2) or "")
+            last = normalize_person_name(m.group(3) or "")
 
     if not first:
         return None
+
+    old_first = normalize_person_name(get_active_first_name(profile) or profile.get("voicemail_first_name") or "")
+    old_last = normalize_person_name(get_active_last_name(profile) or profile.get("voicemail_last_name") or "")
 
     set_authoritative_customer_name(profile, first, last or old_last if first == old_first else last, source="customer_text_correction")
 
@@ -2407,7 +2430,7 @@ def maybe_capture_explicit_name_correction(profile: dict, sched: dict, inbound_t
     sched["name_engine_candidate_last"] = None
     sched["name_engine_expected_known_first"] = None
 
-    if wrong and old_first and wrong.lower() == old_first.lower() and first.lower() != old_first.lower():
+    if wrong and wrong.lower() == old_first.lower() and first.lower() != old_first.lower():
         return f"Thanks for the correction, {first}. I updated your name."
     if first.lower() != old_first.lower() or (last and last.lower() != old_last.lower()):
         return f"Thanks for the correction, {first}. I updated your name."
