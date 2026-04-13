@@ -4830,7 +4830,7 @@ def format_next_available_slots_message(slots: list[dict]) -> str:
         opts = f"{labels[0]} or {labels[1]}"
     else:
         opts = ", ".join(labels[:-1]) + f", or {labels[-1]}"
-    return f"Our next available appointments are {opts}. Which one works best?"
+    return f"My next three openings are {opts}. Which one works best?"
 
 
 def _local_day_range_to_utc(date_str: str) -> tuple[str | None, str | None]:
