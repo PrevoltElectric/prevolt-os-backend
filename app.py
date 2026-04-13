@@ -4896,7 +4896,20 @@ def map_appointment_type_to_variation(appt: str):
     if not appt:
         return None, None
 
-    appt = appt.upper()
+    appt = str(appt).strip().upper()
+
+    # Canonicalize human-readable drift labels back to real internal service types.
+    if appt in {
+        "QUOTE",
+        "QUOTING",
+        "ESTIMATE",
+        "ESTIMATING",
+        "SERVICE CALL",
+        "SERVICE",
+        "STANDARD SERVICE CALL",
+        "ELECTRICAL SERVICE CALL",
+    }:
+        appt = "EVAL_195"
 
     if "EVAL" in appt:
         return SERVICE_VARIATION_EVAL_ID, SERVICE_VARIATION_EVAL_VERSION
