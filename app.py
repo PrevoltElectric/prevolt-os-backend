@@ -943,7 +943,15 @@ def voicemail_complete():
     if classification.get("detected_address"):
         sched["raw_address"] = classification["detected_address"]
 
-    # Refresh address assembly state (safe if normalized/raw changed)
+    if classification.get("appointment_type") and not sched.get("appointment_type"):
+        sched["appointment_type"] = classification["appointment_type"]
+
+    # Refresh address assembly state and attempt early normalization for full voicemail addresses
+    update_address_assembly_state(sched)
+    try:
+        try_early_address_normalize(sched)
+    except Exception as e:
+        print("[WARN] voicemail_complete early normalize failed:", repr(e))
     update_address_assembly_state(sched)
 
     # --------------------------------------
@@ -1190,13 +1198,32 @@ def update_address_assembly_state(sched: dict) -> None:
     # Has explicit CT/MA?
     has_state = (" ct" in f" {low} ") or (" connecticut" in low) or (" ma" in f" {low} ") or (" massachusetts" in low)
 
+    # Raw full-address detection for callers who already gave the full service address.
+    # Example: "97 Maybeth Street, Springfield, Mass. 01119"
+    has_zip = bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw))
+    has_state_word = bool(re.search(r"\b(ct|connecticut|ma|mass|mass\.|massachusetts)\b", low))
+    has_city_separator = ("," in raw) or bool(re.search(r"\d{1,6}.*(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|court|ct|circle|cir|boulevard|blvd|way|parkway|pkwy|terrace|ter)\b.+", low))
+
+    if has_street_word and starts_with_number and (has_zip or has_state_word or has_city_separator):
+        sched["address_verified"] = True
+        sched["address_missing"] = None
+        sched["address_parts"] = {
+            "street": True,
+            "number": True,
+            "city": True,
+            "state": bool(has_state or has_state_word),
+            "zip": has_zip,
+            "source": "raw_full_address"
+        }
+        return
+
     # Street, no number: "Dickerman Ave"
     if has_street_word and not starts_with_number:
         sched["address_missing"] = "number"
         sched["address_parts"] = {"street": True, "number": False, "city": False, "state": has_state, "zip": False, "source": "raw_address"}
         return
 
-    # Number + street: "24 Main St" (needs town confirm possibly)
+    # Number + street only: "24 Main St" (needs town confirm possibly)
     if has_street_word and starts_with_number:
         sched["address_missing"] = "confirm"
         sched["address_parts"] = {"street": True, "number": True, "city": False, "state": has_state, "zip": False, "source": "raw_address"}
@@ -1759,6 +1786,11 @@ def incoming_sms():
                 sched["pending_step"] = None
 
     # Keep address state fresh (pre-Step4)
+    update_address_assembly_state(sched)
+    try:
+        try_early_address_normalize(sched)
+    except Exception as e:
+        print("[WARN] incoming_sms early normalize failed:", repr(e))
     update_address_assembly_state(sched)
 
     # Pre-Step4 smart merge for compact city/state replies.
