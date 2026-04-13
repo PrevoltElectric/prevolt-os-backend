@@ -616,7 +616,7 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     sched = conv.setdefault("sched", {})
     hydrate_square_profile_by_phone(profile, phone)
 
-    first_name = (profile.get("active_first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
+    first_name = (profile.get("voicemail_first_name") or profile.get("active_first_name") or profile.get("recognized_first_name") or "").strip()
     intro = f"Hello {first_name}, you've reached Prevolt Electric. I'll help you here by text." if first_name else "You've reached Prevolt Electric. I'll help you here by text."
 
     topics = conv.get("task_topics") or classification.get("task_topics") or []
@@ -931,10 +931,29 @@ def voicemail_complete():
     conv["appointment_type"] = classification.get("appointment_type")
     conv["task_topics"] = classification.get("task_topics") or []
     conv.setdefault("initial_sms", cleaned)
-    if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
-        profile["voicemail_first_name"] = classification.get("detected_first_name")
-    if classification.get("detected_last_name") and not profile.get("voicemail_last_name"):
-        profile["voicemail_last_name"] = classification.get("detected_last_name")
+
+    detected_first = normalize_person_name(classification.get("detected_first_name") or "")
+    detected_last = normalize_person_name(classification.get("detected_last_name") or "")
+    previous_first = normalize_person_name(profile.get("voicemail_first_name") or profile.get("active_first_name") or "")
+
+    if detected_first:
+        profile["voicemail_first_name"] = detected_first
+        profile["active_first_name"] = detected_first
+        profile["first_name"] = detected_first
+        profile["identity_source"] = "current_voicemail_name"
+        if previous_first and detected_first.lower() != previous_first.lower() and not detected_last:
+            profile["active_last_name"] = None
+            profile["last_name"] = None
+            profile["voicemail_last_name"] = None
+    if detected_last:
+        profile["voicemail_last_name"] = detected_last
+        profile["active_last_name"] = detected_last
+        profile["last_name"] = detected_last
+
+    sched["name_engine_state"] = None
+    sched["name_engine_candidate_first"] = None
+    sched["name_engine_candidate_last"] = None
+    sched["name_engine_expected_known_first"] = None
 
     if classification.get("detected_date"):
         sched["scheduled_date"] = classification["detected_date"]
@@ -1799,6 +1818,26 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # Route-level explicit name correction before Step 4.
+    try:
+        corrected_name_reply = maybe_capture_explicit_name_correction(profile, sched, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms explicit name correction failed:", repr(e))
+        corrected_name_reply = None
+
+    if corrected_name_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = corrected_name_reply.strip()
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(corrected_name_reply)}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(corrected_name_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
+
     # Route-level last-name salvage before Step 4.
     try:
         if maybe_capture_last_name_only(profile, sched, inbound_text):
@@ -2252,6 +2291,127 @@ def normalize_person_name(s: str) -> str:
         return ""
     return " ".join(p[:1].upper() + p[1:].lower() for p in s.split())
 
+def set_authoritative_customer_name(profile: dict, first_name: str | None = None, last_name: str | None = None, *, source: str = "customer") -> None:
+    first_name = normalize_person_name(first_name or "")
+    last_name = normalize_person_name(last_name or "")
+
+    if first_name:
+        profile["active_first_name"] = first_name
+        profile["first_name"] = first_name
+        profile["voicemail_first_name"] = first_name
+        profile["recognized_first_name"] = first_name
+    if last_name:
+        profile["active_last_name"] = last_name
+        profile["last_name"] = last_name
+        profile["voicemail_last_name"] = last_name
+        profile["recognized_last_name"] = last_name
+
+    if first_name or last_name:
+        profile["identity_source"] = source
+
+def maybe_capture_explicit_name_correction(profile: dict, sched: dict, inbound_text: str) -> str | None:
+    txt = " ".join((inbound_text or "").strip().split())
+    if not txt:
+        return None
+
+    patterns = [
+        r"\bmy name is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
+        r"\bi am\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
+        r"\bit'?s\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
+    ]
+
+    first = last = wrong = None
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.I)
+        if m:
+            first = normalize_person_name(m.group(1) or "")
+            last = normalize_person_name(m.group(2) or "")
+            wrong = normalize_person_name(m.group(3) or "")
+            break
+
+    if not first:
+        m = re.search(r"\b(?:not|not\s+the\s+name\s+)?([A-Za-z][A-Za-z'\-]{1,})\s*,?\s*(?:it'?s|is)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\b", txt, flags=re.I)
+        if m:
+            wrong = normalize_person_name(m.group(1) or "")
+            first = normalize_person_name(m.group(2) or "")
+            last = normalize_person_name(m.group(3) or "")
+
+    if not first:
+        return None
+
+    old_first = normalize_person_name(get_active_first_name(profile) or profile.get("voicemail_first_name") or "")
+    old_last = normalize_person_name(get_active_last_name(profile) or profile.get("voicemail_last_name") or "")
+
+    set_authoritative_customer_name(profile, first, last or old_last if first == old_first else last, source="customer_text_correction")
+
+    if first and last:
+        upsert_known_person(profile, first_name=first, last_name=last, email=get_active_email(profile), square_customer_id=profile.get("square_customer_id") or None)
+    elif first:
+        upsert_known_person(profile, first_name=first, last_name=get_active_last_name(profile) or "", email=get_active_email(profile), square_customer_id=profile.get("square_customer_id") or None)
+
+    sched["name_engine_state"] = None
+    sched["name_engine_candidate_first"] = None
+    sched["name_engine_candidate_last"] = None
+    sched["name_engine_expected_known_first"] = None
+
+    if wrong and wrong.lower() == old_first.lower() and first.lower() != old_first.lower():
+        return f"Thanks for the correction, {first}. I updated your name."
+    if first.lower() != old_first.lower() or (last and last.lower() != old_last.lower()):
+        return f"Thanks for the correction, {first}. I updated your name."
+    return None
+
+def _next_business_dates(limit: int = 5) -> list[str]:
+    tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+    now_local = datetime.now(tz)
+    out = []
+    cursor = now_local.date()
+    for _ in range(14):
+        if len(out) >= limit:
+            break
+        if cursor.weekday() < 5:
+            out.append(cursor.strftime("%Y-%m-%d"))
+        cursor = cursor + timedelta(days=1)
+    return out
+
+def handle_next_available_question(conv: dict) -> str | None:
+    sched = conv.setdefault("sched", {})
+    appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+
+    candidate_dates = []
+    if sched.get("scheduled_date"):
+        candidate_dates.append(sched["scheduled_date"])
+    for d in _next_business_dates(limit=5):
+        if d not in candidate_dates:
+            candidate_dates.append(d)
+
+    gathered = []
+    for d in candidate_dates:
+        avails = search_square_availability_for_day(d, appt_type)
+        for slot in avails:
+            key = (slot.get("date"), slot.get("time"))
+            if key not in {(s.get("date"), s.get("time")) for s in gathered}:
+                gathered.append(slot)
+            if len(gathered) >= 3:
+                break
+        if len(gathered) >= 3:
+            break
+
+    if gathered:
+        sched["awaiting_slot_offer_choice"] = True
+        sched["offered_slot_options"] = gathered[:3]
+        labels = [s.get("label") or _humanize_slot_label(s.get("date"), s.get("time")) for s in gathered[:3]]
+        if len(labels) == 1:
+            opts = labels[0]
+        elif len(labels) == 2:
+            opts = f"{labels[0]} or {labels[1]}"
+        else:
+            opts = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+        return f"Our next available appointments are {opts}. Which one works best for you?"
+
+    if sched.get("scheduled_date"):
+        return "I can work with that day. What time works best for you?"
+    return "What day and time work best for you?"
+
 def maybe_capture_last_name_only(profile: dict, sched: dict, inbound_text: str) -> bool:
     """
     Route-level salvage:
@@ -2522,6 +2682,19 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
         if known:
             apply_known_person_to_active(profile, known, source="known_person_match")
             return None
+
+        # If the current voicemail explicitly named someone, do not silently reuse a stale active name from this number.
+        current_active_first = normalize_person_name(get_active_first_name(profile) or "")
+        if current_active_first and current_active_first.lower() != voicemail_first.lower():
+            profile["active_first_name"] = voicemail_first
+            profile["first_name"] = voicemail_first
+            if voicemail_last:
+                profile["active_last_name"] = voicemail_last
+                profile["last_name"] = voicemail_last
+            else:
+                profile["active_last_name"] = None
+                profile["last_name"] = None
+            profile["identity_source"] = "current_voicemail_name"
 
         # Exactly one known person on file but voicemail named someone different -> clarify.
         if len(known_names) == 1:
@@ -2870,7 +3043,10 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
     elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        answer = "Once I have the booking details, I can get you on the schedule."
+        next_available = handle_next_available_question(conv)
+        if next_available:
+            return next_available
+        answer = "What day and time work best for you?"
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
