@@ -1100,6 +1100,7 @@ def parse_complete_raw_address(raw: str) -> dict | None:
       - 97 Maybeth Street, Springfield, MA 01119
       - 97 Maybeth Street Springfield MA 01119
       - 2 Main St, Springfield, Massachusetts 01103
+      - 97 Maybeth Street, Springfield, Mass. 01119
 
     Returns a normalized-address-shaped dict or None.
     """
@@ -1108,6 +1109,51 @@ def parse_complete_raw_address(raw: str) -> dict | None:
     s = " ".join((raw or "").strip().replace("\n", " ").split()).strip(" ,")
     if not s:
         return None
+
+    state_token = r"CT|C\.?T\.?|Connecticut|Conn\.?|MA|M\.?A\.?|Massachusetts|Mass\.?"
+    patterns = [
+        rf"^(?P<line1>\d{{1,6}}\s+.+?),\s*(?P<city>[A-Za-z .'\-]+?),\s*(?P<state>{state_token})\s+(?P<zip>\d{{5}}(?:-\d{{4}})?)$",
+        rf"^(?P<line1>\d{{1,6}}\s+.+?)\s+(?P<city>[A-Za-z .'\-]+?)\s+(?P<state>{state_token})\s+(?P<zip>\d{{5}}(?:-\d{{4}})?)$",
+    ]
+
+    def normalize_state_token(state_raw: str) -> str | None:
+        token = re.sub(r"[^A-Za-z]", "", state_raw or "").upper()
+        if token in {"CT", "CONNECTICUT", "CONN"}:
+            return "CT"
+        if token in {"MA", "MASS", "MASSACHUSETTS"}:
+            return "MA"
+        return None
+
+    for pat in patterns:
+        m = re.match(pat, s, flags=re.I)
+        if not m:
+            continue
+
+        line1 = " ".join((m.group("line1") or "").split()).strip(" ,")
+        city = " ".join((m.group("city") or "").split()).strip(" ,")
+        state_raw = (m.group("state") or "").strip()
+        zipc = (m.group("zip") or "").strip()
+
+        if not re.match(r"^\d{1,6}\b", line1):
+            continue
+        if not line1 or not city or not state_raw or not zipc:
+            continue
+
+        state_up = normalize_state_token(state_raw)
+        if state_up not in {"CT", "MA"}:
+            continue
+
+        city = " ".join(w.capitalize() for w in city.split())
+
+        return {
+            "address_line_1": line1,
+            "locality": city,
+            "administrative_district_level_1": state_up,
+            "postal_code": zipc,
+            "country": "US",
+        }
+
+    return None
 
     patterns = [
         r"^(?P<line1>\d{1,6}\s+.+?),\s*(?P<city>[A-Za-z .'\-]+?),\s*(?P<state>CT|MA|Connecticut|Massachusetts)\s+(?P<zip>\d{5}(?:-\d{4})?)$",
