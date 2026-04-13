@@ -930,6 +930,7 @@ def voicemail_complete():
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
     conv["task_topics"] = classification.get("task_topics") or []
+    conv.setdefault("initial_sms", cleaned)
     if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
         profile["voicemail_first_name"] = classification.get("detected_first_name")
     if classification.get("detected_last_name") and not profile.get("voicemail_last_name"):
@@ -967,8 +968,6 @@ def voicemail_complete():
     # 4) Trigger First SMS using deterministic voicemail opener so task topics and known addresses land reliably
     try:
         initial_msg = build_initial_voicemail_sms(conv, classification, from_number)
-        conv["initial_sms"] = initial_msg
-        conv["last_sms_body"] = initial_msg
         send_sms(from_number, initial_msg)
     except Exception as e:
         print("[ERROR] voicemail_complete → initial sms:", repr(e))
@@ -984,8 +983,6 @@ def voicemail_complete():
                 sched.get("raw_address")
             )
             initial_msg = outbound.get("sms_body") or "Thanks for your voicemail — how can we help?"
-            conv["initial_sms"] = initial_msg
-            conv["last_sms_body"] = initial_msg
             send_sms(from_number, initial_msg)
         except Exception as e2:
             print("[ERROR] voicemail_complete fallback → Step4:", repr(e2))
@@ -1764,42 +1761,6 @@ def incoming_sms():
     # Keep address state fresh (pre-Step4)
     update_address_assembly_state(sched)
 
-    # Hard guard: if the bot already showed a clearly full address and the customer said yes,
-    # lock the address immediately so we do not fall back into the town loop.
-    try:
-        raw_addr = " ".join((sched.get("raw_address") or "").strip().split())
-        last_prompt = " ".join((conv.get("last_sms_body") or initial_sms or "").strip().lower().split())
-        asked_to_confirm = ("is that correct" in last_prompt) or ("is this for that address" in last_prompt)
-        has_number = bool(re.match(r"^\d{1,6}\b", raw_addr))
-        has_street = bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw_addr, flags=re.I))
-        has_cityish = ("," in raw_addr) or bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr))
-
-        if raw_addr and yes_text(inbound_text) and asked_to_confirm and has_number and has_street and has_cityish:
-            try:
-                result = normalize_address(raw_addr)
-                if isinstance(result, tuple) and len(result) >= 2:
-                    status, addr_struct = result[0], result[1]
-                    if status == "ok" and isinstance(addr_struct, dict):
-                        sched["normalized_address"] = addr_struct
-                elif isinstance(result, dict):
-                    sched["normalized_address"] = result
-            except Exception as e:
-                print("[WARN] incoming_sms address confirmation normalize failed:", repr(e))
-
-            sched["address_verified"] = True
-            sched["address_missing"] = None
-            sched["address_candidate"] = raw_addr
-            sched["address_parts"] = {
-                "street": True,
-                "number": True,
-                "city": True,
-                "state": True,
-                "zip": bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr)),
-                "source": "customer_confirmed_full_address",
-            }
-    except Exception as e:
-        print("[WARN] incoming_sms pre-Step4 address confirmation guard failed:", repr(e))
-
     # Pre-Step4 smart merge for compact city/state replies.
     try:
         apply_partial_address_reply(sched, inbound_text)
@@ -1981,31 +1942,6 @@ def incoming_sms():
 
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
-
-    # If Step 4 kept a clearly full address and the customer just confirmed it,
-    # do not let the state machine fall back into need_address.
-    try:
-        raw_addr = " ".join((sched.get("raw_address") or "").strip().split())
-        last_prompt = " ".join((conv.get("last_sms_body") or initial_sms or "").strip().lower().split())
-        asked_to_confirm = ("is that correct" in last_prompt) or ("is this for that address" in last_prompt)
-        has_number = bool(re.match(r"^\d{1,6}\b", raw_addr))
-        has_street = bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw_addr, flags=re.I))
-        has_cityish = ("," in raw_addr) or bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr))
-
-        if raw_addr and yes_text(inbound_text) and asked_to_confirm and has_number and has_street and has_cityish:
-            sched["address_verified"] = True
-            sched["address_missing"] = None
-            sched["address_candidate"] = raw_addr
-            sched["address_parts"] = {
-                "street": True,
-                "number": True,
-                "city": True,
-                "state": True,
-                "zip": bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr)),
-                "source": "customer_confirmed_full_address",
-            }
-    except Exception as e:
-        print("[WARN] incoming_sms post-Step4 address confirmation guard failed:", repr(e))
 
     recompute_pending_step(profile, sched)
 
