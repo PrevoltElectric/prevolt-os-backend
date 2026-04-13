@@ -2018,6 +2018,30 @@ def incoming_sms():
         tw.message(resumed_reply.strip())
         return Response(str(tw), mimetype="text/xml")
 
+    # Direct availability questions should return real next slots.
+    try:
+        if is_next_available_request(inbound_text):
+            slot_options = get_next_available_slots((sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195"), limit=3)
+            if slot_options:
+                sched["awaiting_slot_offer_choice"] = True
+                sched["offered_slot_options"] = slot_options
+                sched["last_slot_unavailable_message"] = format_next_available_slots_message(slot_options)
+                sched["booking_created"] = False
+                sched["square_booking_id"] = None
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = sched["last_slot_unavailable_message"]
+                try:
+                    log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(sched["last_slot_unavailable_message"])}, conv)
+                except Exception:
+                    pass
+                tw = MessagingResponse()
+                tw.message(sched["last_slot_unavailable_message"])
+                return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms next available handling failed:", repr(e))
+
     # Post-booking questions should answer cleanly without reopening the booking flow.
     try:
         post_booking_reply = handle_post_booking_question(conv, inbound_text)
@@ -4702,6 +4726,74 @@ def _humanize_slot_label(date_str: str, time_str: str) -> str:
     if date_str:
         return f"{_humanize_date_for_sms(date_str)} at {human_t}".strip()
     return human_t.strip()
+
+
+def is_next_available_request(inbound_text: str) -> bool:
+    low = _loose_text(inbound_text)
+    if not low:
+        return False
+
+    patterns = [
+        "next available",
+        "next opening",
+        "next appointment",
+        "next available appointment",
+        "earliest appointment",
+        "earliest available",
+        "soonest appointment",
+        "soonest available",
+        "first available",
+        "what is your next available",
+        "when is your next available",
+        "when are you available next",
+        "what is your next available time",
+        "when is your next available time",
+        "what do you have open",
+        "what do you have available",
+    ]
+    return any(p in low for p in patterns)
+
+
+def get_next_available_slots(appointment_type: str, limit: int = 3, days_ahead: int = 14) -> list[dict]:
+    appointment_type = (appointment_type or "EVAL_195").upper()
+    tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+    now_local = datetime.now(tz)
+    collected = []
+    seen = set()
+
+    for offset in range(days_ahead + 1):
+        target_date = (now_local.date() + timedelta(days=offset)).strftime("%Y-%m-%d")
+        day_slots = search_square_availability_for_day(target_date, appointment_type)
+        for slot in day_slots:
+            key = (slot.get("date"), slot.get("time"))
+            if key in seen:
+                continue
+            try:
+                slot_dt = datetime.strptime(f"{slot.get('date')} {slot.get('time')}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+            except Exception:
+                continue
+            if slot_dt <= now_local:
+                continue
+            seen.add(key)
+            collected.append(slot)
+            if len(collected) >= limit:
+                return collected
+
+    return collected
+
+
+def format_next_available_slots_message(slots: list[dict]) -> str:
+    if not slots:
+        return "I’m not seeing open times right now. What day and time work best for you?"
+
+    labels = [s.get("label") or _humanize_slot_label(s.get("date"), s.get("time")) for s in slots[:3]]
+    if len(labels) == 1:
+        opts = labels[0]
+    elif len(labels) == 2:
+        opts = f"{labels[0]} or {labels[1]}"
+    else:
+        opts = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+    return f"My next three openings are {opts}. Which one works best?"
 
 
 def _local_day_range_to_utc(date_str: str) -> tuple[str | None, str | None]:
