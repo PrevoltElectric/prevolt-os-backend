@@ -647,10 +647,10 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
 
     address_line = ""
-    if saved_full:
-        address_line = f" I have {saved_full} on file. Is this for that address?"
-    elif raw_hint and starts_with_house_number(raw_hint):
+    if raw_hint and starts_with_house_number(raw_hint):
         address_line = f" I have {raw_hint} for the visit. Is that correct?"
+    elif saved_full:
+        address_line = f" I have {saved_full} on file. Is this for that address?"
     elif raw_hint:
         address_line = f" What is the house number and street name in {raw_hint}?"
     else:
@@ -3897,6 +3897,43 @@ def generate_reply_for_inbound(
                 if known_q:
                     return {
                         "sms_body": _finalize_sms(known_q, sched.get("appointment_type") or appointment_type or "EVAL_195", booking_created=False),
+                        "scheduled_date": sched.get("scheduled_date"),
+                        "scheduled_time": sched.get("scheduled_time"),
+                        "address": sched.get("raw_address"),
+                        "booking_complete": False
+                    }
+
+        # If the customer confirms a just-stated address, promote that address into a verified state
+        # before any other prompt logic can loop them back into town collection.
+        if inbound_text and yes_text(inbound_text) and (sched.get("pending_step") or "").strip().lower() == "need_address":
+            candidate_addr = (sched.get("raw_address") or "").strip()
+            if not candidate_addr:
+                candidate_addr = (_best_saved_address(profile) or "").strip()
+            if candidate_addr:
+                sched["raw_address"] = candidate_addr
+                try:
+                    normalized = normalize_address(candidate_addr)
+                    if isinstance(normalized, tuple) and len(normalized) >= 2:
+                        status, addr_struct = normalized[0], normalized[1]
+                        if status == "ok" and isinstance(addr_struct, dict):
+                            sched["normalized_address"] = addr_struct
+                    elif isinstance(normalized, dict):
+                        sched["normalized_address"] = normalized
+                except Exception as e:
+                    print("[WARN] address confirmation normalize failed:", repr(e))
+
+                update_address_assembly_state(sched)
+                if not sched.get("address_verified"):
+                    parsed = parse_complete_raw_address(candidate_addr)
+                    if parsed:
+                        sched["normalized_address"] = parsed
+                        update_address_assembly_state(sched)
+
+                if sched.get("address_verified"):
+                    recompute_pending_step(profile, sched)
+                    next_prompt = choose_next_prompt_from_state(conv, inbound_text="")
+                    return {
+                        "sms_body": _finalize_sms(next_prompt, sched.get("appointment_type") or appointment_type or "EVAL_195", booking_created=False),
                         "scheduled_date": sched.get("scheduled_date"),
                         "scheduled_time": sched.get("scheduled_time"),
                         "address": sched.get("raw_address"),
