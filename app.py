@@ -1572,79 +1572,6 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
 
     return (conv.get("last_sms_body") or "Okay.").strip() or "Okay."
 
-def maybe_accept_confirmed_full_address(conv: dict, inbound_text: str) -> bool:
-    """
-    Promote a full raw voicemail address to verified when the customer simply
-    confirms it with a short yes/correct reply to our address-confirmation text.
-    This prevents falling back into the town loop on already-complete addresses.
-    """
-    sched = conv.setdefault("sched", {})
-    raw = (sched.get("raw_address") or "").strip()
-    if not raw:
-        return False
-
-    inbound_norm = " ".join((inbound_text or "").strip().lower().split())
-    positive = {
-        "yes", "y", "yeah", "yep", "correct", "that is correct",
-        "thats correct", "that's correct", "right", "that is right",
-        "thats right", "that's right", "it is", "it is correct", "yes please"
-    }
-    if inbound_norm not in positive:
-        return False
-
-    prompt_src = " ".join(((conv.get("last_sms_body") or conv.get("initial_sms") or "")).lower().split())
-    asked_to_confirm = ("is that correct" in prompt_src) or ("is this for that address" in prompt_src)
-    if not asked_to_confirm:
-        return False
-
-    has_street_number = bool(re.match(r"^\d{1,6}\b", raw))
-    has_street_word = bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw, flags=re.I))
-    has_city_state = bool(re.search(r",\s*[A-Za-z .'-]+,\s*(CT|MA|Connecticut|Massachusetts|Mass\.?)\b", raw, flags=re.I))
-    has_zip = bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw))
-
-    if not (has_street_number and has_street_word and has_city_state):
-        return False
-
-    forced_state = None
-    m_state = re.search(r"\b(CT|MA|Connecticut|Massachusetts|Mass\.?)\b", raw, flags=re.I)
-    if m_state:
-        token = m_state.group(1).lower().replace('.', '')
-        if token in {"ct", "connecticut"}:
-            forced_state = "CT"
-        elif token in {"ma", "mass", "massachusetts"}:
-            forced_state = "MA"
-
-    try:
-        result = normalize_address(raw, forced_state=forced_state)
-        if isinstance(result, tuple) and len(result) >= 2:
-            status, addr_struct = result[0], result[1]
-            if status == "ok" and isinstance(addr_struct, dict):
-                sched["normalized_address"] = addr_struct
-        elif isinstance(result, dict):
-            sched["normalized_address"] = result
-    except Exception as e:
-        print("[WARN] maybe_accept_confirmed_full_address normalize failed:", repr(e))
-
-    update_address_assembly_state(sched)
-
-    # Even if normalization is imperfect, a customer-confirmed full address should
-    # be treated as authoritative enough to move forward.
-    if not sched.get("address_verified") and has_zip:
-        sched["address_verified"] = True
-        sched["address_missing"] = None
-        sched["address_candidate"] = raw
-        sched["address_parts"] = {
-            "street": True,
-            "number": True,
-            "city": True,
-            "state": True,
-            "zip": True,
-            "source": "customer_confirmed_full_raw_address",
-        }
-
-    return bool(sched.get("address_verified"))
-
-
 # ---------------------------------------------------
 # Incoming SMS (B-3 State Machine, Option A)
 # ---------------------------------------------------
@@ -1836,19 +1763,61 @@ def incoming_sms():
     # Keep address state fresh (pre-Step4)
     update_address_assembly_state(sched)
 
-    # If the customer is simply confirming a full address we already showed them,
-    # promote that address to verified before any fallback prompt selection runs.
-    try:
-        if maybe_accept_confirmed_full_address(conv, inbound_text):
-            recompute_pending_step(profile, sched)
-    except Exception as e:
-        print("[WARN] incoming_sms confirmed full address accept failed:", repr(e))
-
     # Pre-Step4 smart merge for compact city/state replies.
     try:
         apply_partial_address_reply(sched, inbound_text)
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
+
+    # Hard guard: if we already showed a clearly full address and the customer says yes,
+    # lock the address instead of falling back into the town loop.
+    try:
+        update_address_assembly_state(sched)
+        raw_addr = " ".join((sched.get("raw_address") or "").strip().split())
+        last_prompt = " ".join((conv.get("last_sms_body") or conv.get("initial_sms") or "").strip().split())
+
+        def _looks_like_full_address(value: str) -> bool:
+            value = " ".join((value or "").strip().split())
+            if not value:
+                return False
+            has_number = bool(re.match(r"^\d{1,6}\b", value))
+            has_street = bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|court|ct|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", value, flags=re.I))
+            has_city_state = bool(re.search(r",\s*[A-Za-z .'-]+,?\s*(CT|Connecticut|MA|Massachusetts|Mass\.?)(?:\s+\d{5})?\b", value, flags=re.I))
+            has_zip = bool(re.search(r"\b\d{5}(?:-\d{4})?\b", value))
+            return bool(has_number and has_street and (has_city_state or has_zip))
+
+        asked_address_confirm = (
+            raw_addr
+            and _looks_like_full_address(raw_addr)
+            and "is that correct" in last_prompt.lower()
+            and raw_addr.lower() in last_prompt.lower()
+        )
+
+        if asked_address_confirm and yes_text(inbound_text):
+            try:
+                result = normalize_address(raw_addr)
+                if isinstance(result, tuple) and len(result) >= 2:
+                    status, addr_struct = result[0], result[1]
+                    if status == "ok" and isinstance(addr_struct, dict):
+                        sched["normalized_address"] = addr_struct
+                elif isinstance(result, dict):
+                    sched["normalized_address"] = result
+            except Exception as e:
+                print("[WARN] incoming_sms address confirmation normalize failed:", repr(e))
+
+            sched["address_verified"] = True
+            sched["address_missing"] = None
+            sched["address_candidate"] = raw_addr
+            sched["address_parts"] = {
+                "street": True,
+                "number": True,
+                "city": True,
+                "state": True,
+                "zip": bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr)),
+                "source": "customer_confirmed_full_address"
+            }
+    except Exception as e:
+        print("[WARN] incoming_sms address confirmation guard failed:", repr(e))
 
     # Route-level last-name salvage before Step 4.
     try:
@@ -2025,6 +1994,27 @@ def incoming_sms():
 
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
+
+    # If Step 4 kept a clearly full address and the customer just confirmed it,
+    # do not let the state machine fall back into need_address.
+    try:
+        raw_addr = " ".join((sched.get("raw_address") or "").strip().split())
+        last_prompt = " ".join((conv.get("last_sms_body") or conv.get("initial_sms") or "").strip().split())
+        if raw_addr and yes_text(inbound_text) and "is that correct" in last_prompt.lower():
+            if bool(re.match(r"^\d{1,6}\b", raw_addr)) and bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|court|ct|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw_addr, flags=re.I)):
+                sched["address_verified"] = True
+                sched["address_missing"] = None
+                sched["address_candidate"] = raw_addr
+                sched["address_parts"] = {
+                    "street": True,
+                    "number": True,
+                    "city": True,
+                    "state": True,
+                    "zip": bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr)),
+                    "source": "customer_confirmed_full_address"
+                }
+    except Exception as e:
+        print("[WARN] incoming_sms post-step4 address confirmation guard failed:", repr(e))
 
     recompute_pending_step(profile, sched)
 
