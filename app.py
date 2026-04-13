@@ -1092,6 +1092,64 @@ Existing SRB matrix:
 # ---------------------------------------------------
 # Address Assembly State Helper (Step 2) — FIXED (requires house number)
 # ---------------------------------------------------
+def parse_complete_raw_address(raw: str) -> dict | None:
+    """
+    Parse a fully spoken/typed residential address directly from raw text.
+
+    Accepts examples like:
+      - 97 Maybeth Street, Springfield, MA 01119
+      - 97 Maybeth Street Springfield MA 01119
+      - 2 Main St, Springfield, Massachusetts 01103
+
+    Returns a normalized-address-shaped dict or None.
+    """
+    import re
+
+    s = " ".join((raw or "").strip().replace("\n", " ").split()).strip(" ,")
+    if not s:
+        return None
+
+    patterns = [
+        r"^(?P<line1>\d{1,6}\s+.+?),\s*(?P<city>[A-Za-z .'\-]+?),\s*(?P<state>CT|MA|Connecticut|Massachusetts)\s+(?P<zip>\d{5}(?:-\d{4})?)$",
+        r"^(?P<line1>\d{1,6}\s+.+?)\s+(?P<city>[A-Za-z .'\-]+?)\s+(?P<state>CT|MA|Connecticut|Massachusetts)\s+(?P<zip>\d{5}(?:-\d{4})?)$",
+    ]
+
+    for pat in patterns:
+        m = re.match(pat, s, flags=re.I)
+        if not m:
+            continue
+
+        line1 = " ".join((m.group("line1") or "").split()).strip(" ,")
+        city = " ".join((m.group("city") or "").split()).strip(" ,")
+        state_raw = (m.group("state") or "").strip()
+        zipc = (m.group("zip") or "").strip()
+
+        if not re.match(r"^\d{1,6}\b", line1):
+            continue
+        if not line1 or not city or not state_raw or not zipc:
+            continue
+
+        state_up = state_raw.upper()
+        if state_up == "CONNECTICUT":
+            state_up = "CT"
+        elif state_up == "MASSACHUSETTS":
+            state_up = "MA"
+
+        if state_up not in {"CT", "MA"}:
+            continue
+
+        city = " ".join(w.capitalize() for w in city.split())
+
+        return {
+            "address_line_1": line1,
+            "locality": city,
+            "administrative_district_level_1": state_up,
+            "postal_code": zipc,
+            "country": "US",
+        }
+
+    return None
+
 def update_address_assembly_state(sched: dict) -> None:
     """
     Derives address state atoms from raw_address / normalized_address.
@@ -1160,6 +1218,28 @@ def update_address_assembly_state(sched: dict) -> None:
                 "source": "normalized_address_missing_number"
             }
             return
+
+    # -----------------------------
+    # 2) Full raw address shortcut
+    # If voicemail/SMS already gave us a complete address string,
+    # trust that structure immediately instead of downgrading to
+    # "confirm" and asking for town again.
+    # -----------------------------
+    parsed_raw = parse_complete_raw_address(raw)
+    if parsed_raw:
+        sched["normalized_address"] = parsed_raw
+        sched["address_verified"] = True
+        sched["address_missing"] = None
+        sched["address_candidate"] = raw or parsed_raw.get("address_line_1")
+        sched["address_parts"] = {
+            "street": True,
+            "number": True,
+            "city": True,
+            "state": True,
+            "zip": True,
+            "source": "raw_full_address"
+        }
+        return
 
     # -----------------------------
     # 2) No normalized verified address → evaluate raw candidate quality
