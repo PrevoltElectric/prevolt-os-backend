@@ -1818,6 +1818,29 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # Direct next-available questions should bypass name correction parsing entirely.
+    try:
+        if any(x in _loose_text(inbound_text) for x in ["availability", "available", "how soon", "earliest", "soonest", "when can you come", "when can you come out"]):
+            direct_next_available = handle_next_available_question(conv)
+        else:
+            direct_next_available = None
+    except Exception as e:
+        print("[WARN] incoming_sms direct next available failed:", repr(e))
+        direct_next_available = None
+
+    if direct_next_available:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = direct_next_available.strip()
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(direct_next_available)}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(direct_next_available.strip())
+        return Response(str(tw), mimetype="text/xml")
+
     # Route-level explicit name correction before Step 4.
     try:
         corrected_name_reply = maybe_capture_explicit_name_correction(profile, sched, inbound_text)
@@ -2314,33 +2337,63 @@ def maybe_capture_explicit_name_correction(profile: dict, sched: dict, inbound_t
     if not txt:
         return None
 
+    low = txt.lower()
+
+    # Hard guard: never treat availability or other generic questions as name corrections.
+    if "?" in txt and not any(k in low for k in ["my name is", "call me", "not my name", "wrong name", "you kept calling", "you called me", "it's ", "its "]):
+        return None
+
+    # Only enter this parser when the text actually looks like a name correction.
+    correction_markers = [
+        "my name is", "call me", "not my name", "wrong name", "you kept calling", "you called me",
+        "that is not my name", "thats not my name", "it is ", "it's ", "its "
+    ]
+    if not any(marker in low for marker in correction_markers):
+        return None
+
+    stop_words = {
+        "your", "you", "when", "what", "where", "why", "how", "next", "available", "appointment",
+        "address", "time", "day", "today", "tomorrow", "soonest", "earliest", "service", "visit"
+    }
+
     patterns = [
         r"\bmy name is\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
-        r"\bi am\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
-        r"\bit'?s\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?(?:\s+not\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
+        r"\bcall me\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
+        r"\byou kept calling me\s+([A-Za-z][A-Za-z'\-]{1,})\b",
+        r"\byou called me\s+([A-Za-z][A-Za-z'\-]{1,})\b",
+        r"\b(?:that'?s|that is) not my name\s*[,. ]*\b(?:it'?s|it is|its)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\b",
+        r"\b(?:it'?s|it is|its)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\s+not\s+([A-Za-z][A-Za-z'\-]{1,})\b",
     ]
 
     first = last = wrong = None
-    for pat in patterns:
+    for idx, pat in enumerate(patterns):
         m = re.search(pat, txt, flags=re.I)
         if m:
-            first = normalize_person_name(m.group(1) or "")
-            last = normalize_person_name(m.group(2) or "")
-            wrong = normalize_person_name(m.group(3) or "")
+            if idx in {0, 1}:
+                first = normalize_person_name(m.group(1) or "")
+                last = normalize_person_name(m.group(2) or "")
+                wrong = normalize_person_name(m.group(3) or "") if m.lastindex and m.lastindex >= 3 else ""
+            elif idx in {2, 3}:
+                wrong = normalize_person_name(m.group(1) or "")
+            elif idx == 4:
+                first = normalize_person_name(m.group(1) or "")
+                last = normalize_person_name(m.group(2) or "")
+            elif idx == 5:
+                first = normalize_person_name(m.group(1) or "")
+                last = normalize_person_name(m.group(2) or "")
+                wrong = normalize_person_name(m.group(3) or "")
             break
 
-    if not first:
-        m = re.search(r"\b(?:not|not\s+the\s+name\s+)?([A-Za-z][A-Za-z'\-]{1,})\s*,?\s*(?:it'?s|is)\s+([A-Za-z][A-Za-z'\-]{1,})(?:\s+([A-Za-z][A-Za-z'\-]{1,}))?\b", txt, flags=re.I)
-        if m:
-            wrong = normalize_person_name(m.group(1) or "")
-            first = normalize_person_name(m.group(2) or "")
-            last = normalize_person_name(m.group(3) or "")
-
-    if not first:
+    if first and first.lower() in stop_words:
         return None
+    if last and last.lower() in stop_words:
+        last = ""
 
     old_first = normalize_person_name(get_active_first_name(profile) or profile.get("voicemail_first_name") or "")
     old_last = normalize_person_name(get_active_last_name(profile) or profile.get("voicemail_last_name") or "")
+
+    if not first:
+        return None
 
     set_authoritative_customer_name(profile, first, last or old_last if first == old_first else last, source="customer_text_correction")
 
@@ -2354,7 +2407,7 @@ def maybe_capture_explicit_name_correction(profile: dict, sched: dict, inbound_t
     sched["name_engine_candidate_last"] = None
     sched["name_engine_expected_known_first"] = None
 
-    if wrong and wrong.lower() == old_first.lower() and first.lower() != old_first.lower():
+    if wrong and old_first and wrong.lower() == old_first.lower() and first.lower() != old_first.lower():
         return f"Thanks for the correction, {first}. I updated your name."
     if first.lower() != old_first.lower() or (last and last.lower() != old_last.lower()):
         return f"Thanks for the correction, {first}. I updated your name."
