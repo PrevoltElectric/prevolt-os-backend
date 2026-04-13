@@ -930,7 +930,6 @@ def voicemail_complete():
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
     conv["task_topics"] = classification.get("task_topics") or []
-    conv["initial_sms"] = cleaned
     if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
         profile["voicemail_first_name"] = classification.get("detected_first_name")
     if classification.get("detected_last_name") and not profile.get("voicemail_last_name"):
@@ -969,6 +968,7 @@ def voicemail_complete():
     try:
         initial_msg = build_initial_voicemail_sms(conv, classification, from_number)
         conv["initial_sms"] = initial_msg
+        conv["last_sms_body"] = initial_msg
         send_sms(from_number, initial_msg)
     except Exception as e:
         print("[ERROR] voicemail_complete → initial sms:", repr(e))
@@ -985,6 +985,7 @@ def voicemail_complete():
             )
             initial_msg = outbound.get("sms_body") or "Thanks for your voicemail — how can we help?"
             conv["initial_sms"] = initial_msg
+            conv["last_sms_body"] = initial_msg
             send_sms(from_number, initial_msg)
         except Exception as e2:
             print("[ERROR] voicemail_complete fallback → Step4:", repr(e2))
@@ -1763,37 +1764,17 @@ def incoming_sms():
     # Keep address state fresh (pre-Step4)
     update_address_assembly_state(sched)
 
-    # Pre-Step4 smart merge for compact city/state replies.
+    # Hard guard: if the bot already showed a clearly full address and the customer said yes,
+    # lock the address immediately so we do not fall back into the town loop.
     try:
-        apply_partial_address_reply(sched, inbound_text)
-    except Exception as e:
-        print("[WARN] incoming_sms partial address merge failed:", repr(e))
-
-    # Hard guard: if we already showed a clearly full address and the customer says yes,
-    # lock the address instead of falling back into the town loop.
-    try:
-        update_address_assembly_state(sched)
         raw_addr = " ".join((sched.get("raw_address") or "").strip().split())
-        last_prompt = " ".join((conv.get("last_sms_body") or conv.get("initial_sms") or "").strip().split())
+        last_prompt = " ".join((conv.get("last_sms_body") or initial_sms or "").strip().lower().split())
+        asked_to_confirm = ("is that correct" in last_prompt) or ("is this for that address" in last_prompt)
+        has_number = bool(re.match(r"^\d{1,6}\b", raw_addr))
+        has_street = bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw_addr, flags=re.I))
+        has_cityish = ("," in raw_addr) or bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr))
 
-        def _looks_like_full_address(value: str) -> bool:
-            value = " ".join((value or "").strip().split())
-            if not value:
-                return False
-            has_number = bool(re.match(r"^\d{1,6}\b", value))
-            has_street = bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|court|ct|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", value, flags=re.I))
-            has_city_state = bool(re.search(r",\s*[A-Za-z .'-]+,?\s*(CT|Connecticut|MA|Massachusetts|Mass\.?)(?:\s+\d{5})?\b", value, flags=re.I))
-            has_zip = bool(re.search(r"\b\d{5}(?:-\d{4})?\b", value))
-            return bool(has_number and has_street and (has_city_state or has_zip))
-
-        asked_address_confirm = (
-            raw_addr
-            and _looks_like_full_address(raw_addr)
-            and "is that correct" in last_prompt.lower()
-            and raw_addr.lower() in last_prompt.lower()
-        )
-
-        if asked_address_confirm and yes_text(inbound_text):
+        if raw_addr and yes_text(inbound_text) and asked_to_confirm and has_number and has_street and has_cityish:
             try:
                 result = normalize_address(raw_addr)
                 if isinstance(result, tuple) and len(result) >= 2:
@@ -1814,10 +1795,16 @@ def incoming_sms():
                 "city": True,
                 "state": True,
                 "zip": bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr)),
-                "source": "customer_confirmed_full_address"
+                "source": "customer_confirmed_full_address",
             }
     except Exception as e:
-        print("[WARN] incoming_sms address confirmation guard failed:", repr(e))
+        print("[WARN] incoming_sms pre-Step4 address confirmation guard failed:", repr(e))
+
+    # Pre-Step4 smart merge for compact city/state replies.
+    try:
+        apply_partial_address_reply(sched, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
     # Route-level last-name salvage before Step 4.
     try:
@@ -1999,22 +1986,26 @@ def incoming_sms():
     # do not let the state machine fall back into need_address.
     try:
         raw_addr = " ".join((sched.get("raw_address") or "").strip().split())
-        last_prompt = " ".join((conv.get("last_sms_body") or conv.get("initial_sms") or "").strip().split())
-        if raw_addr and yes_text(inbound_text) and "is that correct" in last_prompt.lower():
-            if bool(re.match(r"^\d{1,6}\b", raw_addr)) and bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|court|ct|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw_addr, flags=re.I)):
-                sched["address_verified"] = True
-                sched["address_missing"] = None
-                sched["address_candidate"] = raw_addr
-                sched["address_parts"] = {
-                    "street": True,
-                    "number": True,
-                    "city": True,
-                    "state": True,
-                    "zip": bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr)),
-                    "source": "customer_confirmed_full_address"
-                }
+        last_prompt = " ".join((conv.get("last_sms_body") or initial_sms or "").strip().lower().split())
+        asked_to_confirm = ("is that correct" in last_prompt) or ("is this for that address" in last_prompt)
+        has_number = bool(re.match(r"^\d{1,6}\b", raw_addr))
+        has_street = bool(re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", raw_addr, flags=re.I))
+        has_cityish = ("," in raw_addr) or bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr))
+
+        if raw_addr and yes_text(inbound_text) and asked_to_confirm and has_number and has_street and has_cityish:
+            sched["address_verified"] = True
+            sched["address_missing"] = None
+            sched["address_candidate"] = raw_addr
+            sched["address_parts"] = {
+                "street": True,
+                "number": True,
+                "city": True,
+                "state": True,
+                "zip": bool(re.search(r"\b\d{5}(?:-\d{4})?\b", raw_addr)),
+                "source": "customer_confirmed_full_address",
+            }
     except Exception as e:
-        print("[WARN] incoming_sms post-step4 address confirmation guard failed:", repr(e))
+        print("[WARN] incoming_sms post-Step4 address confirmation guard failed:", repr(e))
 
     recompute_pending_step(profile, sched)
 
