@@ -2032,6 +2032,8 @@ def incoming_sms():
                     final_sms = "We typically schedule between 9am and 4pm. What time in that window works for you?"
                 elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "weekend_blocked":
                     final_sms = "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
+                elif isinstance(booking_attempt, dict) and booking_attempt.get("status") in {"needs_state", "address_normalization_failed", "address_incomplete", "missing_house_number", "address_not_verified", "missing_address"}:
+                    final_sms = (booking_attempt.get("message") or build_address_prompt(sched)).strip()
                 else:
                     # We accepted the confirmation but booking is still not complete.
                     # Give the next concrete prompt instead of a dead-end acknowledgement.
@@ -2159,6 +2161,8 @@ def incoming_sms():
                     sms_body = "We typically schedule between 9am and 4pm. What day and time in that window work best for you?"
             elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "weekend_blocked":
                 sms_body = "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
+            elif isinstance(booking_attempt, dict) and booking_attempt.get("status") in {"needs_state", "address_normalization_failed", "address_incomplete", "missing_house_number", "address_not_verified", "missing_address"}:
+                sms_body = (booking_attempt.get("message") or build_address_prompt(sched)).strip()
             elif sched.get("booking_created") and sched.get("square_booking_id"):
                 try:
                     booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
@@ -4878,32 +4882,7 @@ def parse_local_datetime(date_str: str, time_str: str):
 # ---------------------------------------------------
 # Appointment Type → Square Variation Mapping
 # ---------------------------------------------------
-def canonicalize_appointment_type(appt: str) -> str | None:
-    if not appt:
-        return None
-
-    raw = str(appt).strip()
-    if not raw:
-        return None
-
-    up = raw.upper()
-
-    if "INSPECTION" in up:
-        return "WHOLE_HOME_INSPECTION"
-    if "TROUBLESHOOT" in up or "REPAIR" in up or "EMERGENCY" in up:
-        return "TROUBLESHOOT_395"
-    if "EVAL" in up:
-        return "EVAL_195"
-
-    # Human labels that should never break booking.
-    if up in {"SERVICE CALL", "SERVICE", "CALL", "STANDARD SERVICE CALL", "ELECTRICAL SERVICE CALL"}:
-        return "EVAL_195"
-
-    return raw
-
-
 def map_appointment_type_to_variation(appt: str):
-    appt = canonicalize_appointment_type(appt)
     if not appt:
         return None, None
 
@@ -5222,9 +5201,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
     scheduled_date = sched.get("scheduled_date")
     scheduled_time = sched.get("scheduled_time")
     raw_address = (sched.get("raw_address") or "").strip()
-    appointment_type = canonicalize_appointment_type(sched.get("appointment_type"))
-    if appointment_type and appointment_type != sched.get("appointment_type"):
-        sched["appointment_type"] = appointment_type
+    appointment_type = sched.get("appointment_type")
 
     if not sched.get("address_verified"):
         return {"status": "address_not_verified"}
@@ -5332,6 +5309,40 @@ def maybe_create_square_booking(phone: str, convo: dict):
             "country": "US",
         }
 
+    def _disambiguate_state_for_raw(raw: str) -> dict | None:
+        raw = " ".join((raw or "").strip().split())
+        if not raw:
+            return None
+        # Only try this for street + city inputs that do not already include a state.
+        if re.search(r"(CT|Connecticut|MA|Mass|Mass\.|Massachusetts)", raw, flags=re.I):
+            return None
+        if not re.search(r"^\d{1,6}", raw):
+            return None
+        if "," not in raw:
+            return None
+
+        candidates = []
+        seen = set()
+        for forced in ("CT", "MA"):
+            try:
+                st, addr = normalize_address(raw, forced_state=forced)
+            except Exception:
+                continue
+            if st == "ok" and isinstance(addr, dict):
+                key = (
+                    (addr.get("address_line_1") or "").strip().lower(),
+                    (addr.get("locality") or "").strip().lower(),
+                    (addr.get("administrative_district_level_1") or "").strip().upper(),
+                    (addr.get("postal_code") or "").strip(),
+                )
+                if key not in seen and all(key):
+                    seen.add(key)
+                    candidates.append(addr)
+
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
     if not _is_complete_norm(addr_struct):
         if not raw_address:
             sched["address_verified"] = False
@@ -5345,14 +5356,19 @@ def maybe_create_square_booking(phone: str, convo: dict):
             status, fresh = "error", None
 
         fallback_struct = _fallback_struct_from_raw(raw_address)
+        disambiguated_struct = None if fallback_struct else _disambiguate_state_for_raw(raw_address)
 
-        if status == "needs_state" and not fallback_struct:
-            send_sms(phone, "Just to confirm, is this address in Connecticut or Massachusetts?")
+        if disambiguated_struct and not (status == "ok" and isinstance(fresh, dict)):
+            fresh = disambiguated_struct
+            status = "ok_disambiguated"
+
+        if status == "needs_state" and not fallback_struct and not disambiguated_struct:
             sched["address_verified"] = False
-            sched["address_missing"] = "state"
-            return {"status": "needs_state"}
+            sched["address_missing"] = "confirm"
+            sched["normalized_address"] = None
+            return {"status": "needs_state", "message": "Just to confirm, is this address in Connecticut or Massachusetts?"}
 
-        if status != "ok" or not isinstance(fresh, dict):
+        if status != "ok" and status != "ok_disambiguated" or not isinstance(fresh, dict):
             if fallback_struct:
                 print("[WARN] Address normalization failed; using confirmed raw address fallback.")
                 fresh = fallback_struct
@@ -5361,7 +5377,7 @@ def maybe_create_square_booking(phone: str, convo: dict):
                 print("[ERROR] Address normalization failed. status=", status)
                 sched["address_verified"] = False
                 sched["address_missing"] = "confirm"
-                return {"status": "address_normalization_failed"}
+                return {"status": "address_normalization_failed", "message": build_address_prompt(sched)}
 
         addr_struct = fresh
         sched["normalized_address"] = addr_struct
