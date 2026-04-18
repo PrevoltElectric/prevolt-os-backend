@@ -5427,33 +5427,12 @@ def maybe_create_square_booking(phone: str, convo: dict):
         print("[ERROR] Square not configured.")
         return {"status": "square_not_configured"}
 
-    # Preflight exact-slot availability lookup before attempting to book.
-    # Emergency dispatch uses the same Square booking pipeline but does not offer alternate slots.
+    # IMPORTANT: Do NOT preflight-reject an exact customer-selected slot merely because
+    # Square's availability search did not list it. In production, that search can omit
+    # valid bookable times depending on service variation, team member, duration, or API
+    # availability-window behavior. The source of truth is the actual Square create-booking
+    # response. Only offer alternate slots after Square rejects the create request.
     exact_avail = {}
-    if appointment_type != "TROUBLESHOOT_395":
-        day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
-        exact_avail = next((a for a in day_avails if a.get("date") == scheduled_date and a.get("time") == scheduled_time), None)
-
-        if not exact_avail:
-            same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
-            rolled_slots = []
-            if not same_day_options:
-                rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
-
-            offered = same_day_options or rolled_slots
-            sched["awaiting_slot_offer_choice"] = True if offered else False
-            sched["offered_slot_options"] = offered
-            sched["last_slot_unavailable_message"] = _format_slot_offer_message(
-                scheduled_date,
-                scheduled_time,
-                same_day_options,
-                rolled_slots
-            )
-            return {
-                "status": "slot_unavailable",
-                "message": sched["last_slot_unavailable_message"],
-                "options": offered,
-            }
 
     addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
 
@@ -5581,6 +5560,37 @@ def maybe_create_square_booking(phone: str, convo: dict):
         )
         if resp.status_code not in (200, 201):
             print("[ERROR] Square booking failed:", resp.status_code, resp.text)
+
+            # Only now, after Square rejects the actual create request, offer alternate
+            # availability. This avoids false "booked" messages when the availability
+            # search omits a valid empty time.
+            if appointment_type != "TROUBLESHOOT_395":
+                try:
+                    day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
+                    same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
+                    rolled_slots = []
+                    if not same_day_options:
+                        rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
+                    offered = same_day_options or rolled_slots
+                    if offered:
+                        sched["awaiting_slot_offer_choice"] = True
+                        sched["offered_slot_options"] = offered
+                        sched["last_slot_unavailable_message"] = _format_slot_offer_message(
+                            scheduled_date,
+                            scheduled_time,
+                            same_day_options,
+                            rolled_slots
+                        )
+                        return {
+                            "status": "slot_unavailable",
+                            "message": sched["last_slot_unavailable_message"],
+                            "options": offered,
+                            "http_status": resp.status_code,
+                            "body": resp.text,
+                        }
+                except Exception as e:
+                    print("[WARN] slot fallback after create failure failed:", repr(e))
+
             return {"status": "create_booking_failed", "http_status": resp.status_code, "body": resp.text}
 
         data = resp.json()
