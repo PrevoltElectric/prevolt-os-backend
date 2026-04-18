@@ -765,6 +765,16 @@ def maybe_handle_exact_slot_before_step4(conv: dict, phone: str, inbound_text: s
 
     explicit_time = extract_explicit_time_from_text(inbound_text)
     requested_date = salvage_relative_date_from_text(inbound_text)
+
+    # If the customer already picked a day and now replies with only a time
+    # (example: customer says "Tuesday", we offer Tuesday slots, then they say
+    # "Can you do 2pm"), bind that time to the stored date before the model can
+    # improvise "2pm works" or ask for the date again.
+    if explicit_time and not requested_date:
+        stored_date = (sched.get("scheduled_date") or "").strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stored_date):
+            requested_date = stored_date
+
     if not (explicit_time and requested_date):
         return None
 
@@ -801,6 +811,29 @@ def maybe_handle_exact_slot_before_step4(conv: dict, phone: str, inbound_text: s
         return "We typically schedule between 9:00 AM and 4:00 PM. What time in that window works for you?"
 
     # The key live bug: check Square BEFORE asking name/email or letting Step 4 speak.
+    # First use actual availability when Square returns it. If Square returns no
+    # availability data, fall back to the safer conflict-only check below.
+    try:
+        day_avails = search_square_availability_for_day(requested_date, appointment_type)
+        if day_avails:
+            available_times = {str(slot.get("time") or "").strip() for slot in day_avails}
+            if explicit_time not in available_times:
+                result = build_slot_unavailable_result(
+                    sched,
+                    requested_date,
+                    explicit_time,
+                    appointment_type,
+                    reason="requested_time_not_in_square_availability_pre_step4",
+                )
+                sched["scheduled_time"] = None
+                sched.pop("scheduled_time_source", None)
+                sched["final_confirmation_sent"] = False
+                sched["final_confirmation_accepted"] = False
+                sched["last_final_confirmation_key"] = None
+                return result.get("message") or "That time is not showing as available. What other time works for you?"
+    except Exception as e:
+        print("[WARN] exact slot pre-Step4 availability check failed:", repr(e))
+
     try:
         if square_slot_has_existing_booking(requested_date, explicit_time, appointment_type, duration_minutes=60):
             result = build_slot_unavailable_result(
@@ -2375,6 +2408,12 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     """
     inbound = (inbound_text or "").strip()
     if not inbound:
+        return False
+
+    # Live guard: acknowledgements like "Yes" are address confirmations,
+    # not city/state fragments. Never append them to raw_address.
+    low_ack = re.sub(r"[^a-z0-9' ]+", "", inbound.lower()).strip()
+    if low_ack in {"yes", "y", "yeah", "yep", "correct", "right", "that is correct", "thats right", "that's right", "ok", "okay", "sure", "no", "nope"}:
         return False
 
     update_address_assembly_state(sched)
