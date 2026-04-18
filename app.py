@@ -196,7 +196,9 @@ def looks_like_commercial_bid_context(*parts) -> bool:
         "general contractor", "project manager", "project admin",
         "sent you an email", "just sent you an email", "check your email",
         "emailed you", "scope clarification", "scope review",
-        "notes on your estimate", "your estimate are great", "your proposal"
+        "notes on your estimate", "your estimate are great", "your proposal",
+        "walkthrough", "walk through", "site walk", "job walk",
+        "walk the job", "walk the site", "commercial site visit"
     ]
     booking_intent_terms = [
         "availability", "available", "appointment", "schedule", "come out",
@@ -270,8 +272,29 @@ def build_employment_inquiry_reply() -> str:
         f"{EMPLOYMENT_RESUME_EMAIL}, and Kyle can review it."
     )
 
+def is_commercial_walkthrough_request(text: str) -> bool:
+    """Commercial/bid walkthrough requests should not be auto-booked as unpaid Square appointments."""
+    low = _intent_text(text)
+    if not low:
+        return False
+    walkthrough_terms = [
+        "walkthrough", "walk through", "site walk", "job walk",
+        "walk the job", "walk the site", "commercial site visit",
+        "schedule a walkthrough", "schedule the walkthrough",
+        "set up a walkthrough", "set up the walkthrough"
+    ]
+    return any(t in low for t in walkthrough_terms)
+
+def build_commercial_walkthrough_reply() -> str:
+    return (
+        "Got it, thank you. Kyle will review the details and reach out directly "
+        "to coordinate the commercial walkthrough."
+    )
+
 def build_commercial_bid_reply(inbound_text: str = "") -> str:
     low = _intent_text(inbound_text)
+    if is_commercial_walkthrough_request(inbound_text):
+        return build_commercial_walkthrough_reply()
     if "email" in low or "sent" in low or "questions" in low:
         return "Got it, thank you. Kyle will review the email and get back to you."
     if "personal" in low or "save this number" in low:
@@ -287,6 +310,8 @@ def build_commercial_context_reply(conv: dict, inbound_text: str = "") -> str:
     text = (inbound_text or "").strip()
     if not text:
         return build_commercial_bid_reply(text)
+    if is_commercial_walkthrough_request(text):
+        return build_commercial_walkthrough_reply()
 
     system = f"""
 You are writing one SMS reply for Prevolt Electric to an active commercial, GC, bid, or proposal contact.
@@ -295,7 +320,9 @@ Return strict JSON with one key: {{"sms_body": string}}.
 Rules:
 - Do NOT use the residential intake greeting.
 - Do NOT ask for house number, street name, date, or time unless the customer is explicitly trying to schedule a service visit.
-- Do NOT mention the $195 evaluation visit unless the customer is clearly asking for a new service appointment/evaluation.
+- Do NOT mention the $195 evaluation visit unless the customer is clearly asking for a new paid service appointment/evaluation.
+- Do NOT schedule or imply an unpaid commercial walkthrough is booked by SMS.
+- If they ask for a commercial walkthrough, site walk, job walk, or walkthrough availability, say Kyle will review the details and reach out directly to coordinate it.
 - For bid/proposal/estimate conversations, respond naturally to the actual message.
 - If they say they sent an email, acknowledge that Kyle will review it.
 - If they compliment the proposal, acknowledge the compliment and reinforce readiness/fit.
