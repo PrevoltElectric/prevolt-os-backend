@@ -196,9 +196,7 @@ def looks_like_commercial_bid_context(*parts) -> bool:
         "general contractor", "project manager", "project admin",
         "sent you an email", "just sent you an email", "check your email",
         "emailed you", "scope clarification", "scope review",
-        "notes on your estimate", "your estimate are great", "your proposal",
-        "walkthrough", "walk through", "site walk", "job walk",
-        "walk the job", "walk the site", "commercial site visit"
+        "notes on your estimate", "your estimate are great", "your proposal"
     ]
     booking_intent_terms = [
         "availability", "available", "appointment", "schedule", "come out",
@@ -272,29 +270,8 @@ def build_employment_inquiry_reply() -> str:
         f"{EMPLOYMENT_RESUME_EMAIL}, and Kyle can review it."
     )
 
-def is_commercial_walkthrough_request(text: str) -> bool:
-    """Commercial/bid walkthrough requests should not be auto-booked as unpaid Square appointments."""
-    low = _intent_text(text)
-    if not low:
-        return False
-    walkthrough_terms = [
-        "walkthrough", "walk through", "site walk", "job walk",
-        "walk the job", "walk the site", "commercial site visit",
-        "schedule a walkthrough", "schedule the walkthrough",
-        "set up a walkthrough", "set up the walkthrough"
-    ]
-    return any(t in low for t in walkthrough_terms)
-
-def build_commercial_walkthrough_reply() -> str:
-    return (
-        "Got it, thank you. Kyle will review the details and reach out directly "
-        "to coordinate the commercial walkthrough."
-    )
-
 def build_commercial_bid_reply(inbound_text: str = "") -> str:
     low = _intent_text(inbound_text)
-    if is_commercial_walkthrough_request(inbound_text):
-        return build_commercial_walkthrough_reply()
     if "email" in low or "sent" in low or "questions" in low:
         return "Got it, thank you. Kyle will review the email and get back to you."
     if "personal" in low or "save this number" in low:
@@ -310,8 +287,6 @@ def build_commercial_context_reply(conv: dict, inbound_text: str = "") -> str:
     text = (inbound_text or "").strip()
     if not text:
         return build_commercial_bid_reply(text)
-    if is_commercial_walkthrough_request(text):
-        return build_commercial_walkthrough_reply()
 
     system = f"""
 You are writing one SMS reply for Prevolt Electric to an active commercial, GC, bid, or proposal contact.
@@ -320,9 +295,7 @@ Return strict JSON with one key: {{"sms_body": string}}.
 Rules:
 - Do NOT use the residential intake greeting.
 - Do NOT ask for house number, street name, date, or time unless the customer is explicitly trying to schedule a service visit.
-- Do NOT mention the $195 evaluation visit unless the customer is clearly asking for a new paid service appointment/evaluation.
-- Do NOT schedule or imply an unpaid commercial walkthrough is booked by SMS.
-- If they ask for a commercial walkthrough, site walk, job walk, or walkthrough availability, say Kyle will review the details and reach out directly to coordinate it.
+- Do NOT mention the $195 evaluation visit unless the customer is clearly asking for a new service appointment/evaluation.
 - For bid/proposal/estimate conversations, respond naturally to the actual message.
 - If they say they sent an email, acknowledge that Kyle will review it.
 - If they compliment the proposal, acknowledge the compliment and reinforce readiness/fit.
@@ -377,6 +350,220 @@ def outbound_is_duplicate(conv: dict, body: str) -> bool:
 def should_send_no_reply_for_duplicate(inbound_text: str) -> bool:
     low = _intent_text(inbound_text)
     return not any(p in low for p in ["repeat", "again", "what", "which", "?"])
+
+
+# ---------------------------------------------------
+# Availability / Human-Reply Hardening
+# ---------------------------------------------------
+def extract_service_address_from_text(text: str) -> str | None:
+    """Extract a likely street address from a larger sentence without taking phone numbers as addresses."""
+    raw = " ".join(str(text or "").replace("\n", " ").split())
+    if not raw:
+        return None
+    suffix = r"st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place"
+    m = re.search(
+        rf"\b(?P<addr>\d{{1,6}}[A-Za-z]?\s+[A-Za-z0-9.'\- ]+?\b(?:{suffix})\b(?:\s+[A-Za-z.'\- ]{{2,40}})?)",
+        raw,
+        flags=re.I,
+    )
+    if not m:
+        return None
+    addr = m.group("addr").strip(" ,.;")
+    addr = re.split(
+        r"\s*,\s*(?:please|and|we|woodgate|association|condominium|hoa|message|service)\b",
+        addr,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" ,.;")
+    return addr or None
+
+
+def absorb_address_from_mixed_text(conv: dict, inbound_text: str) -> bool:
+    """Save a service address embedded in a longer customer message."""
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    if sched.get("raw_address"):
+        return False
+    addr = extract_service_address_from_text(inbound_text)
+    if not addr:
+        return False
+    sched["raw_address"] = addr
+    try:
+        if addr not in profile.setdefault("addresses", []):
+            profile["addresses"].append(addr)
+    except Exception:
+        pass
+    try:
+        try_early_address_normalize(sched)
+    except Exception:
+        pass
+    update_address_assembly_state(sched)
+    return True
+
+
+def _local_now() -> datetime:
+    tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+    return datetime.now(tz)
+
+
+def _is_non_emergency_appt(sched: dict) -> bool:
+    return "TROUBLESHOOT" not in ((sched.get("appointment_type") or "EVAL_195").upper())
+
+
+def _is_after_hours_now() -> bool:
+    now = _local_now()
+    return now.hour >= BOOKING_END_HOUR or now.hour < BOOKING_START_HOUR
+
+
+def _is_weekend_date(date_str: str) -> bool:
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").weekday() >= 5
+    except Exception:
+        return False
+
+
+def _is_today_date(date_str: str) -> bool:
+    try:
+        return date_str == _local_now().date().strftime("%Y-%m-%d")
+    except Exception:
+        return False
+
+
+def is_flexible_schedule_text(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    phrases = [
+        "any day", "anytime", "any time", "whatever works", "whenever works",
+        "whenever you want", "whenever you can", "you pick", "your choice",
+        "earliest", "soonest", "first available", "next available", "next availability",
+        "open availability", "wide open", "im available whenever", "i am available whenever",
+    ]
+    return any(p in low for p in phrases)
+
+
+def is_today_request_text(text: str) -> bool:
+    low = _intent_text(text)
+    return "today" in low or "same day" in low or "this afternoon" in low or "this morning" in low
+
+
+def is_date_only_schedule_text(text: str) -> bool:
+    """True when the customer gave a day/date but no explicit time."""
+    if extract_explicit_time_from_text(text):
+        return False
+    return bool(salvage_relative_date_from_text(text))
+
+
+def _format_slot_options(slots: list[dict]) -> str:
+    labels = [s.get("label") or _humanize_slot_label(s.get("date"), s.get("time")) for s in (slots or [])[:3]]
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} or {labels[1]}"
+    return ", ".join(labels[:-1]) + f", or {labels[-1]}"
+
+
+def _offer_slots_response(conv: dict, slots: list[dict], prefix: str | None = None) -> str:
+    sched = conv.setdefault("sched", {})
+    if slots:
+        sched["awaiting_slot_offer_choice"] = True
+        sched["offered_slot_options"] = slots[:3]
+        sched["last_slot_unavailable_message"] = None
+        opts = _format_slot_options(slots)
+        return f"{prefix + ' ' if prefix else ''}I have {opts}. Which one works best?".strip()
+    return f"{prefix + ' ' if prefix else ''}What weekday and time work best for you?".strip()
+
+
+def _slots_for_specific_date(date_str: str, appointment_type: str, limit: int = 3) -> list[dict]:
+    try:
+        slots = search_square_availability_for_day(date_str, appointment_type)
+    except Exception:
+        slots = []
+    now = _local_now()
+    out = []
+    seen = set()
+    for slot in slots or []:
+        key = (slot.get("date"), slot.get("time"))
+        if key in seen:
+            continue
+        try:
+            dt = datetime.strptime(f"{slot.get('date')} {slot.get('time')}", "%Y-%m-%d %H:%M").replace(tzinfo=now.tzinfo)
+            if dt <= now:
+                continue
+        except Exception:
+            pass
+        seen.add(key)
+        out.append(slot)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def deterministic_availability_reply(conv: dict, inbound_text: str) -> str | None:
+    """
+    Handles availability language before the LLM can stack prompts or invent a time.
+    Returns an SMS body or None.
+    """
+    sched = conv.setdefault("sched", {})
+    appointment_type = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+    non_emergency = _is_non_emergency_appt(sched)
+
+    try:
+        absorb_address_from_mixed_text(conv, inbound_text)
+    except Exception:
+        pass
+
+    explicit_time = extract_explicit_time_from_text(inbound_text)
+    requested_date = salvage_relative_date_from_text(inbound_text)
+    wants_next = is_next_available_request(inbound_text)
+    flexible = is_flexible_schedule_text(inbound_text)
+    todayish = is_today_request_text(inbound_text)
+    date_only = bool(requested_date and not explicit_time)
+
+    if not (wants_next or flexible or todayish or date_only):
+        return None
+
+    if explicit_time:
+        sched["scheduled_time_source"] = "customer_explicit"
+        return None
+
+    # Date-only must never progress to name/email or booking. Offer concrete slots first.
+    if date_only:
+        sched["scheduled_date"] = requested_date
+        sched["scheduled_time"] = None
+        sched.pop("scheduled_time_source", None)
+
+        if non_emergency and _is_weekend_date(requested_date):
+            slots = get_next_available_slots(appointment_type, limit=3)
+            return _offer_slots_response(conv, slots, "We schedule non-emergency visits Monday through Friday.")
+
+        if non_emergency and _is_today_date(requested_date) and _is_after_hours_now():
+            slots = get_next_available_slots(appointment_type, limit=3)
+            return _offer_slots_response(conv, slots, "We are past the normal non-emergency scheduling window for today.")
+
+        slots = _slots_for_specific_date(requested_date, appointment_type, limit=3)
+        if slots:
+            day_word = "today" if _is_today_date(requested_date) else _humanize_date_for_sms(requested_date)
+            return _offer_slots_response(conv, slots, f"For {day_word},")
+        slots = get_next_available_slots(appointment_type, limit=3)
+        return _offer_slots_response(conv, slots, "I’m not seeing openings for that day.")
+
+    # Flexible / next available requests should get concrete choices, not another generic question.
+    if wants_next or flexible:
+        slots = get_next_available_slots(appointment_type, limit=3)
+        if wants_next:
+            if slots:
+                sched["awaiting_slot_offer_choice"] = True
+                sched["offered_slot_options"] = slots[:3]
+                msg = format_next_available_slots_message(slots)
+                sched["last_slot_unavailable_message"] = msg
+                return msg
+            return "I’m not seeing open times right now. What weekday and time work best for you?"
+        return _offer_slots_response(conv, slots, "No problem.")
+
+    return None
 
 app = Flask(__name__)
 
@@ -534,23 +721,27 @@ def humanize_time(t: str) -> str:
 
 def extract_explicit_time_from_text(text: str) -> str | None:
     """
-    Pull an explicit time out of a mixed customer message.
-    Examples:
-      - "2pm and I have dogs is that ok" -> "14:00"
+    Pull an explicit customer time out of a message without mistaking street
+    numbers or phone numbers for appointment times.
+
+    Safe examples:
+      - "2pm" -> "14:00"
       - "around 2:30 pm" -> "14:30"
-      - "1500" -> "15:00"
-      - "midday" or "noon" -> "12:00"
-    Returns None for vague phrases like "this afternoon" or "later".
+      - "1300" -> "13:00" ONLY when the whole reply is basically "1300"
+      - "next Thursday at 1" -> "01:00" by legacy behavior
+      - "1251 Washington ST" -> None
     """
     import re
 
-    s = (text or "").strip().lower()
+    original = (text or "").strip()
+    s = original.lower()
     if not s:
         return None
 
     if re.search(r"\b(noon|midday)\b", s):
         return "12:00"
 
+    # Explicit AM/PM is always safe.
     m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\s*m\b", s, flags=re.I)
     if m:
         hh = int(m.group(1))
@@ -563,19 +754,25 @@ def extract_explicit_time_from_text(text: str) -> str | None:
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
+    # Explicit HH:MM is safe.
     m = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", s)
     if m:
         return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
 
-    m = re.search(r"\b(\d{3,4})\b", s)
-    if m:
-        raw = m.group(1).zfill(4)
+    # Military-style bare time is safe ONLY when the whole reply is that time.
+    # This prevents "1251 Washington ST" from becoming 12:51 PM.
+    if re.fullmatch(r"\s*(?:at\s+)?(\d{3,4})\s*", s):
+        raw = re.sub(r"\D", "", s).zfill(4)
         hh = int(raw[:2])
         mm = int(raw[2:])
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
-    m = re.search(r"\b(\d{1,2})\b", s)
+    # A bare hour is safe when the whole reply is the hour, or when the user
+    # says "at 1" / "at 2" in a scheduling phrase. Do not grab random numbers.
+    m = re.fullmatch(r"\s*(?:at\s+)?(\d{1,2})\s*", s)
+    if not m:
+        m = re.search(r"\bat\s+(\d{1,2})\b", s)
     if m:
         hh = int(m.group(1))
         if 1 <= hh <= 12:
@@ -1239,7 +1436,6 @@ def voicemail_complete():
         sched["scheduled_date"] = classification["detected_date"]
     if classification.get("detected_time"):
         sched["scheduled_time"] = classification["detected_time"]
-        sched["scheduled_time_source"] = "voicemail_detected"
     if classification.get("detected_address") and conv.get("thread_type") not in {"employment_inquiry", "commercial_bid_contact", "manual_only"}:
         sched["raw_address"] = classification["detected_address"]
 
@@ -2247,6 +2443,26 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms slot rejection handling failed:", repr(e))
 
+    # Deterministic availability and date-only handling before any generic interruption handling.
+    try:
+        availability_reply = deterministic_availability_reply(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms deterministic availability failed:", repr(e))
+        availability_reply = None
+
+    if availability_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = availability_reply.strip()
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(availability_reply), "availability_hardened": True}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(availability_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
+
     # Direct availability questions should return real next slots before any generic interruption handling.
     try:
         if is_next_available_request(inbound_text):
@@ -2324,6 +2540,8 @@ def incoming_sms():
                     fast_interrupt = f"{fast_interrupt.strip()} You're all set for {human_day} at {booked_time}. We have you on the schedule."
                 elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                     fast_interrupt = f"{fast_interrupt.strip()} {booking_attempt.get('message') or ''}".strip()
+                elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "missing_explicit_time":
+                    fast_interrupt = f"{fast_interrupt.strip()} What time works best that day?".strip()
         except Exception as e:
             print("[WARN] fast interrupt immediate booking failed:", repr(e))
 
@@ -2408,20 +2626,6 @@ def incoming_sms():
     # ---------------------------------------------------
     try:
         absorb_obvious_booking_details(conv, inbound_text)
-        clear_unauthorized_time_from_date_only_reply(sched, inbound_text)
-        weekend_reply = block_weekend_date_without_time(conv, inbound_text)
-        if weekend_reply:
-            conv["last_inbound_sid"] = inbound_sid
-            conv["last_inbound_fingerprint"] = inbound_fingerprint
-            conv["last_inbound_fingerprint_ts"] = now_ts
-            conv["last_sms_body"] = weekend_reply
-            try:
-                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(weekend_reply), "weekend_date_only_blocked": True}, conv)
-            except Exception:
-                pass
-            tw = MessagingResponse()
-            tw.message(weekend_reply)
-            return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms absorb obvious booking details failed:", repr(e))
 
@@ -2443,14 +2647,13 @@ def incoming_sms():
     if reply.get("scheduled_date"):
         sched["scheduled_date"] = reply.get("scheduled_date")
     if reply.get("scheduled_time"):
-        if inbound_has_explicit_customer_time(inbound_text):
+        if extract_explicit_time_from_text(inbound_text) or sched.get("scheduled_time_source") in {"customer_explicit", "offered_slot", "voicemail_explicit"}:
             sched["scheduled_time"] = reply.get("scheduled_time")
-            sched["scheduled_time_source"] = "customer_explicit"
-        elif not is_date_only_or_vague_availability_reply(inbound_text):
+            sched["scheduled_time_source"] = sched.get("scheduled_time_source") or "customer_explicit"
+        elif not salvage_relative_date_from_text(inbound_text):
+            # Last-resort compatibility: do not accept model/current-clock times from date-only replies.
             sched["scheduled_time"] = reply.get("scheduled_time")
-            sched.setdefault("scheduled_time_source", "model_context")
-
-    clear_unauthorized_time_from_date_only_reply(sched, inbound_text)
+            sched["scheduled_time_source"] = "model_non_date_only"
 
     if reply.get("address"):
         candidate_address = str(reply["address"] or "").strip()
@@ -2506,6 +2709,8 @@ def incoming_sms():
 
             if isinstance(booking_attempt, dict) and booking_attempt.get("status") == "slot_unavailable":
                 sms_body = booking_attempt.get("message") or "That time is already booked. Here are three other times that work."
+            elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "missing_explicit_time":
+                sms_body = "What time works best that day?"
             elif isinstance(booking_attempt, dict) and booking_attempt.get("status") == "outside_hours":
                 if sched.get("scheduled_date"):
                     sms_body = "We typically schedule between 9am and 4pm. What time in that window works for you?"
@@ -3472,89 +3677,6 @@ def _loose_text(s: str) -> str:
     return " ".join(s.split())
 
 
-def inbound_has_explicit_customer_time(inbound_text: str) -> bool:
-    """True only when the customer actually supplied a clock time like 1pm, 1:30 PM, 13:00, noon, or 1500."""
-    txt = (inbound_text or "").strip()
-    if not txt:
-        return False
-    low = _loose_text(txt)
-    if re.search(r"\b(noon|midday)\b", low):
-        return True
-    if re.search(r"\b\d{1,2}(?::\d{2})?\s*[ap]\s*m\b", txt, flags=re.I):
-        return True
-    if re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b", txt):
-        return True
-    if re.fullmatch(r"\s*\d{3,4}\s*", txt):
-        return True
-    return False
-
-
-def is_date_only_or_vague_availability_reply(inbound_text: str) -> bool:
-    """Date/day/vague availability replies must never create or carry a booking time."""
-    low = _loose_text(inbound_text)
-    if not low:
-        return False
-    if inbound_has_explicit_customer_time(inbound_text):
-        return False
-    date_words = {
-        "today", "tomorrow", "any day", "anyday", "any date", "monday", "tuesday",
-        "wednesday", "thursday", "friday", "saturday", "sunday",
-        "next monday", "next tuesday", "next wednesday", "next thursday", "next friday",
-        "next saturday", "next sunday", "this monday", "this tuesday", "this wednesday",
-        "this thursday", "this friday", "this saturday", "this sunday"
-    }
-    if low in date_words:
-        return True
-    if re.fullmatch(r"(?:next|this)?\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", low):
-        return True
-    if re.fullmatch(r"\d{1,2}/\d{1,2}(?:/\d{2,4})?", low):
-        return True
-    return False
-
-
-def mark_scheduled_time_source(sched: dict, source: str) -> None:
-    if sched.get("scheduled_time"):
-        sched["scheduled_time_source"] = source
-
-
-def clear_unauthorized_time_from_date_only_reply(sched: dict, inbound_text: str) -> None:
-    """Protect against LLM/default current-clock times like 12:51 after 'Today' or 'Monday'."""
-    if not sched.get("scheduled_time"):
-        return
-    if is_date_only_or_vague_availability_reply(inbound_text):
-        source = (sched.get("scheduled_time_source") or "").strip()
-        if source not in {"customer_explicit", "offered_slot", "voicemail_detected", "emergency_dispatch"}:
-            sched["scheduled_time"] = None
-            sched["scheduled_time_source"] = None
-            sched["final_confirmation_sent"] = False
-            sched["final_confirmation_accepted"] = False
-            sched["last_final_confirmation_key"] = None
-
-
-def block_weekend_date_without_time(conv: dict, inbound_text: str) -> str | None:
-    """If a non-emergency customer picks a weekend date without a time, clear it and ask for a weekday."""
-    sched = conv.setdefault("sched", {})
-    appt = (sched.get("appointment_type") or "").upper()
-    if "TROUBLESHOOT" in appt:
-        return None
-    if not sched.get("scheduled_date"):
-        return None
-    if sched.get("scheduled_time"):
-        return None
-    if not is_date_only_or_vague_availability_reply(inbound_text):
-        return None
-    try:
-        if is_weekend(sched.get("scheduled_date")):
-            sched["scheduled_date"] = None
-            sched["scheduled_time"] = None
-            sched["scheduled_time_source"] = None
-            sched["pending_step"] = "need_date"
-            return "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
-    except Exception:
-        return None
-    return None
-
-
 def salvage_relative_date_from_text(inbound_text: str) -> str | None:
     low = _loose_text(inbound_text)
     if not low:
@@ -3627,12 +3749,12 @@ def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
             sched["scheduled_time_source"] = "customer_explicit"
 
     if not sched.get("raw_address"):
-        low = txt.lower()
-        if re.search(r"\b\d{1,6}\b", txt) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
-            sched["raw_address"] = txt
+        extracted_addr = extract_service_address_from_text(txt)
+        if extracted_addr:
+            sched["raw_address"] = extracted_addr
             try:
-                if txt not in profile.setdefault("addresses", []):
-                    profile["addresses"].append(txt)
+                if extracted_addr not in profile.setdefault("addresses", []):
+                    profile["addresses"].append(extracted_addr)
             except Exception:
                 pass
             try:
@@ -4465,7 +4587,6 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["scheduled_date"] = rounded_dt.strftime("%Y-%m-%d")
             sched["scheduled_time"] = rounded_dt.strftime("%H:%M")
-            sched["scheduled_time_source"] = "emergency_dispatch"
             sched["pending_step"] = None
             if not sched.get("price_disclosed"):
                 sched["price_disclosed"] = True
@@ -4638,10 +4759,17 @@ def generate_reply_for_inbound(
 
         # Heuristic slot salvage: preserve explicit times embedded in mixed messages
         # like "2pm and I have dogs is that ok?" when the LLM only answers the question.
+        explicit_customer_time = extract_explicit_time_from_text(inbound_text)
         if not model_time:
-            salvaged_time = extract_explicit_time_from_text(inbound_text)
+            salvaged_time = explicit_customer_time
             if salvaged_time:
                 model_time = salvaged_time
+                sched["scheduled_time_source"] = "customer_explicit"
+        elif explicit_customer_time:
+            sched["scheduled_time_source"] = "customer_explicit"
+        elif salvage_relative_date_from_text(inbound_text) and not sched.get("scheduled_time_source"):
+            # Date-only replies like "today" or "Monday" must not create a time.
+            model_time = None
 
         # --------------------------------------
         # RESET-LOCK (never lose good stored values)
@@ -4681,13 +4809,9 @@ def generate_reply_for_inbound(
         if model_date:
             sched["scheduled_date"] = model_date
         if model_time:
-            if inbound_has_explicit_customer_time(inbound_text):
+            if extract_explicit_time_from_text(inbound_text) or sched.get("scheduled_time_source") in {"customer_explicit", "offered_slot", "voicemail_explicit", "model_non_date_only"}:
                 sched["scheduled_time"] = model_time
-                sched["scheduled_time_source"] = "customer_explicit"
-            elif not is_date_only_or_vague_availability_reply(inbound_text):
-                # Preserve existing trusted time, but do not let date-only/vague replies create a clock time.
-                sched["scheduled_time"] = model_time
-                sched.setdefault("scheduled_time_source", "model_context")
+                sched["scheduled_time_source"] = sched.get("scheduled_time_source") or "customer_explicit"
 
         # CRITICAL: once new slot values are saved, recompute state immediately so
         # the autobooking gate sees the updated step instead of a stale need_date / need_time.
@@ -5244,6 +5368,7 @@ def is_next_available_request(inbound_text: str) -> bool:
 
     patterns = [
         "next available",
+        "next availability",
         "next opening",
         "next appointment",
         "next available appointment",
@@ -5254,6 +5379,7 @@ def is_next_available_request(inbound_text: str) -> bool:
         "first available",
         "what is your next available",
         "when is your next available",
+        "when is your next availability",
         "when are you available next",
         "what is your next available time",
         "when is your next available time",
@@ -5607,17 +5733,8 @@ def maybe_create_square_booking(phone: str, convo: dict):
     if not (scheduled_date and scheduled_time and appointment_type):
         return {"status": "missing_fields"}
 
-    if appointment_type != "TROUBLESHOOT_395":
-        time_source = (sched.get("scheduled_time_source") or "").strip()
-        if time_source not in {"customer_explicit", "offered_slot", "voicemail_detected"}:
-            # Never create non-emergency bookings from model/default/current-clock times.
-            sched["scheduled_time"] = None
-            sched["scheduled_time_source"] = None
-            sched["pending_step"] = "need_time"
-            sched["final_confirmation_sent"] = False
-            sched["final_confirmation_accepted"] = False
-            sched["last_final_confirmation_key"] = None
-            return {"status": "missing_explicit_time"}
+    if appointment_type != "TROUBLESHOOT_395" and not sched.get("scheduled_time_source"):
+        return {"status": "missing_explicit_time"}
 
     variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
     if not variation_id:
@@ -5626,13 +5743,6 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
         print("[BLOCKED] Weekend not allowed for non-emergency.")
-        sched["scheduled_date"] = None
-        sched["scheduled_time"] = None
-        sched["scheduled_time_source"] = None
-        sched["pending_step"] = "need_date"
-        sched["final_confirmation_sent"] = False
-        sched["final_confirmation_accepted"] = False
-        sched["last_final_confirmation_key"] = None
         return _monitor_booking_return(phone, "weekend_blocked", {"status": "weekend_blocked"}, convo)
 
     if appointment_type != "TROUBLESHOOT_395":
