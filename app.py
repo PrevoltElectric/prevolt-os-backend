@@ -903,13 +903,15 @@ def suppress_unbooked_reservation_language(conv: dict, phone: str, inbound_text:
         return body
 
     low = body.lower()
+    low_padded = f" {re.sub(r'\\s+', ' ', low)} "
     dangerous = [
-        "works great", "works!", "that works", "works for us",
+        "works great", "works!", "that works", "works for us", " works ",
+        "i've noted", "i have noted", "noted that for your appointment",
         "i'll reserve", "i will reserve", "reserve that slot", "reserved",
         "looking forward to confirming", "confirming your appointment",
         "you are all set", "you're all set", "we have you on the schedule",
     ]
-    if not any(p in low for p in dangerous):
+    if not any((p in low or p in low_padded) for p in dangerous):
         return body
 
     # If the inbound was an exact slot, rerun the deterministic guard and use its safe output.
@@ -2871,6 +2873,32 @@ def incoming_sms():
             return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms flexible offered slot choice failed:", repr(e))
+
+    # LIVE HOTFIX: exact date/time replies must be handled before any model,
+    # interruption, name-capture, or availability fallback logic. This catches
+    # messages like "Could we do Tuesday at 2pm" while pending_step is need_date.
+    try:
+        exact_slot_reply = maybe_handle_exact_slot_before_step4(conv, phone, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms early exact slot pre-Step4 failed:", repr(e))
+        exact_slot_reply = None
+
+    if exact_slot_reply:
+        exact_slot_reply = sanitize_sms_body(
+            collapse_duplicate_sms(exact_slot_reply.strip()),
+            booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id"))
+        )
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = exact_slot_reply
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(exact_slot_reply), "exact_slot_early_pre_step4": True}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(exact_slot_reply)
+        return Response(str(tw), mimetype="text/xml")
 
     # Route-level last-name salvage before Step 4.
     try:
