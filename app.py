@@ -186,29 +186,34 @@ def looks_like_commercial_bid_context(*parts) -> bool:
     if not low:
         return False
 
-    # Strong bid/proposal signals. These protect active GC/commercial threads
-    # without misclassifying normal residential "can I get an estimate?" leads.
+    # This guard is ONLY for already-active bid/proposal style conversations.
+    # It must NOT steal Google LSA leads or normal commercial service requests
+    # that are asking for availability. Python routes; SRB/model still writes.
     strong_terms = [
         "bid", "proposal", "estimating", "estimator", "qualify bids",
         "leveling sheet", "competitive", "putting our best foot forward",
         "change order", "submittal", "addendum", "drawings", "plans",
         "general contractor", "project manager", "project admin",
         "sent you an email", "just sent you an email", "check your email",
-        "emailed you", "scope clarification", "scope review"
+        "emailed you", "scope clarification", "scope review",
+        "notes on your estimate", "your estimate are great", "your proposal"
     ]
-    commercial_role_terms = [
-        "gc", "commercial", "facility", "government", "airport",
-        "condominium association", "hoa board", "property manager"
+    booking_intent_terms = [
+        "availability", "available", "appointment", "schedule", "come out",
+        "come take a look", "look at", "replace", "repair", "install",
+        "need help", "service", "visit"
     ]
 
-    # Estimate alone is a normal service lead word. Only treat it as commercial
-    # when paired with a bid/proposal/commercial role context.
-    estimate_with_context = (
-        "estimate" in low
-        and any(t in low for t in strong_terms + commercial_role_terms)
-    )
+    has_strong_bid_signal = any(t in low for t in strong_terms)
+    has_booking_intent = any(t in low for t in booking_intent_terms)
 
-    return any(t in low for t in strong_terms + commercial_role_terms) or estimate_with_context
+    # A condo association / facility lead asking for availability is still a lead.
+    # Do not auto-manual it merely because it sounds commercial.
+    if has_booking_intent and not has_strong_bid_signal:
+        return False
+
+    estimate_with_bid_context = "estimate" in low and has_strong_bid_signal
+    return has_strong_bid_signal or estimate_with_bid_context
 
 def detect_non_service_thread_type(conv: dict, inbound_text: str = "", category: str | None = None, cleaned_text: str | None = None) -> str | None:
     """Return a hard thread type that must override normal residential booking."""
@@ -230,7 +235,15 @@ def detect_non_service_thread_type(conv: dict, inbound_text: str = "", category:
     if looks_like_employment_inquiry(history):
         return "employment_inquiry"
 
+    # Google Local Services Ads are paid inbound leads. Even if the scope sounds
+    # commercial, they should begin the booking/availability flow unless the text
+    # is clearly an existing bid/proposal conversation.
     if looks_like_commercial_bid_context(history):
+        if (conv.get("source") or "").strip() == "google_lsa" and not any(
+            phrase in _intent_text(inbound_text)
+            for phrase in ["bid", "proposal", "sent you an email", "just sent you an email", "competitive", "leveling sheet"]
+        ):
+            return None
         return "commercial_bid_contact"
 
     return None
@@ -264,6 +277,50 @@ def build_commercial_bid_reply(inbound_text: str = "") -> str:
     if "personal" in low or "save this number" in low:
         return "Sounds good, thank you. Kyle appreciates it."
     return "Got it, thank you. Kyle will review this and get back to you."
+
+def build_commercial_context_reply(conv: dict, inbound_text: str = "") -> str:
+    """
+    Context-aware commercial/bid reply. Python prevents residential intake;
+    SRB/model writes the human response so good commercial conversations do not
+    collapse into one canned manual-assist line.
+    """
+    text = (inbound_text or "").strip()
+    if not text:
+        return build_commercial_bid_reply(text)
+
+    system = f"""
+You are writing one SMS reply for Prevolt Electric to an active commercial, GC, bid, or proposal contact.
+Return strict JSON with one key: {{"sms_body": string}}.
+
+Rules:
+- Do NOT use the residential intake greeting.
+- Do NOT ask for house number, street name, date, or time unless the customer is explicitly trying to schedule a service visit.
+- Do NOT mention the $195 evaluation visit unless the customer is clearly asking for a new service appointment/evaluation.
+- For bid/proposal/estimate conversations, respond naturally to the actual message.
+- If they say they sent an email, acknowledge that Kyle will review it.
+- If they compliment the proposal, acknowledge the compliment and reinforce readiness/fit.
+- Keep it concise, professional, and human.
+- Do not invent commitments, prices, or schedule availability.
+
+Relevant SRB context:
+{RULE_MATRIX_TEXT[:5000]}
+"""
+    try:
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+        )
+        data = json.loads(completion.choices[0].message.content)
+        body = " ".join(str(data.get("sms_body") or "").split()).strip()
+        if body:
+            return body
+    except Exception as e:
+        print("[WARN] commercial context reply failed:", repr(e))
+    return build_commercial_bid_reply(text)
 
 def is_rejecting_offered_slots(text: str) -> bool:
     low = _intent_text(text)
@@ -2060,7 +2117,7 @@ def incoming_sms():
         return Response(str(tw), mimetype="text/xml")
     if thread_type == "commercial_bid_contact":
         clear_service_booking_state_for_non_service(conv, "commercial_bid_contact")
-        reply_body = build_commercial_bid_reply(inbound_text)
+        reply_body = build_commercial_context_reply(conv, inbound_text)
         conv["last_inbound_sid"] = inbound_sid
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
