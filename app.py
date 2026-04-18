@@ -111,6 +111,90 @@ def humanize_question(core_question: str) -> str:
     core_question = (core_question or "").strip()
     return core_question
 
+
+SYSTEM_WRAPPER_PATTERNS = (
+    "this customer requested only message replies",
+    "reply here or respond via your lsa dashboard",
+    "respond via your lsa dashboard",
+    "replies to this number will be sent to the customer",
+    "g.co/homeservices",
+)
+
+COMMERCIAL_THREAD_PATTERNS = (
+    "proposal", "estimate", "bid", "competitive", "drawings", "scope",
+    "gc", "project manager", "project admin", "change order", "submittal",
+    "sent you an email", "emailed you", "questions on your estimate",
+)
+
+EMPLOYMENT_PATTERNS = (
+    "looking for work", "interested in hiring", "employment", "job inquiry",
+    "join your team", "apprenticeship", "looking for a job", "hiring electricians",
+    "interested in joining", "hire electricians", "are you hiring"
+)
+
+REJECT_ALL_SLOT_PATTERNS = {"none", "neither", "no", "doesn't work", "doesnt work", "not available"}
+
+def classify_thread_type_from_text(text: str, existing: str | None = None) -> str | None:
+    low = (text or "").lower()
+    if any(p in low for p in SYSTEM_WRAPPER_PATTERNS):
+        return "platform_wrapper"
+    if any(p in low for p in EMPLOYMENT_PATTERNS):
+        return "employment_inquiry"
+    if any(p in low for p in COMMERCIAL_THREAD_PATTERNS):
+        return "commercial_bid_contact"
+    return existing
+
+def classify_thread_type_from_category(category: str | None, existing: str | None = None) -> str | None:
+    low = (category or "").lower()
+    if "employment" in low or "job inquiry" in low or "hiring" in low:
+        return "employment_inquiry"
+    if "commercial" in low:
+        return "commercial_bid_contact"
+    return existing
+
+def extract_lsa_customer_message(text: str) -> str:
+    s = " ".join((text or "").split())
+    m = re.search(r"Message:\s*(.+)$", s, flags=re.I)
+    if m:
+        msg = m.group(1).strip()
+        msg = re.sub(r"\s*\[\.\.\.\]$", "", msg).strip()
+        return msg
+    return s
+
+def is_lsa_system_only_message(text: str) -> bool:
+    low = " ".join((text or "").lower().split())
+    if any(p in low for p in SYSTEM_WRAPPER_PATTERNS):
+        return "message:" not in low
+    return False
+
+def looks_like_alnum_unit_prefix(raw: str) -> tuple[str | None, str | None]:
+    s = " ".join((raw or "").strip().split())
+    m = re.match(r"^(\d{1,6})([A-Za-z])\b\s+(.+)$", s)
+    if not m:
+        return None, None
+    num, suffix, rest = m.group(1), m.group(2).upper(), m.group(3).strip()
+    if re.search(r"\b(unit|apt|apartment|suite|ste|#)\b", rest, flags=re.I):
+        return None, None
+    return f"{num} {rest}, Unit {suffix}", suffix
+
+def build_employment_reply(profile: dict | None = None) -> str:
+    first = ((profile or {}).get("active_first_name") or (profile or {}).get("voicemail_first_name") or "").strip()
+    if first:
+        return f"Hi {first}, thanks for reaching out. I understand this is about employment, not electrical service. Please send over your experience, license status, and the best time to reach you, and Kyle can review it."
+    return "Thanks for reaching out. I understand this is about employment, not electrical service. Please send over your experience, license status, and the best time to reach you, and Kyle can review it."
+
+def build_commercial_followup_reply(inbound_text: str = "") -> str:
+    low = (inbound_text or "").lower()
+    if "sent you an email" in low or "emailed you" in low or "just sent you an email" in low:
+        return "Got it, thank you. I will review the email and get back to you shortly."
+    if "save this number as personal" in low:
+        return "Sounds good, thank you. I appreciate it."
+    return "Got it, thank you."
+
+def should_suppress_service_intake(conv: dict) -> bool:
+    t = (conv.get("thread_type") or "").strip().lower()
+    return t in {"employment_inquiry", "commercial_bid_contact", "platform_wrapper", "manual_only"}
+
 app = Flask(__name__)
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -616,6 +700,10 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     sched = conv.setdefault("sched", {})
     hydrate_square_profile_by_phone(profile, phone)
 
+    conv["thread_type"] = classify_thread_type_from_category(classification.get("category"), conv.get("thread_type"))
+    if conv.get("thread_type") == "employment_inquiry":
+        return build_employment_reply(profile)
+
     first_name = (profile.get("active_first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
     intro = f"Hello {first_name}, you've reached Prevolt Electric. I'll help you here by text." if first_name else "You've reached Prevolt Electric. I'll help you here by text."
 
@@ -929,7 +1017,10 @@ def voicemail_complete():
     conv["cleaned_transcript"] = cleaned
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
+    conv["thread_type"] = classify_thread_type_from_category(classification.get("category"), conv.get("thread_type"))
     conv["task_topics"] = classification.get("task_topics") or []
+    if classification.get("appointment_type") and not sched.get("appointment_type"):
+        sched["appointment_type"] = classification.get("appointment_type")
     conv.setdefault("initial_sms", cleaned)
     if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
         profile["voicemail_first_name"] = classification.get("detected_first_name")
@@ -1215,6 +1306,10 @@ def update_address_assembly_state(sched: dict) -> None:
     sched.setdefault("address_parts", {})
 
     raw = (sched.get("raw_address") or "").strip()
+    converted_line1, inline_unit = looks_like_alnum_unit_prefix(raw)
+    if converted_line1 and inline_unit:
+        sched["raw_address"] = converted_line1
+        raw = converted_line1
     norm = sched.get("normalized_address")
 
     # Helper: does a line start with a street number?
@@ -1619,6 +1714,13 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     """Single deterministic next-step selector. Python enforces state; SRBs drive prompt choice."""
     import re
 
+    if should_suppress_service_intake(conv):
+        if conv.get("thread_type") == "employment_inquiry":
+            return build_employment_reply(conv.get("profile") or {})
+        if conv.get("thread_type") == "commercial_bid_contact":
+            return build_commercial_followup_reply(inbound_text)
+        return "Okay."
+
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
     update_address_assembly_state(sched)
@@ -1908,6 +2010,57 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms last-name salvage failed:", repr(e))
 
+
+    # Thread-type reclassification from fresh inbound text overrides stale service state.
+    conv["thread_type"] = classify_thread_type_from_text(inbound_text, conv.get("thread_type"))
+
+    if "google local services ads" in inbound_low and "message:" in inbound_low:
+        conv["lead_source"] = "google_lsa"
+        inbound_text = extract_lsa_customer_message(inbound_text)
+        inbound_low = inbound_text.lower().strip()
+        conv["thread_type"] = classify_thread_type_from_text(inbound_text, conv.get("thread_type"))
+
+    if is_lsa_system_only_message(inbound_text):
+        tw = MessagingResponse()
+        return Response(str(tw), mimetype="text/xml")
+
+    if conv.get("thread_type") == "employment_inquiry":
+        sched["pending_step"] = None
+        sched["appointment_type"] = None
+        sched["raw_address"] = None
+        sched["normalized_address"] = None
+        sched["address_verified"] = False
+        sms_body = build_employment_reply(profile)
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = sms_body
+        tw = MessagingResponse()
+        tw.message(sms_body)
+        return Response(str(tw), mimetype="text/xml")
+
+    if conv.get("thread_type") == "commercial_bid_contact":
+        sms_body = build_commercial_followup_reply(inbound_text)
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = sms_body
+        tw = MessagingResponse()
+        tw.message(sms_body)
+        return Response(str(tw), mimetype="text/xml")
+
+    if (inbound_low in REJECT_ALL_SLOT_PATTERNS or inbound_low.startswith("none ")) and (sched.get("awaiting_slot_offer_choice") or sched.get("last_slot_unavailable_message")):
+        sched["awaiting_slot_offer_choice"] = False
+        sched["offered_slot_options"] = []
+        sms_body = "No problem. What day or time range works better for you?"
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = sms_body
+        tw = MessagingResponse()
+        tw.message(sms_body)
+        return Response(str(tw), mimetype="text/xml")
+
     # Direct availability questions should return real next slots before any generic interruption handling.
     try:
         if is_next_available_request(inbound_text):
@@ -2170,6 +2323,8 @@ def incoming_sms():
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
+    elif conv.get("last_sms_body") and sms_body.strip() == str(conv.get("last_sms_body") or "").strip() and inbound_low not in {"yes", "y", "yeah", "yep", "correct"}:
+        sms_body = next_prompt if next_prompt.strip() != sms_body.strip() else "No problem. What day or time range works better for you?"
 
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
