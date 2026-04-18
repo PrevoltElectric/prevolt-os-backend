@@ -536,10 +536,13 @@ def is_flexible_schedule_text(text: str) -> bool:
     if not low:
         return False
     phrases = [
-        "any day", "anytime", "any time", "whatever works", "whenever works",
-        "whenever you want", "whenever you can", "you pick", "your choice",
+        "any day", "anytime", "any time", "whatever works", "whatever works for you",
+        "whenever works", "whenever works for you", "when ever works", "when ever works for you",
+        "when ever", "whenever", "whenever you want", "when ever you want",
+        "whenever you can", "when ever you can", "you pick", "your choice",
         "earliest", "soonest", "first available", "next available", "next availability",
         "open availability", "wide open", "im available whenever", "i am available whenever",
+        "i'm available whenever", "im available when ever", "i am available when ever",
         "any availability", "let me know availability", "please let me know availability",
     ]
     return any(p in low for p in phrases)
@@ -1626,6 +1629,21 @@ def sanitize_sms_body(s: str, *, booking_created: bool) -> str:
 
     if any(p in low for p in banned_phrases) and not booking_created:
         return "Thanks — got it."
+
+    # Safety net: if the model ever stacks the exact same sentence twice,
+    # collapse it before sending so the reply does not look automated.
+    try:
+        parts = re.split(r"(?<=[.!?])\s+", s.strip())
+        cleaned_parts = []
+        last_norm = ""
+        for part in parts:
+            norm = re.sub(r"\s+", " ", part).strip().lower()
+            if norm and norm != last_norm:
+                cleaned_parts.append(part.strip())
+            last_norm = norm
+        s = " ".join(cleaned_parts).strip() or s
+    except Exception:
+        pass
 
     return s
 
