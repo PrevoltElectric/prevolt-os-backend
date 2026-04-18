@@ -671,6 +671,103 @@ def deterministic_availability_reply(conv: dict, inbound_text: str) -> str | Non
 
     return None
 
+
+def maybe_handle_explicit_slot_before_llm(conv: dict, phone: str, inbound_text: str) -> str | None:
+    """
+    Deterministic guard for customer-supplied exact date/time replies.
+
+    If the customer says something like "Monday at 9am", do not let the LLM
+    say "that works" or "I'll reserve it" before Square/state checks run.
+    Instead:
+      - block weekend/out-of-hours immediately,
+      - check existing Square bookings for that exact slot immediately,
+      - if the slot is available but booking details are still missing, ask only
+        for the next missing booking field,
+      - if everything is ready, create the booking through the normal Square path.
+    """
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+
+    explicit_time = extract_explicit_time_from_text(inbound_text)
+    requested_date = salvage_relative_date_from_text(inbound_text)
+    if not (explicit_time and requested_date):
+        return None
+
+    appointment_type = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+    if not appointment_type:
+        return None
+
+    if "TROUBLESHOOT" in appointment_type or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
+        return None
+
+    update_address_assembly_state(sched)
+    if not sched.get("address_verified"):
+        return None
+
+    sched["scheduled_date"] = requested_date
+    sched["scheduled_time"] = explicit_time
+    sched["scheduled_time_source"] = "customer_explicit"
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    sched["final_confirmation_sent"] = False
+    sched["final_confirmation_accepted"] = False
+    sched["last_final_confirmation_key"] = None
+
+    if is_weekend(requested_date):
+        sched["scheduled_time"] = None
+        sched.pop("scheduled_time_source", None)
+        slots = get_next_available_slots(appointment_type, limit=3)
+        return _offer_slots_response(conv, slots, "We schedule non-emergency visits Monday through Friday.")
+
+    if not is_within_normal_hours(explicit_time):
+        sched["scheduled_time"] = None
+        sched.pop("scheduled_time_source", None)
+        return "We typically schedule between 9:00 AM and 4:00 PM. What time in that window works for you?"
+
+    try:
+        if square_slot_has_existing_booking(requested_date, explicit_time, appointment_type, duration_minutes=60):
+            result = build_slot_unavailable_result(
+                sched,
+                requested_date,
+                explicit_time,
+                appointment_type,
+                reason="existing_square_booking_conflict_pre_llm",
+            )
+            sched["scheduled_time"] = None
+            sched.pop("scheduled_time_source", None)
+            sched["final_confirmation_sent"] = False
+            sched["final_confirmation_accepted"] = False
+            sched["last_final_confirmation_key"] = None
+            return result.get("message") or "That time is already booked. What other time works for you?"
+    except Exception as e:
+        print("[WARN] explicit slot pre-LLM conflict check failed:", repr(e))
+
+    recompute_pending_step(profile, sched)
+    if sched.get("pending_step") in {"need_name", "need_email"}:
+        return choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+
+    has_identity_for_booking = bool(
+        (get_active_first_name(profile) and get_active_last_name(profile))
+        or profile.get("square_customer_id")
+    )
+    has_contact_for_booking = bool(get_active_email(profile) or profile.get("square_customer_id"))
+    if has_identity_for_booking and has_contact_for_booking and not sched.get("booking_created"):
+        attempt = maybe_create_square_booking(phone, conv)
+        if isinstance(attempt, dict) and attempt.get("status") == "stale_cancelled":
+            attempt = maybe_create_square_booking(phone, conv)
+        if isinstance(attempt, dict) and attempt.get("status") == "slot_unavailable":
+            return attempt.get("message") or "That time is already booked. What other time works for you?"
+        if sched.get("booking_created") and sched.get("square_booking_id"):
+            try:
+                booked_dt = datetime.strptime(sched["scheduled_date"], "%Y-%m-%d")
+                human_day = booked_dt.strftime("%A, %B %d").replace(" 0", " ")
+            except Exception:
+                human_day = sched.get("scheduled_date") or "that day"
+            booked_time = humanize_time(sched.get("scheduled_time") or "") or (sched.get("scheduled_time") or "that time")
+            return f"You're all set for {human_day} at {booked_time}. We have you on the schedule."
+
+    return None
+
 app = Flask(__name__)
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -2799,6 +2896,28 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms absorb obvious booking details failed:", repr(e))
 
+    # Exact date/time replies need deterministic validation before the LLM can
+    # claim a slot works or ask for already-confirmed address details.
+    try:
+        exact_slot_reply = maybe_handle_explicit_slot_before_llm(conv, phone, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms explicit slot pre-LLM handling failed:", repr(e))
+        exact_slot_reply = None
+
+    if exact_slot_reply:
+        exact_slot_reply = sanitize_sms_body(collapse_duplicate_sms(exact_slot_reply.strip()), booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = exact_slot_reply
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(exact_slot_reply), "exact_slot_pre_llm": True}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(exact_slot_reply)
+        return Response(str(tw), mimetype="text/xml")
+
     # ---------------------------------------------------
     # Run Step 4
     # ---------------------------------------------------
@@ -2917,6 +3036,8 @@ def incoming_sms():
         except Exception:
             pass
         return Response(str(MessagingResponse()), mimetype="text/xml")
+
+    sms_body = sanitize_sms_body(collapse_duplicate_sms(sms_body), booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
 
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
