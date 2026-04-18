@@ -322,6 +322,66 @@ Relevant SRB context:
         print("[WARN] commercial context reply failed:", repr(e))
     return build_commercial_bid_reply(text)
 
+
+def looks_like_complex_commercial_coordination_request(*parts) -> bool:
+    """
+    Complex commercial / multifamily service-equipment work should not be auto-booked
+    into the normal Square visit flow, even when it arrives through Google LSA.
+    These requests need Kyle to coordinate a walkthrough, access, shutdown/utility
+    details, and scope before any appointment is placed on the calendar.
+    """
+    low = _intent_text(*parts)
+    if not low:
+        return False
+
+    walkthrough_terms = [
+        "commercial walkthrough", "walkthrough", "walk through", "site walk",
+        "job walk", "walk the job", "walk the site", "site visit",
+        "project walkthrough", "coordinate a walkthrough"
+    ]
+    service_equipment_terms = [
+        "meter bank", "meterbank", "gang meter", "multi gang meter",
+        "multi-gang meter", "6-gang", "six gang", "six-gang",
+        "meter stack", "meter center", "meter socket bank", "switchgear",
+        "ct cabinet", "main distribution", "mdp", "service equipment",
+        "utility coordination", "shutdown coordination"
+    ]
+    commercial_context_terms = [
+        "condominium association", "condo association", "hoa", "association",
+        "property manager", "property management", "board", "commercial",
+        "facility", "facilities", "apartment building", "multi family",
+        "multifamily", "multi-family", "tenant", "tenants"
+    ]
+
+    if any(term in low for term in walkthrough_terms):
+        return True
+    if any(term in low for term in service_equipment_terms):
+        return True
+    # Commercial/association context plus replacement/walkthrough language is enough
+    # to avoid a free auto-booked visit. Keep normal small commercial repairs bookable.
+    if any(term in low for term in commercial_context_terms) and any(
+        term in low for term in ["replace", "replacement", "walk", "walkthrough", "site visit", "scope", "utility"]
+    ):
+        return True
+    return False
+
+
+def build_complex_commercial_coordination_reply(inbound_text: str = "") -> str:
+    low = _intent_text(inbound_text)
+    if "meter bank" in low or "6-gang" in low or "six gang" in low or "gang meter" in low:
+        return (
+            "Thanks for reaching out. A meter bank replacement is handled directly by Kyle so the walkthrough, "
+            "access, and utility coordination are set up correctly. Kyle will follow up directly to coordinate the walkthrough."
+        )
+    if "walk" in low or "site visit" in low:
+        return (
+            "Got it, thank you. Kyle will review the details and follow up directly to coordinate the commercial walkthrough."
+        )
+    return (
+        "Thanks for reaching out. This type of commercial project is handled directly by Kyle so the scope and walkthrough "
+        "are coordinated correctly. Kyle will follow up directly."
+    )
+
 def is_rejecting_offered_slots(text: str) -> bool:
     low = _intent_text(text)
     if not low:
@@ -2354,6 +2414,35 @@ def incoming_sms():
         tw = MessagingResponse()
         tw.message(reply_body)
         return Response(str(tw), mimetype="text/xml")
+
+    # Complex commercial service-equipment / walkthrough requests must not fall
+    # into the normal availability-slot offer path. This protects against unpaid
+    # commercial walkthroughs being booked through Square from GLS or direct SMS.
+    try:
+        if looks_like_complex_commercial_coordination_request(inbound_text):
+            clear_service_booking_state_for_non_service(conv, "manual_only")
+            sched["manual_reason"] = "complex_commercial_coordination"
+            # Preserve the address for Kyle's review without treating it as a bookable visit.
+            try:
+                extracted_addr = extract_service_address_from_mixed_text(inbound_text)
+                if extracted_addr:
+                    sched["raw_address"] = extracted_addr
+            except Exception:
+                pass
+            reply_body = build_complex_commercial_coordination_reply(inbound_text)
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply_body
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "thread_type": "manual_only", "manual_reason": "complex_commercial_coordination"}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(reply_body)
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms complex commercial coordination guard failed:", repr(e))
 
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
