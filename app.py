@@ -111,89 +111,188 @@ def humanize_question(core_question: str) -> str:
     core_question = (core_question or "").strip()
     return core_question
 
+# ---------------------------------------------------
+# Pre-Routing / Non-Service Thread Guards
+# ---------------------------------------------------
+EMPLOYMENT_RESUME_EMAIL = "prevoltelectric@gmail.com"
 
-SYSTEM_WRAPPER_PATTERNS = (
-    "this customer requested only message replies",
-    "reply here or respond via your lsa dashboard",
-    "respond via your lsa dashboard",
-    "replies to this number will be sent to the customer",
-    "g.co/homeservices",
-)
+def _intent_text(*parts) -> str:
+    """Normalize text for deterministic routing checks."""
+    joined = " ".join(str(p or "") for p in parts)
+    return re.sub(r"\s+", " ", joined).strip().lower()
 
-COMMERCIAL_THREAD_PATTERNS = (
-    "proposal", "estimate", "bid", "competitive", "drawings", "scope",
-    "gc", "project manager", "project admin", "change order", "submittal",
-    "sent you an email", "emailed you", "questions on your estimate",
-)
+def is_google_lsa_platform_notice(text: str) -> bool:
+    """True for Google LSA wrapper/instruction notices that are not customer-authored content."""
+    low = _intent_text(text)
+    if not low:
+        return False
+    return (
+        "google local services ads" in low
+        or "local services ads" in low
+        or "g.co/homeservices" in low
+        or "lsa dashboard" in low
+        or "replies to this number will be sent to the customer" in low
+        or "this customer requested only message replies" in low
+        or "respond via your lsa dashboard" in low
+        or "reply here or respond via" in low
+    )
 
-EMPLOYMENT_PATTERNS = (
-    "looking for work", "interested in hiring", "employment", "job inquiry",
-    "join your team", "apprenticeship", "looking for a job", "hiring electricians",
-    "interested in joining", "hire electricians", "are you hiring"
-)
+def extract_lsa_customer_message(text: str) -> str | None:
+    """
+    Extract the true customer-authored message from Google LSA wrapper text.
+    Returns None for pure platform notices with no customer message payload.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
 
-REJECT_ALL_SLOT_PATTERNS = {"none", "neither", "no", "doesn't work", "doesnt work", "not available"}
-
-def classify_thread_type_from_text(text: str, existing: str | None = None) -> str | None:
-    low = (text or "").lower()
-    if any(p in low for p in SYSTEM_WRAPPER_PATTERNS):
-        return "platform_wrapper"
-    if any(p in low for p in EMPLOYMENT_PATTERNS):
-        return "employment_inquiry"
-    if any(p in low for p in COMMERCIAL_THREAD_PATTERNS):
-        return "commercial_bid_contact"
-    return existing
-
-def classify_thread_type_from_category(category: str | None, existing: str | None = None) -> str | None:
-    low = (category or "").lower()
-    if "employment" in low or "job inquiry" in low or "hiring" in low:
-        return "employment_inquiry"
-    if "commercial" in low:
-        return "commercial_bid_contact"
-    return existing
-
-def extract_lsa_customer_message(text: str) -> str:
-    s = " ".join((text or "").split())
-    m = re.search(r"Message:\s*(.+)$", s, flags=re.I)
-    if m:
-        msg = m.group(1).strip()
-        msg = re.sub(r"\s*\[\.\.\.\]$", "", msg).strip()
-        return msg
-    return s
-
-def is_lsa_system_only_message(text: str) -> bool:
-    low = " ".join((text or "").lower().split())
-    if any(p in low for p in SYSTEM_WRAPPER_PATTERNS):
-        return "message:" not in low
-    return False
-
-def looks_like_alnum_unit_prefix(raw: str) -> tuple[str | None, str | None]:
-    s = " ".join((raw or "").strip().split())
-    m = re.match(r"^(\d{1,6})([A-Za-z])\b\s+(.+)$", s)
+    m = re.search(r"\bMessage:\s*(.+)$", raw, flags=re.I | re.S)
     if not m:
-        return None, None
-    num, suffix, rest = m.group(1), m.group(2).upper(), m.group(3).strip()
-    if re.search(r"\b(unit|apt|apartment|suite|ste|#)\b", rest, flags=re.I):
-        return None, None
-    return f"{num} {rest}, Unit {suffix}", suffix
+        return None
 
-def build_employment_reply(profile: dict | None = None) -> str:
-    first = ((profile or {}).get("active_first_name") or (profile or {}).get("voicemail_first_name") or "").strip()
-    if first:
-        return f"Hi {first}, thanks for reaching out. I understand this is about employment, not electrical service. Please send over your experience, license status, and the best time to reach you, and Kyle can review it."
-    return "Thanks for reaching out. I understand this is about employment, not electrical service. Please send over your experience, license status, and the best time to reach you, and Kyle can review it."
+    msg = m.group(1).strip()
+    # Remove common truncation markers and dashboard fragments.
+    msg = re.sub(r"\s*\[\.\.\.\]\s*$", "", msg).strip()
+    msg = re.split(r"\b(?:Reply here|Replies to this number|respond via LSA dashboard|https://g\.co/homeservices)\b", msg, maxsplit=1, flags=re.I)[0].strip()
+    return msg or None
 
-def build_commercial_followup_reply(inbound_text: str = "") -> str:
-    low = (inbound_text or "").lower()
-    if "sent you an email" in low or "emailed you" in low or "just sent you an email" in low:
-        return "Got it, thank you. I will review the email and get back to you shortly."
-    if "save this number as personal" in low:
-        return "Sounds good, thank you. I appreciate it."
-    return "Got it, thank you."
+def is_pure_lsa_platform_notice(text: str) -> bool:
+    """Wrapper/instruction only. These must update metadata at most, never generate a customer reply."""
+    return is_google_lsa_platform_notice(text) and not extract_lsa_customer_message(text)
 
-def should_suppress_service_intake(conv: dict) -> bool:
-    t = (conv.get("thread_type") or "").strip().lower()
-    return t in {"employment_inquiry", "commercial_bid_contact", "platform_wrapper", "manual_only"}
+def looks_like_employment_inquiry(*parts) -> bool:
+    low = _intent_text(*parts)
+    if not low:
+        return False
+
+    positive = [
+        "looking for work", "looking for some work", "looking for a job",
+        "looking for employment", "employment inquiry", "job inquiry",
+        "interested in hiring", "are you hiring", "you hiring",
+        "hiring electricians", "hire electricians", "join your team",
+        "joining your team", "apprenticeship", "apprentice position",
+        "resume", "my resume", "license status", "licensed electrician",
+        "unlicensed electrician", "journeyman", "journey man"
+    ]
+    # Avoid confusing a customer asking to hire Prevolt with a job seeker.
+    customer_hire_context = [
+        "hire you", "hire prevolt", "hire an electrician to come", "hire someone to come",
+        "need to hire an electrician for my house", "looking to hire an electrician for my house"
+    ]
+    return any(p in low for p in positive) and not any(p in low for p in customer_hire_context)
+
+def looks_like_commercial_bid_context(*parts) -> bool:
+    low = _intent_text(*parts)
+    if not low:
+        return False
+
+    # Strong bid/proposal signals. These protect active GC/commercial threads
+    # without misclassifying normal residential "can I get an estimate?" leads.
+    strong_terms = [
+        "bid", "proposal", "estimating", "estimator", "qualify bids",
+        "leveling sheet", "competitive", "putting our best foot forward",
+        "change order", "submittal", "addendum", "drawings", "plans",
+        "general contractor", "project manager", "project admin",
+        "sent you an email", "just sent you an email", "check your email",
+        "emailed you", "scope clarification", "scope review"
+    ]
+    commercial_role_terms = [
+        "gc", "commercial", "facility", "government", "airport",
+        "condominium association", "hoa board", "property manager"
+    ]
+
+    # Estimate alone is a normal service lead word. Only treat it as commercial
+    # when paired with a bid/proposal/commercial role context.
+    estimate_with_context = (
+        "estimate" in low
+        and any(t in low for t in strong_terms + commercial_role_terms)
+    )
+
+    return any(t in low for t in strong_terms + commercial_role_terms) or estimate_with_context
+
+def detect_non_service_thread_type(conv: dict, inbound_text: str = "", category: str | None = None, cleaned_text: str | None = None) -> str | None:
+    """Return a hard thread type that must override normal residential booking."""
+    history = " ".join([
+        str(inbound_text or ""),
+        str(category or conv.get("category") or ""),
+        str(cleaned_text or conv.get("cleaned_transcript") or ""),
+        str(conv.get("initial_sms") or ""),
+        str(conv.get("last_sms_body") or ""),
+    ])
+
+    existing = (conv.get("thread_type") or "").strip()
+    if existing in {"employment_inquiry", "commercial_bid_contact", "manual_only"}:
+        return existing
+
+    if is_pure_lsa_platform_notice(inbound_text):
+        return "platform_wrapper"
+
+    if looks_like_employment_inquiry(history):
+        return "employment_inquiry"
+
+    if looks_like_commercial_bid_context(history):
+        return "commercial_bid_contact"
+
+    return None
+
+def clear_service_booking_state_for_non_service(conv: dict, thread_type: str) -> None:
+    """Prevent stale address/date/time pending steps from pulling non-service conversations back into booking."""
+    conv["thread_type"] = thread_type
+    sched = conv.setdefault("sched", {})
+    sched["pending_step"] = None
+    sched["non_service_thread"] = True
+    sched["manual_only"] = thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact"}
+    sched["appointment_type"] = None
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["address_verified"] = False
+
+def build_employment_inquiry_reply() -> str:
+    return (
+        f"Hi, thanks for reaching out. This is about employment, not an electrical service visit. "
+        f"Please email your resume, license status, and the best phone number to reach you to "
+        f"{EMPLOYMENT_RESUME_EMAIL}, and Kyle can review it."
+    )
+
+def build_commercial_bid_reply(inbound_text: str = "") -> str:
+    low = _intent_text(inbound_text)
+    if "email" in low or "sent" in low or "questions" in low:
+        return "Got it, thank you. Kyle will review the email and get back to you."
+    if "personal" in low or "save this number" in low:
+        return "Sounds good, thank you. Kyle appreciates it."
+    return "Got it, thank you. Kyle will review this and get back to you."
+
+def is_rejecting_offered_slots(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    rejection_phrases = [
+        "none", "none of those", "neither", "no", "nope", "not those",
+        "that doesn't work", "that doesnt work", "doesn't work", "doesnt work",
+        "not available", "any other", "anything else", "another day", "different day",
+        "too early", "too late"
+    ]
+    return any(p == low or p in low for p in rejection_phrases)
+
+def is_frustrated_with_bot(text: str) -> bool:
+    low = _intent_text(text)
+    return any(p in low for p in [
+        "i don't understand", "i dont understand", "i gave you", "give up",
+        "your ai", "not working", "call another company", "stop asking",
+        "already told you"
+    ])
+
+def outbound_is_duplicate(conv: dict, body: str) -> bool:
+    last = _intent_text(conv.get("last_sms_body"))
+    current = _intent_text(body)
+    return bool(last and current and last == current)
+
+def should_send_no_reply_for_duplicate(inbound_text: str) -> bool:
+    low = _intent_text(inbound_text)
+    return not any(p in low for p in ["repeat", "again", "what", "which", "?"])
 
 app = Flask(__name__)
 
@@ -441,6 +540,10 @@ def send_sms(to_number: str, body: str) -> None:
 
 
 def recompute_pending_step(profile: dict, sched: dict) -> None:
+    if sched.get("non_service_thread") or sched.get("manual_only"):
+        sched["pending_step"] = None
+        return
+
     active_first = (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or "").strip()
     active_last = (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or "").strip()
     active_email = (profile.get("active_email") or profile.get("email") or profile.get("recognized_email") or "").strip()
@@ -595,7 +698,12 @@ def generate_initial_sms(cleaned_text: str) -> dict:
                         "- Return 1 to 6 short plain-English task labels.\n"
                         "- Examples: 'outlet issue', 'ev charger install', 'panel upgrade', 'recessed lighting', 'smoke from panel'.\n"
                         "- Keep them concise and electrician-facing.\n"
-                        "- If nothing is clear, return an empty list."
+                        "- If nothing is clear, return an empty list.\n"
+                        "\n"
+                        "Non-service classification rules:\n"
+                        "- If the caller is asking for employment, hiring, apprenticeship, a job, or to join the team, category must be 'employment inquiry', intent must be 'other', and appointment_type should be 'none'.\n"
+                        "- If the caller is a general contractor, estimator, commercial client, facility contact, or is discussing a bid/proposal/email/drawings, category must be 'commercial bid contact' when applicable and intent must be 'other'.\n"
+                        "- Do not invent a service appointment for non-service calls."
                     ),
                 },
                 {"role": "user", "content": cleaned_text},
@@ -700,9 +808,23 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
     sched = conv.setdefault("sched", {})
     hydrate_square_profile_by_phone(profile, phone)
 
-    conv["thread_type"] = classify_thread_type_from_category(classification.get("category"), conv.get("thread_type"))
-    if conv.get("thread_type") == "employment_inquiry":
-        return build_employment_reply(profile)
+    # Non-service inquiries must never enter the residential booking opener.
+    thread_type = detect_non_service_thread_type(
+        conv,
+        "",
+        classification.get("category"),
+        conv.get("cleaned_transcript") or ""
+    )
+    if thread_type == "employment_inquiry":
+        clear_service_booking_state_for_non_service(conv, "employment_inquiry")
+        sched["intro_sent"] = True
+        sched["price_disclosed"] = False
+        return build_employment_inquiry_reply()
+    if thread_type == "commercial_bid_contact":
+        clear_service_booking_state_for_non_service(conv, "commercial_bid_contact")
+        sched["intro_sent"] = True
+        sched["price_disclosed"] = False
+        return build_commercial_bid_reply(conv.get("cleaned_transcript") or "")
 
     first_name = (profile.get("active_first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
     intro = f"Hello {first_name}, you've reached Prevolt Electric. I'll help you here by text." if first_name else "You've reached Prevolt Electric. I'll help you here by text."
@@ -1017,11 +1139,13 @@ def voicemail_complete():
     conv["cleaned_transcript"] = cleaned
     conv["category"] = classification.get("category")
     conv["appointment_type"] = classification.get("appointment_type")
-    conv["thread_type"] = classify_thread_type_from_category(classification.get("category"), conv.get("thread_type"))
     conv["task_topics"] = classification.get("task_topics") or []
-    if classification.get("appointment_type") and not sched.get("appointment_type"):
-        sched["appointment_type"] = classification.get("appointment_type")
     conv.setdefault("initial_sms", cleaned)
+
+    # Hard pre-routing lock before any address/date scheduling state is saved.
+    thread_type = detect_non_service_thread_type(conv, "", classification.get("category"), cleaned)
+    if thread_type in {"employment_inquiry", "commercial_bid_contact"}:
+        clear_service_booking_state_for_non_service(conv, thread_type)
     if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
         profile["voicemail_first_name"] = classification.get("detected_first_name")
     if classification.get("detected_last_name") and not profile.get("voicemail_last_name"):
@@ -1031,7 +1155,7 @@ def voicemail_complete():
         sched["scheduled_date"] = classification["detected_date"]
     if classification.get("detected_time"):
         sched["scheduled_time"] = classification["detected_time"]
-    if classification.get("detected_address"):
+    if classification.get("detected_address") and conv.get("thread_type") not in {"employment_inquiry", "commercial_bid_contact", "manual_only"}:
         sched["raw_address"] = classification["detected_address"]
 
     # Refresh address assembly state (safe if normalized/raw changed)
@@ -1040,7 +1164,7 @@ def voicemail_complete():
     # --------------------------------------
     # HARD OVERRIDE: Voicemail Emergency Pre-Flag
     # --------------------------------------
-    if classification.get("intent") == "emergency":
+    if classification.get("intent") == "emergency" and conv.get("thread_type") not in {"employment_inquiry", "commercial_bid_contact", "manual_only"}:
         sched["appointment_type"] = "TROUBLESHOOT_395"
         sched["awaiting_emergency_confirm"] = True
         sched["emergency_approved"] = False
@@ -1164,6 +1288,7 @@ Current stored values:
 Today's date: {today_date_str} ({today_weekday})
 
 Core behavioral constraints:
+- Non-service threads override scheduling. Employment inquiries, job applicants, commercial bid/proposal conversations, and platform wrapper notices must NOT receive address/date/time collection or evaluation pricing.
 - NEVER ask questions already answered.
 - If only one field is missing, ask ONLY for that field.
 - Do not treat vague time phrases as explicit times.
@@ -1200,6 +1325,12 @@ def parse_complete_raw_address(raw: str) -> dict | None:
     s = " ".join((raw or "").strip().replace("\n", " ").split()).strip(" ,")
     if not s:
         return None
+
+    # Accept leading unit suffixes like "72B Dakota Lane" by normalizing to
+    # "72 Dakota Lane, Unit B" before parsing/normalizing.
+    m_unit = re.match(r"^(?P<num>\d{1,6})(?P<unit>[A-Za-z])\s+(?P<rest>.+)$", s)
+    if m_unit and not re.search(r"\b(?:apt|apartment|unit|suite|ste|#)\b", s, flags=re.I):
+        s = f"{m_unit.group('num')} {m_unit.group('rest')}, Unit {m_unit.group('unit').upper()}"
 
     state_token = r"CT|C\.?T\.?|Connecticut|Conn\.?|MA|M\.?A\.?|Massachusetts|Mass\.?"
     patterns = [
@@ -1246,47 +1377,6 @@ def parse_complete_raw_address(raw: str) -> dict | None:
 
     return None
 
-    patterns = [
-        r"^(?P<line1>\d{1,6}\s+.+?),\s*(?P<city>[A-Za-z .'\-]+?),\s*(?P<state>CT|MA|Connecticut|Massachusetts)\s+(?P<zip>\d{5}(?:-\d{4})?)$",
-        r"^(?P<line1>\d{1,6}\s+.+?)\s+(?P<city>[A-Za-z .'\-]+?)\s+(?P<state>CT|MA|Connecticut|Massachusetts)\s+(?P<zip>\d{5}(?:-\d{4})?)$",
-    ]
-
-    for pat in patterns:
-        m = re.match(pat, s, flags=re.I)
-        if not m:
-            continue
-
-        line1 = " ".join((m.group("line1") or "").split()).strip(" ,")
-        city = " ".join((m.group("city") or "").split()).strip(" ,")
-        state_raw = (m.group("state") or "").strip()
-        zipc = (m.group("zip") or "").strip()
-
-        if not re.match(r"^\d{1,6}\b", line1):
-            continue
-        if not line1 or not city or not state_raw or not zipc:
-            continue
-
-        state_up = state_raw.upper()
-        if state_up == "CONNECTICUT":
-            state_up = "CT"
-        elif state_up == "MASSACHUSETTS":
-            state_up = "MA"
-
-        if state_up not in {"CT", "MA"}:
-            continue
-
-        city = " ".join(w.capitalize() for w in city.split())
-
-        return {
-            "address_line_1": line1,
-            "locality": city,
-            "administrative_district_level_1": state_up,
-            "postal_code": zipc,
-            "country": "US",
-        }
-
-    return None
-
 def update_address_assembly_state(sched: dict) -> None:
     """
     Derives address state atoms from raw_address / normalized_address.
@@ -1306,10 +1396,14 @@ def update_address_assembly_state(sched: dict) -> None:
     sched.setdefault("address_parts", {})
 
     raw = (sched.get("raw_address") or "").strip()
-    converted_line1, inline_unit = looks_like_alnum_unit_prefix(raw)
-    if converted_line1 and inline_unit:
-        sched["raw_address"] = converted_line1
-        raw = converted_line1
+    # Normalize leading unit suffixes like 72B Dakota Lane -> 72 Dakota Lane, Unit B.
+    try:
+        m_unit = re.match(r"^(?P<num>\d{1,6})(?P<unit>[A-Za-z])\s+(?P<rest>.+)$", raw)
+        if m_unit and not re.search(r"\b(?:apt|apartment|unit|suite|ste|#)\b", raw, flags=re.I):
+            raw = f"{m_unit.group('num')} {m_unit.group('rest')}, Unit {m_unit.group('unit').upper()}"
+            sched["raw_address"] = raw
+    except Exception:
+        pass
     norm = sched.get("normalized_address")
 
     # Helper: does a line start with a street number?
@@ -1619,29 +1713,28 @@ def try_early_address_normalize(sched: dict) -> None:
 
 
 def extract_city_state_from_reply(text: str) -> tuple[str | None, str | None]:
-    """Parse compact city/state replies like 'Windsor CT' or 'Windsor, Connecticut'."""
+    """Parse compact city/state replies like 'Windsor CT', 'Brockton', or 'Massachusetts'."""
     txt = " ".join((text or "").strip().replace(",", " ").split())
     if not txt:
         return None, None
 
     low = txt.lower()
     state = None
-    if re.search(r"ct|connecticut", low):
+    if re.search(r"\bct\b|\bconnecticut\b", low):
         state = "CT"
-        txt = re.sub(r"ct|connecticut", "", txt, flags=re.I).strip(" ,")
-    elif re.search(r"ma|massachusetts", low):
+        txt = re.sub(r"\bct\b|\bconnecticut\b", "", txt, flags=re.I).strip(" ,")
+    elif re.search(r"\bma\b|\bmass\b|\bmassachusetts\b", low):
         state = "MA"
-        txt = re.sub(r"ma|massachusetts", "", txt, flags=re.I).strip(" ,")
+        txt = re.sub(r"\bma\b|\bmass\b|\bmassachusetts\b", "", txt, flags=re.I).strip(" ,")
 
-    # Reject obvious non-city inputs
+    # Reject obvious non-city inputs.
     if re.search(r"\d", txt):
         return None, state
-    if re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", txt, flags=re.I):
+    if re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", txt, flags=re.I):
         return None, state
 
     city = " ".join(w.capitalize() for w in txt.split()) if txt else None
     return city or None, state
-
 
 def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     """
@@ -1713,13 +1806,6 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
 def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     """Single deterministic next-step selector. Python enforces state; SRBs drive prompt choice."""
     import re
-
-    if should_suppress_service_intake(conv):
-        if conv.get("thread_type") == "employment_inquiry":
-            return build_employment_reply(conv.get("profile") or {})
-        if conv.get("thread_type") == "commercial_bid_contact":
-            return build_commercial_followup_reply(inbound_text)
-        return "Okay."
 
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
@@ -1818,6 +1904,19 @@ def incoming_sms():
     convo_key   = phone or inbound_sid or request.form.get("CallSid") or "unknown"
     inbound_low  = inbound_text.lower().strip()
 
+    # Google LSA can send platform wrappers through the same SMS webhook.
+    # Extract customer-authored payloads and suppress pure platform notices.
+    lsa_customer_message = extract_lsa_customer_message(inbound_text)
+    if is_pure_lsa_platform_notice(inbound_text):
+        try:
+            log_event("SMS_PLATFORM_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
+        except Exception:
+            pass
+        return Response(str(MessagingResponse()), mimetype="text/xml")
+    if lsa_customer_message:
+        inbound_text = lsa_customer_message
+        inbound_low = inbound_text.lower().strip()
+
     try:
         log_event("SMS_IN", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
     except Exception:
@@ -1865,6 +1964,8 @@ def incoming_sms():
     # Initialize layers (HARDENED: never assume dict shape)
     # ---------------------------------------------------
     conv = conversations.setdefault(phone, {})
+    if lsa_customer_message:
+        conv["source"] = "google_lsa"
 
     # Twilio and WhatsApp can occasionally retry the same inbound webhook.
     # Guard both by inbound SID and by a short body fingerprint window.
@@ -1941,6 +2042,37 @@ def incoming_sms():
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
 
+    # Non-service / thread-type hard guard before normal booking state can run.
+    thread_type = detect_non_service_thread_type(conv, inbound_text, conv.get("category"), conv.get("cleaned_transcript"))
+    if thread_type == "employment_inquiry":
+        clear_service_booking_state_for_non_service(conv, "employment_inquiry")
+        reply_body = build_employment_inquiry_reply()
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = reply_body
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "thread_type": "employment_inquiry"}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(reply_body)
+        return Response(str(tw), mimetype="text/xml")
+    if thread_type == "commercial_bid_contact":
+        clear_service_booking_state_for_non_service(conv, "commercial_bid_contact")
+        reply_body = build_commercial_bid_reply(inbound_text)
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = reply_body
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "thread_type": "commercial_bid_contact"}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(reply_body)
+        return Response(str(tw), mimetype="text/xml")
+
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
     appointment_type = sched.get("appointment_type")
@@ -2010,56 +2142,25 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms last-name salvage failed:", repr(e))
 
-
-    # Thread-type reclassification from fresh inbound text overrides stale service state.
-    conv["thread_type"] = classify_thread_type_from_text(inbound_text, conv.get("thread_type"))
-
-    if "google local services ads" in inbound_low and "message:" in inbound_low:
-        conv["lead_source"] = "google_lsa"
-        inbound_text = extract_lsa_customer_message(inbound_text)
-        inbound_low = inbound_text.lower().strip()
-        conv["thread_type"] = classify_thread_type_from_text(inbound_text, conv.get("thread_type"))
-
-    if is_lsa_system_only_message(inbound_text):
-        tw = MessagingResponse()
-        return Response(str(tw), mimetype="text/xml")
-
-    if conv.get("thread_type") == "employment_inquiry":
-        sched["pending_step"] = None
-        sched["appointment_type"] = None
-        sched["raw_address"] = None
-        sched["normalized_address"] = None
-        sched["address_verified"] = False
-        sms_body = build_employment_reply(profile)
-        conv["last_inbound_sid"] = inbound_sid
-        conv["last_inbound_fingerprint"] = inbound_fingerprint
-        conv["last_inbound_fingerprint_ts"] = now_ts
-        conv["last_sms_body"] = sms_body
-        tw = MessagingResponse()
-        tw.message(sms_body)
-        return Response(str(tw), mimetype="text/xml")
-
-    if conv.get("thread_type") == "commercial_bid_contact":
-        sms_body = build_commercial_followup_reply(inbound_text)
-        conv["last_inbound_sid"] = inbound_sid
-        conv["last_inbound_fingerprint"] = inbound_fingerprint
-        conv["last_inbound_fingerprint_ts"] = now_ts
-        conv["last_sms_body"] = sms_body
-        tw = MessagingResponse()
-        tw.message(sms_body)
-        return Response(str(tw), mimetype="text/xml")
-
-    if (inbound_low in REJECT_ALL_SLOT_PATTERNS or inbound_low.startswith("none ")) and (sched.get("awaiting_slot_offer_choice") or sched.get("last_slot_unavailable_message")):
-        sched["awaiting_slot_offer_choice"] = False
-        sched["offered_slot_options"] = []
-        sms_body = "No problem. What day or time range works better for you?"
-        conv["last_inbound_sid"] = inbound_sid
-        conv["last_inbound_fingerprint"] = inbound_fingerprint
-        conv["last_inbound_fingerprint_ts"] = now_ts
-        conv["last_sms_body"] = sms_body
-        tw = MessagingResponse()
-        tw.message(sms_body)
-        return Response(str(tw), mimetype="text/xml")
+    # If customer rejects all offered slot options, do not repeat the same options.
+    try:
+        if sched.get("awaiting_slot_offer_choice") and is_rejecting_offered_slots(inbound_text):
+            sched["awaiting_slot_offer_choice"] = False
+            sched["offered_slot_options"] = []
+            reply_body = "No problem. What day or time range works better for you?"
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply_body
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "slot_rejection": True}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(reply_body)
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms slot rejection handling failed:", repr(e))
 
     # Direct availability questions should return real next slots before any generic interruption handling.
     try:
@@ -2323,8 +2424,18 @@ def incoming_sms():
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
-    elif conv.get("last_sms_body") and sms_body.strip() == str(conv.get("last_sms_body") or "").strip() and inbound_low not in {"yes", "y", "yeah", "yep", "correct"}:
-        sms_body = next_prompt if next_prompt.strip() != sms_body.strip() else "No problem. What day or time range works better for you?"
+
+    # Frustration and duplicate-prompt protection.
+    if is_frustrated_with_bot(inbound_text):
+        sms_body = "Sorry about that. I have the information you sent. Kyle will review this manually."
+        conv["thread_type"] = "manual_only"
+        sched["pending_step"] = None
+    elif outbound_is_duplicate(conv, sms_body) and should_send_no_reply_for_duplicate(inbound_text):
+        try:
+            log_event("SMS_DUPLICATE_SUPPRESSED", phone, {"body": _safe_monitor_text(sms_body)}, conv)
+        except Exception:
+            pass
+        return Response(str(MessagingResponse()), mimetype="text/xml")
 
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
@@ -3287,7 +3398,7 @@ def salvage_relative_date_from_text(inbound_text: str) -> str | None:
             delta = (idx - today.weekday()) % 7
             return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
 
-    m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", low)
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", low)
     if m:
         mo = int(m.group(1))
         day = int(m.group(2))
@@ -3327,7 +3438,7 @@ def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
 
     if not sched.get("raw_address"):
         low = txt.lower()
-        if re.search(r"\d{1,6}", txt) and re.search(r"(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)", low, flags=re.I):
+        if re.search(r"\b\d{1,6}\b", txt) and re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", low, flags=re.I):
             sched["raw_address"] = txt
             try:
                 if txt not in profile.setdefault("addresses", []):
