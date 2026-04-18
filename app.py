@@ -5777,6 +5777,141 @@ def _format_slot_offer_message(requested_date: str, requested_time: str, same_da
     return f"We’re fully booked for {human_day}. Would another day work?"
 
 
+def _requested_local_interval(date_str: str, time_str: str, duration_minutes: int = 60) -> tuple[datetime | None, datetime | None]:
+    """Return the requested appointment interval in America/New_York local time."""
+    try:
+        tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+        start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+        end = start + timedelta(minutes=duration_minutes or 60)
+        return start, end
+    except Exception:
+        return None, None
+
+
+def _square_booking_is_active(status: str) -> bool:
+    """Treat non-cancelled Square bookings as time blockers."""
+    status = (status or "").upper()
+    cancelled_tokens = ("CANCEL", "CANCELED", "NO_SHOW")
+    return bool(status) and not any(tok in status for tok in cancelled_tokens)
+
+
+def square_slot_has_existing_booking(date_str: str, time_str: str, appointment_type: str, duration_minutes: int = 60) -> bool:
+    """
+    Narrow conflict check used before creating a booking.
+
+    This intentionally does NOT use Square availability search as final truth,
+    because that search can omit a valid empty slot. Instead it lists actual
+    bookings for that day and blocks only if an active booking overlaps the
+    exact requested interval for the assigned team member.
+    """
+    if not (date_str and time_str and SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
+        return False
+
+    req_start, req_end = _requested_local_interval(date_str, time_str, duration_minutes)
+    if not (req_start and req_end):
+        return False
+
+    start_at_min, start_at_max = _local_day_range_to_utc(date_str)
+    if not (start_at_min and start_at_max):
+        return False
+
+    params = {
+        "location_id": SQUARE_LOCATION_ID,
+        "team_member_id": SQUARE_TEAM_MEMBER_ID,
+        "start_at_min": start_at_min,
+        "start_at_max": start_at_max,
+        "limit": 100,
+    }
+
+    try:
+        resp = requests.get(
+            "https://connect.squareup.com/v2/bookings",
+            headers=square_headers(),
+            params=params,
+            timeout=12,
+        )
+        if resp.status_code not in (200, 201):
+            print("[WARN] Square booking conflict check failed:", resp.status_code, resp.text)
+            return False
+
+        data = resp.json() or {}
+        bookings = data.get("bookings") or []
+        tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+
+        for booking in bookings:
+            if not isinstance(booking, dict):
+                continue
+            if not _square_booking_is_active(booking.get("status") or ""):
+                continue
+
+            start_raw = booking.get("start_at") or ""
+            if not start_raw:
+                continue
+            try:
+                existing_start = datetime.strptime(start_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(tz)
+            except Exception:
+                continue
+
+            segs = booking.get("appointment_segments") or []
+            if not segs or not isinstance(segs, list):
+                existing_end = existing_start + timedelta(minutes=60)
+                if req_start < existing_end and req_end > existing_start:
+                    return True
+                continue
+
+            for seg in segs:
+                if not isinstance(seg, dict):
+                    continue
+                team_member_id = (seg.get("team_member_id") or "").strip()
+                if team_member_id and team_member_id != SQUARE_TEAM_MEMBER_ID:
+                    continue
+                duration = int(seg.get("duration_minutes") or 60)
+                existing_end = existing_start + timedelta(minutes=duration)
+                if req_start < existing_end and req_end > existing_start:
+                    print("[BLOCKED] Existing Square booking overlaps requested slot:", booking.get("id"), start_raw)
+                    return True
+    except Exception as e:
+        print("[WARN] Square booking conflict check exception:", repr(e))
+        return False
+
+    return False
+
+
+def build_slot_unavailable_result(sched: dict, scheduled_date: str, scheduled_time: str, appointment_type: str, *, reason: str = "slot_unavailable") -> dict:
+    """Offer same-day nearby slots, then same weekday future slots, for a blocked requested slot."""
+    try:
+        day_avails = search_square_availability_for_day(scheduled_date, appointment_type)
+        same_day_options = _nearest_same_day_slots(day_avails, scheduled_time, limit=3)
+        rolled_slots = []
+        if not same_day_options:
+            rolled_slots = _rolling_same_weekday_slots(scheduled_date, appointment_type, limit=3)
+        offered = same_day_options or rolled_slots
+        if offered:
+            sched["awaiting_slot_offer_choice"] = True
+            sched["offered_slot_options"] = offered
+            sched["last_slot_unavailable_message"] = _format_slot_offer_message(
+                scheduled_date,
+                scheduled_time,
+                same_day_options,
+                rolled_slots,
+            )
+            return {
+                "status": "slot_unavailable",
+                "message": sched["last_slot_unavailable_message"],
+                "options": offered,
+                "reason": reason,
+            }
+    except Exception as e:
+        print("[WARN] slot unavailable helper failed:", repr(e))
+
+    return {
+        "status": "slot_unavailable",
+        "message": "That time is already booked. What other day or time works for you?",
+        "reason": reason,
+    }
+
+
+
 def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
     sched = conv.setdefault("sched", {})
     if not sched.get("awaiting_slot_offer_choice"):
@@ -6030,6 +6165,19 @@ def maybe_create_square_booking(phone: str, convo: dict):
     if not start_at_utc:
         print("[ERROR] Invalid start time.")
         return {"status": "invalid_start_time"}
+
+    # Preflight only against actual existing Square bookings, not availability search.
+    # This prevents duplicate bookings at an already-booked exact slot while avoiding
+    # the earlier false-negative issue where Square availability omitted an empty time.
+    if appointment_type != "TROUBLESHOOT_395":
+        if square_slot_has_existing_booking(scheduled_date, scheduled_time, appointment_type, duration_minutes=60):
+            return build_slot_unavailable_result(
+                sched,
+                scheduled_date,
+                scheduled_time,
+                appointment_type,
+                reason="existing_square_booking_conflict",
+            )
 
     booking_nonce = (sched.get("booking_attempt_nonce") or "").strip()
     if not booking_nonce:
