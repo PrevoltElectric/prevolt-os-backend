@@ -1239,6 +1239,7 @@ def voicemail_complete():
         sched["scheduled_date"] = classification["detected_date"]
     if classification.get("detected_time"):
         sched["scheduled_time"] = classification["detected_time"]
+        sched["scheduled_time_source"] = "voicemail_detected"
     if classification.get("detected_address") and conv.get("thread_type") not in {"employment_inquiry", "commercial_bid_contact", "manual_only"}:
         sched["raw_address"] = classification["detected_address"]
 
@@ -2407,6 +2408,20 @@ def incoming_sms():
     # ---------------------------------------------------
     try:
         absorb_obvious_booking_details(conv, inbound_text)
+        clear_unauthorized_time_from_date_only_reply(sched, inbound_text)
+        weekend_reply = block_weekend_date_without_time(conv, inbound_text)
+        if weekend_reply:
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = weekend_reply
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(weekend_reply), "weekend_date_only_blocked": True}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(weekend_reply)
+            return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms absorb obvious booking details failed:", repr(e))
 
@@ -2428,7 +2443,14 @@ def incoming_sms():
     if reply.get("scheduled_date"):
         sched["scheduled_date"] = reply.get("scheduled_date")
     if reply.get("scheduled_time"):
-        sched["scheduled_time"] = reply.get("scheduled_time")
+        if inbound_has_explicit_customer_time(inbound_text):
+            sched["scheduled_time"] = reply.get("scheduled_time")
+            sched["scheduled_time_source"] = "customer_explicit"
+        elif not is_date_only_or_vague_availability_reply(inbound_text):
+            sched["scheduled_time"] = reply.get("scheduled_time")
+            sched.setdefault("scheduled_time_source", "model_context")
+
+    clear_unauthorized_time_from_date_only_reply(sched, inbound_text)
 
     if reply.get("address"):
         candidate_address = str(reply["address"] or "").strip()
@@ -3450,6 +3472,89 @@ def _loose_text(s: str) -> str:
     return " ".join(s.split())
 
 
+def inbound_has_explicit_customer_time(inbound_text: str) -> bool:
+    """True only when the customer actually supplied a clock time like 1pm, 1:30 PM, 13:00, noon, or 1500."""
+    txt = (inbound_text or "").strip()
+    if not txt:
+        return False
+    low = _loose_text(txt)
+    if re.search(r"\b(noon|midday)\b", low):
+        return True
+    if re.search(r"\b\d{1,2}(?::\d{2})?\s*[ap]\s*m\b", txt, flags=re.I):
+        return True
+    if re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b", txt):
+        return True
+    if re.fullmatch(r"\s*\d{3,4}\s*", txt):
+        return True
+    return False
+
+
+def is_date_only_or_vague_availability_reply(inbound_text: str) -> bool:
+    """Date/day/vague availability replies must never create or carry a booking time."""
+    low = _loose_text(inbound_text)
+    if not low:
+        return False
+    if inbound_has_explicit_customer_time(inbound_text):
+        return False
+    date_words = {
+        "today", "tomorrow", "any day", "anyday", "any date", "monday", "tuesday",
+        "wednesday", "thursday", "friday", "saturday", "sunday",
+        "next monday", "next tuesday", "next wednesday", "next thursday", "next friday",
+        "next saturday", "next sunday", "this monday", "this tuesday", "this wednesday",
+        "this thursday", "this friday", "this saturday", "this sunday"
+    }
+    if low in date_words:
+        return True
+    if re.fullmatch(r"(?:next|this)?\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", low):
+        return True
+    if re.fullmatch(r"\d{1,2}/\d{1,2}(?:/\d{2,4})?", low):
+        return True
+    return False
+
+
+def mark_scheduled_time_source(sched: dict, source: str) -> None:
+    if sched.get("scheduled_time"):
+        sched["scheduled_time_source"] = source
+
+
+def clear_unauthorized_time_from_date_only_reply(sched: dict, inbound_text: str) -> None:
+    """Protect against LLM/default current-clock times like 12:51 after 'Today' or 'Monday'."""
+    if not sched.get("scheduled_time"):
+        return
+    if is_date_only_or_vague_availability_reply(inbound_text):
+        source = (sched.get("scheduled_time_source") or "").strip()
+        if source not in {"customer_explicit", "offered_slot", "voicemail_detected", "emergency_dispatch"}:
+            sched["scheduled_time"] = None
+            sched["scheduled_time_source"] = None
+            sched["final_confirmation_sent"] = False
+            sched["final_confirmation_accepted"] = False
+            sched["last_final_confirmation_key"] = None
+
+
+def block_weekend_date_without_time(conv: dict, inbound_text: str) -> str | None:
+    """If a non-emergency customer picks a weekend date without a time, clear it and ask for a weekday."""
+    sched = conv.setdefault("sched", {})
+    appt = (sched.get("appointment_type") or "").upper()
+    if "TROUBLESHOOT" in appt:
+        return None
+    if not sched.get("scheduled_date"):
+        return None
+    if sched.get("scheduled_time"):
+        return None
+    if not is_date_only_or_vague_availability_reply(inbound_text):
+        return None
+    try:
+        if is_weekend(sched.get("scheduled_date")):
+            sched["scheduled_date"] = None
+            sched["scheduled_time"] = None
+            sched["scheduled_time_source"] = None
+            sched["pending_step"] = "need_date"
+            return "We schedule non-emergency visits Monday through Friday. What day and time work best for you?"
+    except Exception:
+        return None
+    return None
+
+
 def salvage_relative_date_from_text(inbound_text: str) -> str | None:
     low = _loose_text(inbound_text)
     if not low:
@@ -3519,6 +3624,7 @@ def absorb_obvious_booking_details(conv: dict, inbound_text: str) -> None:
         t = extract_explicit_time_from_text(txt)
         if t:
             sched["scheduled_time"] = t
+            sched["scheduled_time_source"] = "customer_explicit"
 
     if not sched.get("raw_address"):
         low = txt.lower()
@@ -4359,6 +4465,7 @@ def generate_reply_for_inbound(
             sched["appointment_type"] = "TROUBLESHOOT_395"
             sched["scheduled_date"] = rounded_dt.strftime("%Y-%m-%d")
             sched["scheduled_time"] = rounded_dt.strftime("%H:%M")
+            sched["scheduled_time_source"] = "emergency_dispatch"
             sched["pending_step"] = None
             if not sched.get("price_disclosed"):
                 sched["price_disclosed"] = True
@@ -4574,7 +4681,13 @@ def generate_reply_for_inbound(
         if model_date:
             sched["scheduled_date"] = model_date
         if model_time:
-            sched["scheduled_time"] = model_time
+            if inbound_has_explicit_customer_time(inbound_text):
+                sched["scheduled_time"] = model_time
+                sched["scheduled_time_source"] = "customer_explicit"
+            elif not is_date_only_or_vague_availability_reply(inbound_text):
+                # Preserve existing trusted time, but do not let date-only/vague replies create a clock time.
+                sched["scheduled_time"] = model_time
+                sched.setdefault("scheduled_time_source", "model_context")
 
         # CRITICAL: once new slot values are saved, recompute state immediately so
         # the autobooking gate sees the updated step instead of a stale need_date / need_time.
@@ -5397,6 +5510,7 @@ def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
 
     sched["scheduled_date"] = chosen.get("date")
     sched["scheduled_time"] = chosen.get("time")
+    sched["scheduled_time_source"] = "offered_slot"
     sched["awaiting_slot_offer_choice"] = False
     sched["offered_slot_options"] = []
     sched["last_slot_unavailable_message"] = None
@@ -5493,6 +5607,18 @@ def maybe_create_square_booking(phone: str, convo: dict):
     if not (scheduled_date and scheduled_time and appointment_type):
         return {"status": "missing_fields"}
 
+    if appointment_type != "TROUBLESHOOT_395":
+        time_source = (sched.get("scheduled_time_source") or "").strip()
+        if time_source not in {"customer_explicit", "offered_slot", "voicemail_detected"}:
+            # Never create non-emergency bookings from model/default/current-clock times.
+            sched["scheduled_time"] = None
+            sched["scheduled_time_source"] = None
+            sched["pending_step"] = "need_time"
+            sched["final_confirmation_sent"] = False
+            sched["final_confirmation_accepted"] = False
+            sched["last_final_confirmation_key"] = None
+            return {"status": "missing_explicit_time"}
+
     variation_id, variation_version = map_appointment_type_to_variation(appointment_type)
     if not variation_id:
         print("[ERROR] Unknown appt_type:", appointment_type)
@@ -5500,6 +5626,13 @@ def maybe_create_square_booking(phone: str, convo: dict):
 
     if is_weekend(scheduled_date) and appointment_type != "TROUBLESHOOT_395":
         print("[BLOCKED] Weekend not allowed for non-emergency.")
+        sched["scheduled_date"] = None
+        sched["scheduled_time"] = None
+        sched["scheduled_time_source"] = None
+        sched["pending_step"] = "need_date"
+        sched["final_confirmation_sent"] = False
+        sched["final_confirmation_accepted"] = False
+        sched["last_final_confirmation_key"] = None
         return _monitor_booking_return(phone, "weekend_blocked", {"status": "weekend_blocked"}, convo)
 
     if appointment_type != "TROUBLESHOOT_395":
