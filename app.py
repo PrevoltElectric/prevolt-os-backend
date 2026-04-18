@@ -382,6 +382,10 @@ def build_initial_service_booking_reply(conv: dict, inbound_text: str = "") -> s
     sched["appointment_type"] = "EVAL_195"
     conv["appointment_type"] = "EVAL_195"
     sched["price_disclosed"] = True
+    # This helper itself sends the first customer-facing intro line.
+    # Mark it sent so later slot/name/email prompts do not prepend
+    # "Hello, you've reached Prevolt Electric..." again mid-thread.
+    sched["intro_sent"] = True
     sched["pending_step"] = "need_date"
     sched["manual_only"] = False
     sched["non_service_thread"] = False
