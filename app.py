@@ -454,6 +454,87 @@ def should_send_no_reply_for_duplicate(inbound_text: str) -> bool:
     return not any(p in low for p in ["repeat", "again", "what", "which", "?"])
 
 
+def is_not_a_person_name_reply(text: str) -> bool:
+    """
+    Guardrail for live scheduling: never treat scheduling preferences,
+    slot-choice language, dates, times, or acknowledgements as a last name.
+    This prevents replies like "Anytime" from becoming the customer's last name.
+    """
+    low = _intent_text(text)
+    if not low:
+        return True
+
+    exact_blocked = {
+        "yes", "no", "ok", "okay", "k", "kk", "yep", "yeah", "sure",
+        "thanks", "thank you", "thx", "done", "perfect",
+        "anytime", "any time", "when ever", "whenever", "whenever works",
+        "when ever works", "whenever works for you", "when ever works for you",
+        "whatever works", "whatever works for you", "any day", "any works",
+        "any of those", "either", "either one", "whichever", "whichever one",
+        "you pick", "your choice", "no preference", "all work", "all works",
+        "earliest", "soonest", "first available", "next available",
+    }
+    if low in exact_blocked:
+        return True
+
+    blocked_phrases = [
+        "works for me", "works for you", "i am home", "i'm home",
+        "home all week", "home all day", "available all week",
+        "available whenever", "available when ever", "anytime is fine",
+        "any time is fine", "whatever is fine", "whichever is fine",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+        "morning", "afternoon", "evening", "noon", "midday", "tonight", "today", "tomorrow",
+    ]
+    if any(p in low for p in blocked_phrases):
+        return True
+
+    # Do not treat email addresses, dates, times, or numeric replies as names.
+    if "@" in low or re.search(r"\d", low):
+        return True
+
+    try:
+        if is_flexible_schedule_text(text) or is_next_available_request(text) or is_today_request_text(text):
+            return True
+        if extract_explicit_time_from_text(text) or salvage_relative_date_from_text(text):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def maybe_apply_flexible_offered_slot_choice(conv: dict, inbound_text: str) -> bool:
+    """
+    If the customer replies "anytime" / "whatever works" to a concrete list of
+    offered slots, choose the first offered slot instead of re-offering options
+    or letting the name engine misread it as identity information.
+    """
+    sched = conv.setdefault("sched", {})
+    if not sched.get("awaiting_slot_offer_choice"):
+        return False
+    options = sched.get("offered_slot_options") or []
+    if not options:
+        return False
+    if not is_flexible_schedule_text(inbound_text):
+        return False
+
+    chosen = options[0]
+    sched["scheduled_date"] = chosen.get("date")
+    sched["scheduled_time"] = chosen.get("time")
+    sched["scheduled_time_source"] = "offered_slot_flexible"
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    sched["final_confirmation_sent"] = False
+    sched["final_confirmation_accepted"] = False
+    sched["last_final_confirmation_key"] = None
+    sched["slot_choice_locked"] = True
+    sched["booking_attempt_nonce"] = str(uuid.uuid4())
+    return True
+
+
 # ---------------------------------------------------
 # Availability / Human-Reply Hardening
 # ---------------------------------------------------
@@ -2731,6 +2812,27 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # If customer answers an offered slot list with "anytime" / "whatever works",
+    # take the earliest offered slot before any name capture can misread it.
+    try:
+        if maybe_apply_flexible_offered_slot_choice(conv, inbound_text):
+            recompute_pending_step(profile, sched)
+            reply_body = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+            reply_body = sanitize_sms_body(collapse_duplicate_sms(reply_body.strip()), booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply_body
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "flexible_offered_slot_choice": True}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(reply_body)
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms flexible offered slot choice failed:", repr(e))
+
     # Route-level last-name salvage before Step 4.
     try:
         if maybe_capture_last_name_only(profile, sched, inbound_text):
@@ -3321,10 +3423,16 @@ def maybe_capture_last_name_only(profile: dict, sched: dict, inbound_text: str) 
         return False
 
     low = " ".join(parts).lower().strip()
+    if is_not_a_person_name_reply(inbound_text):
+        return False
+
     blocked = {
         "yes", "no", "okay", "ok", "thanks", "thank you", "yep", "yeah", "sure",
         "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday", "friday",
-        "saturday", "sunday", "morning", "afternoon", "evening", "noon", "midday"
+        "saturday", "sunday", "morning", "afternoon", "evening", "noon", "midday",
+        "anytime", "any time", "whenever", "when ever", "whatever works",
+        "whatever works for you", "any of those", "either", "whichever",
+        "you pick", "your choice", "no preference"
     }
     if low in blocked:
         return False
@@ -3674,6 +3782,8 @@ def handle_name_engine_response(conv: dict, inbound_text: str) -> str | None:
         return wrap_name_engine_message(sched, "What first name should I use today?")
 
     if state == "awaiting_new_person_last_name":
+        if is_not_a_person_name_reply(inbound_text):
+            return wrap_name_engine_message(sched, "What is your last name?")
         cleaned = re.sub(r"[^A-Za-z'\- ]", " ", inbound_text).strip()
         parts = cleaned.split()
         if parts:
@@ -4559,7 +4669,7 @@ def generate_reply_for_inbound(
                 }
         # Opportunistic capture.
         # IMPORTANT: customer-provided identity overrides Square-recognized identity for this booking.
-        if sched.get("pending_step") == "need_name" or "my name" in inbound_lower or inbound_lower.startswith("name is"):
+        if (sched.get("pending_step") == "need_name" or "my name" in inbound_lower or inbound_lower.startswith("name is")) and not is_not_a_person_name_reply(inbound_text):
             fn, ln = _extract_first_last(inbound_text)
             if fn and ln:
                 profile["active_first_name"] = fn
