@@ -325,10 +325,12 @@ Relevant SRB context:
 
 def looks_like_complex_commercial_coordination_request(*parts) -> bool:
     """
-    Complex commercial / multifamily service-equipment work should not be auto-booked
-    into the normal Square visit flow, even when it arrives through Google LSA.
-    These requests need Kyle to coordinate a walkthrough, access, shutdown/utility
-    details, and scope before any appointment is placed on the calendar.
+    Only explicit commercial walkthrough / site-walk requests are manual-only.
+
+    Important: Google Local Services and normal inbound service requests for
+    commercial or multifamily equipment, including meter-bank replacement, are
+    still bookable as a $195 evaluation visit unless the customer specifically
+    asks to schedule a walkthrough/site walk/project walk.
     """
     low = _intent_text(*parts)
     if not low:
@@ -336,42 +338,78 @@ def looks_like_complex_commercial_coordination_request(*parts) -> bool:
 
     walkthrough_terms = [
         "commercial walkthrough", "walkthrough", "walk through", "site walk",
-        "job walk", "walk the job", "walk the site", "site visit",
-        "project walkthrough", "coordinate a walkthrough"
+        "job walk", "walk the job", "walk the site", "project walkthrough",
+        "coordinate a walkthrough", "walk-through", "pre bid walk",
+        "pre-bid walk", "bid walk", "site meeting"
     ]
-    service_equipment_terms = [
-        "meter bank", "meterbank", "gang meter", "multi gang meter",
-        "multi-gang meter", "6-gang", "six gang", "six-gang",
-        "meter stack", "meter center", "meter socket bank", "switchgear",
-        "ct cabinet", "main distribution", "mdp", "service equipment",
-        "utility coordination", "shutdown coordination"
-    ]
-    commercial_context_terms = [
-        "condominium association", "condo association", "hoa", "association",
-        "property manager", "property management", "board", "commercial",
-        "facility", "facilities", "apartment building", "multi family",
-        "multifamily", "multi-family", "tenant", "tenants"
-    ]
+    return any(term in low for term in walkthrough_terms)
 
-    if any(term in low for term in walkthrough_terms):
-        return True
-    if any(term in low for term in service_equipment_terms):
-        return True
-    # Commercial/association context plus replacement/walkthrough language is enough
-    # to avoid a free auto-booked visit. Keep normal small commercial repairs bookable.
-    if any(term in low for term in commercial_context_terms) and any(
-        term in low for term in ["replace", "replacement", "walk", "walkthrough", "site visit", "scope", "utility"]
-    ):
-        return True
-    return False
+
+def looks_like_initial_service_booking_request(conv: dict, inbound_text: str = "") -> bool:
+    """
+    True for a first customer message that is asking for electrical service /
+    availability but has not yet been put into an appointment type.
+
+    This prevents "please let me know availability" from jumping straight to
+    slot offers before the $195 evaluation context is established.
+    """
+    sched = conv.setdefault("sched", {})
+    if sched.get("appointment_type") or conv.get("appointment_type"):
+        return False
+    if conv.get("thread_type") in {"employment_inquiry", "commercial_bid_contact", "manual_only"}:
+        return False
+
+    low = _intent_text(inbound_text)
+    if not low:
+        return False
+
+    service_terms = [
+        "need", "replace", "replacement", "repair", "install", "hooked up",
+        "not working", "troubleshoot", "take a look", "look at", "come out",
+        "service", "electrician", "meter bank", "meter socket", "panel",
+        "outlet", "switch", "ev charger", "charger", "fan", "light"
+    ]
+    availability_terms = [
+        "availability", "available", "when can", "please let me know",
+        "let me know availability", "appointment", "schedule", "come out"
+    ]
+    return any(t in low for t in service_terms) and any(t in low for t in availability_terms)
+
+
+def build_initial_service_booking_reply(conv: dict, inbound_text: str = "") -> str:
+    """Start a normal $195 evaluation booking flow from an inbound SMS/GLS lead."""
+    sched = conv.setdefault("sched", {})
+    sched["appointment_type"] = "EVAL_195"
+    conv["appointment_type"] = "EVAL_195"
+    sched["price_disclosed"] = True
+    sched["pending_step"] = "need_date"
+    sched["manual_only"] = False
+    sched["non_service_thread"] = False
+
+    try:
+        absorb_address_from_mixed_text(conv, inbound_text)
+    except Exception:
+        pass
+
+    low = _intent_text(inbound_text)
+    if "meter bank" in low or "6-gang" in low or "six gang" in low or "gang meter" in low:
+        return (
+            "Hello, you've reached Prevolt Electric. I'll help you here by text. "
+            "For the meter bank replacement, we start with a $195 evaluation visit so we can review everything in person and give you a firm number. "
+            "What day works best for you?"
+        )
+
+    return (
+        "Hello, you've reached Prevolt Electric. I'll help you here by text. "
+        "Our evaluation visit is $195. What day works best for you?"
+    )
 
 
 def build_complex_commercial_coordination_reply(inbound_text: str = "") -> str:
     low = _intent_text(inbound_text)
     if "meter bank" in low or "6-gang" in low or "six gang" in low or "gang meter" in low:
         return (
-            "Thanks for reaching out. A meter bank replacement is handled directly by Kyle so the walkthrough, "
-            "access, and utility coordination are set up correctly. Kyle will follow up directly to coordinate the walkthrough."
+            "Got it, thank you. Kyle will review the walkthrough details and follow up directly to coordinate access and timing."
         )
     if "walk" in low or "site visit" in low:
         return (
@@ -2415,14 +2453,14 @@ def incoming_sms():
         tw.message(reply_body)
         return Response(str(tw), mimetype="text/xml")
 
-    # Complex commercial service-equipment / walkthrough requests must not fall
-    # into the normal availability-slot offer path. This protects against unpaid
-    # commercial walkthroughs being booked through Square from GLS or direct SMS.
+    # Explicit commercial walkthrough/site-walk requests are manual-only.
+    # Commercial/multifamily equipment requests that simply ask for availability
+    # remain normal $195 evaluation leads.
     try:
         if looks_like_complex_commercial_coordination_request(inbound_text):
             clear_service_booking_state_for_non_service(conv, "manual_only")
-            sched["manual_reason"] = "complex_commercial_coordination"
-            # Preserve the address for Kyle's review without treating it as a bookable visit.
+            sched["manual_reason"] = "commercial_walkthrough_coordination"
+            # Preserve the address for Kyle's review without treating it as a bookable Square visit.
             try:
                 extracted_addr = extract_service_address_from_mixed_text(inbound_text)
                 if extracted_addr:
@@ -2435,14 +2473,34 @@ def incoming_sms():
             conv["last_inbound_fingerprint_ts"] = now_ts
             conv["last_sms_body"] = reply_body
             try:
-                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "thread_type": "manual_only", "manual_reason": "complex_commercial_coordination"}, conv)
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "thread_type": "manual_only", "manual_reason": "commercial_walkthrough_coordination"}, conv)
             except Exception:
                 pass
             tw = MessagingResponse()
             tw.message(reply_body)
             return Response(str(tw), mimetype="text/xml")
     except Exception as e:
-        print("[WARN] incoming_sms complex commercial coordination guard failed:", repr(e))
+        print("[WARN] incoming_sms commercial walkthrough coordination guard failed:", repr(e))
+
+    # First-message GLS/SMS service leads should establish the $195 evaluation
+    # context before availability handling offers slots. This includes commercial
+    # or multifamily equipment work like a meter-bank replacement.
+    try:
+        if looks_like_initial_service_booking_request(conv, inbound_text):
+            reply_body = build_initial_service_booking_reply(conv, inbound_text)
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply_body
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "initial_service_booking": True}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(reply_body)
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms initial service booking guard failed:", repr(e))
 
     cleaned_transcript = conv.get("cleaned_transcript")
     category = conv.get("category")
