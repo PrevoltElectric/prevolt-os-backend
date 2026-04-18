@@ -438,6 +438,7 @@ def is_flexible_schedule_text(text: str) -> bool:
         "whenever you want", "whenever you can", "you pick", "your choice",
         "earliest", "soonest", "first available", "next available", "next availability",
         "open availability", "wide open", "im available whenever", "i am available whenever",
+        "any availability", "let me know availability", "please let me know availability",
     ]
     return any(p in low for p in phrases)
 
@@ -3579,16 +3580,20 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         else:
             answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
         sched["price_disclosed"] = True
-    elif any(x in low for x in ["availability", "available", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
-        recompute_pending_step(profile, sched)
-        if (sched.get("pending_step") or "").strip().lower() == "need_date" and not sched.get("scheduled_time"):
-            answer = "What day and time work best for you?"
-        elif (sched.get("pending_step") or "").strip().lower() == "need_date":
-            answer = "What day works best for you?"
-        elif (sched.get("pending_step") or "").strip().lower() == "need_time":
-            answer = "What time works best for you?"
+    elif any(x in low for x in ["availability", "available", "openings", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
+        # Availability questions should never fall into a vague canned response.
+        # Offer concrete openings if possible; otherwise ask for a weekday/time window.
+        try:
+            slot_options = get_next_available_slots((sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195"), limit=3)
+        except Exception:
+            slot_options = []
+        if slot_options:
+            sched["awaiting_slot_offer_choice"] = True
+            sched["offered_slot_options"] = slot_options[:3]
+            answer = format_next_available_slots_message(slot_options)
+            sched["last_slot_unavailable_message"] = answer
         else:
-            answer = "Once I have the booking details, I can get you on the schedule."
+            answer = "What weekday and time work best for you?"
     elif any(x in low for x in ["how long", "visit take", "how long does it take", "how long is the visit"]):
         answer = "Most visits are about an hour, depending on what you have going on."
     elif any(x in low for x in ["panel upgrade", "do you do panel", "service change", "panel replacement"]):
@@ -5390,8 +5395,18 @@ def is_next_available_request(inbound_text: str) -> bool:
         "when can you come out",
         "when can you come",
         "next available slot",
+        "let me know availability",
+        "please let me know availability",
+        "what availability",
+        "your availability",
+        "availability?",
     ]
-    return any(p in low for p in patterns)
+    if any(p in low for p in patterns):
+        return True
+    # Generic availability asks should offer concrete openings, not fall through
+    # to the canned booking-details fallback. Keep this narrow so ordinary words
+    # like "available" in a full scheduling answer do not override explicit dates/times.
+    return bool(re.search(r"\b(?:availability|available openings|openings|available times)\b", low))
 
 
 def get_next_available_slots(appointment_type: str, limit: int = 3, days_ahead: int = 14) -> list[dict]:
@@ -5401,8 +5416,13 @@ def get_next_available_slots(appointment_type: str, limit: int = 3, days_ahead: 
     collected = []
     seen = set()
 
+    non_emergency = "TROUBLESHOOT" not in appointment_type
+
     for offset in range(days_ahead + 1):
-        target_date = (now_local.date() + timedelta(days=offset)).strftime("%Y-%m-%d")
+        target_day = now_local.date() + timedelta(days=offset)
+        if non_emergency and target_day.weekday() >= 5:
+            continue
+        target_date = target_day.strftime("%Y-%m-%d")
         day_slots = search_square_availability_for_day(target_date, appointment_type)
         for slot in day_slots:
             key = (slot.get("date"), slot.get("time"))
