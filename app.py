@@ -160,6 +160,301 @@ def is_pure_lsa_platform_notice(text: str) -> bool:
     """Wrapper/instruction only. These must update metadata at most, never generate a customer reply."""
     return is_google_lsa_platform_notice(text) and not extract_lsa_customer_message(text)
 
+
+# ---------------------------------------------------
+# Google LSA relay sanitation + price firewall
+# ---------------------------------------------------
+def extract_lsa_payload_fields(text: str) -> dict:
+    """Extract stable metadata from Google Local Services Ads relay wrappers."""
+    raw = str(text or "")
+    fields = {}
+    patterns = {
+        "customer_name": r"\bCustomer Name:\s*(.+?)(?=\s+(?:Location|Service|Message):|$)",
+        "location": r"\bLocation:\s*(.+?)(?=\s+(?:Service|Message):|$)",
+        "service": r"\bService:\s*(.+?)(?=\s+Message:|$)",
+        "message": r"\bMessage:\s*(.+)$",
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, raw, flags=re.I | re.S)
+        if m:
+            value = " ".join(m.group(1).split()).strip()
+            if value:
+                fields[key] = value
+    return fields
+
+
+def strip_lsa_customer_text_noise(text: str) -> str:
+    """
+    Remove Google LSA wrapper fragments, notes, quoted email history, and obvious
+    email-signature debris before the text enters the normal booking brain.
+    """
+    raw = str(text or "").replace("\r", "\n").strip()
+    if not raw:
+        return ""
+
+    # Remove Google/LSA notes appended to the customer-authored sentence.
+    raw = re.sub(r"\s*\[Notes?\s+from\s+LSA:.*?\]\s*", " ", raw, flags=re.I | re.S)
+
+    # Cut off relay/dashboard instructions and quoted email boilerplate.
+    cut_patterns = [
+        r"\bTo respond,\s*just reply to this email\b",
+        r"\bReply here or respond via\b",
+        r"\bReplies to this number\b",
+        r"\brespond via your LSA dashboard\b",
+        r"https://g\.co/homeservices\S*",
+        r"\bNeed help\?\s*We are here for you\b",
+        r"\bGoogle LLC\b",
+        r"\bYou received this mandatory service announcement\b",
+        r"\bCONFIDENTIAL:\b",
+        r"\bThis email and any files transmitted\b",
+    ]
+    for pat in cut_patterns:
+        raw = re.split(pat, raw, maxsplit=1, flags=re.I | re.S)[0].strip()
+
+    # Drop common signature-ish lines while preserving the customer's message.
+    kept = []
+    for line in raw.splitlines():
+        line_clean = " ".join(line.split()).strip()
+        low = line_clean.lower()
+        if not line_clean:
+            continue
+        if low in {"thanks,", "thanks", "prevolt", "sent from my iphone"}:
+            continue
+        if low.startswith(("kyle prevost", "owner", "office:", "website:", "now accepting online bookings")):
+            continue
+        if "prevoltelectric@gmail.com" in low or "prevoltllc.com" in low:
+            continue
+        kept.append(line_clean)
+
+    return " ".join(" ".join(kept).split()).strip()
+
+
+def is_lsa_self_echo_or_dirty_business_reply(text: str) -> bool:
+    """
+    True when Google relays Prevolt's own dashboard/email response back into
+    Twilio. These must never generate another automated reply.
+    """
+    low = _intent_text(text)
+    if not low:
+        return False
+    return (
+        "prevolt sent you a response" in low
+        or "prevolt wrote" in low
+        or (
+            "kyle prevost" in low
+            and ("prevoltelectric gmail com" in low or "prevoltllc com" in low)
+        )
+        or (
+            "office 860 758 0707" in low
+            and "prevolt" in low
+        )
+    )
+
+
+def is_google_lsa_thread(conv: dict | None, text: str = "") -> bool:
+    conv = conv or {}
+    return (
+        (conv.get("source") or "").strip() == "google_lsa"
+        or is_google_lsa_platform_notice(text)
+        or bool(extract_lsa_customer_message(text))
+    )
+
+
+def lsa_has_emergency_signal(text: str) -> bool:
+    low = _intent_text(text)
+    emergency_terms = [
+        "no power", "power out", "outage", "burning", "smoke", "sparking", "sparks",
+        "arcing", "melted", "hot outlet", "hot panel", "breaker wont reset",
+        "breaker won't reset", "breaker not resetting", "tree ripped", "line down",
+        "wire down", "service ripped", "meter ripped", "main breaker"
+    ]
+    return any(t in low for t in emergency_terms)
+
+
+def looks_like_lsa_quote_or_service_lead(text: str) -> bool:
+    """
+    LSA 'Get quote' leads often begin with price/scope language instead of
+    scheduling language. Treat those as bookable evaluation leads before the
+    general LLM can improvise pricing.
+    """
+    low = _intent_text(text)
+    if not low:
+        return False
+    if lsa_has_emergency_signal(low):
+        return False
+
+    service_terms = [
+        "install", "installation", "replace", "replacement", "repair", "rewire",
+        "remodel", "charger", "tesla", "ev charger", "wall charger", "outlet",
+        "switch", "panel", "service", "meter", "breaker", "dishwasher",
+        "garbage disposal", "disposal", "light", "fan", "fixture", "quote",
+        "estimate", "electrical"
+    ]
+    quote_terms = [
+        "how much", "cost", "price", "quote", "estimate", "looking for an estimate",
+        "looking for a quote", "requested a quote", "looking to", "need", "needs",
+        "can you help", "help with", "looking for"
+    ]
+    scheduling_terms = [
+        "availability", "available", "appointment", "schedule", "come out",
+        "take a look", "site visit", "visit"
+    ]
+    return (
+        any(t in low for t in service_terms)
+        and (any(t in low for t in quote_terms) or any(t in low for t in scheduling_terms))
+    )
+
+
+def build_lsa_eval_entry_reply(conv: dict, inbound_text: str) -> str:
+    """
+    Safe first response for Google LSA quote/message leads. It anchors to the
+    visit only and never presents $195 as the total job price.
+    """
+    sched = conv.setdefault("sched", {})
+    sched["appointment_type"] = sched.get("appointment_type") or "EVAL_195"
+    conv["appointment_type"] = sched["appointment_type"]
+    sched["price_disclosed"] = True
+    sched["intro_sent"] = True
+    sched["manual_only"] = False
+    sched["non_service_thread"] = False
+
+    try:
+        absorb_address_from_mixed_text(conv, inbound_text)
+    except Exception:
+        pass
+
+    if sched.get("raw_address") or sched.get("address_verified"):
+        sched["pending_step"] = "need_date"
+        return (
+            "For that, we start with a $195 evaluation and quote visit. "
+            "The final price depends on what we find on site. What day works best for the evaluation?"
+        )
+
+    sched["pending_step"] = "need_address"
+    return (
+        "For that, we start with a $195 evaluation and quote visit. "
+        "The final price depends on what we find on site. What is the service address?"
+    )
+
+
+def build_lsa_safety_reply(conv: dict, inbound_text: str) -> str | None:
+    """
+    Deterministic firewall for Google LSA price/material/duration questions.
+    This runs before the LLM and before normal interruption handling.
+    """
+    if not is_google_lsa_thread(conv, inbound_text):
+        return None
+
+    low = _intent_text(inbound_text)
+    if not low:
+        return None
+
+    sched = conv.setdefault("sched", {})
+
+    def _next_lsa_question(default_eval: str = "What day works best for the evaluation?") -> str:
+        if not (sched.get("raw_address") or sched.get("address_verified")):
+            return "What is the service address?"
+        if not sched.get("scheduled_date"):
+            return default_eval
+        if not sched.get("scheduled_time"):
+            return "What time works best?"
+        return ""
+
+    is_emergency = lsa_has_emergency_signal(inbound_text) or "TROUBLESHOOT" in (sched.get("appointment_type") or "").upper()
+
+    price_terms = [
+        "how much", "price", "cost", "$195", "195", "$395", "395", "total",
+        "total cost", "quote", "estimate", "free estimate", "ballpark",
+        "rough price", "what do you charge"
+    ]
+    material_terms = [
+        "material", "materials", "include material", "include materials",
+        "includes material", "includes materials", "included", "parts"
+    ]
+    duration_terms = [
+        "how long", "how long does it take", "install time", "how many hours",
+        "take to install", "duration"
+    ]
+
+    asks_price = any(t in low for t in price_terms)
+    asks_material = any(t in low for t in material_terms)
+    asks_duration = any(t in low for t in duration_terms)
+
+    if not (asks_price or asks_material or asks_duration):
+        return None
+
+    if is_emergency:
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+    else:
+        sched["appointment_type"] = sched.get("appointment_type") or "EVAL_195"
+        conv["appointment_type"] = sched["appointment_type"]
+
+    if asks_material:
+        sched["price_disclosed"] = True
+        if is_emergency:
+            return (
+                "Materials for larger repairs are not included in the $395. "
+                "The $395 is the troubleshoot and repair visit, and anything larger is reviewed on site first. "
+                f"{_next_lsa_question('What day and time work best?')}"
+            )
+        return (
+            "No. Materials for the installation are not included in the $195. "
+            "The $195 is the evaluation and quote visit so we can review everything on site and give you a firm number. "
+            f"{_next_lsa_question()}"
+        )
+
+    if asks_duration:
+        return (
+            "Install time depends on the panel, wire path, distance, and site conditions. "
+            "We review that during the evaluation visit before giving the final installation price. "
+            f"{_next_lsa_question()}"
+        )
+
+    if asks_price:
+        sched["price_disclosed"] = True
+        if is_emergency:
+            return (
+                "The $395 is for the troubleshoot and repair visit, not a guaranteed total for larger repair work. "
+                f"Anything larger is reviewed on site first. {_next_lsa_question('What day and time work best?')}"
+            )
+        return (
+            "The $195 is the evaluation and quote visit, not the total installation price. "
+            "Final pricing depends on the panel, wire path, breaker, distance, and materials after we review it on site. "
+            f"{_next_lsa_question()}"
+        )
+
+    return None
+
+
+def enforce_lsa_outbound_safety(conv: dict, inbound_text: str, outbound_text: str) -> str:
+    """
+    Last-chance guard for any LSA response generated outside the deterministic
+    path. If a forbidden claim slips through, replace it with the safe answer.
+    """
+    body = " ".join(str(outbound_text or "").split()).strip()
+    if not body or not is_google_lsa_thread(conv, inbound_text):
+        return body
+
+    low = _intent_text(body)
+    forbidden = (
+        ("total cost" in low and ("195" in low or "$195" in body))
+        or "includes both the installation and the materials" in low
+        or "includes materials" in low
+        or "materials are included" in low
+        or "usually about an hour" in low
+        or "takes about an hour" in low
+    )
+    if forbidden:
+        safe = build_lsa_safety_reply(conv, inbound_text)
+        if safe:
+            return safe
+        return (
+            "The $195 is the evaluation and quote visit, not the total installation price. "
+            "Final pricing is reviewed on site before any installation work moves forward."
+        )
+    return body
+
 def looks_like_employment_inquiry(*parts) -> bool:
     low = _intent_text(*parts)
     if not low:
@@ -2574,16 +2869,28 @@ def incoming_sms():
     inbound_low  = inbound_text.lower().strip()
 
     # Google LSA can send platform wrappers through the same SMS webhook.
-    # Extract customer-authored payloads and suppress pure platform notices.
-    lsa_customer_message = extract_lsa_customer_message(inbound_text)
-    if is_pure_lsa_platform_notice(inbound_text):
+    # Extract customer-authored payloads, strip relay/email debris, and suppress
+    # Google/Prevolt echo messages before they can enter the normal SMS brain.
+    raw_inbound_text = inbound_text
+    lsa_payload_fields = extract_lsa_payload_fields(raw_inbound_text)
+    lsa_customer_message = extract_lsa_customer_message(raw_inbound_text)
+
+    if is_lsa_self_echo_or_dirty_business_reply(raw_inbound_text):
         try:
-            log_event("SMS_PLATFORM_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
+            log_event("SMS_LSA_SELF_ECHO_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(raw_inbound_text)})
         except Exception:
             pass
         return Response(str(MessagingResponse()), mimetype="text/xml")
+
+    if is_pure_lsa_platform_notice(raw_inbound_text):
+        try:
+            log_event("SMS_PLATFORM_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(raw_inbound_text), "source": "google_lsa"})
+        except Exception:
+            pass
+        return Response(str(MessagingResponse()), mimetype="text/xml")
+
     if lsa_customer_message:
-        inbound_text = lsa_customer_message
+        inbound_text = strip_lsa_customer_text_noise(lsa_customer_message)
         inbound_low = inbound_text.lower().strip()
 
     try:
@@ -2633,14 +2940,33 @@ def incoming_sms():
     # Initialize layers (HARDENED: never assume dict shape)
     # ---------------------------------------------------
     conv = conversations.setdefault(phone, {})
-    if lsa_customer_message:
+    if lsa_customer_message or is_google_lsa_platform_notice(raw_inbound_text):
         conv["source"] = "google_lsa"
+        if lsa_payload_fields:
+            conv["lsa_payload"] = {**(conv.get("lsa_payload") or {}), **lsa_payload_fields}
+        try:
+            if lsa_payload_fields.get("customer_name"):
+                conv.setdefault("profile", {})["lsa_customer_name"] = lsa_payload_fields.get("customer_name")
+            if lsa_payload_fields.get("location"):
+                conv.setdefault("sched", {})["lsa_location"] = lsa_payload_fields.get("location")
+            if lsa_payload_fields.get("service"):
+                conv.setdefault("current_job", {})["lsa_service"] = lsa_payload_fields.get("service")
+        except Exception:
+            pass
+
+    is_lsa_thread_now = is_google_lsa_thread(conv, raw_inbound_text)
 
     # Twilio and WhatsApp can occasionally retry the same inbound webhook.
     # Guard both by inbound SID and by a short body fingerprint window.
     inbound_fingerprint = re.sub(r"\s+", " ", inbound_low).strip()
     now_ts = time.time()
     if inbound_sid and conv.get("last_inbound_sid") == inbound_sid and conv.get("last_sms_body"):
+        if is_lsa_thread_now:
+            try:
+                log_event("SMS_LSA_DUPLICATE_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text), "reason": "same_sid"}, conv)
+            except Exception:
+                pass
+            return Response(str(MessagingResponse()), mimetype="text/xml")
         tw = MessagingResponse()
         tw.message(conv.get("last_sms_body"))
         return Response(str(tw), mimetype="text/xml")
@@ -2651,6 +2977,12 @@ def incoming_sms():
         and (now_ts - float(conv.get("last_inbound_fingerprint_ts") or 0)) <= 90
         and conv.get("last_sms_body")
     ):
+        if is_lsa_thread_now:
+            try:
+                log_event("SMS_LSA_DUPLICATE_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text), "reason": "same_body_window"}, conv)
+            except Exception:
+                pass
+            return Response(str(MessagingResponse()), mimetype="text/xml")
         tw = MessagingResponse()
         tw.message(conv.get("last_sms_body"))
         return Response(str(tw), mimetype="text/xml")
@@ -2710,6 +3042,40 @@ def incoming_sms():
     # Emergency flags (used by incoming_sms patch logic too)
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
+
+    # Google LSA message leads are dirty relay traffic. Before any general
+    # interruption/LLM route can answer, enforce pricing/material/duration rules.
+    try:
+        if is_lsa_thread_now:
+            lsa_safe_reply = build_lsa_safety_reply(conv, inbound_text)
+            if lsa_safe_reply:
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = lsa_safe_reply
+                try:
+                    log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(lsa_safe_reply), "source": "google_lsa", "lsa_safety": True}, conv)
+                except Exception:
+                    pass
+                tw = MessagingResponse()
+                tw.message(lsa_safe_reply)
+                return Response(str(tw), mimetype="text/xml")
+
+            if not sched.get("appointment_type") and looks_like_lsa_quote_or_service_lead(inbound_text):
+                lsa_entry_reply = build_lsa_eval_entry_reply(conv, inbound_text)
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = lsa_entry_reply
+                try:
+                    log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(lsa_entry_reply), "source": "google_lsa", "lsa_entry": True}, conv)
+                except Exception:
+                    pass
+                tw = MessagingResponse()
+                tw.message(lsa_entry_reply)
+                return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms LSA safety/entry guard failed:", repr(e))
 
     # Non-service / thread-type hard guard before normal booking state can run.
     thread_type = detect_non_service_thread_type(conv, inbound_text, conv.get("category"), conv.get("cleaned_transcript"))
@@ -3029,10 +3395,11 @@ def incoming_sms():
         except Exception as e:
             print("[WARN] fast interrupt immediate booking failed:", repr(e))
 
+        fast_interrupt = enforce_lsa_outbound_safety(conv, inbound_text, fast_interrupt).strip()
         conv["last_inbound_sid"] = inbound_sid
         conv["last_inbound_fingerprint"] = inbound_fingerprint
         conv["last_inbound_fingerprint_ts"] = now_ts
-        conv["last_sms_body"] = fast_interrupt.strip()
+        conv["last_sms_body"] = fast_interrupt
         try:
             log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(fast_interrupt)}, conv)
         except Exception:
@@ -3243,6 +3610,9 @@ def incoming_sms():
     generic_fillers = {"", "Okay.", "Okay", "ok", "ok.", "sure.", "Sure."}
     if sms_body in generic_fillers:
         sms_body = next_prompt
+
+    # Final LSA outbound safety net before duplicate/frustration handling.
+    sms_body = enforce_lsa_outbound_safety(conv, inbound_text, sms_body)
 
     # Frustration and duplicate-prompt protection.
     if is_frustrated_with_bot(inbound_text):
@@ -4030,6 +4400,12 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     booked = bool(sched.get("booking_created") and sched.get("square_booking_id"))
     if booked and not allow_post_booking:
         return None
+
+    # Google LSA relay threads must never let the LLM improvise price,
+    # material-inclusion, or install-duration answers.
+    lsa_safe = build_lsa_safety_reply(conv, inbound_text)
+    if lsa_safe:
+        return lsa_safe
 
     # Let the LLM handle trust / hesitation / multi-question turns first.
     trust = llm_trust_reply(conv, inbound_text)
