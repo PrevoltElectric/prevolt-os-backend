@@ -3,6 +3,7 @@ import json
 import sqlite3
 import time
 import uuid
+import re
 from pathlib import Path
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
@@ -121,41 +122,177 @@ def _intent_text(*parts) -> str:
     joined = " ".join(str(p or "") for p in parts)
     return re.sub(r"\s+", " ", joined).strip().lower()
 
+def _normalize_relay_text(text: str) -> str:
+    """Normalize SMS/email-relay payload text without changing customer wording."""
+    try:
+        import html as _html
+        text = _html.unescape(str(text or ""))
+    except Exception:
+        text = str(text or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ").replace("\u200b", "")
+    return text.strip()
+
+
 def is_google_lsa_platform_notice(text: str) -> bool:
-    """True for Google LSA wrapper/instruction notices that are not customer-authored content."""
-    low = _intent_text(text)
+    """True when the inbound body appears to be Google Local Services / LSA relay clutter."""
+    low = _intent_text(_normalize_relay_text(text))
     if not low:
         return False
-    return (
-        "google local services ads" in low
-        or "local services ads" in low
-        or "g.co/homeservices" in low
-        or "lsa dashboard" in low
-        or "replies to this number will be sent to the customer" in low
-        or "this customer requested only message replies" in low
-        or "respond via your lsa dashboard" in low
-        or "reply here or respond via" in low
-    )
+
+    strong_indicators = [
+        "google local services ads",
+        "google local services",
+        "local services ads",
+        "local services lead",
+        "local service ad",
+        "lsa dashboard",
+        "g.co/homeservices",
+        "google guaranteed",
+        "this customer requested only message replies",
+        "replies to this number will be sent to the customer",
+        "reply here or respond via",
+        "respond via your lsa dashboard",
+        "view this lead in local services",
+        "new message from a customer",
+        "you have a new message from a customer",
+    ]
+    if any(p in low for p in strong_indicators):
+        return True
+
+    # Google relay emails sometimes arrive as a timeline containing Customer/Prevolt turns.
+    return bool(re.search(r"(?is)(^|\n)\s*customer\s*[•:\-].+?\n.+?(\n\s*prevolt\s*[•:\-]|$)", _normalize_relay_text(text)))
+
+
+def _clean_lsa_candidate(msg: str) -> str | None:
+    """Remove Google/Twilio/email-chain boilerplate from an already-selected candidate."""
+    msg = _normalize_relay_text(msg)
+    if not msg:
+        return None
+
+    # Stop before quoted history, Prevolt's previous reply, or Google reply instructions.
+    stop_patterns = [
+        r"\n\s*Prevolt\s*[•:\-]",
+        r"\n\s*Reply here\b",
+        r"\n\s*Replies? to this (?:number|email)\b",
+        r"\n\s*Respond via\b",
+        r"\n\s*To reply\b",
+        r"\n\s*View (?:this )?lead\b",
+        r"\n\s*Open in Local Services\b",
+        r"\n\s*Google Local Services\b",
+        r"\n\s*Local Services Ads\b",
+        r"\n\s*https?://g\.co/homeservices\b",
+        r"\n\s*On .+ wrote:\s*$",
+        r"\n\s*-{2,}\s*Original Message\s*-{2,}",
+    ]
+    for pat in stop_patterns:
+        msg = re.split(pat, msg, maxsplit=1, flags=re.I | re.S)[0].strip()
+
+    # Drop quoted email-chain lines and obvious relay/header lines.
+    cleaned_lines = []
+    noise_line_patterns = [
+        r"^\s*>",
+        r"^\s*(from|to|cc|bcc|subject|date|sent):\b",
+        r"^\s*(customer|prevolt)\s*[•:\-]\s*(?:just now|\d+\s*(?:sec|second|min|minute|hr|hour|day)s?\s*ago)?\s*$",
+        r"google local services",
+        r"local services ads",
+        r"lsa dashboard",
+        r"g\.co/homeservices",
+        r"reply here",
+        r"respond via",
+        r"replies? to this (?:number|email)",
+        r"this customer requested only message replies",
+        r"you have a new message from a customer",
+        r"new message from a customer",
+        r"view (?:this )?lead",
+        r"open in local services",
+        r"unsubscribe",
+        r"privacy policy",
+        r"terms of service",
+    ]
+    for line in msg.split("\n"):
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        if any(re.search(pat, line, flags=re.I) for pat in noise_line_patterns):
+            # Preserve inline Customer: actual message if present.
+            m = re.match(r"^\s*customer\s*[:\-]\s*(.+)$", line, flags=re.I)
+            if m and m.group(1).strip():
+                cleaned_lines.append(m.group(1).strip())
+            continue
+        cleaned_lines.append(line)
+
+    msg = " ".join(cleaned_lines)
+    msg = re.sub(r"\s+", " ", msg).strip(" \t\n\r\"'")
+
+    # Remove email-relay lead-in wording if it survived on the same line as the message.
+    leadin_patterns = [
+        r"^(?:hi|hello)\s+prevolt(?:\s+electric)?[,\s]+",
+        r"^you have (?:a )?new message from (?:a )?customer[:\s]+",
+        r"^new message from (?:a )?customer[:\s]+",
+        r"^customer(?: wrote| says| replied)?[:\s]+",
+        r"^message[:\s]+",
+        r"^lead message[:\s]+",
+        r"^customer message[:\s]+",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for pat in leadin_patterns:
+            new_msg = re.sub(pat, "", msg, flags=re.I).strip()
+            if new_msg != msg:
+                msg = new_msg
+                changed = True
+
+    if not msg:
+        return None
+
+    # If what remains is only platform language, do not let it enter booking flow.
+    low = _intent_text(msg)
+    platform_only = [
+        "reply here", "respond via", "local services ads", "google local services",
+        "lsa dashboard", "g.co/homeservices", "this customer requested only message replies",
+        "replies to this number will be sent to the customer",
+    ]
+    if any(p in low for p in platform_only) and len(low.split()) < 14:
+        return None
+
+    return msg
+
 
 def extract_lsa_customer_message(text: str) -> str | None:
     """
-    Extract the true customer-authored message from Google LSA wrapper text.
-    Returns None for pure platform notices with no customer message payload.
+    Extract the true customer-authored message from Google Local Services / LSA relay text.
+
+    This intentionally acts like a sanitizer, not a separate booking lane:
+    - if Google sends a wrapper with Message:, Customer message:, etc., return only that payload;
+    - if Google sends an email-thread/timeline body, strip the relay clutter and return the newest customer text;
+    - if it is only platform instructions, return None so the webhook can suppress it.
     """
-    raw = str(text or "").strip()
+    raw = _normalize_relay_text(text)
     if not raw:
         return None
 
-    m = re.search(r"\bMessage:\s*(.+)$", raw, flags=re.I | re.S)
-    if not m:
-        return None
+    # 1) Explicit labelled payloads. These are safest and should win first.
+    labelled_patterns = [
+        r"(?is)(?:^|\n)\s*(?:message|customer message|lead message|customer replied|customer says|customer wrote)\s*:\s*(?P<msg>.+?)(?=\n\s*(?:reply here|replies? to this|respond via|to reply|view lead|open in local services|google local services|local services ads|prevolt\s*[•:\-]|from:|subject:|on .+ wrote:)|\Z)",
+        r"(?is)(?:^|\n)\s*customer\s*[•:\-][^\n]*\n(?P<msg>.+?)(?=\n\s*(?:prevolt\s*[•:\-]|reply here|replies? to this|respond via|to reply|google local services|local services ads|from:|subject:|on .+ wrote:)|\Z)",
+        r"(?is)(?:^|\n)\s*customer\s*:\s*(?P<msg>.+?)(?=\n\s*(?:prevolt\s*[•:\-]|reply here|replies? to this|respond via|to reply|google local services|local services ads|from:|subject:|on .+ wrote:)|\Z)",
+    ]
+    for pat in labelled_patterns:
+        m = re.search(pat, raw)
+        if m:
+            cleaned = _clean_lsa_candidate(m.group("msg"))
+            if cleaned:
+                return cleaned
 
-    msg = m.group(1).strip()
-    # Remove common truncation markers and dashboard fragments.
-    msg = re.sub(r"\s*\[\.\.\.\]\s*$", "", msg).strip()
-    msg = re.split(r"\b(?:Reply here|Replies to this number|respond via LSA dashboard|https://g\.co/homeservices)\b", msg, maxsplit=1, flags=re.I)[0].strip()
-    return msg or None
+    # 2) No label, but definitely an LSA/email relay. Strip known junk and keep the human text.
+    if is_google_lsa_platform_notice(raw):
+        cleaned = _clean_lsa_candidate(raw)
+        if cleaned:
+            return cleaned
 
+    return None
 def is_pure_lsa_platform_notice(text: str) -> bool:
     """Wrapper/instruction only. These must update metadata at most, never generate a customer reply."""
     return is_google_lsa_platform_notice(text) and not extract_lsa_customer_message(text)
