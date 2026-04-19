@@ -3,7 +3,6 @@ import json
 import sqlite3
 import time
 import uuid
-import re
 from pathlib import Path
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
@@ -122,225 +121,41 @@ def _intent_text(*parts) -> str:
     joined = " ".join(str(p or "") for p in parts)
     return re.sub(r"\s+", " ", joined).strip().lower()
 
-def _normalize_relay_text(text: str) -> str:
-    """Normalize SMS/email-relay payload text without changing customer wording."""
-    try:
-        import html as _html
-        text = _html.unescape(str(text or ""))
-    except Exception:
-        text = str(text or "")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\u00a0", " ").replace("\u200b", "")
-    return text.strip()
-
-
-def extract_lsa_lead_metadata(text: str) -> dict:
-    """Best-effort extraction of Google LSA relay metadata without treating it as customer text."""
-    raw = _normalize_relay_text(text)
-    meta = {}
-    if not raw:
-        return meta
-
-    # Google often sends this as one long line:
-    # Customer Name: Kyle, Location: Windsor Locks, Service: electric_car_charger, Message: ...
-    patterns = {
-        "customer_name": r"\bCustomer\s+Name\s*:\s*(.+?)(?=\s*,\s*(?:Location|Service|Message)\s*:|\n|$)",
-        "location": r"\bLocation\s*:\s*(.+?)(?=\s*,\s*(?:Service|Message|Customer Name)\s*:|\n|$)",
-        "service": r"\bService\s*:\s*(.+?)(?=\s*,\s*(?:Message|Location|Customer Name)\s*:|\n|$)",
-    }
-    for key, pat in patterns.items():
-        m = re.search(pat, raw, flags=re.I | re.S)
-        if m:
-            val = re.sub(r"\s+", " ", m.group(1)).strip(" ,.;\t\n\r")
-            if val:
-                meta[key] = val
-    return meta
-
-
 def is_google_lsa_platform_notice(text: str) -> bool:
-    """True when the inbound body appears to be Google Local Services / LSA relay clutter."""
-    low = _intent_text(_normalize_relay_text(text))
+    """True for Google LSA wrapper/instruction notices that are not customer-authored content."""
+    low = _intent_text(text)
     if not low:
         return False
-
-    strong_indicators = [
-        "google local services ads",
-        "google local services",
-        "local services ads",
-        "local services lead",
-        "local service ad",
-        "lsa dashboard",
-        "g.co/homeservices",
-        "google guaranteed",
-        "this customer requested only message replies",
-        "replies to this number will be sent to the customer",
-        "reply here or respond via",
-        "respond via your lsa dashboard",
-        "view this lead in local services",
-        "new message from a customer",
-        "you have a new message from a customer",
-    ]
-    if any(p in low for p in strong_indicators):
-        return True
-
-    # Google relay emails sometimes arrive as a timeline containing Customer/Prevolt turns.
-    return bool(re.search(r"(?is)(^|\n)\s*customer\s*[•:\-].+?\n.+?(\n\s*prevolt\s*[•:\-]|$)", _normalize_relay_text(text)))
-
-
-def _clean_lsa_candidate(msg: str) -> str | None:
-    """Remove Google/Twilio/email-chain boilerplate from an already-selected candidate."""
-    msg = _normalize_relay_text(msg)
-    if not msg:
-        return None
-
-    # Stop before quoted history, Prevolt's previous reply, or Google reply instructions.
-    stop_patterns = [
-        # Inline Google relay notes can appear on the same physical SMS line
-        # immediately after the customer message. These must be stripped before
-        # the platform/noise filters see the line and throw it away.
-        r"\s*\[\s*Notes\s+from\s+LSA\s*:",
-        r"\s*\bNotes\s+from\s+LSA\s*:",
-        r"\s*\bThis customer requested only message replies\b",
-        r"\s*\bReply here\b",
-        r"\s*\bReplies? to this (?:number|email)\b",
-        r"\s*\bRespond via\b",
-        r"\s*https?://g\.co/homeservices\b",
-        r"\n\s*Prevolt\s*[•:\-]",
-        r"\n\s*Reply here\b",
-        r"\n\s*Replies? to this (?:number|email)\b",
-        r"\n\s*Respond via\b",
-        r"\n\s*To reply\b",
-        r"\n\s*View (?:this )?lead\b",
-        r"\n\s*Open in Local Services\b",
-        r"\n\s*Google Local Services\b",
-        r"\n\s*Local Services Ads\b",
-        r"\n\s*https?://g\.co/homeservices\b",
-        r"\n\s*On .+ wrote:\s*$",
-        r"\n\s*-{2,}\s*Original Message\s*-{2,}",
-    ]
-    for pat in stop_patterns:
-        msg = re.split(pat, msg, maxsplit=1, flags=re.I | re.S)[0].strip()
-
-    # Drop quoted email-chain lines and obvious relay/header lines.
-    cleaned_lines = []
-    noise_line_patterns = [
-        r"^\s*>",
-        r"^\s*(from|to|cc|bcc|subject|date|sent):\b",
-        r"^\s*(customer|prevolt)\s*[•:\-]\s*(?:just now|\d+\s*(?:sec|second|min|minute|hr|hour|day)s?\s*ago)?\s*$",
-        r"google local services",
-        r"local services ads",
-        r"lsa dashboard",
-        r"g\.co/homeservices",
-        r"reply here",
-        r"respond via",
-        r"replies? to this (?:number|email)",
-        r"this customer requested only message replies",
-        r"you have a new message from a customer",
-        r"new message from a customer",
-        r"view (?:this )?lead",
-        r"open in local services",
-        r"unsubscribe",
-        r"privacy policy",
-        r"terms of service",
-    ]
-    for line in msg.split("\n"):
-        line = re.sub(r"\s+", " ", line).strip()
-        if not line:
-            continue
-        if any(re.search(pat, line, flags=re.I) for pat in noise_line_patterns):
-            # Preserve inline Customer: actual message if present.
-            m = re.match(r"^\s*customer\s*[:\-]\s*(.+)$", line, flags=re.I)
-            if m and m.group(1).strip():
-                cleaned_lines.append(m.group(1).strip())
-            continue
-        cleaned_lines.append(line)
-
-    msg = " ".join(cleaned_lines)
-    msg = re.sub(r"\s+", " ", msg).strip(" \t\n\r\"'")
-
-    # Remove email-relay lead-in wording if it survived on the same line as the message.
-    leadin_patterns = [
-        r"^(?:hi|hello)\s+prevolt(?:\s+electric)?[,\s]+",
-        r"^you have (?:a )?new message from (?:a )?customer[:\s]+",
-        r"^new message from (?:a )?customer[:\s]+",
-        r"^customer(?: wrote| says| replied)?[:\s]+",
-        r"^message[:\s]+",
-        r"^lead message[:\s]+",
-        r"^customer message[:\s]+",
-    ]
-    changed = True
-    while changed:
-        changed = False
-        for pat in leadin_patterns:
-            new_msg = re.sub(pat, "", msg, flags=re.I).strip()
-            if new_msg != msg:
-                msg = new_msg
-                changed = True
-
-    if not msg:
-        return None
-
-    # If what remains is only platform language, do not let it enter booking flow.
-    low = _intent_text(msg)
-    platform_only = [
-        "reply here", "respond via", "local services ads", "google local services",
-        "lsa dashboard", "g.co/homeservices", "this customer requested only message replies",
-        "replies to this number will be sent to the customer",
-    ]
-    if any(p in low for p in platform_only) and len(low.split()) < 14:
-        return None
-
-    return msg
-
+    return (
+        "google local services ads" in low
+        or "local services ads" in low
+        or "g.co/homeservices" in low
+        or "lsa dashboard" in low
+        or "replies to this number will be sent to the customer" in low
+        or "this customer requested only message replies" in low
+        or "respond via your lsa dashboard" in low
+        or "reply here or respond via" in low
+    )
 
 def extract_lsa_customer_message(text: str) -> str | None:
     """
-    Extract the true customer-authored message from Google Local Services / LSA relay text.
-
-    This intentionally acts like a sanitizer, not a separate booking lane:
-    - if Google sends a wrapper with Message:, Customer message:, etc., return only that payload;
-    - if Google sends an email-thread/timeline body, strip the relay clutter and return the newest customer text;
-    - if it is only platform instructions, return None so the webhook can suppress it.
+    Extract the true customer-authored message from Google LSA wrapper text.
+    Returns None for pure platform notices with no customer message payload.
     """
-    raw = _normalize_relay_text(text)
+    raw = str(text or "").strip()
     if not raw:
         return None
 
-    # 0) Google frequently sends all metadata on one line, with Message: buried
-    # after Customer Name / Location / Service. The old line-start regex missed
-    # this and then the noise filter discarded the whole line as platform clutter.
-    inline_msg = re.search(r"(?is)\b(?:Message|Customer Message|Lead Message)\s*:\s*(?P<msg>.+)$", raw)
-    if inline_msg:
-        candidate = inline_msg.group("msg")
-        candidate = re.split(
-            r"(?is)\s*(?:\[\s*Notes\s+from\s+LSA\s*:|\bNotes\s+from\s+LSA\s*:|\bThis customer requested only message replies\b|\bReply here\b|\bReplies? to this (?:number|email)\b|\bRespond via\b|https?://g\.co/homeservices\b)",
-            candidate,
-            maxsplit=1,
-        )[0].strip()
-        cleaned = _clean_lsa_candidate(candidate)
-        if cleaned:
-            return cleaned
+    m = re.search(r"\bMessage:\s*(.+)$", raw, flags=re.I | re.S)
+    if not m:
+        return None
 
-    # 1) Explicit labelled payloads. These are safest and should win first.
-    labelled_patterns = [
-        r"(?is)(?:^|\n)\s*(?:message|customer message|lead message|customer replied|customer says|customer wrote)\s*:\s*(?P<msg>.+?)(?=\n\s*(?:reply here|replies? to this|respond via|to reply|view lead|open in local services|google local services|local services ads|prevolt\s*[•:\-]|from:|subject:|on .+ wrote:)|\Z)",
-        r"(?is)(?:^|\n)\s*customer\s*[•:\-][^\n]*\n(?P<msg>.+?)(?=\n\s*(?:prevolt\s*[•:\-]|reply here|replies? to this|respond via|to reply|google local services|local services ads|from:|subject:|on .+ wrote:)|\Z)",
-        r"(?is)(?:^|\n)\s*customer\s*:\s*(?P<msg>.+?)(?=\n\s*(?:prevolt\s*[•:\-]|reply here|replies? to this|respond via|to reply|google local services|local services ads|from:|subject:|on .+ wrote:)|\Z)",
-    ]
-    for pat in labelled_patterns:
-        m = re.search(pat, raw)
-        if m:
-            cleaned = _clean_lsa_candidate(m.group("msg"))
-            if cleaned:
-                return cleaned
+    msg = m.group(1).strip()
+    # Remove common truncation markers and dashboard fragments.
+    msg = re.sub(r"\s*\[\.\.\.\]\s*$", "", msg).strip()
+    msg = re.split(r"\b(?:Reply here|Replies to this number|respond via LSA dashboard|https://g\.co/homeservices)\b", msg, maxsplit=1, flags=re.I)[0].strip()
+    return msg or None
 
-    # 2) No label, but definitely an LSA/email relay. Strip known junk and keep the human text.
-    if is_google_lsa_platform_notice(raw):
-        cleaned = _clean_lsa_candidate(raw)
-        if cleaned:
-            return cleaned
-
-    return None
 def is_pure_lsa_platform_notice(text: str) -> bool:
     """Wrapper/instruction only. These must update metadata at most, never generate a customer reply."""
     return is_google_lsa_platform_notice(text) and not extract_lsa_customer_message(text)
@@ -558,17 +373,7 @@ def looks_like_initial_service_booking_request(conv: dict, inbound_text: str = "
         "availability", "available", "when can", "please let me know",
         "let me know availability", "appointment", "schedule", "come out"
     ]
-    has_service_term = any(t in low for t in service_terms)
-    has_availability_term = any(t in low for t in availability_terms)
-
-    # Google Local Services first messages often sound like: "I was interested
-    # in having outlets installed" and do not include the word "schedule" or
-    # "availability" yet. Once the LSA wrapper is stripped, this is still a
-    # paid service lead and should enter the normal $195 evaluation flow.
-    if (conv.get("source") or "").strip() == "google_lsa" and has_service_term:
-        return True
-
-    return has_service_term and has_availability_term
+    return any(t in low for t in service_terms) and any(t in low for t in availability_terms)
 
 
 def build_initial_service_booking_reply(conv: dict, inbound_text: str = "") -> str:
@@ -591,28 +396,16 @@ def build_initial_service_booking_reply(conv: dict, inbound_text: str = "") -> s
         pass
 
     low = _intent_text(inbound_text)
-
-    update_address_assembly_state(sched)
-    if not sched.get("address_verified"):
-        sched["pending_step"] = "need_address"
-        if sched.get("raw_address") and not re.match(r"^\d{1,6}\b", str(sched.get("raw_address") or "").strip()):
-            address_question = f"What is the house number and street name in {str(sched.get('raw_address')).strip()}?"
-        else:
-            address_question = "What is the address for the visit?"
-    else:
-        sched["pending_step"] = "need_date"
-        address_question = "What day works best for you?"
-
     if "meter bank" in low or "6-gang" in low or "six gang" in low or "gang meter" in low:
         return (
             "Hello, you've reached Prevolt Electric. I'll help you here by text. "
             "For the meter bank replacement, we start with a $195 evaluation visit so we can review everything in person and give you a firm number. "
-            f"{address_question}"
+            "What day works best for you?"
         )
 
     return (
         "Hello, you've reached Prevolt Electric. I'll help you here by text. "
-        f"Our evaluation visit is $195. {address_question}"
+        "Our evaluation visit is $195. What day works best for you?"
     )
 
 
@@ -2782,10 +2575,8 @@ def incoming_sms():
 
     # Google LSA can send platform wrappers through the same SMS webhook.
     # Extract customer-authored payloads and suppress pure platform notices.
-    raw_platform_text = inbound_text
-    lsa_lead_metadata = extract_lsa_lead_metadata(raw_platform_text)
-    lsa_customer_message = extract_lsa_customer_message(raw_platform_text)
-    if is_pure_lsa_platform_notice(raw_platform_text):
+    lsa_customer_message = extract_lsa_customer_message(inbound_text)
+    if is_pure_lsa_platform_notice(inbound_text):
         try:
             log_event("SMS_PLATFORM_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
         except Exception:
@@ -2794,15 +2585,6 @@ def incoming_sms():
     if lsa_customer_message:
         inbound_text = lsa_customer_message
         inbound_low = inbound_text.lower().strip()
-        try:
-            log_event("SMS_PLATFORM_EXTRACTED", phone, {
-                "sid": inbound_sid,
-                "raw_body": _safe_monitor_text(raw_platform_text),
-                "customer_message": _safe_monitor_text(inbound_text),
-                "metadata": lsa_lead_metadata,
-            })
-        except Exception:
-            pass
 
     try:
         log_event("SMS_IN", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
@@ -2928,29 +2710,6 @@ def incoming_sms():
     # Emergency flags (used by incoming_sms patch logic too)
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
-
-    # Apply Google LSA relay metadata as hints only. The customer message still
-    # flows through the normal booking engine; this just prevents the monitor/name
-    # state from looking blank and lets a town hint produce a better address prompt.
-    if lsa_customer_message:
-        conv["source"] = "google_lsa"
-        if lsa_lead_metadata:
-            conv["lsa_lead_metadata"] = lsa_lead_metadata
-        customer_name = (lsa_lead_metadata.get("customer_name") or "").strip() if isinstance(lsa_lead_metadata, dict) else ""
-        if customer_name and not profile.get("active_first_name"):
-            parts = [p for p in re.split(r"\s+", customer_name) if p]
-            if parts:
-                profile["active_first_name"] = parts[0]
-                profile["first_name"] = parts[0]
-                if len(parts) > 1 and not profile.get("active_last_name"):
-                    profile["active_last_name"] = " ".join(parts[1:])
-                    profile["last_name"] = " ".join(parts[1:])
-                profile["identity_source"] = "google_lsa_customer_name"
-        location_hint = (lsa_lead_metadata.get("location") or "").strip() if isinstance(lsa_lead_metadata, dict) else ""
-        if location_hint and not sched.get("raw_address"):
-            sched["raw_address"] = location_hint
-            sched["address_source"] = "google_lsa_location_hint"
-            update_address_assembly_state(sched)
 
     # Non-service / thread-type hard guard before normal booking state can run.
     thread_type = detect_non_service_thread_type(conv, inbound_text, conv.get("category"), conv.get("cleaned_transcript"))
