@@ -205,7 +205,7 @@ def strip_lsa_customer_text_noise(text: str) -> str:
         r"\bNeed help\?\s*We are here for you\b",
         r"\bGoogle LLC\b",
         r"\bYou received this mandatory service announcement\b",
-        r"\bCONFIDENTIAL:\b",
+        r"\bCONFIDENTIAL\s*:",
         r"\bThis email and any files transmitted\b",
     ]
     for pat in cut_patterns:
@@ -261,7 +261,7 @@ def is_google_lsa_thread(conv: dict | None, text: str = "") -> bool:
 
 
 def apply_lsa_customer_name_to_profile(conv: dict, customer_name: str | None) -> None:
-    """Use the LSA form name as identity context without guessing missing pieces."""
+    """Store the LSA form name, but only trust a full non-generic name for booking identity."""
     name = " ".join(str(customer_name or "").split()).strip()
     if not name:
         return
@@ -278,15 +278,83 @@ def apply_lsa_customer_name_to_profile(conv: dict, customer_name: str | None) ->
         return
 
     parts = cleaned.split()
-    if parts and not (profile.get("active_first_name") or profile.get("first_name")):
+    low = cleaned.lower().strip()
+    generic_names = {
+        "john doe", "jane doe", "test test", "test user", "testing testing",
+        "first last", "first name", "last name", "na na", "n a"
+    }
+
+    # LSA often gives only a first name. Do not lock that into active identity,
+    # because a typo in Google's form becomes an awkward prompt like
+    # "Kile, what is your last name?" Store it only as metadata until the
+    # customer confirms a full name in the booking flow.
+    if len(parts) < 2 or low in generic_names:
+        return
+
+    if not (profile.get("active_first_name") or profile.get("first_name")):
         profile["active_first_name"] = parts[0]
         profile["first_name"] = parts[0]
         profile["identity_source"] = profile.get("identity_source") or "lsa_form_name"
-    if len(parts) >= 2 and not (profile.get("active_last_name") or profile.get("last_name")):
+
+    if not (profile.get("active_last_name") or profile.get("last_name")):
         last = " ".join(parts[1:])
         profile["active_last_name"] = last
         profile["last_name"] = last
         profile["identity_source"] = profile.get("identity_source") or "lsa_form_name"
+
+
+def maybe_apply_direct_name_correction(conv: dict, inbound_text: str) -> str | None:
+    """Handle messages like "it's Toby not John" without restarting intake."""
+    raw = " ".join(str(inbound_text or "").split()).strip()
+    if not raw:
+        return None
+
+    # Keep this narrow so normal service text does not get stolen.
+    patterns = [
+        r"\b(?:it\s*is|it's|its|this\s+is|my\s+name\s+is|name\s+is|i\s+am|i'm)\s+([A-Za-z][A-Za-z'\-]{1,})\s+(?:not|not\s+the\s+name)\s+([A-Za-z][A-Za-z'\-]{1,})\b",
+        r"\b([A-Za-z][A-Za-z'\-]{1,})\s+not\s+([A-Za-z][A-Za-z'\-]{1,})\b",
+    ]
+    candidate = None
+    for pat in patterns:
+        m = re.search(pat, raw, flags=re.I)
+        if m:
+            candidate = normalize_person_name(m.group(1))
+            break
+
+    if not candidate:
+        return None
+
+    # Guard against capturing scheduling/service words as names.
+    if candidate.lower() in {
+        "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday",
+        "friday", "saturday", "sunday", "address", "email", "appointment",
+        "service", "quote", "estimate"
+    }:
+        return None
+
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+
+    old_first = (profile.get("active_first_name") or profile.get("first_name") or "").strip()
+    old_last = (profile.get("active_last_name") or profile.get("last_name") or "").strip()
+    old_source = (profile.get("identity_source") or "").strip()
+
+    profile["active_first_name"] = candidate
+    profile["first_name"] = candidate
+    profile["identity_source"] = "customer_provided"
+
+    # If the old identity came from a generic/test/Square/voicemail source and
+    # the customer is correcting only the first name, do not keep a stale last
+    # name attached to the wrong person.
+    if old_first and old_first.lower() != candidate.lower():
+        if old_last.lower() in {"doe", "test", "user"} or old_source not in {"customer_provided", "customer_provided_full_name"}:
+            profile["active_last_name"] = None
+            profile["last_name"] = None
+
+    sched["intro_sent"] = True
+    sched["name_engine_state"] = None
+    sched["name_engine_prompted"] = False
+    return candidate
 
 
 def lsa_has_emergency_signal(text: str) -> bool:
@@ -3035,6 +3103,21 @@ def incoming_sms():
                     pass
                 return Response(str(MessagingResponse()), mimetype="text/xml")
 
+    # Google LSA email replies can arrive as bare follow-up relay texts after a
+    # deploy or memory reset, with no wrapper and no known google_lsa state.
+    # Strip obvious email signature debris globally before the monitor sees it.
+    if re.search(r"\bCONFIDENTIAL\s*:", inbound_text or "", flags=re.I) or re.search(r"\bThis email and any files transmitted\b", inbound_text or "", flags=re.I):
+        cleaned_signature_text = strip_lsa_customer_text_noise(inbound_text)
+        if cleaned_signature_text:
+            inbound_text = cleaned_signature_text
+            inbound_low = inbound_text.lower().strip()
+        else:
+            try:
+                log_event("SMS_SIGNATURE_ONLY_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(raw_inbound_text)})
+            except Exception:
+                pass
+            return Response(str(MessagingResponse()), mimetype="text/xml")
+
     try:
         log_event("SMS_IN", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
     except Exception:
@@ -3174,6 +3257,28 @@ def incoming_sms():
     profile.setdefault("square_lookup_done", False)
     # keep customer_type if it exists (from call flow)
     profile.setdefault("customer_type", profile.get("customer_type"))
+
+    name_correction_first = maybe_apply_direct_name_correction(conv, inbound_text)
+    if name_correction_first:
+        sched = conv.setdefault("sched", {})
+        profile = conv.setdefault("profile", {})
+        if sched.get("appointment_type"):
+            try:
+                recompute_pending_step(profile, sched)
+                next_prompt = choose_next_prompt_from_state(conv, inbound_text="")
+            except Exception:
+                next_prompt = "What is your last name?"
+            body = next_prompt or f"Got it, {name_correction_first}. What is your last name?"
+        else:
+            body = f"Got it, {name_correction_first}. What can I help you with?"
+        conv["last_sms_body"] = body
+        try:
+            log_event("SMS_NAME_CORRECTION", phone, {"body": _safe_monitor_text(body), "first_name": name_correction_first}, conv)
+        except Exception:
+            pass
+        resp = MessagingResponse()
+        resp.message(body)
+        return Response(str(resp), mimetype="text/xml")
 
     current_job = conv.setdefault("current_job", {})
     current_job.setdefault("job_type", None)
