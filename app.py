@@ -433,7 +433,9 @@ def looks_like_lsa_quote_or_service_lead(text: str) -> bool:
     quote_terms = [
         "how much", "cost", "price", "quote", "estimate", "looking for an estimate",
         "looking for a quote", "requested a quote", "looking to", "need", "needs",
-        "can you help", "help with", "looking for"
+        "can you help", "help with", "looking for", "interested in",
+        "interested", "was interested", "i was interested", "getting",
+        "get a", "have a", "having", "wanted", "want to", "would like"
     ]
     scheduling_terms = [
         "availability", "available", "appointment", "schedule", "come out",
@@ -3116,7 +3118,18 @@ def incoming_sms():
     lsa_payload_fields = extract_lsa_payload_fields(raw_inbound_text)
     lsa_customer_message = extract_lsa_customer_message(raw_inbound_text)
 
-    if is_lsa_self_echo_or_dirty_business_reply(raw_inbound_text):
+    # Important: Google can relay a customer's EMAIL reply inside a fresh LSA
+    # wrapper, and that email can contain the customer's signature. Do not
+    # suppress the whole inbound just because the raw wrapper contains Prevolt
+    # signature markers. First strip the signature and preserve any real
+    # customer-authored content before it, such as a name/address/time.
+    cleaned_lsa_message_for_gate = strip_lsa_customer_text_noise(lsa_customer_message) if lsa_customer_message else ""
+    has_usable_lsa_customer_message = bool(
+        cleaned_lsa_message_for_gate
+        and not is_lsa_self_echo_or_dirty_business_reply(cleaned_lsa_message_for_gate)
+    )
+
+    if is_lsa_self_echo_or_dirty_business_reply(raw_inbound_text) and not has_usable_lsa_customer_message:
         log_lsa_suppressed(phone, inbound_sid, raw_inbound_text, "raw_pre_log")
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
@@ -3128,10 +3141,9 @@ def incoming_sms():
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
     if lsa_customer_message:
-        cleaned_lsa_message = strip_lsa_customer_text_noise(lsa_customer_message)
+        cleaned_lsa_message = cleaned_lsa_message_for_gate or strip_lsa_customer_text_noise(lsa_customer_message)
         if (
             not cleaned_lsa_message
-            or is_lsa_self_echo_or_dirty_business_reply(lsa_customer_message)
             or is_lsa_self_echo_or_dirty_business_reply(cleaned_lsa_message)
         ):
             log_lsa_suppressed(phone, inbound_sid, raw_inbound_text, "lsa_payload_signature_or_echo")
