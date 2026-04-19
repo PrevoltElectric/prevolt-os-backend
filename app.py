@@ -207,6 +207,15 @@ def strip_lsa_customer_text_noise(text: str) -> str:
         r"\bYou received this mandatory service announcement\b",
         r"\bCONFIDENTIAL\s*:",
         r"\bThis email and any files transmitted\b",
+        # Inline email signatures often arrive on one line through the Google
+        # relay, e.g. "kyle prevost Kyle Prevost Owner Office: ...". Cut the
+        # signature while preserving the customer-provided name before it.
+        r"\bKyle\s+Prevost\s+(?:Owner|Office)\b",
+        r"\bOwner\s+Office\s*:",
+        r"\bOffice\s*:\s*860[-\s]*758[-\s]*0707\b",
+        r"\bprevoltelectric@gmail\.com\b",
+        r"\bWebsite\s*:\s*https?://prevolt",
+        r"\bNow accepting online bookings\b",
     ]
     for pat in cut_patterns:
         raw = re.split(pat, raw, maxsplit=1, flags=re.I | re.S)[0].strip()
@@ -231,24 +240,56 @@ def strip_lsa_customer_text_noise(text: str) -> str:
 
 def is_lsa_self_echo_or_dirty_business_reply(text: str) -> bool:
     """
-    True when Google relays Prevolt's own dashboard/email response back into
-    Twilio. These must never generate another automated reply.
+    True when Google relays Prevolt's own dashboard/email response or email
+    signature back into Twilio. These must never generate another automated
+    reply and must not pollute the monitor as a customer message.
     """
-    low = _intent_text(text)
-    if not low:
+    raw = str(text or "")
+    low = _intent_text(raw)
+    loose = re.sub(r"[^a-z0-9]+", " ", raw.lower())
+    loose = " ".join(loose.split())
+    if not loose:
         return False
-    return (
-        "prevolt sent you a response" in low
-        or "prevolt wrote" in low
-        or (
-            "kyle prevost" in low
-            and ("prevoltelectric gmail com" in low or "prevoltllc com" in low)
+
+    if "prevolt sent you a response" in low or "prevolt wrote" in low:
+        return True
+
+    # A real customer can be named Kyle Prevost, so do NOT suppress on the name
+    # alone. Suppress only when the relay includes signature/business markers.
+    has_kyle_signature = "kyle prevost" in loose and any(marker in loose for marker in [
+        "owner office", "office 860 758 0707", "prevoltelectric gmail com",
+        "prevoltllc com", "website https prevolt", "now accepting online bookings"
+    ])
+    if has_kyle_signature:
+        return True
+
+    if "office 860 758 0707" in loose and "prevolt" in loose:
+        return True
+    if "prevoltelectric gmail com" in loose and "prevolt" in loose:
+        return True
+    if "prevoltllc com" in loose and "prevolt" in loose:
+        return True
+
+    return False
+
+
+def log_lsa_suppressed(phone: str, inbound_sid: str, raw_text: str, reason: str, conv: dict | None = None) -> None:
+    """Monitor-safe LSA suppression log. Keep raw Google/signature sludge out of the UI body."""
+    try:
+        log_event(
+            "SMS_LSA_SELF_ECHO_SUPPRESSED",
+            phone,
+            {
+                "sid": inbound_sid,
+                "body": "[Google LSA email/signature echo suppressed]",
+                "raw_excerpt": _safe_monitor_text(raw_text, 120),
+                "reason": reason,
+                "source": "google_lsa",
+            },
+            conv,
         )
-        or (
-            "office 860 758 0707" in low
-            and "prevolt" in low
-        )
-    )
+    except Exception:
+        pass
 
 
 def is_google_lsa_thread(conv: dict | None, text: str = "") -> bool:
@@ -3070,21 +3111,26 @@ def incoming_sms():
     lsa_customer_message = extract_lsa_customer_message(raw_inbound_text)
 
     if is_lsa_self_echo_or_dirty_business_reply(raw_inbound_text):
-        try:
-            log_event("SMS_LSA_SELF_ECHO_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(raw_inbound_text)})
-        except Exception:
-            pass
+        log_lsa_suppressed(phone, inbound_sid, raw_inbound_text, "raw_pre_log")
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
     if is_pure_lsa_platform_notice(raw_inbound_text):
         try:
-            log_event("SMS_PLATFORM_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(raw_inbound_text), "source": "google_lsa"})
+            log_event("SMS_PLATFORM_SUPPRESSED", phone, {"sid": inbound_sid, "body": "[Google LSA platform notice suppressed]", "raw_excerpt": _safe_monitor_text(raw_inbound_text, 120), "source": "google_lsa"})
         except Exception:
             pass
         return Response(str(MessagingResponse()), mimetype="text/xml")
 
     if lsa_customer_message:
-        inbound_text = strip_lsa_customer_text_noise(lsa_customer_message)
+        cleaned_lsa_message = strip_lsa_customer_text_noise(lsa_customer_message)
+        if (
+            not cleaned_lsa_message
+            or is_lsa_self_echo_or_dirty_business_reply(lsa_customer_message)
+            or is_lsa_self_echo_or_dirty_business_reply(cleaned_lsa_message)
+        ):
+            log_lsa_suppressed(phone, inbound_sid, raw_inbound_text, "lsa_payload_signature_or_echo")
+            return Response(str(MessagingResponse()), mimetype="text/xml")
+        inbound_text = cleaned_lsa_message
         inbound_low = inbound_text.lower().strip()
     else:
         # Follow-up relay messages usually do not repeat the full LSA wrapper.
@@ -3097,10 +3143,7 @@ def incoming_sms():
                 inbound_text = cleaned_existing_lsa
                 inbound_low = inbound_text.lower().strip()
             if not inbound_text or is_lsa_self_echo_or_dirty_business_reply(inbound_text):
-                try:
-                    log_event("SMS_LSA_SELF_ECHO_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(raw_inbound_text), "reason": "pre_log_existing_lsa"}, existing_conv)
-                except Exception:
-                    pass
+                log_lsa_suppressed(phone, inbound_sid, raw_inbound_text, "pre_log_existing_lsa", existing_conv)
                 return Response(str(MessagingResponse()), mimetype="text/xml")
 
     # Google LSA email replies can arrive as bare follow-up relay texts after a
@@ -3113,7 +3156,7 @@ def incoming_sms():
             inbound_low = inbound_text.lower().strip()
         else:
             try:
-                log_event("SMS_SIGNATURE_ONLY_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(raw_inbound_text)})
+                log_event("SMS_SIGNATURE_ONLY_SUPPRESSED", phone, {"sid": inbound_sid, "body": "[Email signature suppressed]", "raw_excerpt": _safe_monitor_text(raw_inbound_text, 120)})
             except Exception:
                 pass
             return Response(str(MessagingResponse()), mimetype="text/xml")
@@ -3191,10 +3234,7 @@ def incoming_sms():
             inbound_text = cleaned_lsa_followup
             inbound_low = inbound_text.lower().strip()
         if not inbound_text or is_lsa_self_echo_or_dirty_business_reply(inbound_text):
-            try:
-                log_event("SMS_LSA_SELF_ECHO_SUPPRESSED", phone, {"sid": inbound_sid, "body": _safe_monitor_text(raw_inbound_text), "reason": "post_clean"}, conv)
-            except Exception:
-                pass
+            log_lsa_suppressed(phone, inbound_sid, raw_inbound_text, "post_clean", conv)
             return Response(str(MessagingResponse()), mimetype="text/xml")
 
     # Twilio and WhatsApp can occasionally retry the same inbound webhook.
