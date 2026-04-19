@@ -274,19 +274,21 @@ def is_lsa_self_echo_or_dirty_business_reply(text: str) -> bool:
 
 
 def log_lsa_suppressed(phone: str, inbound_sid: str, raw_text: str, reason: str, conv: dict | None = None) -> None:
-    """Monitor-safe LSA suppression log. Keep raw Google/signature sludge out of the UI body."""
+    """
+    Suppress Google LSA email/signature echoes without creating monitor timeline
+    noise. The previous v7 implementation wrote a synthetic monitor event, but
+    the front desk UI rendered that as an Update and sometimes dumped debug JSON.
+    For self-echoes/signatures, silence is safer: no customer reply, no UI card.
+    """
     try:
-        log_event(
-            "SMS_LSA_SELF_ECHO_SUPPRESSED",
-            phone,
+        print(
+            "[LSA_SUPPRESSED]",
             {
+                "phone": phone,
                 "sid": inbound_sid,
-                "body": "[Google LSA email/signature echo suppressed]",
-                "raw_excerpt": _safe_monitor_text(raw_text, 120),
                 "reason": reason,
-                "source": "google_lsa",
+                "raw_excerpt": _safe_monitor_text(raw_text, 120),
             },
-            conv,
         )
     except Exception:
         pass
@@ -611,14 +613,18 @@ def enforce_lsa_outbound_safety(conv: dict, inbound_text: str, outbound_text: st
             "Final pricing is reviewed on site before any installation work moves forward."
         )
 
-    # Do not re-open an active Google relay thread with a new greeting.
-    body = re.sub(
-        r"^(?:hello|hi)[^.!?]{0,80}prevolt electric[.!?]\s*",
-        "",
-        body,
-        flags=re.I,
-    ).strip()
-    body = re.sub(r"^let'?s get this lined up[.!?]?\s*", "", body, flags=re.I).strip()
+    # Do not re-open an active Google relay thread with a new greeting after
+    # we have already sent a message in this thread. Keep the first opener
+    # intact so new leads still receive the normal branded intro.
+    had_prior_outbound = bool((conv.get("last_sms_body") or "").strip())
+    if had_prior_outbound:
+        body = re.sub(
+            r"^(?:hello|hi)[^.!?]{0,80}prevolt electric[.!?]\s*",
+            "",
+            body,
+            flags=re.I,
+        ).strip()
+        body = re.sub(r"^let'?s get this lined up[.!?]?\s*", "", body, flags=re.I).strip()
     return body
 
 def looks_like_employment_inquiry(*parts) -> bool:
@@ -3377,6 +3383,24 @@ def incoming_sms():
                 tw = MessagingResponse()
                 tw.message(lsa_entry_reply)
                 return Response(str(tw), mimetype="text/xml")
+
+        # If the first Google relay message arrives without a recognizable LSA
+        # wrapper, it can look like a normal SMS from a random relay number.
+        # Quote/install/repair first messages should still receive the same safe
+        # evaluation opener instead of falling into the generic address prompt.
+        if not sched.get("appointment_type") and looks_like_lsa_quote_or_service_lead(inbound_text):
+            entry_reply = build_lsa_eval_entry_reply(conv, inbound_text)
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = entry_reply
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(entry_reply), "source": "service_entry", "eval_entry": True}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(entry_reply)
+            return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms LSA safety/entry guard failed:", repr(e))
 
