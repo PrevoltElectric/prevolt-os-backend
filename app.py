@@ -3,6 +3,7 @@ import json
 import sqlite3
 import time
 import uuid
+import re
 from pathlib import Path
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
@@ -121,6 +122,155 @@ def _intent_text(*parts) -> str:
     joined = " ".join(str(p or "") for p in parts)
     return re.sub(r"\s+", " ", joined).strip().lower()
 
+
+# ---------------------------------------------------
+# Production Safety Guards — customer intent first
+# ---------------------------------------------------
+def _loose_bool_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9@.+#\-\s]", " ", _intent_text(text))
+
+
+def looks_like_invalid_voicemail_transcript(text: str) -> bool:
+    """Detect prompt leaks / non-voicemails before any SMS is sent."""
+    low = _intent_text(text)
+    if not low:
+        return True
+    prompt_leaks = [
+        "please provide the voicemail transcription",
+        "please provide the transcript",
+        "please provide the voicemail",
+        "the voicemail transcription you want cleaned up",
+        "the voicemail transcription you would like me to clean up",
+        "i can help clean up",
+        "as an ai",
+    ]
+    if any(p in low for p in prompt_leaks):
+        return True
+
+    # Abandoned voicemail / no actual lead. Do not text these people asking for an address.
+    compact = re.sub(r"[^a-z0-9]+", " ", low).strip()
+    non_messages = {
+        "bye", "bye bye", "goodbye", "hello", "hello hello", "test", "testing",
+        "um", "uh", "no message", "nothing", "wrong number",
+    }
+    if compact in non_messages:
+        return True
+
+    service_signal = re.search(
+        r"\b(?:electric|electrician|outlet|switch|panel|breaker|light|lighting|fan|charger|ev|wire|wiring|power|smoke|detector|quote|estimate|install|repair|replace|service|call back|appointment|schedule)\b",
+        low,
+        flags=re.I,
+    )
+    has_phone_or_address = bool(re.search(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", low)) or bool(extract_service_address_from_text(text))
+    if len(compact.split()) <= 3 and not service_signal and not has_phone_or_address:
+        return True
+
+    return False
+
+
+def looks_like_vendor_sales_or_spam(*parts) -> bool:
+    """Vendor/sales/prospecting messages must never enter service scheduling."""
+    low = _intent_text(*parts)
+    if not low:
+        return False
+    strong = [
+        "jobber", "field service pros", "save a few hours of paperwork",
+        "stop chasing payments", "software that helps pros", "custom checklists",
+        "lead fees", "limited spots", "2 min apply", "vendor call",
+        "dlmpropertygroup.com", "selected your company for jobs", "website link",
+        "sales rep", "marketing agency", "seo services", "merchant services",
+    ]
+    if any(t in low for t in strong):
+        return True
+    if "apply" in low and ("vendor" in low or "property management" in low or "lead" in low or "limited spots" in low):
+        return True
+    return False
+
+
+def detect_customer_hard_stop(text: str) -> str | None:
+    """Customer's newest message can close the automation regardless of pending_step."""
+    low = _intent_text(text)
+    if not low:
+        return None
+    exact = {"cancel", "disregard", "never mind", "nevermind", "forget it", "stop", "unsubscribe"}
+    if low in exact:
+        return "customer_stop"
+    phrases = [
+        "i found someone", "found someone", "found somebody", "found another electrician",
+        "i am all set", "i'm all set", "all set", "we are all set", "we're all set",
+        "do not schedule", "don't schedule", "dont schedule",
+        "do not book", "don't book", "dont book",
+        "i don't want to schedule", "i dont want to schedule",
+        "i do not want to schedule", "i don't want an appointment", "i dont want an appointment",
+        "no longer need", "don't need service", "dont need service",
+        "call someone else", "going with someone else",
+    ]
+    if any(p in low for p in phrases):
+        return "customer_cancelled_or_found_someone"
+    return None
+
+
+def apply_customer_hard_stop(conv: dict, reason: str, inbound_text: str = "") -> str:
+    sched = conv.setdefault("sched", {})
+    conv["thread_type"] = "closed_lost"
+    sched["customer_hard_stop"] = True
+    sched["booking_allowed"] = False
+    sched["pending_step"] = None
+    sched["manual_only"] = False
+    sched["follow_up_due"] = False
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["closed_reason"] = reason
+    sched["closed_text"] = _safe_monitor_text(inbound_text, 240) if "_safe_monitor_text" in globals() else inbound_text
+    return "No problem. We’ll stop the scheduling messages."
+
+
+def last_outbound_asked_address_confirmation(conv: dict) -> bool:
+    last = _intent_text((conv or {}).get("last_sms_body") or "")
+    if not last:
+        return False
+    return (
+        ("is that correct" in last or "is this for that address" in last or "is this the correct address" in last)
+        and ("address" in last or "i have" in last or "on file" in last or "for the visit" in last)
+    )
+
+
+def is_negative_answer(text: str) -> bool:
+    return _intent_text(text) in {"no", "nope", "nah", "incorrect", "not correct", "wrong", "that's wrong", "thats wrong"}
+
+
+def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str | None:
+    if not (last_outbound_asked_address_confirmation(conv) and is_negative_answer(inbound_text)):
+        return None
+    sched = conv.setdefault("sched", {})
+    if sched.get("raw_address"):
+        sched["rejected_address"] = sched.get("raw_address")
+    sched["raw_address"] = None
+    sched["normalized_address"] = None
+    sched["address_verified"] = False
+    sched["address_missing"] = "street"
+    sched["pending_step"] = "need_address"
+    sched["booking_allowed"] = True
+    return "No problem. What is the correct house number, street, and town for the visit?"
+
+
+def _address_has_house_number_and_street(value: str) -> bool:
+    low = f" {(value or '').lower()} "
+    suffixes = (
+        " st ", " street ", " ave ", " avenue ", " rd ", " road ", " ln ", " lane ",
+        " dr ", " drive ", " ct ", " court ", " cir ", " circle ", " blvd ", " boulevard ",
+        " way ", " pkwy ", " parkway ", " ter ", " terrace ", " park "
+    )
+    return bool(re.match(r"^\s*\d{1,6}(?:-\d{1,6})?[A-Za-z]?\b", value or "")) and any(s in low for s in suffixes)
+
+
+def safe_address_candidate_from_text(text: str) -> str | None:
+    addr = extract_service_address_from_text(text)
+    if addr and is_plausible_address_text(addr):
+        return addr
+    return None
+
 def is_google_lsa_platform_notice(text: str) -> bool:
     """True for Google LSA wrapper/instruction notices that are not customer-authored content."""
     low = _intent_text(text)
@@ -226,7 +376,7 @@ def detect_non_service_thread_type(conv: dict, inbound_text: str = "", category:
     ])
 
     existing = (conv.get("thread_type") or "").strip()
-    if existing in {"employment_inquiry", "commercial_bid_contact", "manual_only"}:
+    if existing in {"employment_inquiry", "commercial_bid_contact", "manual_only", "vendor_sales_or_spam", "closed_lost"}:
         return existing
 
     if is_pure_lsa_platform_notice(inbound_text):
@@ -234,6 +384,9 @@ def detect_non_service_thread_type(conv: dict, inbound_text: str = "", category:
 
     if looks_like_employment_inquiry(history):
         return "employment_inquiry"
+
+    if looks_like_vendor_sales_or_spam(history):
+        return "vendor_sales_or_spam"
 
     # Google Local Services Ads are paid inbound leads. Even if the scope sounds
     # commercial, they should begin the booking/availability flow unless the text
@@ -254,7 +407,7 @@ def clear_service_booking_state_for_non_service(conv: dict, thread_type: str) ->
     sched = conv.setdefault("sched", {})
     sched["pending_step"] = None
     sched["non_service_thread"] = True
-    sched["manual_only"] = thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact"}
+    sched["manual_only"] = thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact", "vendor_sales_or_spam", "wrong_number_or_spam"}
     sched["appointment_type"] = None
     sched["booking_created"] = False
     sched["square_booking_id"] = None
@@ -543,46 +696,81 @@ def extract_service_address_from_text(text: str) -> str | None:
     raw = " ".join(str(text or "").replace("\n", " ").split())
     if not raw:
         return None
-    suffix = r"st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place"
-    m = re.search(
-        rf"\b(?P<addr>\d{{1,6}}[A-Za-z]?\s+[A-Za-z0-9.'\- ]+?\b(?:{suffix})\b(?:\s+[A-Za-z.'\- ]{{2,40}})?)",
-        raw,
+
+    # Avoid treating phone numbers as street addresses.
+    raw_no_phone = re.sub(r"\b\+?1?\s*\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b", " ", raw)
+
+    suffix = r"st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place|park"
+    house = r"\d{1,6}(?:-\d{1,6})?[A-Za-z]?"
+    state = r"CT|C\.?T\.?|Connecticut|MA|M\.?A\.?|Massachusetts|Mass\.??"
+
+    # First try a rich address with optional city/state/zip after the street.
+    pattern = re.compile(
+        rf"\b(?P<addr>{house}\s+[A-Za-z0-9.'#\- ]+?\b(?:{suffix})\b"
+        rf"(?:\s*,?\s*[A-Za-z.'\- ]{{2,40}})?"
+        rf"(?:\s*,?\s*(?:{state}))?"
+        rf"(?:\s+\d{{5}}(?:-\d{{4}})?)?)",
         flags=re.I,
     )
-    if not m:
+    matches = list(pattern.finditer(raw_no_phone))
+    if not matches:
         return None
-    addr = m.group("addr").strip(" ,.;")
+
+    # Prefer the longest plausible match, then clean trailing non-address prose.
+    addr = max((m.group("addr") for m in matches), key=len).strip(" ,.;")
     addr = re.split(
-        r"\s*,\s*(?:please|and|we|woodgate|association|condominium|hoa|message|service)\b",
+        r"\b(?:can you|could you|please|thank you|thanks|i need|we need|i am|i'm|i live|my name|call me|give me a call|disregard|found someone)\b",
         addr,
         maxsplit=1,
         flags=re.I,
     )[0].strip(" ,.;")
-    return addr or None
 
+    # Keep a zip if it was separated by a period after MA/CT, e.g. "Springfield ma. 01109".
+    after = raw_no_phone[raw_no_phone.lower().find(addr.lower()) + len(addr):]
+    z = re.match(r"^[\s,.]*(\d{5}(?:-\d{4})?)\b", after or "")
+    if z and not re.search(r"\b\d{5}(?:-\d{4})?\b", addr):
+        addr = f"{addr} {z.group(1)}".strip()
+
+    return addr or None
 
 def absorb_address_from_mixed_text(conv: dict, inbound_text: str) -> bool:
     """Save a service address embedded in a longer customer message."""
     profile = conv.setdefault("profile", {})
     sched = conv.setdefault("sched", {})
-    if sched.get("raw_address"):
-        return False
     addr = extract_service_address_from_text(inbound_text)
     if not addr:
         return False
-    sched["raw_address"] = addr
-    try:
-        if addr not in profile.setdefault("addresses", []):
-            profile["addresses"].append(addr)
-    except Exception:
-        pass
-    try:
-        try_early_address_normalize(sched)
-    except Exception:
-        pass
-    update_address_assembly_state(sched)
-    return True
 
+    existing = (sched.get("raw_address") or "").strip()
+    update_address_assembly_state(sched)
+    existing_verified = bool(sched.get("address_verified"))
+
+    # Do not overwrite a verified full address unless the customer clearly gave a new full address.
+    if existing_verified and existing and existing.lower() == addr.lower():
+        return False
+    if existing_verified and existing and not _address_has_house_number_and_street(addr):
+        return False
+
+    # Upgrade partial town/zip-only values like "Springfield, 01109" to full street addresses.
+    if (not existing) or (not existing_verified) or _address_has_house_number_and_street(addr):
+        sched["raw_address"] = addr
+        sched["normalized_address"] = None
+        try:
+            if addr not in profile.setdefault("addresses", []):
+                profile["addresses"].append(addr)
+        except Exception:
+            pass
+        try:
+            parsed = parse_complete_raw_address(addr)
+            if parsed:
+                sched["normalized_address"] = parsed
+            else:
+                try_early_address_normalize(sched)
+        except Exception:
+            pass
+        update_address_assembly_state(sched)
+        return True
+    return False
 
 def _local_now() -> datetime:
     tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
@@ -976,6 +1164,11 @@ def _safe_monitor_text(value, limit: int = 280) -> str:
 def _monitor_state_label(conv: dict) -> str:
     sched = (conv or {}).get("sched") or {}
     appt = (sched.get("appointment_type") or "").upper()
+    thread_type = (conv or {}).get("thread_type")
+    if thread_type in {"closed_lost", "vendor_sales_or_spam", "wrong_number_or_spam"} or sched.get("customer_hard_stop"):
+        return "closed"
+    if sched.get("manual_only") or thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact"}:
+        return "manual"
     if sched.get("booking_created") and sched.get("square_booking_id"):
         return "booked"
     if "TROUBLESHOOT" in appt or sched.get("emergency_approved") or sched.get("awaiting_emergency_confirm"):
@@ -1010,6 +1203,16 @@ def _conversation_snapshot(phone: str, conv: dict) -> dict:
         "square_booking_id": sched.get("square_booking_id"),
         "pending_step": sched.get("pending_step"),
         "last_sms_body": conv.get("last_sms_body"),
+        "thread_type": conv.get("thread_type"),
+        "manual_only": bool(sched.get("manual_only")),
+        "customer_hard_stop": bool(sched.get("customer_hard_stop")),
+        "booking_allowed": sched.get("booking_allowed", True),
+        "closed_reason": sched.get("closed_reason"),
+        "address_verified": bool(sched.get("address_verified")),
+        "address_missing": sched.get("address_missing"),
+        "awaiting_slot_offer_choice": bool(sched.get("awaiting_slot_offer_choice")),
+        "offered_slot_options": sched.get("offered_slot_options") or [],
+        "last_ai_reason": sched.get("last_ai_reason"),
         "updated_at": _monitor_now_iso(),
     }
 
@@ -1257,7 +1460,15 @@ def transcribe_recording(recording_url: str) -> str:
 def clean_transcript_text(raw_text: str) -> str:
     """
     Minor cleanup only; does NOT change meaning.
+
+    Hotfix: if Whisper returned no usable text, do NOT ask the LLM
+    to clean an empty string. That was creating prompt-leak transcripts
+    like "Please provide the voicemail transcription..." which then
+    got treated as real customer voicemails.
     """
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return ""
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -1456,6 +1667,12 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
         classification.get("category"),
         conv.get("cleaned_transcript") or ""
     )
+    if thread_type == "vendor_sales_or_spam":
+        clear_service_booking_state_for_non_service(conv, "vendor_sales_or_spam")
+        sched["intro_sent"] = True
+        sched["price_disclosed"] = False
+        sched["booking_allowed"] = False
+        return "Thanks for reaching out. Kyle will review this if needed."
     if thread_type == "employment_inquiry":
         clear_service_booking_state_for_non_service(conv, "employment_inquiry")
         sched["intro_sent"] = True
@@ -1735,11 +1952,35 @@ def voicemail_complete():
         print("[ERROR] voicemail_complete transcription:", repr(e))
         cleaned = ""
 
+    # If the voicemail is empty, abandoned, or a prompt-leak from the cleanup layer,
+    # do not classify it and do not text the caller asking for an address.
+    conv = conversations.setdefault(from_number, {})
+    if looks_like_invalid_voicemail_transcript(cleaned):
+        conv["cleaned_transcript"] = cleaned
+        conv["thread_type"] = "manual_only"
+        sched0 = conv.setdefault("sched", {})
+        sched0["manual_only"] = True
+        sched0["pending_step"] = None
+        sched0["invalid_voicemail_transcript"] = True
+        sched0["booking_allowed"] = False
+        try:
+            log_event("VOICEMAIL_INVALID_SUPPRESSED", from_number, {
+                "recording_url": recording_url,
+                "raw_transcript": _safe_monitor_text(transcript if 'transcript' in locals() else '', 700),
+                "cleaned_transcript": _safe_monitor_text(cleaned, 700),
+                "reason": "invalid_or_non_actionable_voicemail",
+            }, conv)
+        except Exception:
+            pass
+        resp.say("Thank you. Your message has been recorded.")
+        resp.hangup()
+        return Response(str(resp), mimetype="text/xml")
+
     # 2) Classification
     classification = generate_initial_sms(cleaned)
 
     # 3) Save to memory
-    conv = conversations.setdefault(from_number, {})
+    # conv was created above so invalid voicemail suppression can log safely.
 
     # ---------------------------------------------------
     # HYDRATE conversation schema (prevents KeyError later)
@@ -1817,6 +2058,7 @@ def voicemail_complete():
             "intent": classification.get("intent"),
             "task_topics": classification.get("task_topics") or [],
             "transcript": _safe_monitor_text(cleaned, 500),
+            "recording_url": recording_url,
         }, conv)
     except Exception:
         pass
@@ -1997,8 +2239,8 @@ def parse_complete_raw_address(raw: str) -> dict | None:
 
     state_token = r"CT|C\.?T\.?|Connecticut|Conn\.?|MA|M\.?A\.?|Massachusetts|Mass\.?"
     patterns = [
-        rf"^(?P<line1>\d{{1,6}}\s+.+?),\s*(?P<city>[A-Za-z .'\-]+?),\s*(?P<state>{state_token})\s+(?P<zip>\d{{5}}(?:-\d{{4}})?)$",
-        rf"^(?P<line1>\d{{1,6}}\s+.+?)\s+(?P<city>[A-Za-z .'\-]+?)\s+(?P<state>{state_token})\s+(?P<zip>\d{{5}}(?:-\d{{4}})?)$",
+        rf"^(?P<line1>\d{{1,6}}(?:-\d{{1,6}})?[A-Za-z]?\s+.+?),\s*(?P<city>[A-Za-z .'\-]+?),\s*(?P<state>{state_token})\s+(?P<zip>\d{{5}}(?:-\d{{4}})?)$",
+        rf"^(?P<line1>\d{{1,6}}(?:-\d{{1,6}})?[A-Za-z]?\s+.+?)\s+(?P<city>[A-Za-z .'\-]+?)\s+(?P<state>{state_token})\s+(?P<zip>\d{{5}}(?:-\d{{4}})?)$",
     ]
 
     def normalize_state_token(state_raw: str) -> str | None:
@@ -2019,7 +2261,7 @@ def parse_complete_raw_address(raw: str) -> dict | None:
         state_raw = (m.group("state") or "").strip()
         zipc = (m.group("zip") or "").strip()
 
-        if not re.match(r"^\d{1,6}\b", line1):
+        if not re.match(r"^\d{1,6}(?:-\d{1,6})?[A-Za-z]?\b", line1):
             continue
         if not line1 or not city or not state_raw or not zipc:
             continue
@@ -2072,7 +2314,7 @@ def update_address_assembly_state(sched: dict) -> None:
     # Helper: does a line start with a street number?
     def line_has_number(line: str) -> bool:
         line = (line or "").strip()
-        return bool(re.match(r"^\d{1,6}\b", line))
+        return bool(re.match(r"^\d{1,6}(?:-\d{1,6})?[A-Za-z]?\b", line))
 
     # -----------------------------
     # 1) If we have normalized_address, validate it properly
@@ -2158,12 +2400,12 @@ def update_address_assembly_state(sched: dict) -> None:
     street_suffixes = (
         " st", " street", " ave", " avenue", " rd", " road", " ln", " lane",
         " dr", " drive", " ct", " court", " cir", " circle", " blvd", " boulevard",
-        " way", " pkwy", " parkway", " ter", " terrace"
+        " way", " pkwy", " parkway", " ter", " terrace", " park"
     )
     has_street_word = any(suf in low for suf in street_suffixes)
 
     # Has a house number at the start?
-    starts_with_number = low[:1].isdigit()
+    starts_with_number = bool(re.match(r"^\s*\d{1,6}(?:-\d{1,6})?[A-Za-z]?\b", raw))
 
     # Has explicit CT/MA?
     has_state = (" ct" in f" {low} ") or (" connecticut" in low) or (" ma" in f" {low} ") or (" massachusetts" in low)
@@ -2346,7 +2588,7 @@ def try_early_address_normalize(sched: dict) -> None:
 
     # Only normalize if it looks like a street input (avoid spamming maps on random text)
     low = raw.lower()
-    street_suffixes = (" st", " street", " ave", " avenue", " rd", " road", " ln", " lane", " dr", " drive", " blvd", " boulevard", " way", " ct", " court", " cir", " circle", " ter", " terrace", " pkwy", " parkway")
+    street_suffixes = (" st", " street", " ave", " avenue", " rd", " road", " ln", " lane", " dr", " drive", " blvd", " boulevard", " way", " ct", " court", " cir", " circle", " ter", " terrace", " park", " pkwy", " parkway")
     if not any(suf in low for suf in street_suffixes):
         return
 
@@ -2711,8 +2953,63 @@ def incoming_sms():
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
 
+    # Customer hard-stop and correction gates run before every pending_step handler.
+    hard_stop_reason = detect_customer_hard_stop(inbound_text)
+    if hard_stop_reason:
+        reply_body = apply_customer_hard_stop(conv, hard_stop_reason, inbound_text)
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = reply_body
+        try:
+            log_event("CUSTOMER_HARD_STOP", phone, {"body": _safe_monitor_text(inbound_text), "reason": hard_stop_reason, "reply": _safe_monitor_text(reply_body)}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(reply_body)
+        return Response(str(tw), mimetype="text/xml")
+
+    address_reject_reply = handle_address_confirmation_rejection(conv, inbound_text)
+    if address_reject_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = address_reject_reply
+        try:
+            log_event("ADDRESS_CONFIRMATION_REJECTED", phone, {"body": _safe_monitor_text(inbound_text), "reply": _safe_monitor_text(address_reject_reply)}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(address_reject_reply)
+        return Response(str(tw), mimetype="text/xml")
+
+    if looks_like_vendor_sales_or_spam(inbound_text):
+        clear_service_booking_state_for_non_service(conv, "vendor_sales_or_spam")
+        sched["booking_allowed"] = False
+        sched["manual_reason"] = "vendor_sales_or_spam"
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        try:
+            log_event("VENDOR_OR_SPAM_SUPPRESSED", phone, {"body": _safe_monitor_text(inbound_text)}, conv)
+        except Exception:
+            pass
+        return Response(str(MessagingResponse()), mimetype="text/xml")
+
     # Non-service / thread-type hard guard before normal booking state can run.
     thread_type = detect_non_service_thread_type(conv, inbound_text, conv.get("category"), conv.get("cleaned_transcript"))
+    if thread_type == "vendor_sales_or_spam":
+        clear_service_booking_state_for_non_service(conv, "vendor_sales_or_spam")
+        sched["booking_allowed"] = False
+        sched["manual_reason"] = "vendor_sales_or_spam"
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        try:
+            log_event("VENDOR_OR_SPAM_SUPPRESSED", phone, {"body": _safe_monitor_text(inbound_text), "thread_type": "vendor_sales_or_spam"}, conv)
+        except Exception:
+            pass
+        return Response(str(MessagingResponse()), mimetype="text/xml")
     if thread_type == "employment_inquiry":
         clear_service_booking_state_for_non_service(conv, "employment_inquiry")
         reply_body = build_employment_inquiry_reply()
@@ -2770,6 +3067,13 @@ def incoming_sms():
             return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms commercial walkthrough coordination guard failed:", repr(e))
+
+    # Before any booking branch, upgrade partial address state from the newest customer text.
+    try:
+        if absorb_address_from_mixed_text(conv, inbound_text):
+            log_event("ADDRESS_ABSORBED_FROM_INBOUND", phone, {"body": _safe_monitor_text(inbound_text), "address": _safe_monitor_text(sched.get("raw_address"), 240)}, conv)
+    except Exception as e:
+        print("[WARN] incoming_sms early address absorb failed:", repr(e))
 
     # First-message GLS/SMS service leads should establish the $195 evaluation
     # context before availability handling offers slots. This includes commercial
@@ -3165,15 +3469,24 @@ def incoming_sms():
     if reply.get("address"):
         candidate_address = str(reply["address"] or "").strip()
         existing_address = str(sched.get("raw_address") or "").strip()
-        if not (
+        safe_candidate = safe_address_candidate_from_text(candidate_address) or (candidate_address if is_plausible_address_text(candidate_address) else None)
+        if safe_candidate and not (
             yes_text(inbound_text)
             and existing_address
-            and (candidate_address == f"{existing_address}, Yes" or candidate_address == f"{existing_address} Yes")
+            and (safe_candidate == f"{existing_address}, Yes" or safe_candidate == f"{existing_address} Yes")
         ):
-            sched["raw_address"] = candidate_address
-            # addresses list is guaranteed above
-            if candidate_address and candidate_address not in profile["addresses"]:
-                profile["addresses"].append(candidate_address)
+            # Do not let customer questions get appended into the address field.
+            if (not existing_address) or (not sched.get("address_verified")) or _address_has_house_number_and_street(safe_candidate):
+                sched["raw_address"] = safe_candidate
+                sched["normalized_address"] = None
+                # addresses list is guaranteed above
+                if safe_candidate and safe_candidate not in profile["addresses"]:
+                    profile["addresses"].append(safe_candidate)
+        elif candidate_address and existing_address:
+            try:
+                log_event("ADDRESS_MODEL_OUTPUT_REJECTED", phone, {"model_address": _safe_monitor_text(candidate_address), "kept_address": _safe_monitor_text(existing_address)}, conv)
+            except Exception:
+                pass
 
     # Re-derive address assembly state after Step 4 updates
     update_address_assembly_state(sched)
@@ -5145,7 +5458,7 @@ def generate_reply_for_inbound(
             street_suffixes = (
                 " st", " street", " ave", " avenue", " rd", " road", " ln", " lane",
                 " dr", " drive", " ct", " court", " cir", " circle", " blvd", " boulevard",
-                " way", " pkwy", " parkway", " ter", " terrace"
+                " way", " pkwy", " parkway", " ter", " terrace", " park"
             )
             inbound_has_street_word = any(suf in f" {low} " for suf in street_suffixes)
             inbound_starts_with_number = bool(re.match(r"^\s*\d{1,6}\b", inbound_clean))
@@ -5271,6 +5584,15 @@ def generate_reply_for_inbound(
             .replace("None", "null")
             .replace("none", "null")
         )
+        try:
+            log_event("AI_STEP4_RESULT", phone, {
+                "inbound": _safe_monitor_text(inbound_text, 700),
+                "pending_before": sched.get("pending_step"),
+                "raw_address_before": _safe_monitor_text(sched.get("raw_address"), 240),
+                "ai_raw": _safe_monitor_text(json.dumps(ai_raw, ensure_ascii=False), 1000),
+            }, conv)
+        except Exception:
+            pass
 
         sms_body   = (ai_raw.get("sms_body") or "").strip()
         model_date = ai_raw.get("scheduled_date")
@@ -5301,8 +5623,18 @@ def generate_reply_for_inbound(
         if sched.get("raw_address") and not model_addr:
             model_addr = sched["raw_address"]
 
-        if isinstance(model_addr, str) and len(model_addr.strip()) > 3 and is_plausible_address_text(model_addr):
-            sched["raw_address"] = model_addr.strip()
+        if isinstance(model_addr, str) and len(model_addr.strip()) > 3:
+            safe_model_addr = safe_address_candidate_from_text(model_addr) or (model_addr.strip() if is_plausible_address_text(model_addr) else None)
+            if safe_model_addr:
+                existing_addr = (sched.get("raw_address") or "").strip()
+                if (not existing_addr) or (not sched.get("address_verified")) or _address_has_house_number_and_street(safe_model_addr):
+                    sched["raw_address"] = safe_model_addr
+                    sched["normalized_address"] = None
+            else:
+                try:
+                    log_event("ADDRESS_MODEL_OUTPUT_REJECTED", phone, {"model_address": _safe_monitor_text(model_addr), "kept_address": _safe_monitor_text(sched.get("raw_address"))}, conv)
+                except Exception:
+                    pass
 
         # ---------------------------------------------------
         # CRITICAL PATCH: re-run address state AFTER model changes
@@ -6356,6 +6688,8 @@ def maybe_create_square_booking(phone: str, convo: dict):
     import re
 
     sched = convo.setdefault("sched", {})
+    if sched.get("booking_allowed") is False or sched.get("customer_hard_stop") or convo.get("thread_type") in {"closed_lost", "vendor_sales_or_spam", "wrong_number_or_spam", "employment_inquiry", "commercial_bid_contact", "manual_only"}:
+        return _monitor_booking_return(phone, "booking_blocked_by_thread_state", {"status": "booking_blocked_by_thread_state", "thread_type": convo.get("thread_type"), "closed_reason": sched.get("closed_reason")}, convo)
     profile = convo.setdefault("profile", {})
     current_job = convo.setdefault("current_job", {})
 
@@ -6748,6 +7082,27 @@ def monitor_conversations():
     ))
     return {"ok": True, "items": items}, 200
 
+
+
+@app.route("/monitor/conversation/close", methods=["POST"])
+def monitor_close_conversation():
+    data = request.get_json(silent=True) or request.form or {}
+    phone = (data.get("phone") or "").replace("whatsapp:", "").strip()
+    reason = (data.get("reason") or "manual_closed").strip() or "manual_closed"
+    if not phone or phone not in conversations:
+        return {"ok": False, "error": "conversation_not_found"}, 404
+    conv = conversations.setdefault(phone, {})
+    sched = conv.setdefault("sched", {})
+    conv["thread_type"] = "closed_lost"
+    sched["customer_hard_stop"] = True
+    sched["booking_allowed"] = False
+    sched["pending_step"] = None
+    sched["closed_reason"] = reason
+    try:
+        log_event("MONITOR_CLOSED_CONVERSATION", phone, {"reason": reason}, conv)
+    except Exception:
+        pass
+    return {"ok": True, "conversation": _conversation_snapshot(phone, conv)}, 200
 
 # ---------------------------------------------------
 # Local Development Entrypoint
