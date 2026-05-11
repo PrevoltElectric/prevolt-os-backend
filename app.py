@@ -179,7 +179,7 @@ def looks_like_vendor_sales_or_spam(*parts) -> bool:
         "stop chasing payments", "software that helps pros", "custom checklists",
         "lead fees", "limited spots", "2 min apply", "vendor call",
         "dlmpropertygroup.com", "selected your company for jobs", "website link",
-        "sales rep", "marketing agency", "seo services", "merchant services",
+        "sales rep", "marketing agency", "marketing company", "seo services", "merchant services",
     ]
     if any(t in low for t in strong):
         return True
@@ -195,7 +195,7 @@ def detect_customer_hard_stop(text: str) -> str | None:
         return None
     exact = {
         "cancel", "disregard", "never mind", "nevermind", "forget it", "stop", "unsubscribe",
-        "no thanks", "no thank you", "pass", "i'll pass", "ill pass", "leave me alone"
+        "no thanks", "no thank you", "pass", "i'll pass", "ill pass", "i will pass", "thanks anyway", "leave me alone"
     }
     if low in exact:
         return "customer_stop"
@@ -210,7 +210,7 @@ def detect_customer_hard_stop(text: str) -> str | None:
         "call someone else", "going with someone else",
         "not interested", "i'm not interested", "im not interested", "not interested anymore",
         "no longer interested", "leave me alone", "please stop", "stop texting", "stop messaging",
-        "don't contact me", "dont contact me", "do not contact me", "thanks anyway", "no thanks",
+        "don't contact me", "dont contact me", "do not contact me", "thanks anyway", "no thanks", "i will pass",
     ]
     if any(p in low for p in phrases):
         return "customer_cancelled_or_found_someone"
@@ -233,6 +233,188 @@ def apply_customer_hard_stop(conv: dict, reason: str, inbound_text: str = "") ->
     return "No problem. We’ll stop the scheduling messages."
 
 
+
+# ---------------------------------------------------
+# Flow Lab V4 / V13 backend hardening helpers
+# ---------------------------------------------------
+def v13_looks_like_smoke_detector_install_request(*parts) -> bool:
+    low = _intent_text(*parts)
+    if not low:
+        return False
+    detector = any(x in low for x in [
+        "smoke detector", "smoke detectors", "smoke alarm", "smoke alarms",
+        "co detector", "co detectors", "carbon monoxide detector", "carbon monoxide detectors"
+    ])
+    install_context = any(x in low for x in [
+        "install", "installed", "replace", "replaced", "hardwire", "hardwired",
+        "quote", "estimate", "need smoke", "need co", "need carbon monoxide", "change", "changed"
+    ])
+    actual_hazard = any(x in low for x in [
+        "smoke from", "smoke coming", "burning", "burning smell", "sparking",
+        "fire department", "melted", "panel is wet", "water in panel", "hot breaker"
+    ])
+    return detector and install_context and not actual_hazard
+
+
+def v13_looks_like_callback_request(*parts) -> bool:
+    low = _intent_text(*parts)
+    if not low:
+        return False
+    phrases = [
+        "call me", "call back", "call me back", "give me a call", "please call",
+        "can someone call", "could someone call", "rather talk", "talk to someone",
+        "talk on the phone", "phone call", "call instead", "can you call"
+    ]
+    return any(p in low for p in phrases)
+
+
+def v13_apply_callback_request(conv: dict, inbound_text: str = "") -> str:
+    sched = conv.setdefault("sched", {})
+    conv["thread_type"] = "needs_callback"
+    sched["manual_only"] = True
+    sched["manual_assist"] = True
+    sched["booking_allowed"] = False
+    sched["pending_step"] = None
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["manual_reason"] = "customer_requested_callback"
+    sched["closed_reason"] = "customer_requested_callback"
+    return "Thanks, we got your message. One of our team members will call you back."
+
+
+def v13_extract_email(text: str) -> str | None:
+    m = re.search(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", text or "", flags=re.I)
+    return m.group(1).strip() if m else None
+
+
+def v13_save_email(conv: dict, email: str) -> None:
+    if not email:
+        return
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    profile["active_email"] = email
+    profile["email"] = email
+    sched["email"] = email
+
+
+def v13_format_slot_choice_prompt(sched: dict) -> str:
+    opts = (sched or {}).get("offered_slot_options") or []
+    if opts:
+        return f"Which one works best for you — {_format_slot_options(opts[:3])}?"
+    return "What day and time works best for you?"
+
+
+def v13_looks_like_real_person_question(text: str) -> bool:
+    low = _loose_text(text)
+    if not low:
+        return False
+    return any(p in low for p in [
+        "is this a real person", "are you a real person", "is this ai", "are you ai",
+        "is this automated", "is this a bot", "are you a bot", "human"
+    ])
+
+
+def v13_real_person_reply(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    answer = "Yes — this is Prevolt Electric. We use this number to keep scheduling organized while we’re in the field."
+    if sched.get("awaiting_slot_offer_choice") and sched.get("offered_slot_options"):
+        return f"{answer} {v13_format_slot_choice_prompt(sched)}"
+    return answer
+
+
+def v13_maybe_imply_address_confirmed(conv: dict, inbound_text: str) -> bool:
+    """If we asked 'You're at X, right?' and the customer keeps scheduling, treat it as a yes."""
+    sched = conv.setdefault("sched", {})
+    if sched.get("address_verified"):
+        return False
+    if starts_with_negative_address_correction(inbound_text) or _intent_text(inbound_text) in {"no", "nope", "nah", "incorrect", "wrong"}:
+        return False
+    raw = (sched.get("raw_address") or sched.get("address_candidate") or "").strip()
+    if not raw or not _address_has_house_number_and_street(raw):
+        return False
+    missing = (sched.get("address_missing") or "").strip().lower()
+    pending = (sched.get("pending_step") or "").strip().lower()
+    if missing not in {"confirm", "state", ""} and pending not in {"need_address", ""}:
+        return False
+    if not (_looks_like_scheduling_reply(inbound_text) or v13_extract_email(inbound_text)):
+        return False
+    sched["raw_address"] = raw
+    sched["address_candidate"] = raw
+    sched["address_verified"] = True
+    sched["address_missing"] = None
+    if sched.get("pending_step") == "need_address":
+        sched["pending_step"] = None
+    try:
+        update_address_assembly_state(sched)
+    except Exception:
+        pass
+    return True
+
+
+def v13_handle_email_before_slot(conv: dict, inbound_text: str) -> str | None:
+    """Preserve email and ask only for the missing scheduling choice; do not reset the flow."""
+    email = v13_extract_email(inbound_text)
+    if not email:
+        return None
+    sched = conv.setdefault("sched", {})
+    v13_save_email(conv, email)
+    try:
+        recompute_pending_step(conv.setdefault("profile", {}), sched)
+    except Exception:
+        pass
+    if not (sched.get("scheduled_date") and sched.get("scheduled_time")):
+        if sched.get("awaiting_slot_offer_choice") and sched.get("offered_slot_options"):
+            return f"Got it, I have your email. {v13_format_slot_choice_prompt(sched)}"
+        return "Got it, I have your email. What day and time works best for you?"
+    return None
+
+
+def v13_time_only_on_offered_slots(conv: dict, inbound_text: str) -> bool:
+    """Bind bare time replies like '9', '4', or 'can you do 3 instead' to the first offered date."""
+    sched = conv.setdefault("sched", {})
+    if not sched.get("awaiting_slot_offer_choice"):
+        return False
+    options = sched.get("offered_slot_options") or []
+    if not options:
+        return False
+    txt = (inbound_text or "").strip()
+    low = _intent_text(txt)
+    if not low:
+        return False
+    # Do not steal ordinal choices. maybe_apply_offered_slot_selection handles those.
+    if re.fullmatch(r"[123]", low):
+        return False
+    time_only = bool(re.fullmatch(r"(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?", low)) or bool(re.search(r"\b(?:can|could)\s+you\s+do\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", low))
+    if not time_only:
+        return False
+    explicit_time = extract_explicit_time_from_text(txt)
+    if not explicit_time:
+        return False
+    chosen = dict(options[0])
+    chosen["time"] = explicit_time
+    try:
+        d = datetime.strptime(str(chosen.get("date") or ""), "%Y-%m-%d")
+        chosen["label"] = f"{d.strftime('%A, %B %d').replace(' 0', ' ')} at {humanize_time(explicit_time)}"
+    except Exception:
+        chosen["label"] = f"{chosen.get('date') or 'that day'} at {humanize_time(explicit_time)}"
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+    sched["appointment_type"] = appt
+    conv["appointment_type"] = appt
+    sched["scheduled_date"] = chosen.get("date")
+    sched["scheduled_time"] = chosen.get("time")
+    sched["scheduled_time_source"] = "customer_time_on_first_offered_day"
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    sched["final_confirmation_sent"] = False
+    sched["final_confirmation_accepted"] = False
+    sched["last_final_confirmation_key"] = None
+    sched["slot_choice_locked"] = True
+    sched["booking_attempt_nonce"] = str(uuid.uuid4())
+    return True
 
 
 def address_gate_blocks_scheduling(conv: dict) -> bool:
@@ -721,6 +903,9 @@ def detect_non_service_thread_type(conv: dict, inbound_text: str = "", category:
     if looks_like_employment_inquiry(history):
         return "employment_inquiry"
 
+    if v13_looks_like_callback_request(history):
+        return "callback_requested"
+
     if looks_like_vendor_sales_or_spam(history):
         return "vendor_sales_or_spam"
 
@@ -743,7 +928,7 @@ def clear_service_booking_state_for_non_service(conv: dict, thread_type: str) ->
     sched = conv.setdefault("sched", {})
     sched["pending_step"] = None
     sched["non_service_thread"] = True
-    sched["manual_only"] = thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact", "vendor_sales_or_spam", "wrong_number_or_spam"}
+    sched["manual_only"] = thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact", "vendor_sales_or_spam", "wrong_number_or_spam", "callback_requested", "needs_callback"}
     sched["appointment_type"] = None
     sched["booking_created"] = False
     sched["square_booking_id"] = None
@@ -1680,17 +1865,32 @@ def extract_explicit_time_from_text(text: str) -> str | None:
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
-    # A bare hour is safe when the whole reply is the hour, or when the user
-    # says "at 1" / "at 2" in a scheduling phrase. Do not grab random numbers.
-    m = re.fullmatch(r"\s*(?:at\s+)?(\d{1,2})\s*", s)
+    # Human shorthand: "9", "4", "Tuesday at 2", "can you do 3 instead".
+    # In appointment context, 1-5 usually means PM; 6-11 means AM; 12 means noon.
+    def _business_hour(hh: int) -> int:
+        if hh == 12:
+            return 12
+        if 1 <= hh <= 5:
+            return hh + 12
+        return hh
+
+    m = re.search(r"\b(?:can|could)\s+you\s+do\s+(\d{1,2})(?::([0-5]\d))?\s*(am|pm)?\b", s)
     if not m:
-        m = re.search(r"\bat\s+(\d{1,2})\b", s)
+        m = re.fullmatch(r"\s*(?:at\s+)?(\d{1,2})(?::([0-5]\d))?\s*(am|pm)?\s*", s)
+    if not m:
+        m = re.search(r"\bat\s+(\d{1,2})(?::([0-5]\d))?\s*(am|pm)?\b", s)
     if m:
         hh = int(m.group(1))
+        mm = int(m.group(2) or "00")
+        marker = (m.group(3) or "").lower()
         if 1 <= hh <= 12:
-            if hh == 12:
-                return "12:00"
-            return f"{hh:02d}:00"
+            if marker == "pm" and hh < 12:
+                hh += 12
+            elif marker == "am" and hh == 12:
+                hh = 0
+            elif not marker:
+                hh = _business_hour(hh)
+            return f"{hh:02d}:{mm:02d}"
 
     return None
 
@@ -2027,6 +2227,11 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
         sched["intro_sent"] = True
         sched["price_disclosed"] = False
         return build_employment_inquiry_reply()
+    if thread_type == "callback_requested":
+        clear_service_booking_state_for_non_service(conv, "callback_requested")
+        sched["intro_sent"] = True
+        sched["price_disclosed"] = False
+        return v13_apply_callback_request(conv, conv.get("cleaned_transcript") or "")
     if thread_type == "commercial_bid_contact":
         clear_service_booking_state_for_non_service(conv, "commercial_bid_contact")
         sched["intro_sent"] = True
@@ -2378,9 +2583,19 @@ def voicemail_complete():
     conv["task_topics"] = classification.get("task_topics") or []
     conv.setdefault("initial_sms", cleaned)
 
+    # Flow Lab V13: smoke detector install/replacement is normal evaluation work,
+    # not emergency dispatch unless the caller describes actual smoke/fire/burning.
+    if v13_looks_like_smoke_detector_install_request(cleaned):
+        classification["intent"] = "quote"
+        classification["appointment_type"] = "EVAL_195"
+        conv["appointment_type"] = "EVAL_195"
+        sched["appointment_type"] = "EVAL_195"
+        sched["awaiting_emergency_confirm"] = False
+        sched["emergency_approved"] = False
+
     # Hard pre-routing lock before any address/date scheduling state is saved.
     thread_type = detect_non_service_thread_type(conv, "", classification.get("category"), cleaned)
-    if thread_type in {"employment_inquiry", "commercial_bid_contact"}:
+    if thread_type in {"employment_inquiry", "commercial_bid_contact", "callback_requested"}:
         clear_service_booking_state_for_non_service(conv, thread_type)
     if classification.get("detected_first_name") and not profile.get("voicemail_first_name"):
         profile["voicemail_first_name"] = classification.get("detected_first_name")
@@ -2400,7 +2615,7 @@ def voicemail_complete():
     # --------------------------------------
     # HARD OVERRIDE: Voicemail Emergency Pre-Flag
     # --------------------------------------
-    if classification.get("intent") == "emergency" and conv.get("thread_type") not in {"employment_inquiry", "commercial_bid_contact", "manual_only"}:
+    if classification.get("intent") == "emergency" and not v13_looks_like_smoke_detector_install_request(cleaned) and conv.get("thread_type") not in {"employment_inquiry", "commercial_bid_contact", "manual_only", "callback_requested"}:
         sched["appointment_type"] = "TROUBLESHOOT_395"
         sched["awaiting_emergency_confirm"] = True
         sched["emergency_approved"] = False
@@ -3239,12 +3454,16 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
     if step == "need_address":
         return build_address_prompt(sched)
     if step == "need_date":
+        if sched.get("offered_slot_options"):
+            return v13_format_slot_choice_prompt(sched)
         if is_emergency and wants_immediate_dispatch and sched.get("address_verified"):
             return "This looks urgent. We can send someone now and arrival is usually within 1 to 2 hours. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
         if not sched.get("scheduled_time"):
             return humanize_question("What day and time work best for you?")
         return humanize_question("What day works best for you?")
     if step == "need_time":
+        if sched.get("offered_slot_options"):
+            return v13_format_slot_choice_prompt(sched)
         if is_emergency and wants_immediate_dispatch and sched.get("address_verified"):
             return "This looks urgent. We can send someone now and arrival is usually within 1 to 2 hours. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
         if not sched.get("scheduled_date"):
@@ -3480,6 +3699,21 @@ def incoming_sms():
         tw.message(reply_body)
         return Response(str(tw), mimetype="text/xml")
 
+    # Customer asked for a call instead of continuing automation.
+    if v13_looks_like_callback_request(inbound_text):
+        reply_body = v13_apply_callback_request(conv, inbound_text)
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = reply_body
+        try:
+            log_event("CUSTOMER_CALLBACK_REQUESTED", phone, {"body": _safe_monitor_text(inbound_text), "reply": _safe_monitor_text(reply_body)}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(reply_body)
+        return Response(str(tw), mimetype="text/xml")
+
     address_reject_reply = handle_address_confirmation_rejection(conv, inbound_text)
     if address_reject_reply:
         conv["last_inbound_sid"] = inbound_sid
@@ -3544,6 +3778,20 @@ def incoming_sms():
         conv["last_sms_body"] = reply_body
         try:
             log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "thread_type": "employment_inquiry"}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(reply_body)
+        return Response(str(tw), mimetype="text/xml")
+    if thread_type == "callback_requested":
+        clear_service_booking_state_for_non_service(conv, "callback_requested")
+        reply_body = v13_apply_callback_request(conv, inbound_text)
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = reply_body
+        try:
+            log_event("CUSTOMER_CALLBACK_REQUESTED", phone, {"body": _safe_monitor_text(inbound_text), "thread_type": "callback_requested"}, conv)
         except Exception:
             pass
         tw = MessagingResponse()
@@ -3682,23 +3930,27 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
-    # Absolute address gate: never schedule, offer slots, or ask for time while the address still needs confirmation.
+    # Absolute address gate: never schedule, offer slots, or ask for time while address is truly missing.
+    # If we only needed confirmation and the customer keeps scheduling, treat that as implied confirmation.
     try:
         if address_gate_blocks_scheduling(conv):
-            if _looks_like_scheduling_reply(inbound_text):
-                sched["deferred_schedule_text"] = inbound_text
-            reply_body = build_address_gate_reply(conv)
-            conv["last_inbound_sid"] = inbound_sid
-            conv["last_inbound_fingerprint"] = inbound_fingerprint
-            conv["last_inbound_fingerprint_ts"] = now_ts
-            conv["last_sms_body"] = reply_body
-            try:
-                log_event("ADDRESS_GATE_BLOCKED_SCHEDULING", phone, {"body": _safe_monitor_text(inbound_text), "reply": _safe_monitor_text(reply_body)}, conv)
-            except Exception:
-                pass
-            tw = MessagingResponse()
-            tw.message(reply_body)
-            return Response(str(tw), mimetype="text/xml")
+            if v13_maybe_imply_address_confirmed(conv, inbound_text):
+                recompute_pending_step(profile, sched)
+            else:
+                if _looks_like_scheduling_reply(inbound_text):
+                    sched["deferred_schedule_text"] = inbound_text
+                reply_body = build_address_gate_reply(conv)
+                conv["last_inbound_sid"] = inbound_sid
+                conv["last_inbound_fingerprint"] = inbound_fingerprint
+                conv["last_inbound_fingerprint_ts"] = now_ts
+                conv["last_sms_body"] = reply_body
+                try:
+                    log_event("ADDRESS_GATE_BLOCKED_SCHEDULING", phone, {"body": _safe_monitor_text(inbound_text), "reply": _safe_monitor_text(reply_body)}, conv)
+                except Exception:
+                    pass
+                tw = MessagingResponse()
+                tw.message(reply_body)
+                return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms address gate failed:", repr(e))
 
@@ -3743,6 +3995,45 @@ def incoming_sms():
             return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms offered slot choice failed:", repr(e))
+
+    # Time-only replies against an offered slot list: bind to the first offered date.
+    try:
+        if v13_time_only_on_offered_slots(conv, inbound_text):
+            recompute_pending_step(profile, sched)
+            reply_body = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+            reply_body = sanitize_sms_body(collapse_duplicate_sms(reply_body.strip()), booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply_body
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "time_only_on_offered_slot": True}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(reply_body)
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms time-only offered slot handling failed:", repr(e))
+
+    # Email can arrive before the slot is locked. Save it and ask only for the missing slot.
+    try:
+        email_guard_reply = v13_handle_email_before_slot(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms email-before-slot guard failed:", repr(e))
+        email_guard_reply = None
+    if email_guard_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = email_guard_reply
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(email_guard_reply), "email_before_slot_guard": True}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(email_guard_reply)
+        return Response(str(tw), mimetype="text/xml")
 
     # LIVE HOTFIX: exact date/time replies must be handled before any model,
     # interruption, name-capture, or availability fallback logic. This catches
@@ -4910,6 +5201,9 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     if booked and not allow_post_booking:
         return None
 
+    if v13_looks_like_real_person_question(inbound_text):
+        return v13_real_person_reply(conv)
+
     # Let the LLM handle trust / hesitation / multi-question turns first.
     trust = llm_trust_reply(conv, inbound_text)
     if trust and trust.get("answer"):
@@ -5601,6 +5895,16 @@ def generate_reply_for_inbound(
 
         # If the customer picks one of the offered fallback slots, lock it in before any LLM work.
         maybe_apply_offered_slot_selection(conv, inbound_text)
+        v13_time_only_on_offered_slots(conv, inbound_text)
+        email_guard_reply = v13_handle_email_before_slot(conv, inbound_text)
+        if email_guard_reply:
+            return {
+                "sms_body": email_guard_reply,
+                "scheduled_date": sched.get("scheduled_date"),
+                "scheduled_time": sched.get("scheduled_time"),
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
 
         # Hazard detection must override post-booking mode.
         EMERGENCY_KEYWORDS = [
@@ -5612,7 +5916,7 @@ def generate_reply_for_inbound(
             "hot panel", "burning smell", "main breaker", "melted",
             "shocked", "shock"
         ]
-        IS_EMERGENCY = any(k in inbound_lower for k in EMERGENCY_KEYWORDS)
+        IS_EMERGENCY = (not v13_looks_like_smoke_detector_install_request(inbound_text, cleaned_transcript, initial_sms) and any(k in inbound_lower for k in EMERGENCY_KEYWORDS))
 
         # Name engine gets first shot before the normal scheduler.
         name_engine_reply = handle_name_engine_response(conv, inbound_text)
@@ -7283,6 +7587,19 @@ def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
     explicit_time = extract_explicit_time_from_text(txt)
     requested_date = salvage_relative_date_from_text(txt)
 
+    # Bare/custom time with an active option list means: use first offered date at that time.
+    # Example: offered Mon/Tue/Wed, customer says "9", "4", or "can you do 3 instead".
+    if chosen is None and explicit_time and not requested_date:
+        time_only = bool(re.fullmatch(r"(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?", low)) or bool(re.search(r"\b(?:can|could)\s+you\s+do\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", low))
+        if time_only and not re.fullmatch(r"[123]", low or ""):
+            chosen = dict(options[0])
+            chosen["time"] = explicit_time
+            try:
+                d = datetime.strptime(str(chosen.get("date") or ""), "%Y-%m-%d")
+                chosen["label"] = f"{d.strftime('%A, %B %d').replace(' 0', ' ')} at {humanize_time(explicit_time)}"
+            except Exception:
+                chosen["label"] = f"{chosen.get('date') or 'that day'} at {humanize_time(explicit_time)}"
+
     def _slot_day_names(opt):
         try:
             d = datetime.strptime(str(opt.get("date") or ""), "%Y-%m-%d")
@@ -7341,7 +7658,9 @@ def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
 def is_within_normal_hours(time_str: str) -> bool:
     try:
         dt = datetime.strptime(time_str, "%H:%M")
-        return 9 <= dt.hour < 16
+        minutes = dt.hour * 60 + dt.minute
+        # Allow exact 4:00 PM starts; block 4:30 PM and later.
+        return (9 * 60) <= minutes <= (16 * 60)
     except:
         return False
 
