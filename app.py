@@ -175,67 +175,14 @@ def looks_like_vendor_sales_or_spam(*parts) -> bool:
     if not low:
         return False
     strong = [
-        "jobber", "field service pros", "field service software", "save a few hours of paperwork",
+        "jobber", "field service pros", "save a few hours of paperwork",
         "stop chasing payments", "software that helps pros", "custom checklists",
         "lead fees", "limited spots", "2 min apply", "vendor call",
         "dlmpropertygroup.com", "selected your company for jobs", "website link",
         "sales rep", "marketing agency", "marketing company", "seo services", "merchant services",
-        "quick demo", "show you a quick demo", "schedule a demo", "book a demo",
-        # Business-loan / working-capital spam. Keep these exact, finance-specific
-        # triggers here so real electrical service leads do not get caught.
-        "working capital", "business funding", "small business funding",
-        "business loan", "merchant cash advance", "cash advance",
-        "funding specialist", "unsecured funding", "capital offer",
-        "funds may be available", "available as soon as tomorrow",
-        "prequalified for up to", "pre-qualified for up to",
-        "reply yes to speak", "reply yes for", "reply yes",
     ]
     if any(t in low for t in strong):
         return True
-
-    # Catch finance spam variants without turning normal customer language into spam.
-    finance_offer = bool(re.search(
-        r"\b(?:prequalified|pre-qualified|approved|selected)\b.{0,90}"
-        r"\b(?:working capital|business funding|funding|business loan|line of credit|cash advance|capital)\b",
-        low,
-        flags=re.I,
-    ))
-    large_money_offer = bool(re.search(
-        r"\bup to\s+\$?\d{2,3}(?:,\d{3})+\b.{0,90}"
-        r"\b(?:working capital|funding|capital|loan|line of credit|cash advance)\b",
-        low,
-        flags=re.I,
-    )) or bool(re.search(
-        r"\b(?:working capital|funding|capital|loan|line of credit|cash advance)\b.{0,90}"
-        r"\bup to\s+\$?\d{2,3}(?:,\d{3})+\b",
-        low,
-        flags=re.I,
-    ))
-    reply_yes_finance = bool(re.search(
-        r"\breply\s+(?:yes|y)\b.{0,90}"
-        r"\b(?:funding|loan|capital|specialist|cash advance|line of credit)\b",
-        low,
-        flags=re.I,
-    )) or bool(re.search(
-        r"\b(?:funding|loan|capital|specialist|cash advance|line of credit)\b.{0,90}"
-        r"\breply\s+(?:yes|y)\b",
-        low,
-        flags=re.I,
-    ))
-    call_for_finance_info = bool(re.search(
-        r"\bcall\s+\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b.{0,120}"
-        r"\b(?:funding|loan|capital|more information|cash advance|line of credit)\b",
-        low,
-        flags=re.I,
-    )) or bool(re.search(
-        r"\b(?:funding|loan|capital|more information|cash advance|line of credit)\b.{0,120}"
-        r"\bcall\s+\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
-        low,
-        flags=re.I,
-    ))
-    if finance_offer or large_money_offer or reply_yes_finance or call_for_finance_info:
-        return True
-
     if "apply" in low and ("vendor" in low or "property management" in low or "lead" in low or "limited spots" in low):
         return True
     return False
