@@ -174,19 +174,51 @@ def looks_like_vendor_sales_or_spam(*parts) -> bool:
     low = _intent_text(*parts)
     if not low:
         return False
+
     strong = [
         "jobber", "field service pros", "save a few hours of paperwork",
         "stop chasing payments", "software that helps pros", "custom checklists",
         "lead fees", "limited spots", "2 min apply", "vendor call",
         "dlmpropertygroup.com", "selected your company for jobs", "website link",
         "sales rep", "marketing agency", "marketing company", "seo services", "merchant services",
+        # Vendor / demo outreach.
+        "field service software", "quick demo", "show you a demo",
+        # Business loan / funding spam. Keep these here so financing spam is
+        # stopped before the address gate tries to treat it like a service lead.
+        "prequalified for up to", "pre-qualified for up to", "pre approved for up to", "pre-approved for up to",
+        "working capital", "business funding", "business loan", "small business loan",
+        "merchant cash advance", "funding specialist", "business line of credit",
+        "funds may be available", "funds available", "access to more capital",
     ]
     if any(t in low for t in strong):
         return True
+
+    # Finance spam often avoids a fixed phrase but has the same structure:
+    # business + capital/funding + quick money + phone/reply CTA.
+    finance_signal = bool(re.search(
+        r"\b(?:capital|funding|loan|cash advance|line of credit|credit line)\b",
+        low,
+        flags=re.I,
+    ))
+    quick_money_signal = bool(re.search(
+        r"\b(?:pre\s*-?\s*qualified|pre\s*-?\s*approved|up to\s*\$?\s*\d{2,4}\s*k|"
+        r"as soon as tomorrow|one business day|same day funding|funds? (?:may be|are) available)\b",
+        low,
+        flags=re.I,
+    ))
+    sales_cta_signal = bool(re.search(
+        r"\b(?:reply\s+(?:yes|y)|call\s+\d{3,4}[-.\s]?\d{3}[-.\s]?\d{4}|"
+        r"speak with (?:a|an) .*?(?:specialist|advisor|representative)|more information)\b",
+        low,
+        flags=re.I,
+    ))
+    business_context = "business" in low or "company" in low or "owner" in low
+    if finance_signal and quick_money_signal and (sales_cta_signal or business_context):
+        return True
+
     if "apply" in low and ("vendor" in low or "property management" in low or "lead" in low or "limited spots" in low):
         return True
     return False
-
 
 def detect_customer_hard_stop(text: str) -> str | None:
     """Customer's newest message can close the automation regardless of pending_step."""
