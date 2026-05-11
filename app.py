@@ -252,7 +252,7 @@ def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str 
     sched["address_missing"] = "street"
     sched["pending_step"] = "need_address"
     sched["booking_allowed"] = True
-    return "No problem. What is the correct house number, street, and town for the work?"
+    return "Sorry about that, the voicemail was a little hard to hear. Can you give me the address again?"
 
 
 def _address_has_house_number_and_street(value: str) -> bool:
@@ -555,16 +555,11 @@ def build_initial_service_booking_reply(conv: dict, inbound_text: str = "") -> s
     if not address_ok:
         sched["price_disclosed"] = False
         sched["pending_step"] = "need_address"
-        return "Hi, this is Prevolt Electric. We can help. What’s the address for the work?"
+        return "Hi, this is Prevolt Electric. We would be more than happy to come out and take a look at your project. What’s the address for the work?"
 
     sched["price_disclosed"] = True
     sched["pending_step"] = "need_date"
-    price_line = "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
-
-    if "meter bank" in low or "6-gang" in low or "six gang" in low or "gang meter" in low:
-        return f"Hi, this is Prevolt Electric. We can help with the meter bank replacement. {price_line} What day works best?"
-
-    return f"Hi, this is Prevolt Electric. We can help. {price_line} What day works best?"
+    return "Hi, this is Prevolt Electric. We would be more than happy to come out and take a look at your project. " + build_price_and_availability_prompt(conv, "EVAL_195")
 
 
 def build_complex_commercial_coordination_reply(inbound_text: str = "") -> str:
@@ -1690,24 +1685,11 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
         return build_commercial_bid_reply(conv.get("cleaned_transcript") or "")
 
     first_name = (profile.get("active_first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
-    intro = f"Hello {first_name}, you've reached Prevolt Electric. I'll help you here by text." if first_name else "You've reached Prevolt Electric. I'll help you here by text."
-
-    topics = conv.get("task_topics") or classification.get("task_topics") or []
-    topics = [str(t).strip() for t in topics if str(t).strip()]
-    task_line = ""
-    if topics:
-        topics = topics[:4]
-        if len(topics) == 1:
-            joined = topics[0]
-        elif len(topics) == 2:
-            joined = f"{topics[0]} and {topics[1]}"
-        else:
-            joined = ", ".join(topics[:-1]) + f", and {topics[-1]}"
-        task_line = f" It sounds like you're looking for help with {joined}."
+    intro = f"Hi {first_name}, this is Prevolt Electric." if first_name else "Hi, this is Prevolt Electric."
 
     def starts_with_house_number(value: str) -> bool:
         value = (value or "").strip()
-        return bool(re.match(r"^\d{1,6}\b", value))
+        return bool(re.match(r"^\d{1,6}(?:-\d{1,6})?\b", value))
 
     saved_full = None
     for a in profile.get("addresses") or []:
@@ -1717,21 +1699,20 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
             break
 
     raw_hint = (sched.get("raw_address") or classification.get("detected_address") or "").strip()
-    appt_type = (sched.get("appointment_type") or conv.get("appointment_type") or classification.get("appointment_type") or "EVAL_195").upper()
 
-    address_line = ""
+    # Keep the first outbound human. Do not inject extracted intent here by default.
+    # The task/scope is stored for the monitor and can be used if the customer asks,
+    # but the first SMS should not read like a generated summary.
     if raw_hint and starts_with_house_number(raw_hint):
-        address_line = f" I have {raw_hint} for the work. Is that correct?"
+        address_line = f" We would be more than happy to come out and take a look at your project. You're at {raw_hint}, right?"
     elif saved_full:
-        address_line = f" I have {saved_full} on file. Is this for that address?"
-    elif raw_hint:
-        address_line = f" What is the house number and street name in {raw_hint}?"
+        address_line = f" We would be more than happy to come out and take a look at your project. Is the work at {saved_full}?"
     else:
-        address_line = " What’s the address for the work?"
+        address_line = " We would be more than happy to come out and take a look at your project. What’s the address for the work?"
 
-    # First voicemail text should prove we understood and collect/confirm the address.
-    # Do not lead with price; disclose it when the customer is moving into scheduling.
-    sms = (intro + task_line + address_line).strip()
+    # First voicemail text should collect/confirm the address only.
+    # Price is disclosed when moving into scheduling.
+    sms = (intro + address_line).strip()
     sched["intro_sent"] = True
     sched["price_disclosed"] = False
     return re.sub(r"\s+", " ", sms).strip()
@@ -2187,6 +2168,76 @@ def prevolt_eval_price_line(appt_type: str) -> str:
     return "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
 
 
+def format_command_center_slot_list(slots: list[dict]) -> str:
+    labels = []
+    for slot in (slots or [])[:3]:
+        label = (slot.get("label") or _humanize_slot_label(slot.get("date"), slot.get("time")) or "").strip()
+        if label:
+            labels.append(label)
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} or {labels[1]}"
+    return ", ".join(labels[:-1]) + f", or {labels[-1]}"
+
+
+def build_price_and_availability_prompt(conv: dict, appt_type: str = "EVAL_195") -> str:
+    """Human price disclosure plus concrete slot choices.
+
+    Used only when the customer is moving into scheduling. The price is not
+    allowed in the first address-collection message.
+    """
+    sched = (conv or {}).setdefault("sched", {}) if isinstance(conv, dict) else {}
+    appt = (appt_type or sched.get("appointment_type") or "EVAL_195").upper()
+    try:
+        slots = get_next_available_slots(appt, limit=3)
+    except Exception as e:
+        print("[WARN] build_price_and_availability_prompt slot lookup failed:", repr(e))
+        slots = []
+
+    # Keep this wording deliberately human and contained. This is the main
+    # customer-facing price + scheduling handoff after the address is accepted.
+    if "TROUBLESHOOT" in appt:
+        intro = "We have availability to come and take a look. Troubleshoot and repair visits are $395."
+    elif "INSPECTION" in appt:
+        intro = "We have availability to come and take a look. The whole-home inspection is $395."
+    else:
+        intro = "We have availability to come and take a look. We do charge $195 to send one of our electricians out so we can get you a written quote."
+
+    if slots:
+        sched["awaiting_slot_offer_choice"] = True
+        sched["offered_slot_options"] = slots[:3]
+        opts = format_command_center_slot_list(slots)
+        return f"{intro} If this is something you're interested in, I have {opts}, or is there a better date/time that works for you?"
+
+    return f"{intro} If this is something you're interested in, what date/time works best for you?"
+
+
+def replace_generic_schedule_question_with_availability(body: str, availability_prompt: str) -> str:
+    body = " ".join(str(body or "").split()).strip()
+    prompt = " ".join(str(availability_prompt or "").split()).strip()
+    if not body or not prompt:
+        return body or prompt
+    low = _intent_text(body)
+    generic = [
+        "what day and time work best for you",
+        "what day and time works best for you",
+        "what day works best for you",
+        "what day works best",
+        "what time works best",
+        "what time works for you",
+    ]
+    if any(g in low for g in generic):
+        # Keep short human acknowledgement if present.
+        m = re.match(r"^(Got it\.|Perfect\.|Sounds good\.|Alright\.|No problem\.)(?:\s+)?", body, flags=re.I)
+        if m:
+            return f"{m.group(1).strip()} {prompt}"
+        return prompt
+    return f"{prompt} {body}".strip()
+
+
 def message_is_scheduling_prompt(body: str) -> bool:
     low = _intent_text(body)
     if not low:
@@ -2274,7 +2325,8 @@ Core behavioral constraints:
 - Do NOT mention $195 or $395 unless the customer directly asks about price. Python will add required price disclosure at the right scheduling step.
 - Do NOT say "for the visit" when asking for an address. Say "for the work".
 - Do NOT mention Kyle by name in customer-facing replies. Use "our electrician", "one of our licensed electricians", "our technician", "our office", or "we".
-- NEVER say “one moment”, “please wait”, “hold on”, “securing your appointment”, or anything implying background processing.
+- Do NOT insert a robotic project-intent summary like "It sounds like you are looking for help with..." unless the customer directly asks what we are coming out for.
+- NEVER say "one moment", "please wait", "hold on", "securing your appointment", or anything implying background processing.
 - If the address is incomplete, ask only for the missing address atom.
 - If date is known but time is missing, ask only for time.
 - If time is known but date is missing, ask only for date.
@@ -4643,9 +4695,33 @@ def salvage_relative_date_from_text(inbound_text: str) -> str | None:
             delta = (idx - today.weekday()) % 7
             return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
 
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", low)
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)
     if m:
         mo = int(m.group(1))
+        day = int(m.group(2))
+        yr_raw = m.group(3)
+        year = today.year
+        if yr_raw:
+            year = int(yr_raw)
+            if year < 100:
+                year += 2000
+        try:
+            dt = datetime(year, mo, day)
+            if not yr_raw and dt.date() < today:
+                dt = datetime(year + 1, mo, day)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    month_names = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    }
+    m = re.search(r"\b(" + "|".join(month_names.keys()) + r")\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{2,4}))?\b", low)
+    if m:
+        mo = month_names[m.group(1)]
         day = int(m.group(2))
         yr_raw = m.group(3)
         year = today.year
@@ -5316,10 +5392,8 @@ def generate_reply_for_inbound(
             s = _norm(s)
             if not sched.get("intro_sent"):
                 intro = build_human_intro_line()
-                if not inbound_text:
-                    topics_text = _task_topics_text()
-                    if topics_text:
-                        intro = f"{intro} It sounds like you're looking for help with {topics_text}."
+                # Do not inject extracted task topics into the opener by default.
+                # It tends to sound robotic; keep scope in the monitor unless the customer asks.
                 s = f"{intro} {s}".strip()
                 sched["intro_sent"] = True
             return _norm(s)
@@ -5345,7 +5419,7 @@ def generate_reply_for_inbound(
 
             if allowed and not sched.get("price_disclosed"):
                 try:
-                    s = apply_price_injection(appt_local, s)
+                    s = apply_price_injection(appt_local, s, conv)
                     sched["price_disclosed"] = True
                 except Exception:
                     pass
@@ -6008,21 +6082,13 @@ def generate_reply_for_inbound(
 # ---------------------------------------------------
 # PRICE INJECTION HELPER (PATCH 2)
 # ---------------------------------------------------
-def apply_price_injection(appt_type: str, body: str) -> str:
+def apply_price_injection(appt_type: str, body: str, conv: dict | None = None) -> str:
     body = " ".join(str(body or "").split()).strip()
     if "$" in body:
         return body
 
-    line = prevolt_eval_price_line(appt_type)
-
-    # Keep the natural acknowledgement first, then disclose price, then ask scheduling.
-    m = re.match(r"^(Got it\.|Perfect\.|Sounds good\.|Alright\.|No problem\.)(.*)$", body, flags=re.I)
-    if m:
-        ack = m.group(1).strip()
-        rest = " ".join((m.group(2) or "").split()).strip()
-        return f"{ack} {line} {rest}".strip()
-
-    return f"{line} {body}".strip()
+    prompt = build_price_and_availability_prompt(conv or {}, appt_type)
+    return replace_generic_schedule_question_with_availability(body, prompt)
 
 
 # ---------------------------------------------------
