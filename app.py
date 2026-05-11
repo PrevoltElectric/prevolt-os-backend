@@ -193,7 +193,10 @@ def detect_customer_hard_stop(text: str) -> str | None:
     low = _intent_text(text)
     if not low:
         return None
-    exact = {"cancel", "disregard", "never mind", "nevermind", "forget it", "stop", "unsubscribe"}
+    exact = {
+        "cancel", "disregard", "never mind", "nevermind", "forget it", "stop", "unsubscribe",
+        "no thanks", "no thank you", "pass", "i'll pass", "ill pass", "leave me alone"
+    }
     if low in exact:
         return "customer_stop"
     phrases = [
@@ -205,6 +208,9 @@ def detect_customer_hard_stop(text: str) -> str | None:
         "i do not want to schedule", "i don't want an appointment", "i dont want an appointment",
         "no longer need", "don't need service", "dont need service",
         "call someone else", "going with someone else",
+        "not interested", "i'm not interested", "im not interested", "not interested anymore",
+        "no longer interested", "leave me alone", "please stop", "stop texting", "stop messaging",
+        "don't contact me", "dont contact me", "do not contact me", "thanks anyway", "no thanks",
     ]
     if any(p in low for p in phrases):
         return "customer_cancelled_or_found_someone"
@@ -226,6 +232,60 @@ def apply_customer_hard_stop(conv: dict, reason: str, inbound_text: str = "") ->
     sched["closed_text"] = _safe_monitor_text(inbound_text, 240) if "_safe_monitor_text" in globals() else inbound_text
     return "No problem. We’ll stop the scheduling messages."
 
+
+
+
+def address_gate_blocks_scheduling(conv: dict) -> bool:
+    """Hard stop: scheduling/slot logic must not run while address is still unverified."""
+    sched = conv.setdefault("sched", {})
+    try:
+        update_address_assembly_state(sched)
+        recompute_pending_step(conv.setdefault("profile", {}), sched)
+    except Exception:
+        pass
+
+    if sched.get("address_verified"):
+        return False
+    if sched.get("customer_hard_stop") or sched.get("manual_only"):
+        return False
+    if (conv.get("thread_type") or "") in {"closed_lost", "manual_only", "vendor_sales_or_spam", "wrong_number_or_spam"}:
+        return False
+
+    raw = (sched.get("raw_address") or sched.get("address_candidate") or "").strip()
+    missing = (sched.get("address_missing") or "").strip().lower()
+    pending = (sched.get("pending_step") or "").strip().lower()
+    return bool(pending == "need_address" or missing in {"street", "number", "confirm", "state", "partial", "missing"} or not raw)
+
+
+def build_address_gate_reply(conv: dict) -> str:
+    """Clear stale scheduling state and ask only for address confirmation/details."""
+    sched = conv.setdefault("sched", {})
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["scheduled_date"] = None
+    sched["scheduled_time"] = None
+    sched["final_confirmation_sent"] = False
+    sched["final_confirmation_accepted"] = False
+    sched["last_final_confirmation_key"] = None
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    try:
+        update_address_assembly_state(sched)
+    except Exception:
+        pass
+
+    raw = (sched.get("raw_address") or sched.get("address_candidate") or "").strip(" ,.")
+    missing = (sched.get("address_missing") or "").strip().lower()
+
+    # If we have a plausible full street/town candidate from voicemail, confirm it.
+    if raw and missing in {"confirm", "state"} and _address_has_house_number_and_street(raw):
+        return f"You're at {raw}, right?"
+
+    # Otherwise ask for the missing address cleanly.
+    try:
+        return build_address_prompt(sched)
+    except Exception:
+        return "What’s the address for the work?"
 
 def last_outbound_asked_address_confirmation(conv: dict) -> bool:
     last = _intent_text((conv or {}).get("last_sms_body") or "")
@@ -3526,6 +3586,24 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms partial address merge failed:", repr(e))
 
+    # Absolute address gate: never schedule, offer slots, or ask for time while the address still needs confirmation.
+    try:
+        if address_gate_blocks_scheduling(conv):
+            reply_body = build_address_gate_reply(conv)
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply_body
+            try:
+                log_event("ADDRESS_GATE_BLOCKED_SCHEDULING", phone, {"body": _safe_monitor_text(inbound_text), "reply": _safe_monitor_text(reply_body)}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(reply_body)
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms address gate failed:", repr(e))
+
     # If customer answers an offered slot list with "anytime" / "whatever works",
     # take the earliest offered slot before any name capture can misread it.
     try:
@@ -3603,7 +3681,7 @@ def incoming_sms():
 
     # If customer rejects all offered slot options, do not repeat the same options.
     try:
-        if sched.get("awaiting_slot_offer_choice") and is_rejecting_offered_slots(inbound_text):
+        if sched.get("awaiting_slot_offer_choice") and is_rejecting_offered_slots(inbound_text) and not detect_customer_hard_stop(inbound_text):
             sched["awaiting_slot_offer_choice"] = False
             sched["offered_slot_options"] = []
             reply_body = "No problem. What day or time range works better for you?"
