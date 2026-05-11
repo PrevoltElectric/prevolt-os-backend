@@ -275,18 +275,133 @@ def extract_address_from_negative_correction(text: str) -> str | None:
     candidate = safe_address_candidate_from_text(cleaned) or safe_address_candidate_from_text(raw)
     return candidate
 
+def _address_text_has_location_tail(value: str) -> bool:
+    """True when an extracted street address appears to already include town/state/zip context."""
+    s = " ".join(str(value or "").split()).strip()
+    if not s:
+        return False
+    if re.search(r"\b(?:CT|C\.?T\.?|Connecticut|MA|M\.?A\.?|Massachusetts|Mass\.?)\b", s, flags=re.I):
+        return True
+    if re.search(r"\b\d{5}(?:-\d{4})?\b", s):
+        return True
+    # If there are words after the street suffix, treat them as likely town context.
+    suffix = r"st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place|park"
+    return bool(re.search(rf"\b(?:{suffix})\b\s*,?\s+(?:in\s+)?[A-Za-z][A-Za-z .'\-]+$", s, flags=re.I))
+
+
+def _location_context_from_text(text: str) -> tuple[str | None, str | None, str | None]:
+    """Pull town/state/zip from a prior address-confirmation text such as '2 Main Street, Windsor, right?'"""
+    raw = " ".join(str(text or "").replace("\n", " ").split()).strip()
+    if not raw:
+        return (None, None, None)
+
+    # Use the same address extractor first so we look at the address-shaped section, not the whole prompt.
+    addr = None
+    try:
+        addr = extract_service_address_from_text(raw)
+    except Exception:
+        addr = None
+    sample = addr or raw
+
+    suffix = r"st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place|park"
+    m = re.search(
+        rf"\b\d{{1,6}}(?:-\d{{1,6}})?[A-Za-z]?\s+[A-Za-z0-9.'#\- ]+?\b(?:{suffix})\b\s*,?\s*(?:in\s+)?(?P<tail>[A-Za-z][A-Za-z .'\-]{{1,40}})?",
+        sample,
+        flags=re.I,
+    )
+    tail = (m.group("tail") or "").strip(" ,.;") if m else ""
+    if tail:
+        tail = re.split(
+            r"\b(?:right|correct|is that|for the work|for the visit|thank|thanks|please|can you|could you|our evaluation|we would|i have)\b",
+            tail,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" ,.;")
+
+    state = None
+    if re.search(r"\b(?:CT|C\.?T\.?|Connecticut|Conn\.?)\b", sample, flags=re.I):
+        state = "CT"
+    elif re.search(r"\b(?:MA|M\.?A\.?|Massachusetts|Mass\.?)\b", sample, flags=re.I):
+        state = "MA"
+
+    zip_match = re.search(r"\b(\d{5}(?:-\d{4})?)\b", sample)
+    zipc = zip_match.group(1) if zip_match else None
+
+    # Guard against junk tails.
+    if tail:
+        bad = {"right", "correct", "the work", "the visit", "you", "your project"}
+        if tail.lower() in bad or len(tail) < 2:
+            tail = ""
+    return (tail or None, state, zipc)
+
+
+def inherit_location_context_for_corrected_address(conv: dict, corrected_address: str) -> str:
+    """
+    If the customer corrects only the street/number after we asked
+    'You're at 2 Main Street, Windsor, right?', inherit the town/state from
+    the address we just asked about. This prevents the bot from asking
+    'What town is that in?' after 'No, 1 Main St.'
+    """
+    corrected = " ".join(str(corrected_address or "").split()).strip(" ,.;")
+    if not corrected:
+        return corrected
+    if _address_text_has_location_tail(corrected):
+        return corrected
+
+    sched = conv.setdefault("sched", {})
+    norm = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+    if norm:
+        city = (norm.get("locality") or "").strip()
+        state = (norm.get("administrative_district_level_1") or "").strip()
+        zipc = (norm.get("postal_code") or "").strip()
+        if city:
+            tail = " ".join(x for x in [city, state, zipc] if x)
+            return f"{corrected} {tail}".strip()
+
+    candidates = [
+        sched.get("rejected_address"),
+        sched.get("raw_address"),
+        sched.get("address_candidate"),
+        conv.get("last_sms_body"),
+        conv.get("initial_sms"),
+        conv.get("cleaned_transcript"),
+    ]
+    for candidate in candidates:
+        city, state, zipc = _location_context_from_text(candidate or "")
+        if city:
+            tail = " ".join(x for x in [city, state, zipc] if x)
+            return f"{corrected} {tail}".strip()
+
+    return corrected
+
+
+def should_handle_negative_address_correction(conv: dict, inbound_text: str) -> bool:
+    """Broader than last_outbound_asked_address_confirmation; catches 'No, 1 Main St' reliably."""
+    if not starts_with_negative_address_correction(inbound_text):
+        return False
+    if last_outbound_asked_address_confirmation(conv):
+        return True
+    sched = conv.setdefault("sched", {})
+    last = _intent_text(conv.get("last_sms_body"))
+    # If we have any address state and the customer starts with no + address,
+    # this is almost certainly a correction to our guessed/heard address.
+    return bool(
+        sched.get("raw_address")
+        or sched.get("address_candidate")
+        or sched.get("normalized_address")
+        or ("right" in last and ("youre at" in last or "you're at" in last or "address" in last))
+    )
+
 
 def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str | None:
-    if not last_outbound_asked_address_confirmation(conv):
-        return None
-
     sched = conv.setdefault("sched", {})
     profile = conv.setdefault("profile", {})
 
     corrected_address = extract_address_from_negative_correction(inbound_text)
-    if corrected_address:
+    if corrected_address and should_handle_negative_address_correction(conv, inbound_text):
         if sched.get("raw_address"):
             sched["rejected_address"] = sched.get("raw_address")
+        corrected_address = inherit_location_context_for_corrected_address(conv, corrected_address)
         sched["raw_address"] = corrected_address
         sched["normalized_address"] = None
         sched["address_verified"] = True
@@ -310,6 +425,9 @@ def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str 
             pass
         availability = build_price_and_availability_prompt(conv, sched.get("appointment_type") or "EVAL_195")
         return f"Sorry about that, the voicemail was a little tough to hear. I have it now. {availability}"
+
+    if not last_outbound_asked_address_confirmation(conv):
+        return None
 
     if not is_negative_answer(inbound_text):
         return None
