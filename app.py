@@ -1974,6 +1974,32 @@ def voicemail_complete():
         resp.hangup()
         return Response(str(resp), mimetype="text/xml")
 
+    # Command Center manual takeover also suppresses voicemail auto-follow-up.
+    # We still transcribe and log the voicemail so the desk can review it, but
+    # we do not classify, text, or reopen the automated booking flow.
+    sched_manual_vm = conv.setdefault("sched", {})
+    if conv.get("thread_type") == "manual_only" or sched_manual_vm.get("manual_only"):
+        conv["thread_type"] = "manual_only"
+        conv["cleaned_transcript"] = cleaned
+        sched_manual_vm["manual_only"] = True
+        sched_manual_vm["booking_allowed"] = False
+        sched_manual_vm["pending_step"] = None
+        sched_manual_vm["awaiting_slot_offer_choice"] = False
+        sched_manual_vm["offered_slot_options"] = []
+        sched_manual_vm.setdefault("manual_reason", "command_center_manual")
+        try:
+            log_event("VOICEMAIL_MANUAL_ONLY_SUPPRESSED", from_number, {
+                "recording_url": recording_url,
+                "raw_transcript": _safe_monitor_text(transcript if 'transcript' in locals() else '', 700),
+                "cleaned_transcript": _safe_monitor_text(cleaned, 700),
+                "reason": sched_manual_vm.get("manual_reason") or "command_center_manual",
+            }, conv)
+        except Exception:
+            pass
+        resp.say("Thank you. Your message has been recorded.")
+        resp.hangup()
+        return Response(str(resp), mimetype="text/xml")
+
     # 2) Classification
     classification = generate_initial_sms(cleaned)
 
@@ -2926,6 +2952,32 @@ def incoming_sms():
     conv = conversations.setdefault(phone, {})
     if lsa_customer_message:
         conv["source"] = "google_lsa"
+
+    # Command Center manual takeover hard lock.
+    # If Kyle marks a thread Manual in Prevolt Command Center, the backend must
+    # keep logging inbound customer messages but must not send automated SMS,
+    # continue address/date/email prompts, or create bookings.
+    manual_sched = conv.setdefault("sched", {})
+    if conv.get("thread_type") == "manual_only" or manual_sched.get("manual_only"):
+        conv["thread_type"] = "manual_only"
+        manual_sched["manual_only"] = True
+        manual_sched["booking_allowed"] = False
+        manual_sched["pending_step"] = None
+        manual_sched["awaiting_slot_offer_choice"] = False
+        manual_sched["offered_slot_options"] = []
+        manual_sched.setdefault("manual_reason", "command_center_manual")
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        try:
+            log_event("MANUAL_ONLY_SMS_SUPPRESSED", phone, {
+                "sid": inbound_sid,
+                "body": _safe_monitor_text(inbound_text),
+                "reason": manual_sched.get("manual_reason") or "command_center_manual",
+            }, conv)
+        except Exception:
+            pass
+        return Response(str(MessagingResponse()), mimetype="text/xml")
 
     # Twilio and WhatsApp can occasionally retry the same inbound webhook.
     # Guard both by inbound SID and by a short body fingerprint window.
@@ -7374,11 +7426,15 @@ def monitor_conversation_status():
         sched["booking_allowed"] = False
         sched["pending_step"] = None
         sched["closed_reason"] = reason
-    elif status in {"manual_only", "needs_callback"}:
+    elif status in {"manual_only", "manual", "needs_callback", "callback"}:
         conv["thread_type"] = "manual_only"
+        conv["manual_takeover"] = True
         sched["manual_only"] = True
         sched["manual_reason"] = reason
+        sched["booking_allowed"] = False
         sched["pending_step"] = None
+        sched["awaiting_slot_offer_choice"] = False
+        sched["offered_slot_options"] = []
     elif status == "booked_manual":
         sched["booking_created"] = True
         sched["manual_booked"] = True
