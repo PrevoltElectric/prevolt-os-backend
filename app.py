@@ -1952,10 +1952,80 @@ def send_sms(to_number: str, body: str) -> None:
 
 
 
+
+def sync_confirmed_name_from_context(profile: dict, sched: dict) -> None:
+    """
+    Promote a full name that is already known inside the current thread into
+    the active booking identity so we do not ask the customer for their name again.
+
+    Important: this does NOT override the shared-number name engine. If the
+    name engine is waiting for confirmation/selection, we leave it alone.
+    """
+    if not isinstance(profile, dict) or not isinstance(sched, dict):
+        return
+
+    # If the name engine is actively resolving a shared-number/new-person
+    # conflict, do not silently choose a name.
+    if (sched.get("name_engine_state") or "").strip():
+        return
+
+    def _norm_name(value: str) -> str:
+        value = " ".join(str(value or "").strip().split())
+        if not value:
+            return ""
+        return " ".join(part[:1].upper() + part[1:].lower() for part in value.split())
+
+    active_first = _norm_name(profile.get("active_first_name") or profile.get("first_name") or "")
+    active_last = _norm_name(profile.get("active_last_name") or profile.get("last_name") or "")
+    if active_first and active_last:
+        return
+
+    # The monitor can display voicemail_first_name/voicemail_last_name, but
+    # recompute_pending_step previously ignored those. That caused the bot to
+    # ask for first/last name even though the voicemail said "Kyle Prevost".
+    candidate_first = _norm_name(profile.get("voicemail_first_name") or "")
+    candidate_last = _norm_name(profile.get("voicemail_last_name") or "")
+
+    # Some paths store a full display name under profile["name"]. Use it only
+    # when it cleanly looks like a normal two-part person name.
+    if not (candidate_first and candidate_last):
+        raw_name = " ".join(str(profile.get("name") or "").strip().split())
+        parts = [p for p in re.sub(r"[^A-Za-z'\- ]", " ", raw_name).split() if p]
+        if len(parts) >= 2 and len(parts) <= 4:
+            candidate_first = candidate_first or _norm_name(parts[0])
+            candidate_last = candidate_last or _norm_name(" ".join(parts[1:]))
+
+    if not (candidate_first and candidate_last):
+        return
+
+    # If there are known people on this number and the voicemail name is not
+    # one of them, shared-number logic must confirm it first.
+    known_people = profile.get("known_people") or []
+    if isinstance(known_people, list) and known_people:
+        matched_known = False
+        for person in known_people:
+            if not isinstance(person, dict):
+                continue
+            k_first = _norm_name(person.get("first_name") or "")
+            k_last = _norm_name(person.get("last_name") or "")
+            if k_first and k_first.lower() == candidate_first.lower() and (not k_last or k_last.lower() == candidate_last.lower()):
+                matched_known = True
+                break
+        if not matched_known:
+            return
+
+    profile["active_first_name"] = active_first or candidate_first
+    profile["first_name"] = active_first or candidate_first
+    profile["active_last_name"] = active_last or candidate_last
+    profile["last_name"] = active_last or candidate_last
+    profile["identity_source"] = profile.get("identity_source") or "thread_full_name"
+
 def recompute_pending_step(profile: dict, sched: dict) -> None:
     if sched.get("non_service_thread") or sched.get("manual_only"):
         sched["pending_step"] = None
         return
+
+    sync_confirmed_name_from_context(profile, sched)
 
     active_first = (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or "").strip()
     active_last = (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or "").strip()
@@ -5145,7 +5215,12 @@ def maybe_apply_name_engine_from_context(profile: dict, sched: dict, cleaned_tra
         # No known people yet -> trust the explicit voicemail name.
         profile["active_first_name"] = voicemail_first
         profile["first_name"] = voicemail_first
-        profile["identity_source"] = "voicemail_first_name"
+        if voicemail_last:
+            profile["active_last_name"] = voicemail_last
+            profile["last_name"] = voicemail_last
+            profile["identity_source"] = "voicemail_full_name"
+        else:
+            profile["identity_source"] = "voicemail_first_name"
         return None
 
     # No voicemail name was given.
