@@ -424,6 +424,11 @@ def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str 
             sched["address_missing"] = None
         except Exception:
             pass
+        # Address correction into scheduling is always a normal evaluation unless
+        # a prior emergency/inspection classification already exists.
+        if not sched.get("appointment_type"):
+            sched["appointment_type"] = "EVAL_195"
+        conv["appointment_type"] = sched.get("appointment_type")
         availability = build_price_and_availability_prompt(conv, sched.get("appointment_type") or "EVAL_195")
         return f"Sorry about that, the voicemail was a little tough to hear. I have it now. {availability}"
 
@@ -861,6 +866,9 @@ def maybe_apply_flexible_offered_slot_choice(conv: dict, inbound_text: str) -> b
         return False
 
     chosen = options[0]
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+    sched["appointment_type"] = appt
+    conv["appointment_type"] = appt
     sched["scheduled_date"] = chosen.get("date")
     sched["scheduled_time"] = chosen.get("time")
     sched["scheduled_time_source"] = "offered_slot_flexible"
@@ -1156,6 +1164,13 @@ def maybe_handle_exact_slot_before_step4(conv: dict, phone: str, inbound_text: s
         return None
 
     appointment_type = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+    # If we already offered evaluation slots, an exact date/time reply is a slot
+    # choice even if an older state snapshot failed to mirror appointment_type.
+    # Default it to EVAL_195 so the handler can check Square and move to name/email.
+    if not appointment_type and (sched.get("awaiting_slot_offer_choice") or sched.get("offered_slot_options") or sched.get("address_verified")):
+        appointment_type = "EVAL_195"
+        sched["appointment_type"] = appointment_type
+        conv["appointment_type"] = appointment_type
     if not appointment_type:
         return None
 
@@ -1231,6 +1246,9 @@ def maybe_handle_exact_slot_before_step4(conv: dict, phone: str, inbound_text: s
 
     # If the slot is not blocked, continue the normal booking data collection.
     # Do NOT say it works, reserved, confirmed, or anything similar yet.
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
     recompute_pending_step(profile, sched)
     step = sched.get("pending_step")
     if step in {"need_name", "need_email"}:
@@ -2380,6 +2398,14 @@ def build_price_and_availability_prompt(conv: dict, appt_type: str = "EVAL_195")
     """
     sched = (conv or {}).setdefault("sched", {}) if isinstance(conv, dict) else {}
     appt = (appt_type or sched.get("appointment_type") or "EVAL_195").upper()
+    # Once we are disclosing the evaluation price and offering slots, the
+    # appointment type is no longer optional. Keep both sched and top-level
+    # mirrors in sync so later slot replies do not fall back to need_appt_type.
+    if not sched.get("appointment_type"):
+        sched["appointment_type"] = appt
+    if isinstance(conv, dict):
+        conv["appointment_type"] = sched.get("appointment_type") or appt
+    sched["booking_allowed"] = True
     try:
         slots = get_next_available_slots(appt, limit=3)
     except Exception as e:
@@ -3520,6 +3546,27 @@ def incoming_sms():
             return Response(str(tw), mimetype="text/xml")
     except Exception as e:
         print("[WARN] incoming_sms flexible offered slot choice failed:", repr(e))
+
+    # If customer chooses one of the offered slots, lock it in at the route level
+    # before exact-slot fallback or the model can reinterpret the reply.
+    try:
+        if maybe_apply_offered_slot_selection(conv, inbound_text):
+            recompute_pending_step(profile, sched)
+            reply_body = choose_next_prompt_from_state(conv, inbound_text=inbound_text)
+            reply_body = sanitize_sms_body(collapse_duplicate_sms(reply_body.strip()), booking_created=bool(sched.get("booking_created") and sched.get("square_booking_id")))
+            conv["last_inbound_sid"] = inbound_sid
+            conv["last_inbound_fingerprint"] = inbound_fingerprint
+            conv["last_inbound_fingerprint_ts"] = now_ts
+            conv["last_sms_body"] = reply_body
+            try:
+                log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(reply_body), "offered_slot_choice": True}, conv)
+            except Exception:
+                pass
+            tw = MessagingResponse()
+            tw.message(reply_body)
+            return Response(str(tw), mimetype="text/xml")
+    except Exception as e:
+        print("[WARN] incoming_sms offered slot choice failed:", repr(e))
 
     # LIVE HOTFIX: exact date/time replies must be handled before any model,
     # interruption, name-capture, or availability fallback logic. This catches
@@ -7016,6 +7063,18 @@ def build_slot_unavailable_result(sched: dict, scheduled_date: str, scheduled_ti
 
 
 def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
+    """Lock one of the currently offered slots when the customer chooses it.
+
+    Handles natural replies like:
+    - "first one"
+    - "Tuesday works"
+    - "Tuesday at 2"
+    - "2pm"
+    - "May 12"
+
+    This must run before Step 4 and before exact-slot fallback so the system does
+    not treat an offered-slot choice as a new scheduling request or reopen price.
+    """
     sched = conv.setdefault("sched", {})
     if not sched.get("awaiting_slot_offer_choice"):
         return False
@@ -7026,13 +7085,13 @@ def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
         return False
 
     txt = (inbound_text or "").strip()
-    low = txt.lower()
+    low = _intent_text(txt)
     chosen = None
 
     ordinal_map = [
-        ("first", 0), ("1st", 0), ("one", 0),
-        ("second", 1), ("2nd", 1), ("two", 1),
-        ("third", 2), ("3rd", 2), ("three", 2),
+        ("first", 0), ("1st", 0), ("option 1", 0), ("number 1", 0), ("one", 0),
+        ("second", 1), ("2nd", 1), ("option 2", 1), ("number 2", 1), ("two", 1),
+        ("third", 2), ("3rd", 2), ("option 3", 2), ("number 3", 2), ("three", 2),
     ]
     for key, idx in ordinal_map:
         if re.search(rf"\b{re.escape(key)}\b", low):
@@ -7040,27 +7099,49 @@ def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
                 chosen = options[idx]
                 break
 
-    if chosen is None and txt.isdigit():
-        idx = int(txt) - 1
+    if chosen is None and re.fullmatch(r"\d+", low or ""):
+        idx = int(low) - 1
         if 0 <= idx < len(options):
             chosen = options[idx]
 
     explicit_time = extract_explicit_time_from_text(txt)
-    if chosen is None and explicit_time:
-        matches = [opt for opt in options if opt.get("time") == explicit_time]
-        if matches:
+    requested_date = salvage_relative_date_from_text(txt)
+
+    def _slot_day_names(opt):
+        try:
+            d = datetime.strptime(str(opt.get("date") or ""), "%Y-%m-%d")
+            return {d.strftime("%A").lower(), d.strftime("%a").lower()}
+        except Exception:
+            return set()
+
+    # Match a specific offered date/day, optionally with a time.
+    if chosen is None:
+        matches = []
+        for opt in options:
+            opt_date = str(opt.get("date") or "").strip()
+            opt_time = str(opt.get("time") or "").strip()
+            day_match = any(re.search(rf"\b{re.escape(day)}\b", low) for day in _slot_day_names(opt))
+            date_match = bool(requested_date and requested_date == opt_date)
+            label_match = bool((opt.get("label") or "").strip().lower() and (opt.get("label") or "").strip().lower() in low)
+            if day_match or date_match or label_match:
+                if explicit_time and explicit_time != opt_time:
+                    continue
+                matches.append(opt)
+        if len(matches) == 1:
             chosen = matches[0]
 
-    if chosen is None:
-        for opt in options:
-            label = (opt.get("label") or "").lower()
-            if label and label in low:
-                chosen = opt
-                break
+    # Match by time when the offered times are unique. This catches "2pm".
+    if chosen is None and explicit_time:
+        matches = [opt for opt in options if str(opt.get("time") or "").strip() == explicit_time]
+        if len(matches) == 1:
+            chosen = matches[0]
 
     if not chosen:
         return False
 
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+    sched["appointment_type"] = appt
+    conv["appointment_type"] = appt
     sched["scheduled_date"] = chosen.get("date")
     sched["scheduled_time"] = chosen.get("time")
     sched["scheduled_time_source"] = "offered_slot"
