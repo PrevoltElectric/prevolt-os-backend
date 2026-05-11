@@ -230,10 +230,29 @@ def last_outbound_asked_address_confirmation(conv: dict) -> bool:
     last = _intent_text((conv or {}).get("last_sms_body") or "")
     if not last:
         return False
-    return (
-        ("is that correct" in last or "is this for that address" in last or "is this the correct address" in last)
-        and ("address" in last or "i have" in last or "on file" in last or "for the visit" in last or "for the work" in last)
+
+    # The humanized first voicemail opener usually says:
+    # "You're at 45 Dickerman Ave, Windsor Locks, right?"
+    # Treat that as an address confirmation question even though it does not
+    # literally contain "is that correct". This prevents a customer reply like
+    # "No, 34 Dickerman Ave" from skipping the apology/correction branch.
+    explicit_confirm = (
+        "is that correct" in last
+        or "is this for that address" in last
+        or "is this the correct address" in last
+        or "is that the correct address" in last
     )
+    human_confirm = ("youre at" in last or "you're at" in last) and ("right" in last or "correct" in last)
+    has_address_context = (
+        "address" in last
+        or "i have" in last
+        or "on file" in last
+        or "for the visit" in last
+        or "for the work" in last
+        or "youre at" in last
+        or "you're at" in last
+    )
+    return (explicit_confirm or human_confirm) and has_address_context
 
 
 def is_negative_answer(text: str) -> bool:
@@ -5409,6 +5428,15 @@ def generate_reply_for_inbound(
 
         def _shorten_texty(s: str, max_chars: int = 260) -> str:
             s = _norm(s)
+
+            # Do not truncate the controlled price + slot handoff. The slots are
+            # the whole point of that message; earlier versions shortened the
+            # message after the price sentence and accidentally removed the three
+            # available times.
+            low_s = _intent_text(s)
+            if ("$195" in s or "$395" in s) and ("we have" in low_s or "i have" in low_s) and ("or is there a better" in low_s):
+                return s
+
             if len(s) <= max_chars:
                 return s
             parts = re.split(r"(?<=[.!?])\s+", s)
