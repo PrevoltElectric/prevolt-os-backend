@@ -7023,8 +7023,44 @@ def monitor_health():
     return {"ok": True}, 200
 
 
+
+# ---------------------------------------------------
+# Prevolt Command Center Security + Control Endpoints
+# ---------------------------------------------------
+def _command_center_authorized() -> bool:
+    """Require the Command Center API key for monitor/control routes.
+    Set COMMAND_CENTER_API_KEY in Render and the same value in the desktop app settings.
+    """
+    required = (os.environ.get("COMMAND_CENTER_API_KEY") or "").strip()
+    supplied = (
+        request.headers.get("X-Prevolt-Command-Key")
+        or request.args.get("command_key")
+        or request.form.get("command_key")
+        or ""
+    ).strip()
+    return bool(required) and bool(supplied) and supplied == required
+
+
+def _command_center_auth_error():
+    return {"ok": False, "error": "unauthorized_command_center"}, 401
+
+
+def _cc_phone(raw: str) -> str:
+    raw = (raw or "").strip().replace("whatsapp:", "")
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    if raw.startswith("+"):
+        return raw
+    return "+" + digits if digits else raw
+
+
 @app.route("/monitor/events", methods=["GET"])
 def monitor_events():
+    if not _command_center_authorized():
+        return _command_center_auth_error()
     init_monitor_db()
     limit_raw = request.args.get("limit", "250")
     phone = (request.args.get("phone") or "").replace("whatsapp:", "").strip()
@@ -7066,6 +7102,8 @@ def monitor_events():
 
 @app.route("/monitor/conversations", methods=["GET"])
 def monitor_conversations():
+    if not _command_center_authorized():
+        return _command_center_auth_error()
     items = []
     for phone, conv in conversations.items():
         if not isinstance(conv, dict):
@@ -7086,6 +7124,8 @@ def monitor_conversations():
 
 @app.route("/monitor/conversation/close", methods=["POST"])
 def monitor_close_conversation():
+    if not _command_center_authorized():
+        return _command_center_auth_error()
     data = request.get_json(silent=True) or request.form or {}
     phone = (data.get("phone") or "").replace("whatsapp:", "").strip()
     reason = (data.get("reason") or "manual_closed").strip() or "manual_closed"
@@ -7103,6 +7143,146 @@ def monitor_close_conversation():
     except Exception:
         pass
     return {"ok": True, "conversation": _conversation_snapshot(phone, conv)}, 200
+
+
+
+@app.route("/monitor/send-sms", methods=["POST"])
+def monitor_send_sms():
+    if not _command_center_authorized():
+        return _command_center_auth_error()
+    data = request.get_json(silent=True) or request.form or {}
+    to_phone = _cc_phone(data.get("to") or data.get("phone") or "")
+    body = str(data.get("body") or "").strip()
+    if not to_phone or not body:
+        return {"ok": False, "error": "missing_to_or_body"}, 400
+    if not twilio_client or not TWILIO_FROM_NUMBER:
+        return {"ok": False, "error": "twilio_not_configured"}, 500
+    try:
+        msg = twilio_client.messages.create(to=to_phone, from_=TWILIO_FROM_NUMBER, body=body)
+        conv = conversations.setdefault(to_phone, {"profile": {}, "sched": {}})
+        conv["last_sms_body"] = body
+        log_event("MANUAL_SMS_OUT", to_phone, {"body": _safe_monitor_text(body), "sid": getattr(msg, "sid", None), "source": "command_center"}, conv)
+        return {"ok": True, "sid": getattr(msg, "sid", None), "to": to_phone}, 200
+    except Exception as e:
+        try:
+            log_event("MANUAL_SMS_FAILED", to_phone, {"body": _safe_monitor_text(body), "error": repr(e), "source": "command_center"})
+        except Exception:
+            pass
+        return {"ok": False, "error": "twilio_sms_failed", "detail": repr(e)}, 500
+
+
+@app.route("/monitor/start-call", methods=["POST"])
+def monitor_start_call():
+    """
+    Secure click-to-call bridge:
+    1. Command Center asks Render to start the call.
+    2. Twilio calls the operator phone first.
+    3. When answered, Twilio fetches /monitor/twiml/bridge and dials the customer.
+    """
+    if not _command_center_authorized():
+        return _command_center_auth_error()
+    data = request.get_json(silent=True) or request.form or {}
+    customer = _cc_phone(data.get("to") or data.get("customer_phone") or data.get("phone") or "")
+    operator = _cc_phone(data.get("operator_phone") or data.get("operator") or os.environ.get("COMMAND_CENTER_OPERATOR_PHONE") or "")
+    if not customer or not operator:
+        return {"ok": False, "error": "missing_customer_or_operator_phone"}, 400
+    if not twilio_client or not TWILIO_FROM_NUMBER:
+        return {"ok": False, "error": "twilio_not_configured"}, 500
+
+    from urllib.parse import quote_plus
+    base = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or request.url_root).rstrip("/")
+    bridge_token = (os.environ.get("PREVOLT_CALL_BRIDGE_TOKEN") or "").strip()
+    if not bridge_token:
+        return {"ok": False, "error": "missing_prevolt_call_bridge_token"}, 500
+    twiml_url = f"{base}/monitor/twiml/bridge?to={quote_plus(customer)}&token={quote_plus(bridge_token)}"
+    try:
+        call = twilio_client.calls.create(
+            to=operator,
+            from_=TWILIO_FROM_NUMBER,
+            url=twiml_url,
+            method="POST",
+        )
+        conv = conversations.setdefault(customer, {"profile": {}, "sched": {}})
+        log_event("MONITOR_CALL_STARTED", customer, {
+            "to": customer,
+            "operator_phone": operator,
+            "call_sid": getattr(call, "sid", None),
+            "source": "command_center",
+        }, conv)
+        return {"ok": True, "call_sid": getattr(call, "sid", None), "to": customer, "operator_phone": operator}, 200
+    except Exception as e:
+        return {"ok": False, "error": "twilio_call_failed", "detail": repr(e)}, 500
+
+
+@app.route("/monitor/twiml/bridge", methods=["GET", "POST"])
+def monitor_twiml_bridge():
+    token = (request.values.get("token") or "").strip()
+    expected = (os.environ.get("PREVOLT_CALL_BRIDGE_TOKEN") or "").strip()
+    vr = VoiceResponse()
+    if not expected or token != expected:
+        vr.say("Unauthorized Prevolt call bridge request.")
+        return Response(str(vr), mimetype="text/xml")
+    customer = _cc_phone(request.values.get("to") or "")
+    if not customer:
+        vr.say("No customer phone number was provided.")
+        return Response(str(vr), mimetype="text/xml")
+    vr.say("Connecting Prevolt Command Center.")
+    dial = Dial(caller_id=TWILIO_FROM_NUMBER, answer_on_bridge=True, timeout=25)
+    dial.number(customer)
+    vr.append(dial)
+    return Response(str(vr), mimetype="text/xml")
+
+
+@app.route("/monitor/conversation/status", methods=["POST"])
+def monitor_conversation_status():
+    if not _command_center_authorized():
+        return _command_center_auth_error()
+    data = request.get_json(silent=True) or request.form or {}
+    phone = _cc_phone(data.get("phone") or "")
+    status = str(data.get("status") or "manual_only").strip() or "manual_only"
+    reason = str(data.get("reason") or status).strip() or status
+    if not phone:
+        return {"ok": False, "error": "missing_phone"}, 400
+    conv = conversations.setdefault(phone, {"profile": {}, "sched": {}})
+    sched = conv.setdefault("sched", {})
+
+    if status in {"closed_lost", "vendor_sales_or_spam", "wrong_number_or_spam", "spam", "found_someone"}:
+        conv["thread_type"] = "vendor_sales_or_spam" if status in {"vendor_sales_or_spam", "spam"} else "closed_lost"
+        sched["customer_hard_stop"] = True
+        sched["booking_allowed"] = False
+        sched["pending_step"] = None
+        sched["closed_reason"] = reason
+    elif status in {"manual_only", "needs_callback"}:
+        conv["thread_type"] = "manual_only"
+        sched["manual_only"] = True
+        sched["manual_reason"] = reason
+        sched["pending_step"] = None
+    elif status == "booked_manual":
+        sched["booking_created"] = True
+        sched["manual_booked"] = True
+        sched["manual_reason"] = reason
+    else:
+        sched["manual_status"] = status
+        sched["manual_reason"] = reason
+
+    log_event("MONITOR_STATUS_UPDATED", phone, {"status": status, "reason": reason, "source": "command_center"}, conv)
+    return {"ok": True, "conversation": _conversation_snapshot(phone, conv)}, 200
+
+
+@app.route("/monitor/conversation/note", methods=["POST"])
+def monitor_conversation_note():
+    if not _command_center_authorized():
+        return _command_center_auth_error()
+    data = request.get_json(silent=True) or request.form or {}
+    phone = _cc_phone(data.get("phone") or "")
+    note = str(data.get("note") or "").strip()
+    if not phone or not note:
+        return {"ok": False, "error": "missing_phone_or_note"}, 400
+    conv = conversations.setdefault(phone, {"profile": {}, "sched": {}})
+    conv.setdefault("notes", []).append({"ts": _monitor_now_iso(), "note": note, "source": "command_center"})
+    log_event("MONITOR_NOTE", phone, {"note": _safe_monitor_text(note, 800), "source": "command_center"}, conv)
+    return {"ok": True}, 200
+
 
 # ---------------------------------------------------
 # Local Development Entrypoint
