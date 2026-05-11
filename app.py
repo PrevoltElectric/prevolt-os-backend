@@ -2204,7 +2204,7 @@ def build_price_and_availability_prompt(conv: dict, appt_type: str = "EVAL_195")
     elif "INSPECTION" in appt:
         intro = "We have availability to come and take a look. The whole-home inspection is $395."
     else:
-        intro = "We can definitely take care of this. We do charge $195 for one of our electricians to come out and take a look as well as provide you with a same-day quote."
+        intro = "We can definitely take care of this. We do charge $195 for one of our electricians to come out and take a look as well as provide you with a quote."
 
     if slots:
         sched["awaiting_slot_offer_choice"] = True
