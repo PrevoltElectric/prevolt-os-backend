@@ -2204,15 +2204,15 @@ def build_price_and_availability_prompt(conv: dict, appt_type: str = "EVAL_195")
     elif "INSPECTION" in appt:
         intro = "We have availability to come and take a look. The whole-home inspection is $395."
     else:
-        intro = "We have availability to come and take a look. We do charge $195 to send one of our electricians out so we can get you a written quote."
+        intro = "We can definitely take care of this. We do charge $195 for one of our electricians to come out and take a look as well as provide you with a same-day quote."
 
     if slots:
         sched["awaiting_slot_offer_choice"] = True
         sched["offered_slot_options"] = slots[:3]
         opts = format_command_center_slot_list(slots)
-        return f"{intro} If this is something you're interested in, I have {opts}, or is there a better date/time that works for you?"
+        return f"{intro} If that is something you're interested in, we have {opts}. Or is there a better date/time you're available?"
 
-    return f"{intro} If this is something you're interested in, what date/time works best for you?"
+    return f"{intro} If that is something you're interested in, what date/time are you available?"
 
 
 def replace_generic_schedule_question_with_availability(body: str, availability_prompt: str) -> str:
