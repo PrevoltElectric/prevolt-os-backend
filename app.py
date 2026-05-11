@@ -1452,8 +1452,20 @@ def deterministic_availability_reply(conv: dict, inbound_text: str) -> str | Non
         if slots:
             day_word = "today" if _is_today_date(requested_date) else _humanize_date_for_sms(requested_date)
             return _offer_slots_response(conv, slots, f"For {day_word},")
+
+        # If the customer requested a future date but did not give a time, do not
+        # abandon their date and jump back to near-term openings. Store the date
+        # and ask for the missing time; the exact-slot handler will validate Square
+        # once they provide it.
+        if not _is_today_date(requested_date):
+            sched["awaiting_slot_offer_choice"] = False
+            sched["offered_slot_options"] = []
+            sched["last_slot_unavailable_message"] = None
+            sched["pending_step"] = "need_time"
+            return f"Got it — what time works for {_date_label_for_sms(requested_date)}?"
+
         slots = get_next_available_slots(appointment_type, limit=3)
-        return _offer_slots_response(conv, slots, "I’m not seeing openings for that day.")
+        return _offer_slots_response(conv, slots, "I’m not seeing openings for today.")
 
     # Flexible / next available requests should get concrete choices, not another generic question.
     if wants_next or flexible:
@@ -4140,6 +4152,26 @@ def incoming_sms():
     except Exception as e:
         print("[WARN] incoming_sms flexible offered slot choice failed:", repr(e))
 
+    # If the customer asks for a different date while viewing fallback options,
+    # respect the new date before words like "first" can be misread as "first option".
+    try:
+        date_change_reply = maybe_handle_new_date_during_offered_slots(conv, inbound_text)
+    except Exception as e:
+        print("[WARN] incoming_sms offered-slot date change handling failed:", repr(e))
+        date_change_reply = None
+    if date_change_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = date_change_reply.strip()
+        try:
+            log_event("SMS_FLOW_REPLY", phone, {"body": _safe_monitor_text(date_change_reply), "offered_slot_date_change": True}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(date_change_reply.strip())
+        return Response(str(tw), mimetype="text/xml")
+
     # If customer chooses one of the offered slots, lock it in at the route level
     # before exact-slot fallback or the model can reinterpret the reply.
     try:
@@ -5549,12 +5581,181 @@ def _loose_text(s: str) -> str:
     return " ".join(s.split())
 
 
+def parse_ordinal_weekday_of_month_date(text: str, today=None) -> str | None:
+    """
+    Parse customer date requests such as:
+      - first Monday of July
+      - 1st Monday in July
+      - second Tuesday of June 2026
+      - last Friday of August
+
+    This must run before generic weekday parsing so "first Monday of July"
+    does not collapse to the next upcoming Monday or the first offered slot.
+    """
+    low = _loose_text(text)
+    if not low:
+        return None
+
+    if today is None:
+        now_local = datetime.now(ZoneInfo("America/New_York")) if ZoneInfo else datetime.now()
+        today = now_local.date()
+
+    month_names = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    }
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    ordinals = {
+        "first": 1, "1st": 1,
+        "second": 2, "2nd": 2,
+        "third": 3, "3rd": 3,
+        "fourth": 4, "4th": 4,
+        "fifth": 5, "5th": 5,
+        "last": -1,
+    }
+
+    pattern = re.compile(
+        r"\b(?:the\s+)?(?P<ord>first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last)\s+"
+        r"(?P<weekday>monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+"
+        r"(?:(?:of|in)\s+)?"
+        r"(?P<month>jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)"
+        r"(?:\s+(?P<year>\d{2,4}))?\b",
+        flags=re.I,
+    )
+    m = pattern.search(low)
+    if not m:
+        return None
+
+    ordinal = ordinals.get(m.group("ord").lower())
+    weekday_idx = weekdays.get(m.group("weekday").lower())
+    month = month_names.get(m.group("month").lower())
+    yr_raw = m.group("year")
+    if ordinal is None or weekday_idx is None or month is None:
+        return None
+
+    year = today.year
+    if yr_raw:
+        year = int(yr_raw)
+        if year < 100:
+            year += 2000
+
+    try:
+        if ordinal == -1:
+            if month == 12:
+                last_day = (datetime(year + 1, 1, 1).date() - timedelta(days=1))
+            else:
+                last_day = (datetime(year, month + 1, 1).date() - timedelta(days=1))
+            delta = (last_day.weekday() - weekday_idx) % 7
+            target = last_day - timedelta(days=delta)
+        else:
+            first_day = datetime(year, month, 1).date()
+            delta = (weekday_idx - first_day.weekday()) % 7
+            target = first_day + timedelta(days=delta + (ordinal - 1) * 7)
+            if target.month != month:
+                return None
+
+        if not yr_raw and target < today:
+            # Customer did not specify a year and that ordinal date already passed this year.
+            return parse_ordinal_weekday_of_month_date(f"{m.group('ord')} {m.group('weekday')} {m.group('month')} {today.year + 1}", today=today)
+        return target.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _date_label_for_sms(date_str: str) -> str:
+    try:
+        return _humanize_date_for_sms(date_str)
+    except Exception:
+        try:
+            d = datetime.strptime(str(date_str or ""), "%Y-%m-%d")
+            return d.strftime("%A, %B %d").replace(" 0", " ")
+        except Exception:
+            return str(date_str or "that day")
+
+
+def maybe_handle_new_date_during_offered_slots(conv: dict, inbound_text: str) -> str | None:
+    """
+    If the customer is looking at offered fallback slots but asks for a different
+    date, respect the new date instead of treating words like "first" as
+    "first option".
+
+    Example failure this prevents:
+      Offered: Tue May 12 2 PM, Wed May 13 3 PM, Thu May 14 4 PM
+      Customer: "Can we do the first Monday of July?"
+      Bad old behavior: selects the first offered May slot.
+      Correct behavior: stores 2026-07-06 and asks for the time.
+    """
+    sched = conv.setdefault("sched", {})
+    if not sched.get("awaiting_slot_offer_choice"):
+        return None
+
+    options = sched.get("offered_slot_options") or []
+    if not options:
+        return None
+
+    requested_date = salvage_relative_date_from_text(inbound_text)
+    if not requested_date:
+        return None
+
+    option_dates = {str(opt.get("date") or "").strip() for opt in options if opt.get("date")}
+    # If the requested date is one of the offered choices, let normal offered-slot
+    # selection handle it so "Tuesday works" still selects the Tuesday option.
+    if requested_date in option_dates:
+        return None
+
+    explicit_time = extract_explicit_time_from_text(inbound_text)
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+    sched["appointment_type"] = appt
+    conv["appointment_type"] = appt
+    sched["scheduled_date"] = requested_date
+    sched["scheduled_time"] = explicit_time if explicit_time else None
+    if explicit_time:
+        sched["scheduled_time_source"] = "customer_explicit_new_date_after_offer"
+    else:
+        sched.pop("scheduled_time_source", None)
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    sched["final_confirmation_sent"] = False
+    sched["final_confirmation_accepted"] = False
+    sched["last_final_confirmation_key"] = None
+    sched["slot_choice_locked"] = False
+    sched["booking_attempt_nonce"] = str(uuid.uuid4())
+
+    if explicit_time:
+        # Let maybe_handle_exact_slot_before_step4 validate Square availability later in the route.
+        return None
+
+    if "TROUBLESHOOT" not in appt and is_weekend(requested_date):
+        sched["pending_step"] = "need_date"
+        return "We schedule non-emergency visits Monday through Friday. What weekday and time work better?"
+
+    sched["pending_step"] = "need_time"
+    return f"Got it — what time works for {_date_label_for_sms(requested_date)}?"
+
+
 def salvage_relative_date_from_text(inbound_text: str) -> str | None:
     low = _loose_text(inbound_text)
     if not low:
         return None
     now_local = datetime.now(ZoneInfo("America/New_York")) if ZoneInfo else datetime.now()
     today = now_local.date()
+
+    ordinal_weekday_date = parse_ordinal_weekday_of_month_date(low, today=today)
+    if ordinal_weekday_date:
+        return ordinal_weekday_date
 
     if "today" in low:
         return today.strftime("%Y-%m-%d")
@@ -6060,6 +6261,18 @@ def generate_reply_for_inbound(
 
         ensure_name_engine_defaults(profile, sched)
         name_engine_prompt = maybe_apply_name_engine_from_context(profile, sched, cleaned_transcript, initial_sms)
+
+        # If the customer asks for a different date while viewing fallback options,
+        # handle that before offered-slot selection can treat "first" as "first option".
+        date_change_reply = maybe_handle_new_date_during_offered_slots(conv, inbound_text)
+        if date_change_reply:
+            return {
+                "sms_body": date_change_reply,
+                "scheduled_date": sched.get("scheduled_date"),
+                "scheduled_time": sched.get("scheduled_time"),
+                "address": sched.get("raw_address"),
+                "booking_complete": False
+            }
 
         # If the customer picks one of the offered fallback slots, lock it in before any LLM work.
         maybe_apply_offered_slot_selection(conv, inbound_text)
@@ -7737,6 +7950,16 @@ def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
 
     txt = (inbound_text or "").strip()
     low = _intent_text(txt)
+    explicit_time = extract_explicit_time_from_text(txt)
+    requested_date = salvage_relative_date_from_text(txt)
+    option_dates = {str(opt.get("date") or "").strip() for opt in options if opt.get("date")}
+
+    # A real date request that is not one of the offered dates is not a slot choice.
+    # This prevents "first Monday of July" from matching the word "first" and
+    # selecting option 1 from a May fallback list.
+    if requested_date and requested_date not in option_dates:
+        return False
+
     chosen = None
 
     ordinal_map = [
@@ -7754,9 +7977,6 @@ def maybe_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
         idx = int(low) - 1
         if 0 <= idx < len(options):
             chosen = options[idx]
-
-    explicit_time = extract_explicit_time_from_text(txt)
-    requested_date = salvage_relative_date_from_text(txt)
 
     # Bare/custom time with an active option list means: use first offered date at that time.
     # Example: offered Mon/Tue/Wed, customer says "9", "4", or "can you do 3 instead".
