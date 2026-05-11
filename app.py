@@ -240,10 +240,61 @@ def is_negative_answer(text: str) -> bool:
     return _intent_text(text) in {"no", "nope", "nah", "incorrect", "not correct", "wrong", "that's wrong", "thats wrong"}
 
 
-def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str | None:
-    if not (last_outbound_asked_address_confirmation(conv) and is_negative_answer(inbound_text)):
+def starts_with_negative_address_correction(text: str) -> bool:
+    """True when the customer rejects the heard address and provides the corrected one in the same reply."""
+    low = _intent_text(text)
+    return bool(re.match(r"^(no|nope|nah|incorrect|wrong|not correct|that's wrong|thats wrong)\b", low))
+
+
+def extract_address_from_negative_correction(text: str) -> str | None:
+    """Extract address from replies like 'No, 34 Dickerman Ave Windsor Locks.'"""
+    raw = str(text or "").strip()
+    if not raw or not starts_with_negative_address_correction(raw):
         return None
+    cleaned = re.sub(r"^\s*(?:no|nope|nah|incorrect|wrong|not correct|that's wrong|thats wrong)\b\s*[,.;:-]?\s*", "", raw, flags=re.I).strip()
+    # Prefer the text after the rejection, but fall back to the whole reply if needed.
+    candidate = safe_address_candidate_from_text(cleaned) or safe_address_candidate_from_text(raw)
+    return candidate
+
+
+def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str | None:
+    if not last_outbound_asked_address_confirmation(conv):
+        return None
+
     sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+
+    corrected_address = extract_address_from_negative_correction(inbound_text)
+    if corrected_address:
+        if sched.get("raw_address"):
+            sched["rejected_address"] = sched.get("raw_address")
+        sched["raw_address"] = corrected_address
+        sched["normalized_address"] = None
+        sched["address_verified"] = True
+        sched["address_missing"] = None
+        sched["pending_step"] = None
+        sched["booking_allowed"] = True
+        try:
+            addresses = profile.setdefault("addresses", [])
+            if corrected_address not in addresses:
+                addresses.append(corrected_address)
+        except Exception:
+            pass
+        try:
+            try_early_address_normalize(sched)
+            update_address_assembly_state(sched)
+            # A corrected address sent directly by the customer should be trusted even
+            # if Google normalization only marks it as a raw street/town candidate.
+            sched["address_verified"] = True
+            sched["address_missing"] = None
+        except Exception:
+            pass
+        availability = build_price_and_availability_prompt(conv, sched.get("appointment_type") or "EVAL_195")
+        return f"Sorry about that, the voicemail was a little tough to hear. I have it now. {availability}"
+
+    if not is_negative_answer(inbound_text):
+        return None
+
     if sched.get("raw_address"):
         sched["rejected_address"] = sched.get("raw_address")
     sched["raw_address"] = None
@@ -252,7 +303,7 @@ def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str 
     sched["address_missing"] = "street"
     sched["pending_step"] = "need_address"
     sched["booking_allowed"] = True
-    return "Sorry about that, the voicemail was a little hard to hear. Can you give me the address again?"
+    return "Sorry about that, the voicemail was a little tough to hear. Can you give me the address again?"
 
 
 def _address_has_house_number_and_street(value: str) -> bool:
