@@ -287,6 +287,88 @@ def build_address_gate_reply(conv: dict) -> str:
     except Exception:
         return "What’s the address for the work?"
 
+
+
+def _looks_like_scheduling_reply(text: str) -> bool:
+    """True if a reply appears to be a scheduling choice/request that should be deferred until address is verified."""
+    low = _intent_text(text)
+    if not low:
+        return False
+    if any(w in low for w in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "today", "tomorrow", "morning", "afternoon", "noon"]):
+        return True
+    if re.search(r"\b\d{1,2}[:.]?\d{0,2}\s*(?:am|pm)\b", low):
+        return True
+    if re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", low):
+        return True
+    if low in {"first", "second", "third", "option 1", "option 2", "option 3", "1", "2", "3", "anytime", "any time", "whenever"}:
+        return True
+    return False
+
+
+def _confirm_address_acceptance_should_run(conv: dict, inbound_text: str) -> bool:
+    """Catch yes/correct replies to address confirmation before address gate can loop."""
+    if not yes_text(inbound_text):
+        return False
+    sched = conv.setdefault("sched", {})
+    if last_outbound_asked_address_confirmation(conv):
+        return True
+    if (sched.get("address_missing") or "").strip().lower() == "confirm" and (sched.get("raw_address") or sched.get("address_candidate")):
+        return True
+    if (sched.get("pending_step") or "").strip().lower() == "need_address" and (sched.get("raw_address") or sched.get("address_candidate")):
+        return True
+    return False
+
+
+def handle_address_confirmation_acceptance(conv: dict, inbound_text: str) -> str | None:
+    """
+    If we asked "You're at X, right?" and the customer says yes, verify the
+    address and continue. This prevents yes from being treated as another
+    address problem, and it resumes any scheduling text that was deferred while
+    the address gate was active.
+    """
+    if not _confirm_address_acceptance_should_run(conv, inbound_text):
+        return None
+
+    sched = conv.setdefault("sched", {})
+    raw = (sched.get("raw_address") or sched.get("address_candidate") or "").strip(" ,.")
+    if not raw:
+        return None
+
+    sched["raw_address"] = raw
+    sched["address_verified"] = True
+    sched["address_missing"] = None
+    sched["pending_step"] = None
+    sched["booking_allowed"] = True
+    if not sched.get("appointment_type"):
+        sched["appointment_type"] = "EVAL_195"
+    conv["appointment_type"] = sched.get("appointment_type")
+
+    try:
+        try_early_address_normalize(sched)
+        update_address_assembly_state(sched)
+        # The customer just confirmed the address explicitly, so the confirmation wins.
+        sched["address_verified"] = True
+        sched["address_missing"] = None
+    except Exception:
+        pass
+
+    # If a date/time was sent while the address still needed confirmation,
+    # resume that request now that the address is verified.
+    deferred = (sched.pop("deferred_schedule_text", None) or "").strip()
+    if deferred:
+        try:
+            exact_reply = maybe_handle_exact_slot_before_step4(conv, conv.get("phone") or sched.get("phone") or "", deferred)
+            if exact_reply:
+                return exact_reply
+        except Exception as e:
+            print("[WARN] deferred schedule after address confirmation failed:", repr(e))
+
+    # If no deferred schedule exists, move to the normal price + three-day availability handoff.
+    try:
+        return "Got it. " + build_price_and_availability_prompt(conv, sched.get("appointment_type") or "EVAL_195")
+    except Exception:
+        return "Got it. What day and time works best for you?"
+
 def last_outbound_asked_address_confirmation(conv: dict) -> bool:
     last = _intent_text((conv or {}).get("last_sms_body") or "")
     if not last:
@@ -3412,6 +3494,20 @@ def incoming_sms():
         tw.message(address_reject_reply)
         return Response(str(tw), mimetype="text/xml")
 
+    address_accept_reply = handle_address_confirmation_acceptance(conv, inbound_text)
+    if address_accept_reply:
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = address_accept_reply
+        try:
+            log_event("ADDRESS_CONFIRMATION_ACCEPTED", phone, {"body": _safe_monitor_text(inbound_text), "reply": _safe_monitor_text(address_accept_reply)}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(address_accept_reply)
+        return Response(str(tw), mimetype="text/xml")
+
     if looks_like_vendor_sales_or_spam(inbound_text):
         clear_service_booking_state_for_non_service(conv, "vendor_sales_or_spam")
         sched["booking_allowed"] = False
@@ -3589,6 +3685,8 @@ def incoming_sms():
     # Absolute address gate: never schedule, offer slots, or ask for time while the address still needs confirmation.
     try:
         if address_gate_blocks_scheduling(conv):
+            if _looks_like_scheduling_reply(inbound_text):
+                sched["deferred_schedule_text"] = inbound_text
             reply_body = build_address_gate_reply(conv)
             conv["last_inbound_sid"] = inbound_sid
             conv["last_inbound_fingerprint"] = inbound_fingerprint
