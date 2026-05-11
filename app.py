@@ -339,7 +339,8 @@ def v13_maybe_imply_address_confirmed(conv: dict, inbound_text: str) -> bool:
         return False
     if not (_looks_like_scheduling_reply(inbound_text) or v13_extract_email(inbound_text)):
         return False
-    sched["raw_address"] = raw
+    set_raw_address_safe(sched, raw)
+    raw = sched.get("raw_address") or raw
     sched["address_candidate"] = raw
     sched["address_verified"] = True
     sched["address_missing"] = None
@@ -727,7 +728,8 @@ def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str 
         if sched.get("raw_address"):
             sched["rejected_address"] = sched.get("raw_address")
         corrected_address = inherit_location_context_for_corrected_address(conv, corrected_address)
-        sched["raw_address"] = corrected_address
+        set_raw_address_safe(sched, corrected_address)
+        corrected_address = sched.get("raw_address") or corrected_address
         sched["normalized_address"] = None
         sched["address_verified"] = True
         sched["address_missing"] = None
@@ -785,6 +787,8 @@ def _address_has_house_number_and_street(value: str) -> bool:
 
 def safe_address_candidate_from_text(text: str) -> str | None:
     addr = extract_service_address_from_text(text)
+    if addr:
+        addr = scrub_non_address_tail(addr)
     if addr and is_plausible_address_text(addr):
         return addr
     return None
@@ -1255,6 +1259,7 @@ def extract_service_address_from_text(text: str) -> str | None:
     if z and not re.search(r"\b\d{5}(?:-\d{4})?\b", addr):
         addr = f"{addr} {z.group(1)}".strip()
 
+    addr = scrub_non_address_tail(addr)
     return addr or None
 
 def absorb_address_from_mixed_text(conv: dict, inbound_text: str) -> bool:
@@ -1277,7 +1282,8 @@ def absorb_address_from_mixed_text(conv: dict, inbound_text: str) -> bool:
 
     # Upgrade partial town/zip-only values like "Springfield, 01109" to full street addresses.
     if (not existing) or (not existing_verified) or _address_has_house_number_and_street(addr):
-        sched["raw_address"] = addr
+        set_raw_address_safe(sched, addr)
+        addr = sched.get("raw_address") or addr
         sched["normalized_address"] = None
         try:
             if addr not in profile.setdefault("addresses", []):
@@ -1701,10 +1707,10 @@ def _monitor_state_label(conv: dict) -> str:
     thread_type = (conv or {}).get("thread_type")
     if thread_type in {"closed_lost", "vendor_sales_or_spam", "wrong_number_or_spam"} or sched.get("customer_hard_stop"):
         return "closed"
-    if sched.get("manual_only") or thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact"}:
-        return "manual"
     if sched.get("booking_created") and sched.get("square_booking_id"):
         return "booked"
+    if sched.get("manual_only") or thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact"}:
+        return "manual"
     if "TROUBLESHOOT" in appt or sched.get("emergency_approved") or sched.get("awaiting_emergency_confirm"):
         return "emergency"
     step = (sched.get("pending_step") or "").strip().lower()
@@ -1724,7 +1730,9 @@ def _conversation_snapshot(phone: str, conv: dict) -> dict:
     first = (profile.get("active_first_name") or profile.get("first_name") or profile.get("recognized_first_name") or profile.get("voicemail_first_name") or "").strip()
     last = (profile.get("active_last_name") or profile.get("last_name") or profile.get("recognized_last_name") or profile.get("voicemail_last_name") or "").strip()
     name = " ".join([p for p in [first, last] if p]).strip()
-    address = (sched.get("raw_address") or "").strip()
+    address = scrub_non_address_tail((sched.get("raw_address") or "").strip())
+    if address and address != (sched.get("raw_address") or "").strip():
+        sched["raw_address"] = address
     return {
         "phone": phone or "",
         "name": name,
@@ -3001,6 +3009,13 @@ def update_address_assembly_state(sched: dict) -> None:
     sched.setdefault("address_parts", {})
 
     raw = (sched.get("raw_address") or "").strip()
+    try:
+        cleaned_raw = scrub_non_address_tail(raw)
+        if cleaned_raw and cleaned_raw != raw:
+            raw = cleaned_raw
+            sched["raw_address"] = raw
+    except Exception:
+        pass
     # Normalize leading unit suffixes like 72B Dakota Lane -> 72 Dakota Lane, Unit B.
     try:
         m_unit = re.match(r"^(?P<num>\d{1,6})(?P<unit>[A-Za-z])\s+(?P<rest>.+)$", raw)
@@ -3317,10 +3332,159 @@ def try_early_address_normalize(sched: dict) -> None:
 
 
 
+
+# ---------------------------------------------------
+# Address Tail Contamination Guard
+# Prevents customer questions like "Are you licensed?" from becoming city text.
+# ---------------------------------------------------
+ADDRESS_SUFFIX_RE_SAFE = r"(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|court|ct|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place|park)"
+QUESTION_START_RE_SAFE = re.compile(
+    r"^\s*(?:are|is|do|does|did|can|could|would|will|why|what|when|where|who|how)\b",
+    re.I,
+)
+NON_ADDRESS_WORD_RE_SAFE = re.compile(
+    r"\b(?:licensed|license|insured|insurance|permit|employment|job|hiring|resume|"
+    r"coming|still\s+coming|appointment|schedule|email|phone|quote|estimate|service|"
+    r"work|visit|price|cost|charge|thank|thanks|hello|hi|ai|bot|real\s+person)\b",
+    re.I,
+)
+DAY_TIME_WORD_RE_SAFE = re.compile(
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|"
+    r"morning|afternoon|evening|noon|tonight|asap|soonest|earliest|whenever|anytime|any\s+time)\b",
+    re.I,
+)
+
+
+def looks_like_non_address_fragment(text: str) -> bool:
+    value = " ".join(str(text or "").strip().split())
+    if not value:
+        return True
+    low = value.lower()
+    compact = re.sub(r"[^a-z0-9']+", " ", low).strip()
+    if compact in {"yes", "y", "yeah", "yep", "correct", "right", "ok", "okay", "sure", "no", "nope", "nah"}:
+        return True
+    if "?" in value:
+        return True
+    if QUESTION_START_RE_SAFE.search(value):
+        return True
+    if NON_ADDRESS_WORD_RE_SAFE.search(low):
+        return True
+    if DAY_TIME_WORD_RE_SAFE.search(low):
+        return True
+    if "@" in value:
+        return True
+    if re.search(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", value):
+        return True
+    return False
+
+
+def _is_state_token_safe(text: str) -> bool:
+    token = re.sub(r"[^A-Za-z]", "", str(text or "")).upper()
+    return token in {"CT", "CONNECTICUT", "CONN", "MA", "MASS", "MASSACHUSETTS"}
+
+
+def _looks_like_city_name_fragment_safe(text: str) -> bool:
+    value = " ".join(str(text or "").strip(" ,.;").split())
+    if not value:
+        return False
+    if looks_like_non_address_fragment(value):
+        return False
+    if re.search(r"\d", value):
+        return False
+    if re.search(rf"\b{ADDRESS_SUFFIX_RE_SAFE}\b", value, flags=re.I):
+        return False
+    if len(value.split()) > 4:
+        return False
+    if not re.fullmatch(r"[A-Za-z][A-Za-z .'-]*", value):
+        return False
+    return True
+
+
+def _city_state_zip_fragment_ok_safe(fragment: str) -> bool:
+    value = " ".join(str(fragment or "").strip(" ,.;").split())
+    if not value:
+        return False
+    value = re.sub(r"\b\d{5}(?:-\d{4})?\b", "", value).strip(" ,.;")
+    value = re.sub(
+        r"\b(?:CT|C\.?T\.?|Connecticut|Conn\.?|MA|M\.?A\.?|Mass\.?|Massachusetts)\b",
+        "",
+        value,
+        flags=re.I,
+    ).strip(" ,.;")
+    if not value:
+        return True
+    return _looks_like_city_name_fragment_safe(value)
+
+
+def scrub_non_address_tail(address_text: str) -> str:
+    """
+    Keeps normal street/city/state/zip tails and drops customer prose/questions.
+    Example: '34 Dickerman Ave, Are You Licensed' -> '34 Dickerman Ave'.
+    """
+    value = " ".join(str(address_text or "").replace("\n", " ").split()).strip(" ,.;")
+    if not value:
+        return ""
+
+    m = re.match(
+        rf"^(?P<line>\d{{1,6}}(?:-\d{{1,6}})?[A-Za-z]?\s+[A-Za-z0-9.'#\- ]+?\b{ADDRESS_SUFFIX_RE_SAFE}\b)(?P<tail>.*)$",
+        value,
+        flags=re.I,
+    )
+    if not m:
+        return value
+
+    line = m.group("line").strip(" ,.;")
+    tail = (m.group("tail") or "").strip(" ,.;")
+    if not tail:
+        return line
+
+    tail = re.split(
+        r"\b(?:are\s+you|do\s+you|can\s+you|could\s+you|would\s+you|will\s+you|what|when|where|why|how|"
+        r"right|correct|please|thank\s+you|thanks|is\s+this|is\s+that)\b",
+        tail,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" ,.;")
+
+    if not tail or looks_like_non_address_fragment(tail):
+        return line
+
+    parts = [p.strip(" ,.;") for p in tail.split(",") if p.strip(" ,.;")]
+    if not parts and tail:
+        parts = [tail]
+
+    safe_parts = []
+    for part in parts:
+        if _is_state_token_safe(part):
+            token = re.sub(r"[^A-Za-z]", "", part).upper()
+            safe_parts.append("MA" if token.startswith("MA") or token == "MASSACHUSETTS" else "CT")
+            continue
+        if re.fullmatch(r"\d{5}(?:-\d{4})?", part):
+            safe_parts.append(part)
+            continue
+        if _city_state_zip_fragment_ok_safe(part):
+            safe_parts.append(part)
+            continue
+        break
+
+    return ", ".join([line] + safe_parts).strip(" ,.;") if safe_parts else line
+
+
+def set_raw_address_safe(sched: dict, value: str) -> None:
+    cleaned = scrub_non_address_tail(value)
+    if cleaned:
+        sched["raw_address"] = cleaned
+
 def extract_city_state_from_reply(text: str) -> tuple[str | None, str | None]:
-    """Parse compact city/state replies like 'Windsor CT', 'Brockton', or 'Massachusetts'."""
+    """
+    Parse compact city/state replies like 'Windsor CT' or 'Windsor Locks'.
+    Customer questions/prose such as 'Are you licensed?' must never become city text.
+    """
     txt = " ".join((text or "").strip().replace(",", " ").split())
     if not txt:
+        return None, None
+
+    if looks_like_non_address_fragment(txt):
         return None, None
 
     low = txt.lower()
@@ -3332,13 +3496,12 @@ def extract_city_state_from_reply(text: str) -> tuple[str | None, str | None]:
         state = "MA"
         txt = re.sub(r"\bma\b|\bmass\b|\bmassachusetts\b", "", txt, flags=re.I).strip(" ,")
 
-    # Reject obvious non-city inputs.
-    if re.search(r"\d", txt):
+    if not txt:
         return None, state
-    if re.search(r"\b(st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace)\b", txt, flags=re.I):
+    if not _looks_like_city_name_fragment_safe(txt):
         return None, state
 
-    city = " ".join(w.capitalize() for w in txt.split()) if txt else None
+    city = " ".join(w.capitalize() for w in txt.split())
     return city or None, state
 
 def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
@@ -3352,6 +3515,8 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     """
     inbound = (inbound_text or "").strip()
     if not inbound:
+        return False
+    if looks_like_non_address_fragment(inbound):
         return False
 
     # Live guard: acknowledgements like "Yes" are address confirmations,
@@ -3396,7 +3561,7 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
     else:
         return False
 
-    sched["raw_address"] = re.sub(r"\s+,", ",", merged).strip(" ,")
+    set_raw_address_safe(sched, re.sub(r"\s+,", ",", merged).strip(" ,"))
 
     # Best effort normalization immediately so the thread advances instead of re-asking.
     forced_state = state if state in {"CT", "MA"} else None
@@ -4324,8 +4489,9 @@ def incoming_sms():
             sched["scheduled_time_source"] = "model_non_date_only"
 
     if reply.get("address"):
-        candidate_address = str(reply["address"] or "").strip()
-        existing_address = str(sched.get("raw_address") or "").strip()
+        candidate_address = scrub_non_address_tail(str(reply["address"] or "").strip())
+        existing_address = scrub_non_address_tail(str(sched.get("raw_address") or "").strip())
+        inbound_has_address = bool(extract_service_address_from_text(inbound_text))
         safe_candidate = safe_address_candidate_from_text(candidate_address) or (candidate_address if is_plausible_address_text(candidate_address) else None)
         if safe_candidate and not (
             yes_text(inbound_text)
@@ -4333,12 +4499,14 @@ def incoming_sms():
             and (safe_candidate == f"{existing_address}, Yes" or safe_candidate == f"{existing_address} Yes")
         ):
             # Do not let customer questions get appended into the address field.
-            if (not existing_address) or (not sched.get("address_verified")) or _address_has_house_number_and_street(safe_candidate):
-                sched["raw_address"] = safe_candidate
-                sched["normalized_address"] = None
-                # addresses list is guaranteed above
-                if safe_candidate and safe_candidate not in profile["addresses"]:
-                    profile["addresses"].append(safe_candidate)
+            if not (existing_address and looks_like_non_address_fragment(inbound_text) and not inbound_has_address):
+                if (not existing_address) or (not sched.get("address_verified")) or _address_has_house_number_and_street(safe_candidate):
+                    set_raw_address_safe(sched, safe_candidate)
+                    sched["normalized_address"] = None
+                    # addresses list is guaranteed above
+                    saved_candidate = sched.get("raw_address") or safe_candidate
+                    if saved_candidate and saved_candidate not in profile["addresses"]:
+                        profile["addresses"].append(saved_candidate)
         elif candidate_address and existing_address:
             try:
                 log_event("ADDRESS_MODEL_OUTPUT_REJECTED", phone, {"model_address": _safe_monitor_text(candidate_address), "kept_address": _safe_monitor_text(existing_address)}, conv)
@@ -6399,31 +6567,31 @@ def generate_reply_for_inbound(
                 if inbound_has_street_word and not inbound_starts_with_number:
                     city_hint = raw.strip()
                     if city_hint and city_hint.lower() not in inbound_clean.lower():
-                        sched["raw_address"] = f"{inbound_clean}, {city_hint}".strip(" ,")
+                        set_raw_address_safe(sched, f"{inbound_clean}, {city_hint}".strip(" ,"))
                     else:
-                        sched["raw_address"] = inbound_clean
+                        set_raw_address_safe(sched, inbound_clean)
                     sched["normalized_address"] = None
                     update_address_assembly_state(sched)
 
                 elif inbound_starts_with_number and inbound_has_street_word:
                     city_hint = raw.strip()
                     if city_hint and city_hint.lower() not in inbound_clean.lower():
-                        sched["raw_address"] = f"{inbound_clean}, {city_hint}".strip(" ,")
+                        set_raw_address_safe(sched, f"{inbound_clean}, {city_hint}".strip(" ,"))
                     else:
-                        sched["raw_address"] = inbound_clean
+                        set_raw_address_safe(sched, inbound_clean)
                     sched["normalized_address"] = None
                     update_address_assembly_state(sched)
 
             elif missing_atom == "number":
                 if inbound_starts_with_number and inbound_has_street_word:
-                    sched["raw_address"] = inbound_clean
+                    set_raw_address_safe(sched, inbound_clean)
                     sched["normalized_address"] = None
                     update_address_assembly_state(sched)
 
                 elif num:
                     base = raw or norm_line1
                     if base and not re.match(r"^\d{1,6}\b", base):
-                        sched["raw_address"] = f"{num} {base}".strip()
+                        set_raw_address_safe(sched, f"{num} {base}".strip())
                         sched["normalized_address"] = None
                     update_address_assembly_state(sched)
 
@@ -6550,12 +6718,15 @@ def generate_reply_for_inbound(
             model_addr = sched["raw_address"]
 
         if isinstance(model_addr, str) and len(model_addr.strip()) > 3:
+            model_addr = scrub_non_address_tail(model_addr)
             safe_model_addr = safe_address_candidate_from_text(model_addr) or (model_addr.strip() if is_plausible_address_text(model_addr) else None)
+            inbound_has_address = bool(extract_service_address_from_text(inbound_text))
             if safe_model_addr:
-                existing_addr = (sched.get("raw_address") or "").strip()
-                if (not existing_addr) or (not sched.get("address_verified")) or _address_has_house_number_and_street(safe_model_addr):
-                    sched["raw_address"] = safe_model_addr
-                    sched["normalized_address"] = None
+                existing_addr = scrub_non_address_tail((sched.get("raw_address") or "").strip())
+                if not (existing_addr and looks_like_non_address_fragment(inbound_text) and not inbound_has_address):
+                    if (not existing_addr) or (not sched.get("address_verified")) or _address_has_house_number_and_street(safe_model_addr):
+                        set_raw_address_safe(sched, safe_model_addr)
+                        sched["normalized_address"] = None
             else:
                 try:
                     log_event("ADDRESS_MODEL_OUTPUT_REJECTED", phone, {"model_address": _safe_monitor_text(model_addr), "kept_address": _safe_monitor_text(sched.get("raw_address"))}, conv)
