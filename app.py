@@ -7057,6 +7057,60 @@ def _cc_phone(raw: str) -> str:
     return "+" + digits if digits else raw
 
 
+def _safe_twilio_recording_url(raw_url: str) -> str | None:
+    """Return a safe Twilio recording media URL or None.
+
+    Twilio Recording URLs require HTTP Basic Auth. The desktop app should
+    never open api.twilio.com directly because the browser will prompt Kyle
+    for Twilio credentials. Instead Command Center calls this Render proxy;
+    Render holds TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN securely.
+    """
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return None
+    # Permit only the authenticated Twilio API recording resource for this account.
+    acct = (TWILIO_ACCOUNT_SID or "").strip()
+    if not acct or "api.twilio.com" not in raw or "/Recordings/" not in raw:
+        return None
+    if f"/Accounts/{acct}/" not in raw:
+        return None
+    # Strip query fragments and force playable MP3 media.
+    raw = raw.split("#", 1)[0].split("?", 1)[0]
+    if not (raw.endswith(".mp3") or raw.endswith(".wav")):
+        raw = raw + ".mp3"
+    return raw
+
+
+@app.route("/monitor/recording-audio", methods=["GET"])
+def monitor_recording_audio():
+    """Secure proxy for voicemail/call recording playback.
+
+    The desktop app sends a Twilio recording URL. Render validates that it is a
+    recording URL for this Twilio account, fetches it with Twilio credentials,
+    and streams the MP3 back to the desktop app. No Twilio secrets are stored on
+    the PC and the browser no longer shows a Twilio login prompt.
+    """
+    if not _command_center_authorized():
+        return _command_center_auth_error()
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        return {"ok": False, "error": "twilio_auth_not_configured"}, 500
+    recording_url = request.args.get("url") or request.args.get("recording_url") or ""
+    media_url = _safe_twilio_recording_url(recording_url)
+    if not media_url:
+        return {"ok": False, "error": "invalid_or_unsafe_recording_url"}, 400
+    try:
+        rr = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30)
+        if rr.status_code >= 400:
+            return {"ok": False, "error": "twilio_recording_fetch_failed", "status_code": rr.status_code, "detail": rr.text[:300]}, 502
+        content_type = rr.headers.get("Content-Type") or "audio/mpeg"
+        return Response(rr.content, status=200, mimetype=content_type, headers={
+            "Cache-Control": "private, max-age=60",
+            "Content-Disposition": "inline; filename=prevolt-recording.mp3",
+        })
+    except Exception as e:
+        return {"ok": False, "error": "recording_proxy_failed", "detail": repr(e)}, 500
+
+
 @app.route("/monitor/events", methods=["GET"])
 def monitor_events():
     if not _command_center_authorized():
