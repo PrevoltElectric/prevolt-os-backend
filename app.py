@@ -2165,7 +2165,7 @@ def prevolt_eval_price_line(appt_type: str) -> str:
         return "Troubleshoot and repair visits are $395."
     if "INSPECTION" in appt:
         return "The whole-home inspection is $395."
-    return "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
+    return "We do charge $195 for one of our electricians to come out, take a look, and provide you with a written quote."
 
 
 def format_command_center_slot_list(slots: list[dict]) -> str:
@@ -2204,7 +2204,7 @@ def build_price_and_availability_prompt(conv: dict, appt_type: str = "EVAL_195")
     elif "INSPECTION" in appt:
         intro = "We have availability to come and take a look. The whole-home inspection is $395."
     else:
-        intro = "We can definitely take care of this. We do charge $195 for one of our electricians to come out and take a look as well as provide you with a quote."
+        intro = "We can definitely take care of this. We do charge $195 for one of our electricians to come out, take a look, and provide you with a quote."
 
     if slots:
         sched["awaiting_slot_offer_choice"] = True
@@ -2259,6 +2259,7 @@ def customer_is_asking_price(text: str) -> bool:
         "how much", "price", "cost", "$195", "$395", "195", "395",
         "just to come out", "service fee", "trip fee", "diagnostic fee",
         "what do you charge", "what does the evaluation include", "what does that include",
+        "what does that cover", "what does this cover", "what does the 195 cover", "what does $195 cover", "what is covered",
         "go toward", "go towards", "goes toward", "goes towards", "applied to the project",
         "credit toward", "credited toward", "deposit", "free estimate", "ballpark", "rough price",
     ])
@@ -4532,6 +4533,7 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee",
         "quote", "estimate", "free estimate", "ballpark", "rough price", "firm number",
         "what do you charge", "what does the visit include", "what does that include",
+        "what does that cover", "what does this cover", "what does the 195 cover", "what does $195 cover", "what is covered",
         "go towards the project", "go toward the project", "goes towards the project", "goes toward the project",
         "apply to the project", "applied to the project", "credit toward the project", "credited toward the project",
         "does it go toward", "does it go towards", "does that go toward", "does that go towards",
@@ -4551,15 +4553,25 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             elif "INSPECTION" in appt:
                 answer = "The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately."
             else:
-                answer = "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
+                answer = "Not as a separate credit. The $195 covers our time and fuel to send one of our electricians out, look everything over, and get you a written quote."
+        elif any(x in low for x in [
+            "what does that cover", "what does this cover", "what does the 195 cover", "what does $195 cover",
+            "what is covered", "what does the visit include", "what does that include", "what does the evaluation include"
+        ]):
+            if "TROUBLESHOOT" in appt:
+                answer = "The $395 covers the troubleshoot and repair visit itself. If larger repair work is needed, we go over that separately on site first."
+            elif "INSPECTION" in appt:
+                answer = "The inspection fee covers sending one of our electricians out to review the home and go over the next step with you."
+            else:
+                answer = "It covers sending one of our electricians out, reviewing the work in person, going over the next step with you, and putting together a quote."
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
-            answer = "For quote requests, we start with a $195 on-site evaluation, and that goes toward the project cost if you move forward with the work."
+            answer = "For quote requests, we do charge $195 for one of our electricians to come out, take a look, and provide you with a quote."
         elif "TROUBLESHOOT" in appt:
             answer = "The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site."
         elif "INSPECTION" in appt:
             answer = "Whole-home inspections are $395, and larger homes can run higher depending on square footage."
         else:
-            answer = "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
+            answer = "We do charge $195 for one of our electricians to come out, take a look, and provide you with a quote."
         sched["price_disclosed"] = True
     elif any(x in low for x in ["availability", "available", "openings", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
         # Availability questions should never fall into a vague canned response.
