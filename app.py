@@ -232,7 +232,7 @@ def last_outbound_asked_address_confirmation(conv: dict) -> bool:
         return False
     return (
         ("is that correct" in last or "is this for that address" in last or "is this the correct address" in last)
-        and ("address" in last or "i have" in last or "on file" in last or "for the visit" in last)
+        and ("address" in last or "i have" in last or "on file" in last or "for the visit" in last or "for the work" in last)
     )
 
 
@@ -252,7 +252,7 @@ def handle_address_confirmation_rejection(conv: dict, inbound_text: str) -> str 
     sched["address_missing"] = "street"
     sched["pending_step"] = "need_address"
     sched["booking_allowed"] = True
-    return "No problem. What is the correct house number, street, and town for the visit?"
+    return "No problem. What is the correct house number, street, and town for the work?"
 
 
 def _address_has_house_number_and_street(value: str) -> bool:
@@ -420,16 +420,16 @@ def build_employment_inquiry_reply() -> str:
     return (
         f"Hi, thanks for reaching out. This is about employment, not an electrical service visit. "
         f"Please email your resume, license status, and the best phone number to reach you to "
-        f"{EMPLOYMENT_RESUME_EMAIL}, and Kyle can review it."
+        f"{EMPLOYMENT_RESUME_EMAIL}, and our office can review it."
     )
 
 def build_commercial_bid_reply(inbound_text: str = "") -> str:
     low = _intent_text(inbound_text)
     if "email" in low or "sent" in low or "questions" in low:
-        return "Got it, thank you. Kyle will review the email and get back to you."
+        return "Got it, thank you. We will review the email and get back to you."
     if "personal" in low or "save this number" in low:
-        return "Sounds good, thank you. Kyle appreciates it."
-    return "Got it, thank you. Kyle will review this and get back to you."
+        return "Sounds good, thank you. We appreciate it."
+    return "Got it, thank you. We will review this and get back to you."
 
 def build_commercial_context_reply(conv: dict, inbound_text: str = "") -> str:
     """
@@ -450,7 +450,7 @@ Rules:
 - Do NOT ask for house number, street name, date, or time unless the customer is explicitly trying to schedule a service visit.
 - Do NOT mention the $195 evaluation visit unless the customer is clearly asking for a new service appointment/evaluation.
 - For bid/proposal/estimate conversations, respond naturally to the actual message.
-- If they say they sent an email, acknowledge that Kyle will review it.
+- If they say they sent an email, acknowledge that our office will review it.
 - If they compliment the proposal, acknowledge the compliment and reinforce readiness/fit.
 - Keep it concise, professional, and human.
 - Do not invent commitments, prices, or schedule availability.
@@ -530,51 +530,56 @@ def looks_like_initial_service_booking_request(conv: dict, inbound_text: str = "
 
 
 def build_initial_service_booking_reply(conv: dict, inbound_text: str = "") -> str:
-    """Start a normal $195 evaluation booking flow from an inbound SMS/GLS lead."""
+    """Start a normal evaluation booking flow from an inbound SMS/GLS lead.
+
+    Price disclosure is intentionally delayed until the lead is moving into
+    scheduling. If the address is still missing, ask for the address first so
+    the opener does not feel like a paywall.
+    """
     sched = conv.setdefault("sched", {})
     sched["appointment_type"] = "EVAL_195"
     conv["appointment_type"] = "EVAL_195"
-    sched["price_disclosed"] = True
-    # This helper itself sends the first customer-facing intro line.
-    # Mark it sent so later slot/name/email prompts do not prepend
-    # "Hello, you've reached Prevolt Electric..." again mid-thread.
     sched["intro_sent"] = True
-    sched["pending_step"] = "need_date"
     sched["manual_only"] = False
     sched["non_service_thread"] = False
 
     try:
         absorb_address_from_mixed_text(conv, inbound_text)
+        update_address_assembly_state(sched)
     except Exception:
         pass
 
+    address_ok = bool(sched.get("address_verified")) or _address_has_house_number_and_street(str(sched.get("raw_address") or ""))
     low = _intent_text(inbound_text)
-    if "meter bank" in low or "6-gang" in low or "six gang" in low or "gang meter" in low:
-        return (
-            "Hello, you've reached Prevolt Electric. I'll help you here by text. "
-            "For the meter bank replacement, we start with a $195 evaluation visit so we can review everything in person and give you a firm number. "
-            "What day works best for you?"
-        )
 
-    return (
-        "Hello, you've reached Prevolt Electric. I'll help you here by text. "
-        "Our evaluation visit is $195. What day works best for you?"
-    )
+    if not address_ok:
+        sched["price_disclosed"] = False
+        sched["pending_step"] = "need_address"
+        return "Hi, this is Prevolt Electric. We can help. What’s the address for the work?"
+
+    sched["price_disclosed"] = True
+    sched["pending_step"] = "need_date"
+    price_line = "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
+
+    if "meter bank" in low or "6-gang" in low or "six gang" in low or "gang meter" in low:
+        return f"Hi, this is Prevolt Electric. We can help with the meter bank replacement. {price_line} What day works best?"
+
+    return f"Hi, this is Prevolt Electric. We can help. {price_line} What day works best?"
 
 
 def build_complex_commercial_coordination_reply(inbound_text: str = "") -> str:
     low = _intent_text(inbound_text)
     if "meter bank" in low or "6-gang" in low or "six gang" in low or "gang meter" in low:
         return (
-            "Got it, thank you. Kyle will review the walkthrough details and follow up directly to coordinate access and timing."
+            "Got it, thank you. Our office will review the walkthrough details and follow up directly to coordinate access and timing."
         )
     if "walk" in low or "site visit" in low:
         return (
-            "Got it, thank you. Kyle will review the details and follow up directly to coordinate the commercial walkthrough."
+            "Got it, thank you. Our office will review the details and follow up directly to coordinate the commercial walkthrough."
         )
     return (
-        "Thanks for reaching out. This type of commercial project is handled directly by Kyle so the scope and walkthrough "
-        "are coordinated correctly. Kyle will follow up directly."
+        "Thanks for reaching out. This type of commercial project is handled directly by our office so the scope and walkthrough "
+        "are coordinated correctly. We will follow up directly."
     )
 
 def is_rejecting_offered_slots(text: str) -> bool:
@@ -1672,7 +1677,7 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
         sched["intro_sent"] = True
         sched["price_disclosed"] = False
         sched["booking_allowed"] = False
-        return "Thanks for reaching out. Kyle will review this if needed."
+        return "Thanks for reaching out. Our office will review this if needed."
     if thread_type == "employment_inquiry":
         clear_service_booking_state_for_non_service(conv, "employment_inquiry")
         sched["intro_sent"] = True
@@ -1716,26 +1721,19 @@ def build_initial_voicemail_sms(conv: dict, classification: dict, phone: str) ->
 
     address_line = ""
     if raw_hint and starts_with_house_number(raw_hint):
-        address_line = f" I have {raw_hint} for the visit. Is that correct?"
+        address_line = f" I have {raw_hint} for the work. Is that correct?"
     elif saved_full:
         address_line = f" I have {saved_full} on file. Is this for that address?"
     elif raw_hint:
         address_line = f" What is the house number and street name in {raw_hint}?"
     else:
-        address_line = " What is the address for the visit?"
+        address_line = " What’s the address for the work?"
 
-    # Emergency first text should gather the missing address only.
-    # Do not disclose price yet and do not mark it as disclosed.
-    if appt_type == "TROUBLESHOOT_395":
-        sms = (intro + task_line + address_line).strip()
-        sched["intro_sent"] = True
-        sched["price_disclosed"] = False
-        return re.sub(r"\s+", " ", sms).strip()
-
-    price_line = " Home inspections are $395." if appt_type == "WHOLE_HOME_INSPECTION" else " Our evaluation visit is $195."
-    sms = (intro + task_line + address_line + price_line).strip()
+    # First voicemail text should prove we understood and collect/confirm the address.
+    # Do not lead with price; disclose it when the customer is moving into scheduling.
+    sms = (intro + task_line + address_line).strip()
     sched["intro_sent"] = True
-    sched["price_disclosed"] = True
+    sched["price_disclosed"] = False
     return re.sub(r"\s+", " ", sms).strip()
 
 # ---------------------------------------------------
@@ -2152,6 +2150,54 @@ def sanitize_sms_body(s: str, *, booking_created: bool) -> str:
 
 
 # ---------------------------------------------------
+# Controlled customer-facing price disclosure helpers
+# ---------------------------------------------------
+def prevolt_eval_price_line(appt_type: str) -> str:
+    appt = (appt_type or "").upper()
+    if "TROUBLESHOOT" in appt:
+        return "Troubleshoot and repair visits are $395."
+    if "INSPECTION" in appt:
+        return "The whole-home inspection is $395."
+    return "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
+
+
+def message_is_scheduling_prompt(body: str) -> bool:
+    low = _intent_text(body)
+    if not low:
+        return False
+    schedule_markers = [
+        "what day", "what time", "which one works best", "which time works best",
+        "what weekday", "i have monday", "i have tuesday", "i have wednesday",
+        "i have thursday", "i have friday", "i have saturday", "i have sunday",
+        "at 9 00", "at 10 00", "at 11 00", "at 12 00", "at 1 00", "at 2 00", "at 3 00", "at 4 00",
+    ]
+    return any(m in low for m in schedule_markers)
+
+
+def customer_is_asking_price(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return any(p in low for p in [
+        "how much", "price", "cost", "$195", "$395", "195", "395",
+        "just to come out", "service fee", "trip fee", "diagnostic fee",
+        "what do you charge", "what does the evaluation include", "what does that include",
+        "go toward", "go towards", "goes toward", "goes towards", "applied to the project",
+        "credit toward", "credited toward", "deposit", "free estimate", "ballpark", "rough price",
+    ])
+
+
+def strip_unapproved_price_language(body: str) -> str:
+    """Remove evaluation pricing if the LLM leaks it before the controlled price gate."""
+    s = str(body or "")
+    # Remove full sentences containing the standard evaluation fee.
+    s = re.sub(r"(?:^|(?<=[.!?])\s+)[^.!?]*\$195[^.!?]*(?:[.!?]|$)", " ", s, flags=re.I)
+    s = re.sub(r"(?:^|(?<=[.!?])\s+)[^.!?]*evaluation visit[^.!?]*(?:[.!?]|$)", " ", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or body
+
+
+# ---------------------------------------------------
 # build_system_prompt (RESTORED + PATCHED)
 # ---------------------------------------------------
 def build_system_prompt(
@@ -2199,6 +2245,9 @@ Core behavioral constraints:
 - Do not treat vague time phrases as explicit times.
 - Do not confirm a booking unless a real Square booking exists.
 - Use simple, direct language.
+- Do NOT mention $195 or $395 unless the customer directly asks about price. Python will add required price disclosure at the right scheduling step.
+- Do NOT say "for the visit" when asking for an address. Say "for the work".
+- Do NOT mention Kyle by name in customer-facing replies. Use "our electrician", "one of our licensed electricians", "our technician", "our office", or "we".
 - NEVER say “one moment”, “please wait”, “hold on”, “securing your appointment”, or anything implying background processing.
 - If the address is incomplete, ask only for the missing address atom.
 - If date is known but time is missing, ask only for time.
@@ -2495,8 +2544,8 @@ def build_address_prompt(sched: dict) -> str:
 
         options = [
             "What is the house number and street name?",
-            "Send the house number and street name for the address.",
-            "What’s the house number and street for the visit?",
+            "Send the house number and street name for the work.",
+            "What’s the house number and street for the work?",
         ]
         return pick_variant_once(sched, "addr_missing_street", options)
 
@@ -2549,9 +2598,9 @@ def build_address_prompt(sched: dict) -> str:
 
     # FALLBACK
     options = [
-        "What’s the address?",
-        "What address are we heading to?",
-        "What’s the address for the visit?",
+        "What’s the address for the work?",
+        "What address should we use?",
+        "Send the address for the work.",
     ]
     return pick_variant_once(sched, "addr_fallback", options)
 
@@ -2768,7 +2817,7 @@ def choose_next_prompt_from_state(conv: dict, inbound_text: str = "") -> str:
             if is_emergency and sched.get("address_verified"):
                 return "This looks urgent. We can send someone now and arrival is usually within 1 to 2 hours. Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?"
             if is_emergency:
-                return humanize_question("What is the address for the visit?")
+                return humanize_question("What’s the address for the work?")
             return humanize_question("What time works for you?")
         return humanize_question("What time works best for you?")
     if step == "need_name":
@@ -3046,7 +3095,7 @@ def incoming_sms():
         if looks_like_complex_commercial_coordination_request(inbound_text):
             clear_service_booking_state_for_non_service(conv, "manual_only")
             sched["manual_reason"] = "commercial_walkthrough_coordination"
-            # Preserve the address for Kyle's review without treating it as a bookable Square visit.
+            # Preserve the address for office review without treating it as a bookable Square visit.
             try:
                 extracted_addr = extract_service_address_from_mixed_text(inbound_text)
                 if extracted_addr:
@@ -3559,7 +3608,7 @@ def incoming_sms():
 
     # Frustration and duplicate-prompt protection.
     if is_frustrated_with_bot(inbound_text):
-        sms_body = "Sorry about that. I have the information you sent. Kyle will review this manually."
+        sms_body = "Sorry about that. I have the information you sent. Our office will review this manually."
         conv["thread_type"] = "manual_only"
         sched["pending_step"] = None
     elif outbound_is_duplicate(conv, sms_body) and should_send_no_reply_for_duplicate(inbound_text):
@@ -4361,7 +4410,7 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
         answer = "Yes, that is fine. Just make sure we can safely get to the panel when we arrive."
     elif any(x in low for x in ["licensed", "license", "insured", "insurance"]):
         if "copy" in low or "certificate" in low or "proof" in low:
-            answer = "We can provide insurance documentation when the visit is moving forward."
+            answer = "We can provide insurance documentation when the work is moving forward."
         else:
             answer = "Yes, we're licensed and insured."
     elif any(x in low for x in ["where are you located", "where are you guys located", "where are you based", "where are you out of"]):
@@ -4369,11 +4418,11 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
     elif any(x in low for x in ["call when", "text when", "on the way", "arrival window", "when close", "when you re close", "when you're close", "when youre close"]):
         answer = "Yes, you'll get a text when we're on the way."
     elif any(x in low for x in ["do i need to buy", "bring anything", "materials", "should i buy", "do i need anything"]):
-        answer = "No, you do not need to buy anything ahead of time for the visit."
+        answer = "No, you do not need to buy anything ahead of time."
     elif any(x in low for x in ["permit", "permit required"]):
         answer = "If anything needs a permit, we'll go over that during the visit."
     elif any(x in low for x in ["card", "cash", "check", "payment", "pay by", "how do i pay"]):
-        answer = "Card or cash after the visit is fine."
+        answer = "Card or cash after the work is fine."
     elif any(x in low for x in [
         "how much", "price", "cost", "$195", "$395", "195", "395",
         "just to come out", "just to come", "service fee", "trip fee", "diagnostic fee",
@@ -4398,15 +4447,15 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             elif "INSPECTION" in appt:
                 answer = "The inspection fee covers the inspection visit itself. If you need additional work after that, we would go over it separately."
             else:
-                answer = "The $195 covers the evaluation visit itself. If you decide to move forward after that, we go over the next step in person."
+                answer = "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
-            answer = "For quote requests, we handle that with a $195 evaluation visit so we can see everything in person and give you a firm number."
+            answer = "For quote requests, we start with a $195 on-site evaluation, and that goes toward the project cost if you move forward with the work."
         elif "TROUBLESHOOT" in appt:
             answer = "The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site."
         elif "INSPECTION" in appt:
             answer = "Whole-home inspections are $395, and larger homes can run higher depending on square footage."
         else:
-            answer = "The $195 is the service visit to come out, evaluate the issue, and go over the next step."
+            answer = "The on-site evaluation is $195, and that goes toward the project cost if you move forward with the work."
         sched["price_disclosed"] = True
     elif any(x in low for x in ["availability", "available", "openings", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
         # Availability questions should never fall into a vague canned response.
@@ -4768,13 +4817,13 @@ def handle_post_booking(conv: dict, inbound_text: str) -> str | None:
             return f"You're all set for {date_txt} at {time_txt}."
         if date_txt:
             return f"You're all set for {date_txt}."
-        return "You're all set for the visit."
+        return "You're all set."
 
     if any(x in low for x in ["who is coming", "who's coming", "whos coming", "on the way", "arrival window", "will they call"]):
         return "You'll get a text when we're on the way."
 
     if any(x in low for x in ["price", "how much", "cost"]):
-        return "You're all set for the visit."
+        return "You're all set."
 
     if any(x in low for x in ["address", "coming to", "where are you going"]):
         return "We've got the address already attached to the visit."
@@ -5224,16 +5273,30 @@ def generate_reply_for_inbound(
             return _norm(s)
 
         def _maybe_price_once(s: str, appt_type_local: str) -> str:
-            # Emergency pricing is disclosed manually at the dispatch prompt, not on the opener
-            # and not on every follow-up.
-            if appt_type_local == "TROUBLESHOOT_395":
-                return _norm(s)
-            if not sched.get("price_disclosed"):
+            # Price is controlled by Python so it cannot leak into address collection.
+            # Best point: after the lead feels understood and the address is verified,
+            # immediately before asking for a day/time or offering slots.
+            s = _norm(s)
+            appt_local = (appt_type_local or "").upper()
+
+            # Emergency pricing is disclosed only at the emergency dispatch confirmation.
+            if appt_local == "TROUBLESHOOT_395":
+                return s
+
+            allowed = bool(sched.get("address_verified")) and (message_is_scheduling_prompt(s) or customer_is_asking_price(inbound_text))
+
+            if "$195" in s or "$395" in s:
+                if allowed or customer_is_asking_price(inbound_text):
+                    sched["price_disclosed"] = True
+                    return s
+                return _norm(strip_unapproved_price_language(s))
+
+            if allowed and not sched.get("price_disclosed"):
                 try:
-                    s = apply_price_injection(appt_type_local, s)
+                    s = apply_price_injection(appt_local, s)
+                    sched["price_disclosed"] = True
                 except Exception:
                     pass
-                sched["price_disclosed"] = True
             return _norm(s)
 
         def _finalize_sms(s: str, appt_type_local: str, booking_created: bool) -> str:
@@ -5894,15 +5957,20 @@ def generate_reply_for_inbound(
 # PRICE INJECTION HELPER (PATCH 2)
 # ---------------------------------------------------
 def apply_price_injection(appt_type: str, body: str) -> str:
+    body = " ".join(str(body or "").split()).strip()
     if "$" in body:
         return body
 
-    if "TROUBLESHOOT" in appt_type:
-        return f"{body} Troubleshooting and repair visits are $395."
-    if "INSPECTION" in appt_type:
-        return f"{body} Whole-home electrical inspections range from $375–$650 depending on square footage."
-    return f"{body} Our evaluation visit is $195."
+    line = prevolt_eval_price_line(appt_type)
 
+    # Keep the natural acknowledgement first, then disclose price, then ask scheduling.
+    m = re.match(r"^(Got it\.|Perfect\.|Sounds good\.|Alright\.|No problem\.)(.*)$", body, flags=re.I)
+    if m:
+        ack = m.group(1).strip()
+        rest = " ".join((m.group(2) or "").split()).strip()
+        return f"{ack} {line} {rest}".strip()
+
+    return f"{line} {body}".strip()
 
 
 # ---------------------------------------------------
@@ -7061,7 +7129,7 @@ def _safe_twilio_recording_url(raw_url: str) -> str | None:
     """Return a safe Twilio recording media URL or None.
 
     Twilio Recording URLs require HTTP Basic Auth. The desktop app should
-    never open api.twilio.com directly because the browser will prompt Kyle
+    never open api.twilio.com directly because the browser will prompt for credentials
     for Twilio credentials. Instead Command Center calls this Render proxy;
     Render holds TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN securely.
     """
