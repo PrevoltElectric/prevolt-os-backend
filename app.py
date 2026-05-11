@@ -4,6 +4,7 @@ import sqlite3
 import time
 import uuid
 import re
+import random
 from pathlib import Path
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
@@ -6652,11 +6653,20 @@ def is_next_available_request(inbound_text: str) -> bool:
 
 
 def get_next_available_slots(appointment_type: str, limit: int = 3, days_ahead: int = 14) -> list[dict]:
+    """Return up to `limit` available options on different calendar days.
+
+    Prevolt's customer-facing flow should not offer three times on the same day
+    by default. It feels narrow and robotic. For the scheduling handoff, offer
+    the next available day/time, then a later day/time, then a third later
+    day/time. Each day gets one available time so the customer sees real choice
+    across the week.
+    """
     appointment_type = (appointment_type or "EVAL_195").upper()
     tz = ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
     now_local = datetime.now(tz)
     collected = []
-    seen = set()
+    seen_days = set()
+    rng = random.SystemRandom()
 
     non_emergency = "TROUBLESHOOT" not in appointment_type
 
@@ -6665,21 +6675,41 @@ def get_next_available_slots(appointment_type: str, limit: int = 3, days_ahead: 
         if non_emergency and target_day.weekday() >= 5:
             continue
         target_date = target_day.strftime("%Y-%m-%d")
-        day_slots = search_square_availability_for_day(target_date, appointment_type)
-        for slot in day_slots:
-            key = (slot.get("date"), slot.get("time"))
-            if key in seen:
+        if target_date in seen_days:
+            continue
+
+        try:
+            day_slots = search_square_availability_for_day(target_date, appointment_type)
+        except Exception as e:
+            print("[WARN] get_next_available_slots day lookup failed:", target_date, repr(e))
+            day_slots = []
+
+        valid_slots = []
+        seen_times = set()
+        for slot in day_slots or []:
+            slot_date = str(slot.get("date") or target_date).strip()
+            slot_time = str(slot.get("time") or "").strip()
+            if not slot_time or slot_time in seen_times:
                 continue
             try:
-                slot_dt = datetime.strptime(f"{slot.get('date')} {slot.get('time')}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+                slot_dt = datetime.strptime(f"{slot_date} {slot_time}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
             except Exception:
                 continue
             if slot_dt <= now_local:
                 continue
-            seen.add(key)
-            collected.append(slot)
-            if len(collected) >= limit:
-                return collected
+            seen_times.add(slot_time)
+            valid_slots.append(slot)
+
+        if not valid_slots:
+            continue
+
+        # Pick one valid time for this date so the three options are three
+        # different days, not the same day repeated at 9/10/12.
+        chosen = rng.choice(valid_slots)
+        seen_days.add(target_date)
+        collected.append(chosen)
+        if len(collected) >= limit:
+            return collected
 
     return collected
 
