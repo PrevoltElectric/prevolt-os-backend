@@ -289,15 +289,40 @@ def v13_looks_like_smoke_detector_install_request(*parts) -> bool:
 
 
 def v13_looks_like_callback_request(*parts) -> bool:
+    """
+    True only when the customer is explicitly requiring a phone call instead
+    of normal text-based scheduling.
+
+    Important: ordinary voicemail closers like "call me back", "give me a
+    call", or "please call when you get a chance" are soft callback language.
+    Almost every voicemail contains that kind of wording, so it must not force
+    manual mode or block the normal address/scheduling flow.
+    """
     low = _intent_text(*parts)
     if not low:
         return False
-    phrases = [
-        "call me", "call back", "call me back", "give me a call", "please call",
-        "can someone call", "could someone call", "rather talk", "talk to someone",
-        "talk on the phone", "phone call", "call instead", "can you call"
+
+    hard_patterns = [
+        # Clear opt-out of texting / automation.
+        r"\b(?:do not|don't|dont)\s+text\b",
+        r"\b(?:stop|quit)\s+text(?:ing)?\b",
+        r"\b(?:i\s+)?(?:can't|cant|cannot)\s+text\b",
+        r"\b(?:texting|sms|messages?)\s+(?:does not|doesn't|doesnt|won't|wont)\s+work\b",
+        r"\b(?:call|phone)\s+only\b",
+        r"\bonly\s+(?:call|phone)\b",
+
+        # They are asking to replace the text flow with a phone call.
+        r"\b(?:please\s+)?call\s+(?:me\s+)?instead\b",
+        r"\b(?:can|could|would)\s+you\s+(?:please\s+)?call\s+me\b",
+        r"\b(?:rather|prefer)\s+(?:a\s+)?(?:phone\s+)?call\b",
+        r"\b(?:rather|prefer)\s+(?:to\s+)?(?:talk|speak)\b",
+
+        # They need a human conversation before scheduling can continue.
+        r"\b(?:need|want)\s+to\s+(?:speak|talk)\s+(?:with|to)\s+(?:(?:a|an)\s+)?(?:person|someone|somebody|human|electrician|tech|technician)\b",
+        r"\b(?:need|want)\s+a\s+(?:phone\s+)?call\s+(?:before|prior to)\b",
+        r"\b(?:before|prior to)\s+(?:scheduling|booking).*?\b(?:call|speak|talk)\b",
     ]
-    return any(p in low for p in phrases)
+    return any(re.search(pattern, low, flags=re.I) for pattern in hard_patterns)
 
 
 def v13_apply_callback_request(conv: dict, inbound_text: str = "") -> str:
