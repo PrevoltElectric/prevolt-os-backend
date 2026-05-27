@@ -1876,7 +1876,7 @@ def build_residential_realtime_twiml(phone: str, call_sid: str) -> VoiceResponse
     hydrate_voice_conversation(phone, call_sid)
     response.say(
         '<speak><prosody rate="98%">'
-        "You have reached Pree-volt Electric&apos;s automated scheduling assistant. "
+        "You have reached Prevolt Electric&apos;s automated scheduling assistant. "
         'This call may be recorded to help with scheduling. '
         "In a couple of words, please tell us why you're calling today."
         '</prosody></speak>',
@@ -1909,6 +1909,7 @@ Critical rules:
 - Do not say phrases that only make sense in SMS, including: "by text", "reply here", "I'll help you here by text", "I can help you right here by text", or "text thread".
 - For every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
 - Never answer directly from your own wording after the caller speaks. Always call the prevolt_os_turn tool first, then speak only reply_to_customer. It has already been converted into phone language.
+- When the next missing field is an address or address confirmation, the phone reply should sound like: "I can get your appointment scheduled here, what's the missing address piece?" or "I can get your appointment scheduled here, just to confirm, you're at the address heard, right?"
 - Do not say any greeting starting with "Thanks for calling" after the Twilio intro has played.
 - If the tool returns end_call=true, speak the reply_to_customer, then stop the call naturally.
 - If the tool says booking_created is true, tell the caller they are on the schedule and that a confirmation text will be sent.
@@ -2059,6 +2060,43 @@ def _voice_naturalize_reply(reply: str) -> str:
     ]
     for pat, repl in replacements:
         text = re.sub(pat, repl, text, flags=re.I)
+
+    # Voice-only UX cleanup: keep the scheduling-assistant transition, but
+    # do not let it become a standalone sentence that can sound like a stall.
+    # Desired phone shape:
+    # "I can get your appointment scheduled here, what's the house number and street name for the work?"
+    # or, when the address was already heard:
+    # "I can get your appointment scheduled here, just to confirm, you're at 45 Main Street, right?"
+    text = re.sub(
+        r"^\s*(?:Okay,?\s*)?(?:let(?:'|’)s get (?:that|this) (?:request )?(?:set up|started)\.?\s*)?(?:Got it\.\s*)?(?:I can help get this (?:scheduled|started)\.\s*)+(?=(?:what|what's|which|we do|we have|please|can you|tell me|you(?:'|’)re at|you're at)\b)",
+        "I can get your appointment scheduled here, ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"^\s*(?:Okay,?\s*)?(?:let(?:'|’)s get (?:that|this) (?:request )?(?:set up|started)\.?\s*)+(?=(?:what|what's|which|we do|we have|please|can you|tell me|you(?:'|’)re at|you're at)\b)",
+        "I can get your appointment scheduled here, ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"^\s*I can get your appointment scheduled here,\s*(?:you(?:'|’)re|you're) at\s+",
+        "I can get your appointment scheduled here, just to confirm, you're at ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"^\s*I can get your appointment scheduled here,\s*we do charge\b",
+        "We do charge",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"^\s*I can get your appointment scheduled here,\s*we have\b",
+        "We have",
+        text,
+        flags=re.I,
+    )
 
     # Voice-specific cleanup: do not prefix name questions with the first name;
     # phone TTS creates an awkward long pause after the comma. Also never ask
@@ -2723,7 +2761,7 @@ def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
 
     # Three audible soft pops with a tiny high-frequency texture after each pop.
     # This should read as "processing", not as static or speech.
-    tick_starts_ms = (80, 310, 540)
+    tick_starts_ms = (80, 300, 520, 740)
     for start_ms in tick_starts_ms:
         start = int(8000 * start_ms / 1000.0)
         tick_len = min(int(8000 * 0.075), max(0, total - start))  # 75ms
@@ -2731,10 +2769,10 @@ def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
             decay = math.exp(-4.2 * (i / max(1, tick_len)))
             # A pop transient plus a short tone component, intentionally louder
             # than previous versions but still far quieter than speech.
-            transient = 9000 if i < 8 else 0
-            tone = int(5200 * decay * math.sin(2 * math.pi * 1150 * (i / 8000.0)))
-            texture = int(1200 * decay * math.sin(2 * math.pi * 2300 * (i / 8000.0)))
-            sample = max(-14000, min(14000, transient + tone + texture))
+            transient = 11000 if i < 10 else 0
+            tone = int(6800 * decay * math.sin(2 * math.pi * 1050 * (i / 8000.0)))
+            texture = int(1800 * decay * math.sin(2 * math.pi * 2150 * (i / 8000.0)))
+            sample = max(-15000, min(15000, transient + tone + texture))
             data[start + i] = _linear16_to_mulaw(sample)
     return base64.b64encode(bytes(data)).decode("ascii")
 
@@ -2789,12 +2827,18 @@ def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: d
             "output": json.dumps(output),
         },
     })
+    exact_reply = _voice_to_sms_text(str(output.get("reply_to_customer") or "Sorry, can you say that again?"))
     _send_openai_event(openai_ws, {
         "type": "response.create",
         "response": {
             "output_modalities": ["audio"],
             "tool_choice": "none",
-            "instructions": "Speak only the reply_to_customer from the tool output. Do not add anything else. Do not add filler phrases or ask for confirmation before the next needed question.",
+            "instructions": (
+                "Say this exact phone reply, word for word, including every question in it, then stop speaking. "
+                "Do not add any acknowledgement, greeting, filler phrase, or extra question. "
+                "Do not stop after the first clause or first sentence; speak the complete exact reply. "
+                "Exact reply: " + json.dumps(exact_reply)
+            ),
         },
     })
     return True
