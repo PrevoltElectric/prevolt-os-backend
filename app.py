@@ -111,6 +111,7 @@ VOICE_AGENT_THINKING_SOUND_ENABLED = _env_bool("VOICE_AGENT_THINKING_SOUND_ENABL
 VOICE_AGENT_THINKING_SOUND_MS = int(os.environ.get("VOICE_AGENT_THINKING_SOUND_MS") or "650")
 VOICE_AGENT_VAD_SILENCE_MS = int(os.environ.get("VOICE_AGENT_VAD_SILENCE_MS") or "300")
 VOICE_AGENT_VAD_THRESHOLD = float(os.environ.get("VOICE_AGENT_VAD_THRESHOLD") or "0.35")
+VOICE_RESIDENTIAL_MAX_TRAVEL_MINUTES = int(os.environ.get("VOICE_RESIDENTIAL_MAX_TRAVEL_MINUTES") or str(MAX_TRAVEL_MINUTES or 60))
 
 RULES_FILE = os.environ.get("PREVOLT_RULES_FILE") or os.environ.get("PREVOLT_RULES_PATH")
 
@@ -1830,6 +1831,17 @@ def hydrate_voice_conversation(phone: str, call_sid: str = "") -> dict:
     sched.setdefault("voice_intro_sms_sent", False)
     sched.setdefault("voice_close_after_reply", False)
     sched.setdefault("voice_drag_handoff_sent", False)
+    # Voice calls should get the same repeat-customer context as the SMS path.
+    # This lets the assistant confirm a saved Square address instead of asking
+    # the caller to repeat it.
+    try:
+        if phone and "hydrate_square_profile_by_phone" in globals():
+            hydrate_square_profile_by_phone(profile, phone)
+    except Exception as e:
+        try:
+            log_event("VOICE_SQUARE_HYDRATE_ERROR", phone, {"error": repr(e), "call_sid": call_sid})
+        except Exception:
+            pass
     return conv
 
 
@@ -1904,7 +1916,8 @@ Critical rules:
 - If the caller describes active fire, smoke filling the home, shock/unconscious person, or water touching energized electrical, tell them to call 911 first and stop scheduling until they confirm it is safe.
 - Ask one question at a time. Do not ask for the phone number; caller ID already provides it.
 - Keep replies short enough for a phone call. No paragraphs.
-- Do not say filler phrases like "let me check", "let me lock that in", "one moment", "hold on", "I am noting", or "I am finishing" before or after the tool returns. Move directly to the next required question or the final confirmation.
+- Do not say filler phrases like "let me check", "let me lock that in", "one moment", "hold on", "I am noting", "I am finishing", "routing through our scheduling system", or "the scheduling system is still processing" before or after the tool returns. Move directly to the next required question or the final confirmation.
+- If a residential caller is in Worcester, Boston, Malden, or another property too far outside the service area, politely say we do not schedule residential repairs that far out, apologize, thank them, and end the call.
 - Do not wait for the caller to say okay or thanks before asking the next required scheduling question.
 - If the caller confirms an address you just read from file, do not ask for the address again; continue to dispatch confirmation or the next missing booking detail.
 - If the caller asks what the emergency troubleshoot and repair visit covers, answer once, then ask if they want dispatch. If they say yes, okay, or let's do it, proceed; do not repeat the same dispatch question.
@@ -2024,6 +2037,130 @@ def _voice_looks_like_live_person_demand(text: str) -> bool:
         "i need a person", "i want to talk to someone", "i need to talk to someone",
     ])
 
+
+
+
+def _voice_close_with_reply(phone: str, conv: dict, reply: str, reason: str = "") -> dict:
+    """Mark a live voice call as complete/closed and return a clean spoken reply."""
+    sched = conv.setdefault("sched", {})
+    conv["thread_type"] = conv.get("thread_type") or "closed_lost"
+    sched["voice_close_after_reply"] = True
+    sched["voice_resume_sms_sent"] = True
+    sched["voice_intro_sms_sent"] = True
+    sched["booking_allowed"] = False
+    sched["closed_reason"] = reason or sched.get("closed_reason")
+    conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+    conv["last_voice_reply"] = reply
+    return {
+        "reply_to_customer": reply,
+        "booking_created": False,
+        "manual_only": bool(sched.get("manual_only")),
+        "pending_step": sched.get("pending_step"),
+        "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"),
+        "end_call": True,
+    }
+
+
+def _voice_is_out_of_area_town(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    # Explicit residential no-go towns from Kyle's service-area rule.
+    return bool(re.search(r"\b(?:worcester|worcestor|boston|malden)\b", low, flags=re.I))
+
+
+def _voice_out_of_area_reply() -> str:
+    return (
+        "I'm sorry, but we do not schedule residential repairs for properties that far outside our service area. "
+        "If there is active smoke, fire, or immediate danger, please call 911 first. "
+        "Thank you for calling Prevolt Electric. Goodbye."
+    )
+
+
+def _voice_destination_from_sched(sched: dict) -> str:
+    addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+    if addr_struct:
+        destination = (
+            f"{(addr_struct.get('address_line_1') or '').strip()}, "
+            f"{(addr_struct.get('locality') or '').strip()}, "
+            f"{(addr_struct.get('administrative_district_level_1') or '').strip()} "
+            f"{(addr_struct.get('postal_code') or '').strip()}"
+        ).strip(" ,")
+        if destination:
+            return destination
+    return str(sched.get("raw_address") or sched.get("address_candidate") or "").strip()
+
+
+def _voice_residential_address_too_far(conv: dict) -> tuple[bool, int | None]:
+    """Return true when a residential voice address is beyond the service radius."""
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    dest = _voice_destination_from_sched(sched)
+    if not dest:
+        return (False, None)
+    # Hard block the explicit far-away towns even if travel API is unavailable.
+    if _voice_is_out_of_area_town(dest):
+        return (True, None)
+    origin = TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS
+    if not origin:
+        return (False, None)
+    try:
+        minutes = compute_travel_time_minutes(origin, dest)
+    except Exception:
+        minutes = None
+    if minutes and minutes > VOICE_RESIDENTIAL_MAX_TRAVEL_MINUTES:
+        return (True, int(minutes))
+    return (False, int(minutes) if minutes else None)
+
+
+def _voice_looks_like_true_hazard(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return bool(re.search(
+        r"\b(?:smoke|smoking|caught fire|fire|burning|burnt|hot to the touch|hot outlet|hot panel|sparking|sparks|arcing|melted|panel is hot|outlet is hot|burning smell|smells like smoke|as soon as possible|immediately|right now|dispatch now)\b",
+        low,
+        flags=re.I,
+    ))
+
+
+def _voice_text_contains_real_address(text: str) -> bool:
+    try:
+        addr = extract_service_address_from_text(text or "")
+    except Exception:
+        addr = None
+    return bool(addr and _address_has_house_number_and_street(addr))
+
+
+def _voice_hazard_intake_fast_path(phone: str, conv: dict, caller_text: str) -> str | None:
+    """Prevent hazard descriptions from being misread as addresses and move to emergency flow."""
+    if not _voice_looks_like_true_hazard(caller_text):
+        return None
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    sched["appointment_type"] = "TROUBLESHOOT_395"
+    conv["appointment_type"] = "TROUBLESHOOT_395"
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    # Never let the emergency description itself become the address.
+    if sched.get("raw_address") and _intent_text(str(sched.get("raw_address"))) in _intent_text(caller_text):
+        sched["raw_address"] = None
+        sched["address_candidate"] = None
+        sched["address_verified"] = False
+        sched["address_missing"] = "street"
+    if not sched.get("address_verified"):
+        saved = _best_saved_address(profile)
+        if saved and not _voice_text_contains_real_address(caller_text):
+            sched["address_candidate"] = saved
+            sched["address_missing"] = "confirm"
+            sched["pending_step"] = "need_address"
+            return f"This sounds urgent. I have {saved} on file. Is this for that address?"
+        sched["pending_step"] = "need_address"
+        sched["address_missing"] = "street"
+        return "This sounds urgent. If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what's the address for the work?"
+    sched["awaiting_emergency_confirm"] = True
+    sched["price_disclosed"] = True
+    return "This looks urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
 
 
 
@@ -2404,6 +2541,10 @@ def _voice_naturalize_reply(reply: str) -> str:
     text = re.sub(r"\bhere\s+by\s+text\b", "here", text, flags=re.I)
 
     replacements = [
+        (r"\bI(?:'|’)m gonna route your request through our scheduling system to get the right next step\.?", ""),
+        (r"\bI'm going to route your request through our scheduling system to get the right next step\.?", ""),
+        (r"\bThe scheduling system is still processing your request right now\.?", ""),
+        (r"\bWhat number is it on [^?]+\?", "What's the house number and street name for the work?"),
         (r"\breply here\b", "tell me"),
         (r"\breply with\b", "tell me"),
         (r"\bsend over\b", "tell me"),
@@ -3087,6 +3228,35 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     if len(caller_text.strip()) >= 4:
         sched["voice_meaningful_customer_turns"] = int(sched.get("voice_meaningful_customer_turns") or 0) + 1
 
+    # Hard residential service-area closeout before any booking logic.
+    if _voice_is_out_of_area_town(caller_text):
+        reply = _voice_out_of_area_reply()
+        try:
+            log_event("VOICE_OUT_OF_AREA_TOWN", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return _voice_close_with_reply(phone, conv, reply, "residential_out_of_area_town")
+
+    # True hazard/emergency descriptions must not be sent through the generic address parser;
+    # it can mistake the issue text for an address and create the "what number is it on..." loop.
+    try:
+        hazard_reply = _voice_hazard_intake_fast_path(phone, conv, caller_text)
+    except Exception as e:
+        hazard_reply = None
+        try:
+            log_event("VOICE_HAZARD_FAST_PATH_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+    if hazard_reply:
+        hazard_reply = _voice_naturalize_reply(hazard_reply)
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": hazard_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        conv["last_voice_reply"] = hazard_reply
+        try:
+            log_event("VOICE_HAZARD_FAST_PATH", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(hazard_reply), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": hazard_reply, "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
     # If we just asked the caller to confirm a saved/on-file address and they say yes,
     # trust that confirmation and move forward. Do not ask for the address again.
     try:
@@ -3098,6 +3268,15 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     if address_confirm_reply:
+        # After a saved/on-file address is confirmed, immediately enforce residential service radius.
+        too_far, travel_minutes = _voice_residential_address_too_far(conv)
+        if too_far:
+            reply = _voice_out_of_area_reply()
+            try:
+                log_event("VOICE_OUT_OF_AREA_ADDRESS", phone, {"travel_minutes": travel_minutes, "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return _voice_close_with_reply(phone, conv, reply, "residential_out_of_area_address")
         address_confirm_reply = _voice_naturalize_reply(address_confirm_reply)
         conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": address_confirm_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
         conv["last_voice_reply"] = address_confirm_reply
@@ -3264,6 +3443,23 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         _voice_sanitize_name_fields(conv.setdefault("profile", {}), sched)
     except Exception:
         pass
+    # If the generic SRB path accepted an address, stop residential jobs that are too far away
+    # before offering slots or continuing the booking.
+    try:
+        if sched.get("address_verified"):
+            too_far, travel_minutes = _voice_residential_address_too_far(conv)
+            if too_far:
+                reply_far = _voice_out_of_area_reply()
+                try:
+                    log_event("VOICE_OUT_OF_AREA_ADDRESS", phone, {"travel_minutes": travel_minutes, "reply": _safe_monitor_text(reply_far), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+                return _voice_close_with_reply(phone, conv, reply_far, "residential_out_of_area_address")
+    except Exception as e:
+        try:
+            log_event("VOICE_OUT_OF_AREA_CHECK_ERROR", phone, {"error": repr(e), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
     reply = _voice_naturalize_reply((result or {}).get("sms_body") or "Sorry, can you say that again?")
     if _voice_reply_asks_for_phone(reply) and phone:
         profile_local = conv.setdefault("profile", {})
@@ -3674,7 +3870,11 @@ if sock is not None:
                             except Exception:
                                 pass
                         elif etype == "response.output_item.done":
-                            _handle_realtime_function_call(openai_ws, phone, call_sid, event.get("item") or {}, handled_function_calls, ws, stream_sid)
+                            # Do not create the follow-up spoken response here. OpenAI may still
+                            # consider the parent response active, which causes
+                            # conversation_already_has_active_response errors. Function calls are
+                            # handled from response.done instead.
+                            pass
                         elif etype in {"error", "invalid_request_error"}:
                             try:
                                 log_event("VOICE_OPENAI_ERROR", phone, {"event": event, "call_sid": call_sid})
@@ -10577,6 +10777,7 @@ def monitor_voice_health():
         "max_customer_turns": VOICE_AGENT_MAX_CUSTOMER_TURNS,
         "vad_silence_ms": VOICE_AGENT_VAD_SILENCE_MS,
         "vad_threshold": VOICE_AGENT_VAD_THRESHOLD,
+        "residential_max_travel_minutes": VOICE_RESIDENTIAL_MAX_TRAVEL_MINUTES,
     }, (200 if ready else 503)
 
 
