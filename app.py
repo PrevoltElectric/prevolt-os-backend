@@ -1970,7 +1970,7 @@ Critical rules:
 - If the caller describes active fire, smoke filling the home, shock/unconscious person, or water touching energized electrical, tell them to call 911 first and stop scheduling until they confirm it is safe.
 - Ask one question at a time. Do not ask for the phone number; caller ID already provides it.
 - Keep replies short enough for a phone call. No paragraphs.
-- Do not say filler phrases like "let me check", "let me lock that in", "one moment", "hold on", "I am noting", "I am finishing", "routing through our scheduling system", or "the scheduling system is still processing" before or after the tool returns. Move directly to the next required question or the final confirmation.
+- Do not say filler phrases like "let me check", "let me lock that in", "one moment", "hold on", "I am noting", "I am finishing", "routing through our scheduling system", "the scheduling system is still processing", "let me respond", "let me move ahead", or "let me think" before or after the tool returns. Move directly to the next required question or the final confirmation.
 - If a residential caller is in Worcester, Boston, Malden, or another property too far outside the service area, politely say we do not schedule residential repairs that far out, apologize, thank them, and end the call.
 - Do not wait for the caller to say okay or thanks before asking the next required scheduling question.
 - If the caller confirms an address you just read from file, do not ask for the address again; continue to dispatch confirmation or the next missing booking detail.
@@ -1978,7 +1978,7 @@ Critical rules:
 - Do not say phrases that only make sense in SMS, including: "by text", "reply here", "I'll help you here by text", "I can help you right here by text", or "text thread".
 - For every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
 - Never answer directly from your own wording after the caller speaks. Always call the prevolt_os_turn tool first, then speak only reply_to_customer. It has already been converted into phone language.
-- When the next missing field is an address or address confirmation, the phone reply should sound like: "I can get your appointment scheduled here, what's the missing address piece?" or "I can get your appointment scheduled here. Just to confirm, you're at the address heard, right?"
+- When the next missing field is an address or address confirmation, the phone reply should sound like: "I can get your appointment scheduled here. What's the missing address piece?" or "I have the address on file. Is this for that address?"
 - Do not say any greeting starting with "Thanks for calling" after the Twilio intro has played.
 - If the tool returns end_call=true, speak the reply_to_customer, then stop the call naturally.
 - If the tool says booking_created is true, tell the caller they are on the schedule, that a confirmation text will be sent, say goodbye, and end the call.
@@ -2258,13 +2258,13 @@ def _voice_hazard_intake_fast_path(phone: str, conv: dict, caller_text: str) -> 
                 log_event("VOICE_HAZARD_SAVED_ADDRESS_CONFIRM", phone, {"saved_address": saved, "call_sid": conv.get("last_call_sid")}, conv)
             except Exception:
                 pass
-            return f"This sounds urgent. I have {saved} on file. Is this for that address?"
+            return f"I have {saved} on file. Is this for that address?"
         sched["pending_step"] = "need_address"
         sched["address_missing"] = "street"
-        return "This sounds urgent. If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what's the address for the work?"
+        return "If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what's the address for the work?"
     sched["awaiting_emergency_confirm"] = True
     sched["price_disclosed"] = True
-    return "This looks urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
+    return "This sounds urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
 
 
 
@@ -2392,7 +2392,7 @@ def _voice_known_address_confirm_fast_path(conv: dict, caller_text: str) -> str 
         sched["awaiting_emergency_confirm"] = True
         sched["price_disclosed"] = True
         return _voice_naturalize_reply(
-            "This looks urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
+            "This sounds urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
         )
 
     try:
@@ -2482,7 +2482,7 @@ def _voice_is_emergency_coverage_question(text: str) -> bool:
         return False
     return any(p in low for p in [
         "what does that cover", "what's that cover", "what does it cover", "what is included",
-        "what's included", "what am i paying", "what do i get", "what does the 395 cover",
+        "what's included", "what does that include", "what does it include", "what is included", "what am i paying", "what do i get", "what does the 395 cover",
         "what does $395 cover", "what is the 395", "what is that charge",
     ])
 
@@ -2647,6 +2647,9 @@ def _voice_naturalize_reply(reply: str) -> str:
     replacements = [
         (r"\bI(?:'|’)m gonna route your request through our scheduling system to get the right next step\.?", ""),
         (r"\bI'm going to route your request through our scheduling system to get the right next step\.?", ""),
+        (r"\bLet me respond with the safest next step\.?", ""),
+        (r"\bLet me move ahead with that\.?", ""),
+        (r"\bGot it\.\s*Thanks for confirming\.\s*Let me move ahead with that\.?", "Got it."),
         (r"\bThe scheduling system is still processing your request right now\.?", ""),
         (r"\bWhat number is it on [^?]+\?", "What's the house number and street name for the work?"),
         (r"\breply here\b", "tell me"),
@@ -2661,7 +2664,7 @@ def _voice_naturalize_reply(reply: str) -> str:
         (r"\bLet me think this through for scheduling\.?", ""),
         (r"\bSure, let me check what(?:\'|’)s included for that visit\.?", ""),
         (r"\bAll right, let me get this dispatch set up for you\.?", "Got it."),
-        (r"\bI(?:'|’)m going to get the right safety first next step for this\.?", "This sounds urgent."),
+        (r"\bI(?:'|’)m going to get the right safety first next step for this\.?", ""),
         (r"\bOkay, let(?:'|’)s keep this safe and get the next step lined up\.?", "Got it."),
         (r"\bLet me quickly explain what that visit[^.?!]*[.?!]?", ""),
         (r"\bThanks for hanging on\.\s*I(?:'|’)m still waiting for the exact coverage details to come through\.?", ""),
@@ -3308,7 +3311,11 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     last_text_norm = sched.get("voice_last_caller_text_norm") or ""
     this_text_norm = re.sub(r"[^a-z0-9]+", " ", caller_text.lower()).strip()
     last_ts = float(sched.get("voice_last_caller_text_ts") or 0)
-    if this_text_norm and this_text_norm == last_text_norm and (now_ts - last_ts) < 8:
+    confirmation_norms = {"yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "right"}
+    # Do not suppress repeated confirmations. A caller can legitimately say "yes"
+    # once to confirm an on-file address and then "yes" again to approve emergency
+    # dispatch. Suppressing the second yes caused the dispatch question to repeat.
+    if this_text_norm and this_text_norm == last_text_norm and this_text_norm not in confirmation_norms and (now_ts - last_ts) < 8:
         reply = conv.get("last_voice_reply") or "Got it."
         try:
             log_event("VOICE_DUPLICATE_TURN_SUPPRESSED", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
@@ -3824,7 +3831,13 @@ def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: d
     output = process_prevolt_voice_turn(phone, call_sid, args.get("caller_text") or "")
     if output.get("end_call"):
         try:
-            hydrate_voice_conversation(phone, call_sid).setdefault("sched", {})["voice_close_after_reply"] = True
+            sched_local = hydrate_voice_conversation(phone, call_sid).setdefault("sched", {})
+            sched_local["voice_close_after_reply"] = True
+            # Do not close on the function-call response.done event. The final
+            # confirmation is spoken by the *next* audio-only response we create below.
+            # Closing immediately after the function call caused the confirmation to be
+            # sent by SMS but cut off before the caller heard it.
+            sched_local["voice_waiting_for_final_audio_done"] = True
         except Exception:
             pass
     _send_openai_event(openai_ws, {
@@ -3958,13 +3971,21 @@ if sock is not None:
                             pass
                         elif etype == "response.done":
                             output = ((event.get("response") or {}).get("output") or [])
+                            had_function_call = any(isinstance(item, dict) and item.get("type") == "function_call" for item in output)
                             for item in output:
                                 _handle_realtime_function_call(openai_ws, phone, call_sid, item, handled_function_calls, ws, stream_sid)
                             try:
                                 conv_local = hydrate_voice_conversation(phone, call_sid)
-                                if conv_local.setdefault("sched", {}).get("voice_close_after_reply"):
-                                    # Let the final goodbye finish before closing Twilio's stream.
-                                    time.sleep(2.75)
+                                sched_local = conv_local.setdefault("sched", {})
+                                if had_function_call:
+                                    # A tool call may have queued the final spoken reply with response.create.
+                                    # Do NOT close here or the final confirmation will be sent by SMS but never spoken.
+                                    if sched_local.get("voice_close_after_reply"):
+                                        sched_local["voice_final_reply_queued"] = True
+                                    continue
+                                if sched_local.get("voice_close_after_reply"):
+                                    # This response.done belongs to the spoken final reply, so let audio finish, then close.
+                                    time.sleep(3.5)
                                     stop_flag["stop"] = True
                                     try:
                                         ws.close()
