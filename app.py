@@ -1871,7 +1871,9 @@ def build_residential_realtime_twiml(phone: str, call_sid: str) -> VoiceResponse
     hydrate_voice_conversation(phone, call_sid)
     response.say(
         '<speak><prosody rate="98%">'
-        'Connecting you to Prevolt Electric’s scheduling assistant. This call may be recorded to help with scheduling.'
+        "You have reached PREE-volt Electric\'s automated scheduling assistant. "
+        'This call may be recorded to help with scheduling. '
+        "In a couple of words, please tell us why you\'re calling today."
         '</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
@@ -1904,7 +1906,9 @@ Critical rules:
 - If the tool says booking_created is true, tell the caller they are on the schedule and that a confirmation text will be sent.
 - If the caller asks whether you are automated, answer honestly: "This is Prevolt's scheduling assistant. It helps keep appointments organized while our electricians are in the field."
 Opening behavior:
-Start with: "Thanks for calling Prevolt Electric. What town is the work in?"
+Twilio already plays the opening prompt before the live stream starts: "You have reached Prevolt Electric's automated scheduling assistant. In a couple of words, please tell us why you're calling today."
+Do not repeat the greeting or ask the opening question again. Wait for the caller's answer, then call the prevolt_os_turn tool.
+If the caller demands a live person, do not argue. Say: "We handle residential scheduling through our automated booking assistant so our electricians can stay in the field. I can help get the request started now."
 """.strip()
 
 
@@ -1952,18 +1956,52 @@ def _voice_session_update_event() -> dict:
     }
 
 
-def _voice_initial_response_event() -> dict:
-    return {
-        "type": "response.create",
-        "response": {
-            "output_modalities": ["audio"],
-            "instructions": "Say exactly: Thanks for calling Prevolt Electric. What town is the work in?",
-        },
-    }
+def _voice_initial_response_event() -> dict | None:
+    # Twilio's Polly voice already plays the live-call opening prompt before
+    # the WebSocket stream begins. Returning None prevents the realtime model
+    # from repeating a second, different-voice intro.
+    return None
 
 
 def _voice_to_sms_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _voice_dedupe_consecutive_sentences(text: str) -> str:
+    """Remove accidental repeated spoken prompts without changing meaning."""
+    text = _voice_to_sms_text(text)
+    if not text:
+        return text
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    cleaned = []
+    last_norm = ""
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        norm = re.sub(r"[^a-z0-9]+", " ", p.lower()).strip()
+        if norm and norm == last_norm:
+            continue
+        cleaned.append(p)
+        last_norm = norm
+    # Also catch repeated question fragments that may not have punctuation.
+    out = " ".join(cleaned).strip()
+    out = re.sub(r"\b(What(?:'| is|’s)? your first and last name\??)\s+\1", r"\1", out, flags=re.I)
+    out = re.sub(r"\b(Send the house number and street name for the work\.?)\s+\1", r"\1", out, flags=re.I)
+    return _voice_to_sms_text(out)
+
+
+def _voice_looks_like_live_person_demand(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return any(p in low for p in [
+        "speak to a person", "speak to a human", "speak with a person", "speak with a human",
+        "talk to a person", "talk to a human", "talk with a person", "talk with a human",
+        "real person", "live person", "human being", "representative", "operator",
+        "connect me to someone", "transfer me", "get someone on the phone", "i want a person",
+        "i need a person", "i want to talk to someone", "i need to talk to someone",
+    ])
 
 
 def _voice_naturalize_reply(reply: str) -> str:
@@ -1985,6 +2023,11 @@ def _voice_naturalize_reply(reply: str) -> str:
         (r"\breply here\b", "tell me"),
         (r"\breply with\b", "tell me"),
         (r"\bsend over\b", "tell me"),
+        (r"\bplease send (?:me )?the house number and street name for the work\.?", "what's the house number and street name for the work?"),
+        (r"\bsend (?:me )?the house number and street name for the work\.?", "what's the house number and street name for the work?"),
+        (r"\bSend (?:me )?the house number and street name for the work\.?", "What's the house number and street name for the work?"),
+        (r"\bWhat is your first and last name\??", "What's your first and last name?"),
+        (r"\bWe can definitely take care of this\.\s*", "Got it. "),
         (r"\btext you shortly\b", "send you a confirmation text shortly"),
         (r"\bWe will text you shortly\b", "We'll send you a confirmation text shortly"),
         (r"\bWe'll text you shortly\b", "We'll send you a confirmation text shortly"),
@@ -2008,6 +2051,7 @@ def _voice_naturalize_reply(reply: str) -> str:
     low = _intent_text(text)
     if "what town is the work in" in low and ("help get this" in low or "prevolt electric" in low):
         return "What town is the work in?"
+    text = _voice_dedupe_consecutive_sentences(text)
     if len(text) > 320:
         parts = re.split(r"(?<=[.!?])\s+", text)
         text = " ".join(parts[:2]).strip()
@@ -2040,6 +2084,55 @@ def _voice_send_intro_sms_if_abandoned(phone: str, conv: dict, reason: str = "")
         sched["voice_intro_sms_error"] = repr(e)
         try:
             log_event("VOICE_ABANDONED_INTRO_SMS_FAILED", phone, {"error": repr(e), "reason": reason}, conv)
+        except Exception:
+            pass
+
+
+def _voice_send_resume_sms_if_needed(phone: str, conv: dict, reason: str = "") -> None:
+    """If a live voice call drops mid-flow, continue through the existing SMS path."""
+    if not VOICE_AGENT_HANGUP_SMS_ENABLED:
+        return
+    if not phone or not (twilio_client and TWILIO_FROM_NUMBER):
+        return
+    sched = conv.setdefault("sched", {})
+    if sched.get("booking_created") or sched.get("voice_resume_sms_sent") or sched.get("voice_intro_sms_sent"):
+        return
+    if sched.get("manual_only"):
+        return
+
+    meaningful = int(sched.get("voice_meaningful_customer_turns") or 0)
+    if meaningful <= 0:
+        _voice_send_intro_sms_if_abandoned(phone, conv, reason or "abandoned_before_details")
+        return
+
+    step = (sched.get("pending_step") or "").strip().lower()
+    if sched.get("awaiting_slot_offer_choice") and sched.get("offered_slot_options"):
+        try:
+            body = f"This is Prevolt Electric. We got started over the phone. Which appointment option works best — {_format_slot_options((sched.get('offered_slot_options') or [])[:3])}?"
+        except Exception:
+            body = "This is Prevolt Electric. We got started over the phone. What day and time works best for you?"
+    elif step == "need_name":
+        body = "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your first and last name so we can finish booking."
+    elif step == "need_email":
+        body = "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your email address so we can finish booking."
+    elif step == "need_address" or not (sched.get("raw_address") or sched.get("address_candidate")):
+        body = "This is Prevolt Electric. We got started over the phone. Please reply with the house number and street name for the work."
+    elif step in {"need_date", "need_time"} or not (sched.get("scheduled_date") and sched.get("scheduled_time")):
+        body = "This is Prevolt Electric. We got started over the phone. What day and time works best for you?"
+    else:
+        body = "This is Prevolt Electric. We got started over the phone. Please reply here with any remaining details so we can finish getting you on the schedule."
+
+    try:
+        msg = twilio_client.messages.create(body=body, from_=TWILIO_FROM_NUMBER, to=phone)
+        sched["voice_resume_sms_sent"] = True
+        sched["voice_resume_sms_reason"] = reason
+        sched["voice_resume_sms_sid"] = getattr(msg, "sid", None)
+        conv["last_sms_body"] = body
+        log_event("VOICE_RESUME_SMS_SENT", phone, {"sid": getattr(msg, "sid", None), "reason": reason, "call_sid": conv.get("last_call_sid")}, conv)
+    except Exception as e:
+        sched["voice_resume_sms_error"] = repr(e)
+        try:
+            log_event("VOICE_RESUME_SMS_FAILED", phone, {"error": repr(e), "reason": reason}, conv)
         except Exception:
             pass
 
@@ -2105,6 +2198,16 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         return {"reply_to_customer": "Sorry, can you say that again?", "booking_created": False, "manual_only": False, "end_call": False}
 
     sched = conv.setdefault("sched", {})
+    if _voice_looks_like_live_person_demand(caller_text):
+        sched["voice_customer_turn_count"] = int(sched.get("voice_customer_turn_count") or 0) + 1
+        reply = "We handle residential scheduling through our automated booking assistant so our electricians can stay in the field. I can help get the request started now. What town is the work in?"
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        try:
+            log_event("VOICE_LIVE_PERSON_DEMAND", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "end_call": False}
+
     sched["voice_customer_turn_count"] = int(sched.get("voice_customer_turn_count") or 0) + 1
     if len(caller_text.strip()) >= 4:
         sched["voice_meaningful_customer_turns"] = int(sched.get("voice_meaningful_customer_turns") or 0) + 1
@@ -2268,13 +2371,17 @@ def _send_twilio_clear(twilio_ws, stream_sid: str) -> None:
         pass
 
 
-def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: dict) -> bool:
+def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: dict, handled_call_ids: set | None = None) -> bool:
     if not isinstance(item, dict) or item.get("type") != "function_call":
         return False
     name = item.get("name") or ""
     if name != "prevolt_os_turn":
         return False
     call_id = item.get("call_id") or item.get("id") or ""
+    if handled_call_ids is not None and call_id:
+        if call_id in handled_call_ids:
+            return True
+        handled_call_ids.add(call_id)
     try:
         args = json.loads(item.get("arguments") or "{}")
     except Exception:
@@ -2385,6 +2492,7 @@ if sock is not None:
             _wait_for_openai_session_updated(openai_ws, phone, call_sid, timeout_seconds=8)
 
             stop_flag = {"stop": False}
+            handled_function_calls = set()
 
             def openai_to_twilio():
                 nonlocal stream_sid, phone, call_sid
@@ -2402,7 +2510,7 @@ if sock is not None:
                         elif etype == "response.done":
                             output = ((event.get("response") or {}).get("output") or [])
                             for item in output:
-                                _handle_realtime_function_call(openai_ws, phone, call_sid, item)
+                                _handle_realtime_function_call(openai_ws, phone, call_sid, item, handled_function_calls)
                             try:
                                 conv_local = hydrate_voice_conversation(phone, call_sid)
                                 if conv_local.setdefault("sched", {}).get("voice_close_after_reply"):
@@ -2416,7 +2524,7 @@ if sock is not None:
                             except Exception:
                                 pass
                         elif etype == "response.output_item.done":
-                            _handle_realtime_function_call(openai_ws, phone, call_sid, event.get("item") or {})
+                            _handle_realtime_function_call(openai_ws, phone, call_sid, event.get("item") or {}, handled_function_calls)
                         elif etype in {"error", "invalid_request_error"}:
                             try:
                                 log_event("VOICE_OPENAI_ERROR", phone, {"event": event, "call_sid": call_sid})
@@ -2432,7 +2540,9 @@ if sock is not None:
 
             t = threading.Thread(target=openai_to_twilio, daemon=True)
             t.start()
-            _send_openai_event(openai_ws, _voice_initial_response_event())
+            initial_event = _voice_initial_response_event()
+            if initial_event:
+                _send_openai_event(openai_ws, initial_event)
 
             while True:
                 if time.time() - started_at > VOICE_AGENT_MAX_SECONDS:
@@ -2448,7 +2558,7 @@ if sock is not None:
                 if raw is None:
                     try:
                         conv = hydrate_voice_conversation(phone, call_sid)
-                        _voice_send_intro_sms_if_abandoned(phone, conv, "idle_timeout_no_customer_details")
+                        _voice_send_resume_sms_if_needed(phone, conv, "idle_timeout")
                         log_event("VOICE_IDLE_TIMEOUT", phone, {"call_sid": call_sid, "stream_sid": stream_sid})
                     except Exception:
                         pass
@@ -2465,7 +2575,7 @@ if sock is not None:
                 elif event_type == "stop":
                     try:
                         conv = hydrate_voice_conversation(phone, call_sid)
-                        _voice_send_intro_sms_if_abandoned(phone, conv, "caller_hung_up")
+                        _voice_send_resume_sms_if_needed(phone, conv, "caller_hung_up")
                         log_event("VOICE_STREAM_STOPPED", phone, {"call_sid": call_sid, "stream_sid": stream_sid})
                     except Exception:
                         pass
@@ -2474,7 +2584,7 @@ if sock is not None:
             try:
                 conv = hydrate_voice_conversation(phone, call_sid) if (phone or call_sid) else {}
                 if phone and conv:
-                    _voice_send_intro_sms_if_abandoned(phone, conv, "voice_ws_fatal")
+                    _voice_send_resume_sms_if_needed(phone, conv, "voice_ws_fatal")
                 log_event("VOICE_WS_FATAL", phone, {"error": repr(e), "trace": traceback.format_exc(limit=6), "call_sid": call_sid, "stream_sid": stream_sid})
             except Exception:
                 pass
