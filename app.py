@@ -99,7 +99,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 PREVOLT_VOICE_AGENT_ENABLED = _env_bool("PREVOLT_VOICE_AGENT_ENABLED", False)
 PREVOLT_VOICE_AGENT_FAILOVER_TO_VOICEMAIL = _env_bool("PREVOLT_VOICE_AGENT_FAILOVER_TO_VOICEMAIL", True)
 PREVOLT_PUBLIC_BASE_URL = (os.environ.get("PREVOLT_PUBLIC_BASE_URL") or "").strip().rstrip("/")
-OPENAI_REALTIME_MODEL = (os.environ.get("OPENAI_REALTIME_MODEL") or "gpt-realtime-2").strip()
+OPENAI_REALTIME_MODEL = (os.environ.get("OPENAI_REALTIME_MODEL") or "gpt-realtime").strip()
 OPENAI_REALTIME_VOICE = (os.environ.get("OPENAI_REALTIME_VOICE") or "marin").strip()
 OPENAI_REALTIME_WS_URL = (os.environ.get("OPENAI_REALTIME_WS_URL") or "wss://api.openai.com/v1/realtime").strip()
 VOICE_AGENT_MAX_SECONDS = int(os.environ.get("VOICE_AGENT_MAX_SECONDS") or "540")
@@ -1925,15 +1925,11 @@ def _voice_session_update_event() -> dict:
         "session": {
             "type": "realtime",
             "model": OPENAI_REALTIME_MODEL,
-            "output_modalities": ["audio", "text"],
+            "output_modalities": ["audio"],
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "interrupt_response": True,
-                        "create_response": True,
-                    },
+                    "turn_detection": {"type": "server_vad"},
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
@@ -2461,13 +2457,22 @@ def log_event(event_type: str, phone: str = "", payload: dict | None = None, con
         if conv is not None:
             base_payload.setdefault("state", _monitor_state_label(conv))
             base_payload.setdefault("snapshot", _conversation_snapshot(phone, conv))
+        # During live voice testing, mirror VOICE_* events to Render stdout so
+        # failures are visible immediately in Render logs instead of only in
+        # the monitor database.
+        if str(event_type or "").startswith("VOICE"):
+            try:
+                printable = json.dumps(base_payload, ensure_ascii=False)[:1200]
+            except Exception:
+                printable = str(base_payload)[:1200]
+            print(f"[PREVOLT_OS_EVENT] {event_type} phone={phone or ''} payload={printable}", flush=True)
         with _monitor_connect() as conn:
             conn.execute(
                 "INSERT INTO monitor_events (ts, event_type, phone, payload_json) VALUES (?, ?, ?, ?)",
                 (_monitor_now_iso(), event_type, phone or "", json.dumps(base_payload, ensure_ascii=False)),
             )
     except Exception as e:
-        print("[WARN] monitor log_event failed:", repr(e))
+        print("[WARN] monitor log_event failed:", repr(e), flush=True)
 
 def _monitor_booking_return(phone: str, status: str, payload: dict, convo: dict | None = None) -> dict:
     try:
