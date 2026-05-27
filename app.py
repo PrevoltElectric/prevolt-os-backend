@@ -104,8 +104,10 @@ OPENAI_REALTIME_VOICE = (os.environ.get("OPENAI_REALTIME_VOICE") or "echo").stri
 OPENAI_REALTIME_WS_URL = (os.environ.get("OPENAI_REALTIME_WS_URL") or "wss://api.openai.com/v1/realtime").strip()
 VOICE_AGENT_MAX_SECONDS = int(os.environ.get("VOICE_AGENT_MAX_SECONDS") or "300")
 VOICE_AGENT_IDLE_SECONDS = int(os.environ.get("VOICE_AGENT_IDLE_SECONDS") or "30")
-VOICE_AGENT_MAX_CUSTOMER_TURNS = int(os.environ.get("VOICE_AGENT_MAX_CUSTOMER_TURNS") or "6")
+VOICE_AGENT_MAX_CUSTOMER_TURNS = int(os.environ.get("VOICE_AGENT_MAX_CUSTOMER_TURNS") or "10")
 VOICE_AGENT_HANGUP_SMS_ENABLED = _env_bool("VOICE_AGENT_HANGUP_SMS_ENABLED", True)
+VOICE_AGENT_THINKING_SOUND_ENABLED = _env_bool("VOICE_AGENT_THINKING_SOUND_ENABLED", True)
+VOICE_AGENT_THINKING_SOUND_MS = int(os.environ.get("VOICE_AGENT_THINKING_SOUND_MS") or "650")
 
 RULES_FILE = os.environ.get("PREVOLT_RULES_FILE") or os.environ.get("PREVOLT_RULES_PATH")
 
@@ -1839,7 +1841,7 @@ def build_residential_voicemail_twiml(reason: str = "") -> VoiceResponse:
     response.say(
         '<speak>'
             '<prosody rate="95%">'
-                'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
+                'Welcome to Prevolt Electric’s residential service desk.<break time="0.7s"/>'
                 'Please leave your name, address, and a brief description of what you need help with.<break time="0.6s"/>'
                 'We will text you shortly.'
             '</prosody>'
@@ -1871,7 +1873,7 @@ def build_residential_realtime_twiml(phone: str, call_sid: str) -> VoiceResponse
     hydrate_voice_conversation(phone, call_sid)
     response.say(
         '<speak><prosody rate="98%">'
-        "You have reached PREE-volt Electric\'s automated scheduling assistant. "
+        "You have reached Prevolt Electric automated scheduling assistant. "
         'This call may be recorded to help with scheduling. '
         "In a couple of words, please tell us why you\'re calling today."
         '</prosody></speak>',
@@ -1901,7 +1903,8 @@ Critical rules:
 - Keep replies short enough for a phone call. No paragraphs.
 - Do not say phrases that only make sense in SMS, including: "by text", "reply here", "I'll help you here by text", "I can help you right here by text", or "text thread".
 - For every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
-- When the tool returns reply_to_customer, speak only that reply_to_customer. It has already been converted into phone language.
+- Never answer directly from your own wording after the caller speaks. Always call the prevolt_os_turn tool first, then speak only reply_to_customer. It has already been converted into phone language.
+- Do not say any greeting starting with "Thanks for calling" after the Twilio intro has played.
 - If the tool returns end_call=true, speak the reply_to_customer, then stop the call naturally.
 - If the tool says booking_created is true, tell the caller they are on the schedule and that a confirmation text will be sent.
 - If the caller asks whether you are automated, answer honestly: "This is Prevolt's scheduling assistant. It helps keep appointments organized while our electricians are in the field."
@@ -1942,7 +1945,7 @@ def _voice_session_update_event() -> dict:
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad"},
+                    "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 650},
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
@@ -2137,8 +2140,26 @@ def _voice_send_resume_sms_if_needed(phone: str, conv: dict, reason: str = "") -
             pass
 
 
-def _voice_handoff_sms_body() -> str:
-    return "This is Prevolt Electric. To keep this moving, reply here with the town, address for the work, and a quick description of the electrical issue."
+def _voice_handoff_sms_body(conv: dict | None = None) -> str:
+    """State-aware SMS when the voice call is taking too long. Ask only for what is missing."""
+    conv = conv or {}
+    sched = conv.setdefault("sched", {}) if isinstance(conv, dict) else {}
+    profile = conv.setdefault("profile", {}) if isinstance(conv, dict) else {}
+    step = (sched.get("pending_step") or "").strip().lower()
+    has_address = bool(sched.get("raw_address") or sched.get("address_candidate"))
+    has_slot = bool(sched.get("scheduled_date") and sched.get("scheduled_time"))
+    has_name = bool(profile.get("active_first_name") or profile.get("first_name") or profile.get("name"))
+    has_email = bool(profile.get("active_email") or profile.get("email") or sched.get("email"))
+
+    if step == "need_name" or not has_name:
+        return "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your first and last name so we can finish booking."
+    if step == "need_email" or not has_email:
+        return "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your email address so we can finish booking."
+    if not has_address or step == "need_address":
+        return "This is Prevolt Electric. We got started over the phone. Please reply with the house number and street name for the work."
+    if not has_slot or step in {"need_date", "need_time"}:
+        return "This is Prevolt Electric. We got started over the phone. What day and time works best for you?"
+    return "This is Prevolt Electric. We got most of the appointment details started over the phone. Please reply with the electrical issue and any remaining details so we can finish booking."
 
 
 def _voice_send_drag_handoff_sms(phone: str, conv: dict, reason: str = "") -> None:
@@ -2148,7 +2169,7 @@ def _voice_send_drag_handoff_sms(phone: str, conv: dict, reason: str = "") -> No
     if sched.get("voice_drag_handoff_sent"):
         return
     try:
-        body = _voice_handoff_sms_body()
+        body = _voice_handoff_sms_body(conv)
         msg = twilio_client.messages.create(body=body, from_=TWILIO_FROM_NUMBER, to=phone)
         sched["voice_drag_handoff_sent"] = True
         sched["voice_drag_handoff_reason"] = reason
@@ -2198,6 +2219,24 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         return {"reply_to_customer": "Sorry, can you say that again?", "booking_created": False, "manual_only": False, "end_call": False}
 
     sched = conv.setdefault("sched", {})
+
+    # Realtime can occasionally deliver the same recognized utterance twice with
+    # different internal response IDs. Do not count or process duplicate turns;
+    # this prevents repeated prompts and false max-turn handoffs.
+    now_ts = time.time()
+    last_text_norm = sched.get("voice_last_caller_text_norm") or ""
+    this_text_norm = re.sub(r"[^a-z0-9]+", " ", caller_text.lower()).strip()
+    last_ts = float(sched.get("voice_last_caller_text_ts") or 0)
+    if this_text_norm and this_text_norm == last_text_norm and (now_ts - last_ts) < 8:
+        reply = conv.get("last_voice_reply") or "Got it."
+        try:
+            log_event("VOICE_DUPLICATE_TURN_SUPPRESSED", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": reply, "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")), "manual_only": bool(sched.get("manual_only")), "end_call": False}
+    sched["voice_last_caller_text_norm"] = this_text_norm
+    sched["voice_last_caller_text_ts"] = now_ts
+
     if _voice_looks_like_live_person_demand(caller_text):
         sched["voice_customer_turn_count"] = int(sched.get("voice_customer_turn_count") or 0) + 1
         reply = "We handle residential scheduling through our automated booking assistant so our electricians can stay in the field. I can help get the request started now. What town is the work in?"
@@ -2217,7 +2256,7 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     if int(sched.get("voice_customer_turn_count") or 0) > VOICE_AGENT_MAX_CUSTOMER_TURNS and not sched.get("booking_created"):
         sched["voice_close_after_reply"] = True
         _voice_send_drag_handoff_sms(phone, conv, "max_customer_turns")
-        reply = "I’m going to send you a text so we can keep this moving cleanly. Please reply there with the address and what you need help with."
+        reply = "I’m going to send you a text so we can finish this cleanly without keeping you on the phone."
         conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
         return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "end_call": True}
 
@@ -2371,6 +2410,43 @@ def _send_twilio_clear(twilio_ws, stream_sid: str) -> None:
         pass
 
 
+def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
+    """Return a short, quiet PCMU/8000 processing sound for Twilio Media Streams.
+
+    Twilio outbound media must be raw audio/x-mulaw at 8000 Hz, base64 encoded.
+    0xFF is silence in u-law. We insert very short low-frequency ticks separated
+    by silence so the caller hears an intentional soft processing cue, not static.
+    """
+    ms = max(120, min(1200, int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 650)))
+    total = int(8000 * (ms / 1000.0))
+    data = bytearray([0xFF] * total)
+    # Three very small click groups. Keep them sparse and low duty-cycle.
+    for start_ms in (70, 250, 430):
+        start = int(8000 * start_ms / 1000.0)
+        if start >= total:
+            continue
+        for i in range(0, min(28, total - start)):
+            # Alternate quiet-ish u-law values to avoid a harsh square blast.
+            data[start + i] = 0xE8 if i % 2 == 0 else 0xFF
+    return base64.b64encode(bytes(data)).decode("ascii")
+
+
+def _send_twilio_thinking_sound(twilio_ws, stream_sid: str, phone: str = "", call_sid: str = "", reason: str = "") -> None:
+    if not (VOICE_AGENT_THINKING_SOUND_ENABLED and stream_sid):
+        return
+    try:
+        _send_twilio_media(twilio_ws, stream_sid, _voice_thinking_click_payload())
+        try:
+            log_event("VOICE_THINKING_SOUND_SENT", phone, {"reason": reason, "call_sid": call_sid, "stream_sid": stream_sid})
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            log_event("VOICE_THINKING_SOUND_FAILED", phone, {"error": repr(e), "reason": reason, "call_sid": call_sid})
+        except Exception:
+            pass
+
+
 def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: dict, handled_call_ids: set | None = None) -> bool:
     if not isinstance(item, dict) or item.get("type") != "function_call":
         return False
@@ -2507,6 +2583,8 @@ if sock is not None:
                             _send_twilio_media(ws, stream_sid, event.get("delta") or "")
                         elif etype == "input_audio_buffer.speech_started":
                             _send_twilio_clear(ws, stream_sid)
+                        elif etype == "input_audio_buffer.speech_stopped":
+                            _send_twilio_thinking_sound(ws, stream_sid, phone, call_sid, "speech_stopped")
                         elif etype == "response.done":
                             output = ((event.get("response") or {}).get("output") or [])
                             for item in output:
@@ -2583,9 +2661,13 @@ if sock is not None:
         except Exception as e:
             try:
                 conv = hydrate_voice_conversation(phone, call_sid) if (phone or call_sid) else {}
+                err = repr(e)
+                # Twilio/browser side closes often surface as simple_websocket ConnectionClosed(1005).
+                # Treat that as a normal dropped/ended call, not an application crash.
                 if phone and conv:
-                    _voice_send_resume_sms_if_needed(phone, conv, "voice_ws_fatal")
-                log_event("VOICE_WS_FATAL", phone, {"error": repr(e), "trace": traceback.format_exc(limit=6), "call_sid": call_sid, "stream_sid": stream_sid})
+                    _voice_send_resume_sms_if_needed(phone, conv, "voice_ws_closed" if "ConnectionClosed" in err else "voice_ws_fatal")
+                event_name = "VOICE_WS_CLOSED" if "ConnectionClosed" in err else "VOICE_WS_FATAL"
+                log_event(event_name, phone, {"error": err, "trace": traceback.format_exc(limit=6), "call_sid": call_sid, "stream_sid": stream_sid})
             except Exception:
                 pass
         finally:
@@ -3316,7 +3398,7 @@ def incoming_call():
     gather.say(
         '<speak>'
             '<prosody rate="95%">'
-                'Thanks for calling PREE-volt Electric.<break time="0.7s"/>'
+                'Thanks for calling Prevolt Electric.<break time="0.7s"/>'
                 'To help us direct your call, please choose an option.<break time="0.6s"/>'
                 'If you are a residential customer, press 1.<break time="0.6s"/>'
                 'If you are a commercial, government, or facility customer, press 2.'
@@ -9417,6 +9499,8 @@ def monitor_voice_health():
         "websocket_client": websocket_client is not None,
         "model": OPENAI_REALTIME_MODEL,
         "voice": OPENAI_REALTIME_VOICE,
+        "thinking_sound_enabled": VOICE_AGENT_THINKING_SOUND_ENABLED,
+        "max_customer_turns": VOICE_AGENT_MAX_CUSTOMER_TURNS,
     }, (200 if ready else 503)
 
 
