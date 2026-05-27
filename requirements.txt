@@ -3,3 +3,6 @@ gunicorn
 twilio
 openai>=1.55.0
 requests
+flask-sock>=0.7.0
+websocket-client>=1.8.0
+simple-websocket>=1.0.0
