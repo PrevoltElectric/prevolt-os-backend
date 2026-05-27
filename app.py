@@ -1912,7 +1912,7 @@ Critical rules:
 - When the next missing field is an address or address confirmation, the phone reply should sound like: "I can get your appointment scheduled here, what's the missing address piece?" or "I can get your appointment scheduled here, just to confirm, you're at the address heard, right?"
 - Do not say any greeting starting with "Thanks for calling" after the Twilio intro has played.
 - If the tool returns end_call=true, speak the reply_to_customer, then stop the call naturally.
-- If the tool says booking_created is true, tell the caller they are on the schedule and that a confirmation text will be sent.
+- If the tool says booking_created is true, tell the caller they are on the schedule, that a confirmation text will be sent, say goodbye, and end the call.
 - If the caller asks whether you are automated, answer honestly: "This is Prevolt's scheduling assistant. It helps keep appointments organized while our electricians are in the field."
 Opening behavior:
 Twilio already plays the opening prompt before the live stream starts: "You have reached Prevolt Electric's automated scheduling assistant. In a couple of words, please tell us why you're calling today."
@@ -2335,9 +2335,13 @@ def _voice_format_scheduled_slot_from_state(conv: dict) -> str:
 def _voice_finalize_booking_reply(conv: dict, reply: str) -> str:
     """Force a clean live-call closing after Square booking creation."""
     slot = _voice_format_scheduled_slot_from_state(conv)
-    base = _voice_to_sms_text(reply)
     # Prefer a consistent spoken ending over backend/SMS phrasing variants.
-    return f"You're all set. We have you on the schedule for {slot}. You'll receive a text shortly with confirmation."
+    # Include goodbye because the WebSocket will close after this response finishes.
+    return (
+        f"You're all set. We have you on the schedule for {slot}. "
+        "You'll receive a confirmation text shortly. "
+        "Thank you for calling Prevolt Electric. Goodbye."
+    )
 
 def _voice_maybe_send_booking_sms(phone: str, conv: dict, voice_reply: str) -> None:
     sched = conv.setdefault("sched", {})
@@ -2710,6 +2714,9 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
     if booking_created:
         reply = _voice_finalize_booking_reply(conv, reply)
+        # After the final spoken confirmation, close the call cleanly.
+        sched["voice_close_after_reply"] = True
+        sched["voice_booking_completed_close"] = True
     conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
     conv["last_voice_reply"] = reply
     _voice_maybe_send_booking_sms(phone, conv, reply)
@@ -2845,60 +2852,70 @@ def _linear16_to_mulaw(sample: int) -> int:
 
 
 def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
-    """Return a soft, lower-pitched PCMU/8000 processing cue.
+    """Return a smooth low-level PCMU/8000 processing cue.
 
-    This is intentionally not a sharp high beep. It uses a short sequence of
-    muted low-mid "boop" chirps with a tiny echo tail and fade-out, encoded as
+    This is meant to feel like a modern call-center AI "processing" sound:
+    soft flutter/boop, rounded edges, small reverb tail, and fade-out. It is
     raw G.711 mu-law with no WAV headers for Twilio Media Streams.
     """
-    ms = max(450, min(1600, int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 850)))
+    ms = max(550, min(1800, int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 950)))
     rate = 8000
     total = int(rate * (ms / 1000.0))
-    silence = _linear16_to_mulaw(0)
     pcm = [0] * total
 
-    # A more organic flutter: lower frequencies, staggered gently, each with
-    # an attack/decay envelope. The later chirps get softer and the whole cue
-    # fades out so it reads as "thinking" rather than a ringtone.
-    starts_ms = [65, 190, 340, 520]
-    freqs = [420, 510, 455, 570]
-    lengths_ms = [145, 125, 155, 210]
-    gains = [0.34, 0.27, 0.22, 0.16]
+    # Softer, smoother clustered tones. This avoids the old sharp high-G ping.
+    # Frequencies are lower and close together so the result feels like a small
+    # flutter/boop rather than separate beeps.
+    starts_ms = [70, 150, 245, 365]
+    freqs = [255, 335, 292, 385]
+    lengths_ms = [210, 230, 250, 330]
+    gains = [0.18, 0.16, 0.13, 0.10]
+
     for n, (start_ms, freq, length_ms, gain) in enumerate(zip(starts_ms, freqs, lengths_ms, gains)):
         start = int(rate * start_ms / 1000.0)
         length = min(int(rate * length_ms / 1000.0), max(0, total - start))
         if length <= 0:
             continue
+        phase_offset = n * 0.73
         for i in range(length):
+            idx = start + i
             t = i / rate
             x = i / max(1, length - 1)
-            # Soft attack, long exponential decay, and a global late fade.
-            attack = min(1.0, i / max(1, int(rate * 0.018)))
-            decay = math.exp(-3.2 * x)
-            late_fade = max(0.0, 1.0 - ((start + i) / max(1, total)) ** 1.8)
-            # Slight vibrato makes it flutter instead of pinging a fixed key.
-            inst_freq = freq + 18 * math.sin(2 * math.pi * 8.0 * t + n)
-            base = math.sin(2 * math.pi * inst_freq * t)
-            # Very light overtone for phone audibility, much lower than the old high ping.
-            overtone = 0.18 * math.sin(2 * math.pi * (inst_freq * 1.55) * t + 0.7)
-            sample = int(12000 * gain * attack * decay * late_fade * (base + overtone))
-            idx = start + i
-            pcm[idx] = max(-16000, min(16000, pcm[idx] + sample))
+            # Rounded attack and slow decay so there is no hard click.
+            attack = min(1.0, i / max(1, int(rate * 0.035)))
+            release = (1.0 - x) ** 1.7
+            # Global fade makes the whole cue disappear naturally.
+            global_fade = max(0.0, 1.0 - (idx / max(1, total)) ** 1.55)
+            # Small pitch movement creates the fluent flutter.
+            inst_freq = freq + 22 * math.sin(2 * math.pi * 5.5 * t + phase_offset)
+            tone = math.sin(2 * math.pi * inst_freq * t + phase_offset)
+            tone += 0.10 * math.sin(2 * math.pi * inst_freq * 1.38 * t + 1.1)
+            sample = int(12500 * gain * attack * release * global_fade * tone)
+            pcm[idx] = max(-14000, min(14000, pcm[idx] + sample))
 
-            # Simple echo/reverb taps, quiet and decaying. This gives the cue a
-            # rounded tail without increasing latency or requiring libraries.
-            for delay_ms, echo_gain in ((46, 0.22), (92, 0.09)):
+            # Soft reverb taps. They are deliberately quiet so they add air
+            # without sounding like echo or static over the phone.
+            for delay_ms, echo_gain in ((42, 0.20), (88, 0.10), (138, 0.045)):
                 eidx = idx + int(rate * delay_ms / 1000.0)
                 if eidx < total:
-                    pcm[eidx] = max(-16000, min(16000, pcm[eidx] + int(sample * echo_gain)))
+                    pcm[eidx] = max(-14000, min(14000, pcm[eidx] + int(sample * echo_gain)))
 
-    # Very low bed under the first half second to smooth the discrete pops.
-    bed_len = min(total, int(rate * 0.55))
+    # Low, quiet under-bed to glue the chirps together. Phone compression often
+    # eats very quiet audio, so keep it present but far below the voice level.
+    bed_len = min(total, int(rate * 0.72))
     for i in range(bed_len):
         t = i / rate
-        fade = max(0.0, 1.0 - (i / max(1, bed_len)) ** 1.4)
-        sample = int(520 * fade * math.sin(2 * math.pi * 185 * t))
-        pcm[i] = max(-16000, min(16000, pcm[i] + sample))
+        fade = max(0.0, 1.0 - (i / max(1, bed_len)) ** 1.25)
+        bed = int(360 * fade * math.sin(2 * math.pi * 170 * t))
+        pcm[i] = max(-14000, min(14000, pcm[i] + bed))
+
+    # Very short leading/trailing fade prevents clicks at the packet boundary.
+    fade_samples = int(rate * 0.025)
+    for i in range(min(fade_samples, total)):
+        mult = i / max(1, fade_samples)
+        pcm[i] = int(pcm[i] * mult)
+        j = total - 1 - i
+        pcm[j] = int(pcm[j] * mult)
 
     data = bytearray(_linear16_to_mulaw(sample) for sample in pcm)
     return base64.b64encode(bytes(data)).decode("ascii")
@@ -3079,7 +3096,8 @@ if sock is not None:
                             try:
                                 conv_local = hydrate_voice_conversation(phone, call_sid)
                                 if conv_local.setdefault("sched", {}).get("voice_close_after_reply"):
-                                    time.sleep(0.8)
+                                    # Let the final goodbye finish before closing Twilio's stream.
+                                    time.sleep(1.25)
                                     stop_flag["stop"] = True
                                     try:
                                         ws.close()
