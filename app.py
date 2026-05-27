@@ -105,7 +105,7 @@ OPENAI_REALTIME_VOICE = (os.environ.get("OPENAI_REALTIME_VOICE") or "echo").stri
 OPENAI_REALTIME_WS_URL = (os.environ.get("OPENAI_REALTIME_WS_URL") or "wss://api.openai.com/v1/realtime").strip()
 VOICE_AGENT_MAX_SECONDS = int(os.environ.get("VOICE_AGENT_MAX_SECONDS") or "300")
 VOICE_AGENT_IDLE_SECONDS = int(os.environ.get("VOICE_AGENT_IDLE_SECONDS") or "30")
-VOICE_AGENT_MAX_CUSTOMER_TURNS = int(os.environ.get("VOICE_AGENT_MAX_CUSTOMER_TURNS") or "10")
+VOICE_AGENT_MAX_CUSTOMER_TURNS = int(os.environ.get("VOICE_AGENT_MAX_CUSTOMER_TURNS") or "16")
 VOICE_AGENT_HANGUP_SMS_ENABLED = _env_bool("VOICE_AGENT_HANGUP_SMS_ENABLED", True)
 VOICE_AGENT_THINKING_SOUND_ENABLED = _env_bool("VOICE_AGENT_THINKING_SOUND_ENABLED", True)
 VOICE_AGENT_THINKING_SOUND_MS = int(os.environ.get("VOICE_AGENT_THINKING_SOUND_MS") or "650")
@@ -1970,7 +1970,7 @@ Critical rules:
 - If the caller describes active fire, smoke filling the home, shock/unconscious person, or water touching energized electrical, tell them to call 911 first and stop scheduling until they confirm it is safe.
 - Ask one question at a time. Do not ask for the phone number; caller ID already provides it.
 - Keep replies short enough for a phone call. No paragraphs.
-- Do not say filler phrases like "let me check", "let me lock that in", "one moment", "hold on", "I am noting", "I am finishing", "routing through our scheduling system", "the scheduling system is still processing", "let me respond", "let me move ahead", or "let me think" before or after the tool returns. Move directly to the next required question or the final confirmation.
+- Do not say filler phrases like "let me check", "let me lock that in", "one moment", "hold on", "I am noting", "I am finishing", "routing through our scheduling system", "the scheduling system is still processing", "let me respond", "let me move ahead", "let me think", "let me check what we still need", "I will clarify details", "thanks for hanging on", or "I am going to focus on safety" before or after the tool returns. Move directly to the next required question or the final confirmation.
 - If a residential caller is in Worcester, Boston, Malden, or another property too far outside the service area, politely say we do not schedule residential repairs that far out, apologize, thank them, and end the call.
 - Do not wait for the caller to say okay or thanks before asking the next required scheduling question.
 - If the caller confirms an address you just read from file, do not ask for the address again; continue to dispatch confirmation or the next missing booking detail.
@@ -2629,9 +2629,135 @@ def _voice_emergency_dispatch_fast_path(phone: str, conv: dict, caller_text: str
         return "Got it. What's the full address for the work?"
     return "Got it. I'm going to send a text so we can finish the emergency dispatch details cleanly."
 
+
+
+def _voice_yes_no_text(text: str) -> str | None:
+    low = _intent_text(text)
+    if not low:
+        return None
+    if low in {"yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "that works", "works for me"} or any(p in low for p in ["that works", "works for me", "go ahead", "let's do it", "lets do it", "book it", "schedule it"]):
+        return "yes"
+    if low in {"no", "nope", "nah", "no thanks", "not interested"} or any(p in low for p in ["too much", "i'll pass", "ill pass", "not interested", "no thanks", "doesn't work", "does not work"]):
+        return "no"
+    return None
+
+
+def _voice_looks_like_multiple_addresses(text: str) -> bool:
+    low = _intent_text(text)
+    return bool(low and (
+        re.search(r"\b(?:multiple|several|different|four|three|two|5|4|3|2)\s+(?:different\s+)?(?:addresses|properties|units|apartments|locations|houses)\b", low)
+        or "more than one address" in low
+        or "multiple addresses" in low
+        or "i have four" in low
+        or "i have several" in low
+    ))
+
+
+def _voice_multiple_address_reply(conv: dict, caller_text: str) -> str | None:
+    if not _voice_looks_like_multiple_addresses(caller_text):
+        return None
+    sched = conv.setdefault("sched", {})
+    sched["multiple_addresses"] = True
+    sched["pending_step"] = "need_address"
+    sched["state"] = "waiting_for_address"
+    return (
+        "We can start with the first address and get that visit scheduled. "
+        "The $195 evaluation applies to the first location, and we can handle additional addresses after that. "
+        "What's the first address for the work?"
+    )
+
+
+def _voice_split_eval_price_and_slots(text: str) -> tuple[str, str | None]:
+    raw = _voice_to_sms_text(text)
+    if not raw or not re.search(r"\$?195\b", raw):
+        return raw, None
+    patterns = [
+        r"\bWhich one works best for you\??\s*.*$",
+        r"\bWe have\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)[^.?!]*(?:\?|\.)?.*$",
+        r"\b(?:The next openings are|Our next openings are)\s+.*$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, raw, flags=re.I | re.S)
+        if m:
+            price = raw[:m.start()].strip(" ,.;")
+            slots = raw[m.start():].strip()
+            return price, slots
+    return raw, None
+
+
+def _voice_eval_price_confirm_fast_path(conv: dict, caller_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    if not sched.get("awaiting_eval_price_confirm"):
+        return None
+    yn = _voice_yes_no_text(caller_text)
+    if yn == "no":
+        sched["voice_close_after_reply"] = True
+        sched["closed_reason"] = "declined_eval_price"
+        return "No problem. We won't schedule the visit right now. Thank you for calling Prevolt Electric. Goodbye."
+    if yn != "yes":
+        return "The on-site evaluation visit is $195. Does that work for you?"
+    sched["awaiting_eval_price_confirm"] = False
+    slots = (sched.get("voice_pending_slot_offer_reply") or "").strip()
+    if slots:
+        return slots
+    if sched.get("awaiting_slot_offer_choice") and sched.get("offered_slot_options"):
+        return f"Which one works best for you — {_format_slot_options((sched.get('offered_slot_options') or [])[:3])}?"
+    return "What day and time works best for you?"
+
+
+def _voice_hold_eval_price_for_confirmation(conv: dict, reply: str) -> str:
+    sched = conv.setdefault("sched", {})
+    if sched.get("awaiting_eval_price_confirm"):
+        return reply
+    price, slots = _voice_split_eval_price_and_slots(reply)
+    if not slots or not re.search(r"\$?195\b", price or ""):
+        return reply
+    sched["awaiting_eval_price_confirm"] = True
+    sched["voice_pending_slot_offer_reply"] = slots
+    price = price.strip()
+    if not price.endswith((".", "?", "!")):
+        price += "."
+    return price + " Does that work for you?"
+
+
+def _voice_remove_filler_sentences(text: str) -> str:
+    t = _voice_to_sms_text(text)
+    if not t:
+        return t
+    filler_patterns = [
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*that sounds (?:serious|urgent|dangerous)\.\s*Let me (?:think|check|respond|look) [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)m going to focus on safety [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let(?:'|’)s focus on immediate safety [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me check what we still need [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me check [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I'll just clarify [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)ll just clarify [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*One moment [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Thanks for hanging on [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)ll move ahead [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me move ahead [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me set up [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me get [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*The scheduling system [^.?!]*(?:[.?!]|$)",
+    ]
+    for pat in filler_patterns:
+        t = re.sub(pat, "", t, flags=re.I)
+    sentences = re.split(r"(?<=[.!?])\s+", t.strip())
+    out=[]; urgent_seen=False
+    for sent in sentences:
+        low=_intent_text(sent)
+        if any(x in low for x in ["sounds urgent", "sounds serious", "sounds dangerous", "looks urgent"]):
+            if urgent_seen:
+                continue
+            urgent_seen=True
+        if low in {"okay", "got it", "all right", "alright", "sure", "thanks"}:
+            continue
+        out.append(sent.strip())
+    return re.sub(r"\s+", " ", " ".join(out)).strip()
+
 def _voice_naturalize_reply(reply: str) -> str:
     """Make an SMS-safe SRB reply sound normal on the phone without changing meaning."""
-    text = _voice_to_sms_text(reply)
+    text = _voice_remove_filler_sentences(_voice_to_sms_text(reply))
     if not text:
         return "Sorry, can you say that again?"
 
@@ -2804,7 +2930,7 @@ def _voice_naturalize_reply(reply: str) -> str:
     low = _intent_text(text)
     if "what town is the work in" in low and ("help get this" in low or "prevolt electric" in low):
         return "What town is the work in?"
-    text = _voice_dedupe_consecutive_sentences(text)
+    text = _voice_dedupe_consecutive_sentences(_voice_remove_filler_sentences(text))
     # Final booking language should clearly restate date/time and mention the confirmation text.
     text = re.sub(
         r"You(?:'|’)re all set for ([^.]+?) at ([^.]+?)\.\s*We have you on the schedule\.?",
@@ -3443,6 +3569,22 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             pass
         return {"reply_to_customer": emergency_fast_reply, "booking_created": booking_created_fast, "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": bool(sched.get("voice_close_after_reply"))}
 
+    # If the caller is deciding whether the $195 evaluation works, do not offer slots until they say yes.
+    price_confirm_reply = _voice_eval_price_confirm_fast_path(conv, caller_text)
+    if price_confirm_reply:
+        price_confirm_reply = _voice_naturalize_reply(price_confirm_reply)
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": price_confirm_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        conv["last_voice_reply"] = price_confirm_reply
+        return {"reply_to_customer": price_confirm_reply, "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")), "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": bool(sched.get("voice_close_after_reply"))}
+
+    # Multiple-address callers need a first-location path, not an address loop.
+    multi_addr_reply = _voice_multiple_address_reply(conv, caller_text)
+    if multi_addr_reply:
+        multi_addr_reply = _voice_naturalize_reply(multi_addr_reply)
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": multi_addr_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        conv["last_voice_reply"] = multi_addr_reply
+        return {"reply_to_customer": multi_addr_reply, "booking_created": False, "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
     # If we are waiting for a missing name, handle a one-word last-name reply
     # directly. This prevents loops like: "Prevost" -> "what is your last name?".
     try:
@@ -3572,6 +3714,7 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     reply = _voice_naturalize_reply((result or {}).get("sms_body") or "Sorry, can you say that again?")
+    reply = _voice_hold_eval_price_for_confirmation(conv, reply)
     if _voice_reply_asks_for_phone(reply) and phone:
         profile_local = conv.setdefault("profile", {})
         if _voice_profile_first_name(profile_local) and _voice_profile_last_name(profile_local):
@@ -3701,6 +3844,12 @@ def _send_twilio_clear(twilio_ws, stream_sid: str) -> None:
         twilio_ws.send(json.dumps({"event": "clear", "streamSid": stream_sid}))
     except Exception:
         pass
+
+
+def _send_twilio_mark(twilio_ws, stream_sid: str, name: str) -> None:
+    if not (stream_sid and name):
+        return
+    twilio_ws.send(json.dumps({"event": "mark", "streamSid": stream_sid, "mark": {"name": name}}))
 
 
 def _linear16_to_mulaw(sample: int) -> int:
@@ -3950,6 +4099,7 @@ if sock is not None:
 
             stop_flag = {"stop": False}
             handled_function_calls = set()
+            final_mark = {"name": ""}
 
             def openai_to_twilio():
                 nonlocal stream_sid, phone, call_sid
@@ -3984,14 +4134,21 @@ if sock is not None:
                                         sched_local["voice_final_reply_queued"] = True
                                     continue
                                 if sched_local.get("voice_close_after_reply"):
-                                    # This response.done belongs to the spoken final reply, so let audio finish, then close.
-                                    time.sleep(3.5)
-                                    stop_flag["stop"] = True
+                                    # This response.done belongs to the spoken final reply.
+                                    # Send a Twilio mark and close only after Twilio says the buffered audio played.
+                                    mark_name = f"final-{call_sid or stream_sid or uuid.uuid4()}"
+                                    final_mark["name"] = mark_name
                                     try:
-                                        ws.close()
+                                        _send_twilio_mark(ws, stream_sid, mark_name)
+                                        log_event("VOICE_FINAL_MARK_SENT", phone, {"mark": mark_name, "call_sid": call_sid, "stream_sid": stream_sid})
                                     except Exception:
-                                        pass
-                                    break
+                                        time.sleep(7.0)
+                                        stop_flag["stop"] = True
+                                        try:
+                                            ws.close()
+                                        except Exception:
+                                            pass
+                                        break
                             except Exception:
                                 pass
                         elif etype == "response.output_item.done":
@@ -4047,6 +4204,19 @@ if sock is not None:
                     payload = ((msg.get("media") or {}).get("payload") or "")
                     if payload:
                         _send_openai_event(openai_ws, {"type": "input_audio_buffer.append", "audio": payload})
+                elif event_type == "mark":
+                    mark_name = (((msg.get("mark") or {}).get("name")) or "")
+                    if final_mark.get("name") and mark_name == final_mark.get("name"):
+                        try:
+                            log_event("VOICE_FINAL_MARK_PLAYED", phone, {"mark": mark_name, "call_sid": call_sid, "stream_sid": stream_sid})
+                        except Exception:
+                            pass
+                        stop_flag["stop"] = True
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
+                        break
                 elif event_type == "stop":
                     try:
                         conv = hydrate_voice_conversation(phone, call_sid)
