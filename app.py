@@ -12098,3 +12098,234 @@ def _voice_multiple_address_reply(conv: dict, caller_text: str) -> str | None:
         "The $195 evaluation applies to the first location, and we can handle additional addresses after that. "
         "What's the first address for the work?"
     )
+
+# ---------------------------------------------------
+# Voice Agent v31 name/email hardening overrides
+# Fixes: intro name over-capture ("My name's Sean and I live...") and
+# voice email misrecognition by requiring confirmation before booking.
+# ---------------------------------------------------
+
+_VOICE_BAD_NAME_WORDS_V31 = {
+    "and", "or", "in", "at", "from", "with", "for", "about", "because", "the", "a", "an",
+    "live", "lives", "living", "looking", "need", "needs", "want", "wants", "was", "were",
+    "ev", "charger", "installed", "install", "outlet", "outlets", "panel", "smoke", "smoking",
+    "windsor", "locks", "connecticut", "massachusetts", "ct", "ma", "garage", "basement",
+}
+
+def _voice_extract_intro_name_v31(text: str) -> tuple[str, str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return ("", "")
+    # Normalize common speech/transcript variants: "my name's", "my name s".
+    pats = [
+        r"\bmy\s+name\s*(?:is|'s|’s|s)?\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?",
+        r"\bthis\s+is\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?",
+        r"\bit(?:'|’)?s\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?",
+        r"\bi\s+am\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?",
+        r"\bi'm\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?",
+    ]
+    for pat in pats:
+        m = re.search(pat, raw, flags=re.I)
+        if not m:
+            continue
+        first = normalize_person_name(m.group(1) or "")
+        second = normalize_person_name(m.group(2) or "")
+        if first.lower() in _VOICE_BAD_NAME_WORDS_V31:
+            first = ""
+        if second.lower() in _VOICE_BAD_NAME_WORDS_V31:
+            second = ""
+        # If the second captured word is immediately followed by a stop phrase,
+        # keep it only if it is not a filler word. This handles "Sean and I live...".
+        return (first, second)
+    return ("", "")
+
+
+def _voice_name_field_is_malformed_v31(value: str) -> bool:
+    v = " ".join(str(value or "").strip().split())
+    if not v:
+        return False
+    low = v.lower()
+    if len(v.split()) >= 4:
+        return True
+    bad_phrases = [
+        "my name", "name s", "i live", "live in", "looking to", "looking for", "ev charger",
+        "charger installed", "outlet replaced", "outlets replaced", "smoke coming", "electrical panel",
+        "need somebody", "hoping to", "was looking", "i was looking", "this is kyle and",
+    ]
+    return any(p in low for p in bad_phrases)
+
+
+def _voice_repair_malformed_name_v31(conv: dict, caller_text: str = "") -> None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    fields = [
+        profile.get("name"), profile.get("active_first_name"), profile.get("active_last_name"),
+        profile.get("first_name"), profile.get("last_name"), profile.get("recognized_first_name"), profile.get("recognized_last_name"),
+    ]
+    combined = " ".join(str(x or "") for x in fields if x)
+    malformed = any(_voice_name_field_is_malformed_v31(str(x or "")) for x in fields)
+    intro_first, intro_last = _voice_extract_intro_name_v31((caller_text or "") + " " + combined)
+    if not malformed and not intro_first:
+        return
+    # If malformed, throw away the bad long name and keep only a clean spoken name if available.
+    clean_first = intro_first or ""
+    clean_last = intro_last or ""
+    # Existing good Square/customer names should not be replaced by empty strings.
+    if not clean_first and not malformed:
+        return
+    for key in ["name", "active_first_name", "active_last_name", "first_name", "last_name", "recognized_first_name", "recognized_last_name"]:
+        profile[key] = None
+    if clean_first:
+        profile["active_first_name"] = clean_first
+        profile["first_name"] = clean_first
+        profile["name"] = clean_first
+    if clean_first and clean_last:
+        profile["active_last_name"] = clean_last
+        profile["last_name"] = clean_last
+        profile["name"] = f"{clean_first} {clean_last}".strip()
+    try:
+        recompute_pending_step(profile, sched)
+    except Exception:
+        pass
+
+
+def _voice_speak_email_v31(email: str) -> str:
+    e = str(email or "").strip().lower()
+    if not e:
+        return ""
+    e = e.replace("@", " at ")
+    e = e.replace(".", " dot ")
+    e = re.sub(r"\s+", " ", e).strip()
+    return e
+
+
+def _voice_save_confirmed_email_and_maybe_book_v31(phone: str, conv: dict, email: str) -> dict:
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    v13_save_email(conv, email)
+    try:
+        _voice_repair_malformed_name_v31(conv, "")
+        recompute_pending_step(profile, sched)
+    except Exception:
+        pass
+    first = _voice_profile_first_name(profile)
+    last = _voice_profile_last_name(profile)
+    if not first:
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        reply = "Thanks. What's your first and last name?"
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+    if first and not last:
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        reply = "Thanks. What's your last name?"
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+    if not sched.get("address_verified"):
+        sched["pending_step"] = "need_address"
+        sched["state"] = "waiting_for_address"
+        reply = "Thanks. What's the full address for the work?"
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+    if not (sched.get("scheduled_date") and sched.get("scheduled_time")):
+        try:
+            reply = _voice_naturalize_reply(choose_next_prompt_from_state(conv, inbound_text=""))
+        except Exception:
+            reply = "Thanks. What day and time works best?"
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+    try:
+        booking_attempt = maybe_create_square_booking(phone, conv)
+    except Exception as e:
+        try:
+            log_event("VOICE_EMAIL_CONFIRM_BOOKING_ERROR_V31", phone, {"error": repr(e)}, conv)
+        except Exception:
+            pass
+        booking_attempt = {"status": "exception"}
+    status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
+    if sched.get("booking_created") and sched.get("square_booking_id") or status in {"created", "success", "booked"}:
+        if isinstance(booking_attempt, dict) and booking_attempt.get("booking_id"):
+            sched["square_booking_id"] = booking_attempt.get("booking_id")
+            sched["booking_created"] = True
+        reply = _voice_finalize_booking_reply(conv, "")
+        sched["voice_close_after_reply"] = True
+        sched["voice_booking_completed_close"] = True
+        _voice_maybe_send_booking_sms(phone, conv, reply)
+        return {"reply_to_customer": reply, "booking_created": True, "manual_only": False, "pending_step": None, "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": True}
+    reply = _voice_naturalize_reply(choose_next_prompt_from_state(conv, inbound_text="")) if 'choose_next_prompt_from_state' in globals() else "Thanks. What else is needed for the appointment?"
+    return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
+
+_ORIGINAL_PROCESS_PREVOLT_VOICE_TURN_V31 = process_prevolt_voice_turn
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    conv = hydrate_voice_conversation((phone or "").replace("whatsapp:", "").strip(), call_sid)
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    try:
+        _voice_repair_malformed_name_v31(conv, caller_text)
+    except Exception as e:
+        try:
+            log_event("VOICE_NAME_REPAIR_PRE_ERROR_V31", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+
+    # Email confirmation gate: voice ASR can mishear names inside email addresses.
+    # Do not create the Square booking until the caller confirms the email we heard.
+    yn = _voice_yes_no_text(caller_text)
+    if sched.get("voice_awaiting_email_confirm"):
+        pending_email = (sched.get("voice_pending_email") or "").strip().lower()
+        if yn == "yes" and pending_email:
+            sched["voice_awaiting_email_confirm"] = False
+            sched["voice_pending_email"] = None
+            out = _voice_save_confirmed_email_and_maybe_book_v31(phone, conv, pending_email)
+            out["reply_to_customer"] = _voice_naturalize_reply(out.get("reply_to_customer") or "")
+            conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": out["reply_to_customer"], "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+            conv["last_voice_reply"] = out["reply_to_customer"]
+            return out
+        if yn == "no" or any(p in _intent_text(caller_text) for p in ["wrong", "not correct", "incorrect", "nope"]):
+            sched["voice_awaiting_email_confirm"] = False
+            sched["voice_pending_email"] = None
+            reply = "No problem. Please say the email again slowly, and spell any unusual part if needed."
+            conv["last_voice_reply"] = reply
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+        # If the correction itself contains an email, replace pending and confirm that instead.
+        corrected = v13_extract_email(caller_text or "")
+        if corrected and corrected.lower() != pending_email:
+            sched["voice_pending_email"] = corrected.lower()
+            spoken = _voice_speak_email_v31(corrected)
+            reply = f"I heard {spoken}. Is that correct?"
+            conv["last_voice_reply"] = reply
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+        reply = f"I heard {_voice_speak_email_v31(pending_email)}. Is that correct?"
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
+    incoming_email = v13_extract_email(caller_text or "")
+    if incoming_email and not sched.get("voice_email_confirmed"):
+        # Store only as pending. Confirm before booking.
+        sched["voice_pending_email"] = incoming_email.lower()
+        sched["voice_awaiting_email_confirm"] = True
+        sched["pending_step"] = "need_email"
+        sched["state"] = "waiting_for_email"
+        spoken = _voice_speak_email_v31(incoming_email)
+        reply = f"I heard {spoken}. Is that correct?"
+        conv["last_voice_reply"] = reply
+        try:
+            log_event("VOICE_EMAIL_CONFIRM_PROMPT_V31", phone, {"email": incoming_email.lower(), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
+    output = _ORIGINAL_PROCESS_PREVOLT_VOICE_TURN_V31(phone, call_sid, caller_text)
+    try:
+        _voice_repair_malformed_name_v31(conv, caller_text)
+        # If the original path produced a malformed name in a reply state, repair it and avoid booking with it later.
+        reply = _voice_naturalize_reply(output.get("reply_to_customer") or "")
+        reply = re.sub(r"\bIf that is something you(?:'|’)re interested in\.\s*Does that work for you\?", "Does that work for you?", reply, flags=re.I)
+        reply = re.sub(r"\bBefore we confirm, may I have the best email address for the appointment\?\s*What's the best email address for the appointment\?", "What's the best email address for the appointment?", reply, flags=re.I)
+        reply = re.sub(r"\bfor your preferred time!\s*", "", reply, flags=re.I)
+        output["reply_to_customer"] = reply
+        conv["last_voice_reply"] = reply
+    except Exception as e:
+        try:
+            log_event("VOICE_POSTPROCESS_ERROR_V31", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+    return output
