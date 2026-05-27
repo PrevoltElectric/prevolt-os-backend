@@ -12329,3 +12329,274 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return output
+
+# =============================
+# v32 VOICE HOTFIX LAYER
+# =============================
+# Targets live failures observed after v31:
+# - first utterance name like "My name is Sean, and I live..." saved as whole sentence
+# - spelled last names like "B-A-C-O-N" saved literally instead of "Bacon"
+# - email confirmation not clear enough for ASR-misheard letters
+# - filler phrases leaking into voice output
+# - first response sometimes stalling after generic scheduling lead-in
+
+import string as _v32_string
+
+_ORIG_VOICE_NATURALIZE_REPLY_V32 = _voice_naturalize_reply
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V32 = process_prevolt_voice_turn
+
+_V32_FILLER_PATTERNS = [
+    r"\bOkay,?\s+let me (?:check|grab|get|confirm|run|move|finish|finalize|set up|process)[^.?!]*[.?!]\s*",
+    r"\bGot it,?\s+thanks(?: for that address)?\.\s*",
+    r"\bThanks\.\s+I've got your name\.\s*",
+    r"\bNext,?\s+I just need one more detail to finish booking\.\s*",
+    r"\bLet me (?:check|think|respond|route|process|finish|finalize|move ahead|get)[^.?!]*[.?!]\s*",
+    r"\bOne moment while I[^.?!]*[.?!]\s*",
+    r"\bThe scheduling system is still processing[^.?!]*[.?!]\s*",
+    r"\bI'm going to (?:focus|route|check|process|move)[^.?!]*[.?!]\s*",
+    r"\bI'll (?:just )?(?:clarify|check|use|move|finish|wrap)[^.?!]*[.?!]\s*",
+    r"\bAll right,?\s+we can move forward with that\.\s*",
+    r"\bBefore choosing a time,\s*",
+    r"\bBefore we confirm,\s*",
+]
+
+_V32_STOP_AFTER_FIRST_NAME = re.compile(
+    r"\b(?:my\s+name\s*(?:is|'s|s)|this\s+is|it'?s|i\s+am|i'm)\s+([A-Z][a-zA-Z'\-]{1,24})\b",
+    re.I,
+)
+
+_V32_BAD_NAME_WORDS = {
+    "my", "name", "s", "is", "and", "i", "im", "i'm", "live", "in", "windsor", "looking",
+    "need", "want", "have", "ev", "charger", "installed", "outlet", "repair", "replace",
+    "work", "calling", "for", "the", "a", "an", "to", "get", "somebody", "come", "out",
+}
+
+_V32_LASTNAME_STOPWORDS = {
+    "and", "i", "im", "i'm", "live", "in", "looking", "need", "want", "have", "for", "to",
+    "at", "from", "calling", "ev", "outlet", "charger", "installed", "repair", "replace",
+}
+
+_V32_LETTERS = {c: c for c in "abcdefghijklmnopqrstuvwxyz"}
+_V32_LETTER_WORDS = {
+    "a": "a", "ay": "a", "b": "b", "be": "b", "bee": "b", "c": "c", "see": "c", "sea": "c",
+    "d": "d", "dee": "d", "e": "e", "f": "f", "eff": "f", "g": "g", "gee": "g",
+    "h": "h", "aitch": "h", "i": "i", "eye": "i", "j": "j", "jay": "j", "k": "k", "kay": "k",
+    "l": "l", "el": "l", "m": "m", "em": "m", "n": "n", "en": "n", "o": "o", "oh": "o",
+    "p": "p", "pee": "p", "q": "q", "cue": "q", "queue": "q", "r": "r", "are": "r",
+    "s": "s", "ess": "s", "t": "t", "tee": "t", "u": "u", "you": "u", "v": "v", "vee": "v",
+    "w": "w", "doubleyou": "w", "double-u": "w", "x": "x", "ex": "x", "y": "y", "why": "y", "z": "z", "zee": "z", "zed": "z",
+}
+
+
+def _v32_clean_person_name_piece(s: str) -> str:
+    s = re.sub(r"[^A-Za-z'\-\s]", " ", str(s or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:40]
+
+
+def _v32_extract_first_name(text: str) -> str:
+    m = _V32_STOP_AFTER_FIRST_NAME.search(str(text or ""))
+    if not m:
+        return ""
+    name = _v32_clean_person_name_piece(m.group(1))
+    if not name or name.lower() in _V32_BAD_NAME_WORDS:
+        return ""
+    return name[:1].upper() + name[1:].lower()
+
+
+def _v32_spelled_name_to_word(text: str) -> str:
+    raw = str(text or "").strip()
+    # Examples: B-A-C-O-N, B A C O N, B. A. C. O. N.
+    tokens = re.findall(r"[A-Za-z]+", raw.lower())
+    if not tokens:
+        return ""
+    # Strip leading explanation words: "Bacon B A C O N" should prefer the first normal word.
+    if len(tokens) == 1 and len(tokens[0]) > 1:
+        word = tokens[0]
+        if word not in _V32_LASTNAME_STOPWORDS:
+            return word[:1].upper() + word[1:].lower()
+    letters = []
+    for tok in tokens:
+        if len(tok) == 1:
+            letters.append(tok)
+        elif tok in _V32_LETTER_WORDS:
+            letters.append(_V32_LETTER_WORDS[tok])
+        else:
+            # A normal word like "bacon" wins over trying to spell the whole phrase.
+            if tok not in _V32_LASTNAME_STOPWORDS and len(tok) >= 2:
+                return tok[:1].upper() + tok[1:].lower()
+            return ""
+    if 2 <= len(letters) <= 18:
+        word = "".join(letters)
+        return word[:1].upper() + word[1:].lower()
+    return ""
+
+
+def _v32_name_is_malformed(name: str) -> bool:
+    n = re.sub(r"\s+", " ", str(name or "")).strip().lower()
+    if not n:
+        return False
+    if len(n.split()) >= 5:
+        return True
+    return any(p in n for p in [" i live ", " looking to ", " ev charger", " outlet ", " installed", " my name "])
+
+
+def _v32_apply_name_repairs(conv: dict, caller_text: str = "") -> None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    full = profile.get("name") or ""
+    first = profile.get("active_first_name") or profile.get("first_name") or ""
+    last = profile.get("active_last_name") or profile.get("last_name") or ""
+
+    extracted_first = _v32_extract_first_name(caller_text)
+    if extracted_first:
+        # If the first utterance says "My name is Sean...", never allow the rest of the sentence as last name.
+        profile["active_first_name"] = extracted_first
+        profile["first_name"] = extracted_first
+        if _v32_name_is_malformed(full) or _v32_name_is_malformed(last) or not last:
+            profile["active_last_name"] = None
+            profile["last_name"] = None
+            profile["name"] = extracted_first
+
+    # Waiting for last name: accept one-word or spelled last name, but not filler.
+    step = str(sched.get("pending_step") or "")
+    state = str(sched.get("state") or "")
+    has_first = bool(profile.get("active_first_name") or profile.get("first_name"))
+    has_last = bool(profile.get("active_last_name") or profile.get("last_name"))
+    if has_first and not has_last and (step == "need_name" or "name" in state.lower()):
+        possible_last = _v32_spelled_name_to_word(caller_text)
+        if possible_last and possible_last.lower() not in _V32_LASTNAME_STOPWORDS:
+            first_name = profile.get("active_first_name") or profile.get("first_name")
+            profile["active_last_name"] = possible_last
+            profile["last_name"] = possible_last
+            profile["name"] = f"{first_name} {possible_last}".strip()
+            try:
+                recompute_pending_step(profile, sched)
+            except Exception:
+                pass
+
+    # If previous code already wrote a malformed name, salvage it.
+    full = profile.get("name") or ""
+    if _v32_name_is_malformed(full):
+        salvage = _v32_extract_first_name(full) or _v32_extract_first_name(caller_text)
+        for key in ["name", "active_first_name", "active_last_name", "first_name", "last_name"]:
+            profile[key] = None
+        if salvage:
+            profile["active_first_name"] = salvage
+            profile["first_name"] = salvage
+            profile["name"] = salvage
+        try:
+            recompute_pending_step(profile, sched)
+        except Exception:
+            pass
+
+
+def _v32_spoken_email(email: str) -> str:
+    """Read email slowly enough that b/v/i/y mistakes are catchable."""
+    e = str(email or "").strip().lower()
+    if not e:
+        return ""
+    # Only spell the local part character-by-character; domain is usually obvious.
+    if "@" in e:
+        local, domain = e.split("@", 1)
+    else:
+        local, domain = e, ""
+    pieces = []
+    for ch in local:
+        if ch == ".":
+            pieces.append("dot")
+        elif ch == "_":
+            pieces.append("underscore")
+        elif ch == "-":
+            pieces.append("dash")
+        elif ch.isalnum():
+            # Make the common trouble letters more explicit.
+            names = {"b": "B as in boy", "v": "V as in Victor", "i": "I", "y": "Y", "o": "O", "m": "M", "n": "N"}
+            pieces.append(names.get(ch, ch.upper() if ch.isalpha() else ch))
+    local_spoken = ", ".join(pieces)
+    if domain:
+        domain_spoken = domain.replace(".", " dot ")
+        return f"{local_spoken}, at {domain_spoken}"
+    return local_spoken
+
+
+def _voice_naturalize_reply(reply: str) -> str:
+    r = _ORIG_VOICE_NATURALIZE_REPLY_V32(reply or "")
+    # Remove filler fragments repeatedly because the model/backend often chains them.
+    changed = True
+    while changed:
+        old = r
+        for pat in _V32_FILLER_PATTERNS:
+            r = re.sub(pat, "", r, flags=re.I)
+        changed = (r != old)
+    # Avoid split prompt duplication.
+    r = re.sub(r"\bI can help get this scheduled\.\s*", "I can get your appointment scheduled here. ", r, flags=re.I)
+    r = re.sub(r"\bI can get your appointment scheduled here\.\s*Okay\.\s*", "I can get your appointment scheduled here. ", r, flags=re.I)
+    r = re.sub(r"\bI can get your appointment scheduled here\.\s*(What(?:'s| is) the house number)", r"I can get your appointment scheduled here. \1", r, flags=re.I)
+    r = re.sub(r"\bThanks\.\s+What's", "What's", r, flags=re.I)
+    r = re.sub(r"\bOkay\.\s+What's", "What's", r, flags=re.I)
+    r = re.sub(r"\bIf that is something you(?:'|’)re interested in\.\s*Does that work for you\?", "Does that work for you?", r, flags=re.I)
+    r = re.sub(r"\bBefore we confirm, may I have the best email address for the appointment\?\s*What's the best email address for the appointment\?", "What's the best email address for the appointment?", r, flags=re.I)
+    r = re.sub(r"\s+", " ", r).strip()
+    # Tiny punctuation cleanup for voice pacing.
+    r = r.replace(" ,", ",").replace(" .", ".")
+    return r
+
+
+# Override email confirmation wording to be spelling-forward.
+def _voice_speak_email_v31(email: str) -> str:
+    return _v32_spoken_email(email)
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    conv = hydrate_voice_conversation((phone or "").replace("whatsapp:", "").strip(), call_sid)
+    try:
+        _v32_apply_name_repairs(conv, caller_text)
+    except Exception as e:
+        try:
+            log_event("VOICE_V32_NAME_PRE_REPAIR_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V32(phone, call_sid, caller_text)
+
+    try:
+        _v32_apply_name_repairs(conv, caller_text)
+        sched = conv.setdefault("sched", {})
+        profile = conv.setdefault("profile", {})
+        # If booking was just created with a malformed name, update state before any future/customer record logic sees it.
+        if _v32_name_is_malformed(profile.get("name") or ""):
+            _v32_apply_name_repairs(conv, profile.get("name") or caller_text)
+        reply = str(out.get("reply_to_customer") or "")
+        reply = _voice_naturalize_reply(reply)
+        # If we only have a first name, do not let the flow skip last-name collection before email/booking.
+        first = profile.get("active_first_name") or profile.get("first_name")
+        last = profile.get("active_last_name") or profile.get("last_name")
+        if first and not last and (sched.get("pending_step") == "need_email" or "email" in reply.lower()):
+            sched["pending_step"] = "need_name"
+            sched["state"] = "waiting_for_name"
+            reply = "What's your last name?"
+            out["booking_created"] = False
+            out["end_call"] = False
+        out["reply_to_customer"] = reply
+        conv["last_voice_reply"] = reply
+    except Exception as e:
+        try:
+            log_event("VOICE_V32_POSTPROCESS_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+    return out
+
+
+# v32b: make the processing cue last long enough to cover the common dead-air gap.
+# This intentionally reuses the smooth cue generator above, but forces a longer default.
+_ORIG_VOICE_THINKING_CLICK_PAYLOAD_V32 = _voice_thinking_click_payload
+
+def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
+    try:
+        requested = int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 1600)
+    except Exception:
+        requested = 1600
+    # The original generator caps at 1800ms. Force at least 1400ms unless an explicit longer env is set.
+    requested = max(1400, min(1800, requested))
+    return _ORIG_VOICE_THINKING_CLICK_PAYLOAD_V32(requested)
