@@ -1831,12 +1831,66 @@ def hydrate_voice_conversation(phone: str, call_sid: str = "") -> dict:
     sched.setdefault("voice_intro_sms_sent", False)
     sched.setdefault("voice_close_after_reply", False)
     sched.setdefault("voice_drag_handoff_sent", False)
-    # Voice calls should get the same repeat-customer context as the SMS path.
-    # This lets the assistant confirm a saved Square address instead of asking
-    # the caller to repeat it.
+
+    # IMPORTANT: A new phone call from the same number should keep the customer
+    # profile/Square identity, but it must not keep stale live-call scheduling
+    # state from the prior test/call. We only clear transient booking fields;
+    # saved Square names, emails, and addresses stay in profile and are refreshed
+    # below.
+    prior_call_sid = sched.get("voice_active_call_sid")
+    is_new_voice_call = bool(call_sid and prior_call_sid and prior_call_sid != call_sid)
+    if is_new_voice_call:
+        for k in [
+            "pending_step", "scheduled_date", "scheduled_time", "raw_address",
+            "address_candidate", "normalized_address", "address_missing",
+            "appointment_type", "last_slot_unavailable_message",
+            "voice_last_caller_text_norm", "voice_last_caller_text_ts",
+            "last_final_confirmation_key", "scheduled_time_source",
+        ]:
+            sched[k] = None
+        for k in [
+            "address_verified", "booking_created", "awaiting_emergency_confirm",
+            "emergency_approved", "manual_only", "voice_close_after_reply",
+            "voice_drag_handoff_sent", "voice_resume_sms_sent",
+            "voice_booking_completed_close", "voice_sms_confirmation_sent",
+            "awaiting_slot_offer_choice", "final_confirmation_sent",
+            "final_confirmation_accepted",
+        ]:
+            sched[k] = False
+        sched["booking_allowed"] = True
+        sched["address_parts"] = {}
+        sched["offered_slot_options"] = []
+        sched["square_booking_id"] = None
+        sched["voice_customer_turn_count"] = 0
+        sched["voice_meaningful_customer_turns"] = 0
+        conv["voice_transcript"] = []
+        conv["cleaned_transcript"] = ""
+        conv["last_voice_reply"] = ""
+        # Force a Square refresh for this new call. This is what lets an existing
+        # customer be recognized again after deploys/tests without relying on
+        # stale in-memory flags.
+        profile["square_lookup_done"] = False
+    if call_sid:
+        sched["voice_active_call_sid"] = call_sid
+
+    # Voice calls should get repeat-customer context immediately. Keep profile;
+    # refresh it from Square so the assistant can confirm a saved address instead
+    # of treating the caller like a new customer.
     try:
         if phone and "hydrate_square_profile_by_phone" in globals():
-            hydrate_square_profile_by_phone(profile, phone)
+            hydrate_square_profile_by_phone(profile, phone, force=is_new_voice_call)
+            try:
+                log_event("VOICE_SQUARE_PROFILE_READY", phone, {
+                    "call_sid": call_sid,
+                    "square_customer_id": profile.get("square_customer_id"),
+                    "addresses_count": len(profile.get("addresses") or []),
+                    "active_first_name": profile.get("active_first_name"),
+                    "active_last_name": profile.get("active_last_name"),
+                    "active_email_present": bool(profile.get("active_email")),
+                    "phone_variants_tried": _phone_lookup_variants(phone)[:6] if "_phone_lookup_variants" in globals() else [],
+                }, conv)
+            except Exception:
+                pass
     except Exception as e:
         try:
             log_event("VOICE_SQUARE_HYDRATE_ERROR", phone, {"error": repr(e), "call_sid": call_sid})
@@ -2142,18 +2196,26 @@ def _voice_hazard_intake_fast_path(phone: str, conv: dict, caller_text: str) -> 
     conv["appointment_type"] = "TROUBLESHOOT_395"
     sched["awaiting_emergency_confirm"] = False
     sched["emergency_approved"] = False
-    # Never let the emergency description itself become the address.
-    if sched.get("raw_address") and _intent_text(str(sched.get("raw_address"))) in _intent_text(caller_text):
+    # Never let an emergency description itself become the address.
+    raw_low = _intent_text(str(sched.get("raw_address") or ""))
+    caller_low = _intent_text(caller_text)
+    if sched.get("raw_address") and (raw_low in caller_low or _voice_looks_like_true_hazard(str(sched.get("raw_address")))):
         sched["raw_address"] = None
         sched["address_candidate"] = None
+        sched["normalized_address"] = None
         sched["address_verified"] = False
         sched["address_missing"] = "street"
     if not sched.get("address_verified"):
         saved = _best_saved_address(profile)
         if saved and not _voice_text_contains_real_address(caller_text):
             sched["address_candidate"] = saved
+            sched["raw_address"] = saved
             sched["address_missing"] = "confirm"
             sched["pending_step"] = "need_address"
+            try:
+                log_event("VOICE_HAZARD_SAVED_ADDRESS_CONFIRM", phone, {"saved_address": saved, "call_sid": conv.get("last_call_sid")}, conv)
+            except Exception:
+                pass
             return f"This sounds urgent. I have {saved} on file. Is this for that address?"
         sched["pending_step"] = "need_address"
         sched["address_missing"] = "street"
@@ -4532,8 +4594,13 @@ def generate_initial_sms(cleaned_text: str) -> dict:
 # ---------------------------------------------------
 # Initial Voicemail SMS Builder (deterministic first text)
 # ---------------------------------------------------
-def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
-    """Best-effort one-time Square hydrate for repeat callers before the first text goes out."""
+def hydrate_square_profile_by_phone(profile: dict, phone: str, force: bool = False) -> None:
+    """Best-effort Square hydrate for repeat callers before the first text/call flow.
+
+    force=True is used by the live voice assistant at the start of each new call
+    so an existing Square customer address is available immediately. This does
+    NOT reset the customer profile; it refreshes it from Square.
+    """
     profile.setdefault("addresses", [])
     profile.setdefault("square_lookup_done", False)
     profile.setdefault("square_customer_id", None)
@@ -4545,7 +4612,7 @@ def hydrate_square_profile_by_phone(profile: dict, phone: str) -> None:
     profile.setdefault("active_email", None)
     profile.setdefault("identity_source", None)
 
-    if profile.get("square_lookup_done"):
+    if profile.get("square_lookup_done") and not force:
         return
 
     try:
@@ -9653,22 +9720,63 @@ def square_headers() -> dict:
     }
 
 
+def _phone_lookup_variants(phone: str) -> list[str]:
+    """Return practical phone formats Square may have stored for the same caller."""
+    raw = str(phone or "").strip().replace("whatsapp:", "")
+    digits = re.sub(r"\D+", "", raw)
+    variants: list[str] = []
+
+    def add(v: str):
+        v = str(v or "").strip()
+        if v and v not in variants:
+            variants.append(v)
+
+    add(raw)
+    if digits:
+        add(digits)
+        if len(digits) == 11 and digits.startswith("1"):
+            ten = digits[1:]
+            add("+" + digits)
+            add(ten)
+        elif len(digits) == 10:
+            ten = digits
+            add("+1" + ten)
+            add("1" + ten)
+        else:
+            ten = digits[-10:] if len(digits) >= 10 else ""
+        if len(digits) >= 10:
+            ten = digits[-10:]
+            add(ten)
+            add(f"+1{ten}")
+            add(f"1{ten}")
+            add(f"{ten[0:3]}-{ten[3:6]}-{ten[6:10]}")
+            add(f"({ten[0:3]}) {ten[3:6]}-{ten[6:10]}")
+            add(f"{ten[0:3]}.{ten[3:6]}.{ten[6:10]}")
+    return variants
+
+
 def square_lookup_customer_by_phone(phone: str) -> dict | None:
-    """Return the first Square customer match for this phone, or None."""
+    """Return the first Square customer match for this phone, or None.
+
+    Square's exact phone filter can be format-sensitive depending on how the
+    customer was created/imported. Try common E.164 and local formats so an
+    existing customer is recognized from the live voice call.
+    """
     try:
-        payload = {"query": {"filter": {"phone_number": {"exact": phone}}}}
-        resp = requests.post(
-            "https://connect.squareup.com/v2/customers/search",
-            json=payload,
-            headers=square_headers(),
-            timeout=10,
-        )
-        if resp.status_code not in (200, 201):
-            return None
-        data = resp.json() or {}
-        custs = data.get("customers") or []
-        if custs:
-            return custs[0]
+        for candidate in _phone_lookup_variants(phone):
+            payload = {"query": {"filter": {"phone_number": {"exact": candidate}}}}
+            resp = requests.post(
+                "https://connect.squareup.com/v2/customers/search",
+                json=payload,
+                headers=square_headers(),
+                timeout=10,
+            )
+            if resp.status_code not in (200, 201):
+                continue
+            data = resp.json() or {}
+            custs = data.get("customers") or []
+            if custs:
+                return custs[0]
     except Exception as e:
         print("[WARN] customer search failed:", repr(e))
     return None
