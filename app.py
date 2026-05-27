@@ -1897,21 +1897,21 @@ def _voice_agent_instructions() -> str:
     # the source of truth for booking logic; the realtime model is the voice layer.
     return """
 You are Prevolt Electric's scheduling assistant for callers who pressed 1 for residential service.
-Be calm, natural, brief, and receptionist-like. Do not pretend to be a human. Do not say you are an AI unless asked; say you are Prevolt's scheduling assistant.
+Be calm, natural, brief, and receptionist-like. Speak at a normal call-center pace, not slowly. Do not pretend to be a human. Do not say you are an AI unless asked; say you are Prevolt's scheduling assistant.
 Critical rules:
 - Your job is to collect scheduling information, not diagnose electrical problems.
 - Never give electrical troubleshooting, breaker-flipping, panel-opening, or DIY safety instructions.
 - If the caller describes active fire, smoke filling the home, shock/unconscious person, or water touching energized electrical, tell them to call 911 first and stop scheduling until they confirm it is safe.
 - Ask one question at a time. Do not ask for the phone number; caller ID already provides it.
 - Keep replies short enough for a phone call. No paragraphs.
-- Do not say filler phrases like "let me check", "let me lock that in", "one moment", or "hold on" before the tool returns.
+- Do not say filler phrases like "let me check", "let me lock that in", "one moment", "hold on", "I am noting", or "I am finishing" before or after the tool returns. Move directly to the next required question or the final confirmation.
 - Do not wait for the caller to say okay or thanks before asking the next required scheduling question.
 - If the caller confirms an address you just read from file, do not ask for the address again; continue to dispatch confirmation or the next missing booking detail.
 - If the caller asks what the emergency troubleshoot and repair visit covers, answer once, then ask if they want dispatch. If they say yes, okay, or let's do it, proceed; do not repeat the same dispatch question.
 - Do not say phrases that only make sense in SMS, including: "by text", "reply here", "I'll help you here by text", "I can help you right here by text", or "text thread".
 - For every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
 - Never answer directly from your own wording after the caller speaks. Always call the prevolt_os_turn tool first, then speak only reply_to_customer. It has already been converted into phone language.
-- When the next missing field is an address or address confirmation, the phone reply should sound like: "I can get your appointment scheduled here, what's the missing address piece?" or "I can get your appointment scheduled here, just to confirm, you're at the address heard, right?"
+- When the next missing field is an address or address confirmation, the phone reply should sound like: "I can get your appointment scheduled here, what's the missing address piece?" or "I can get your appointment scheduled here. Just to confirm, you're at the address heard, right?"
 - Do not say any greeting starting with "Thanks for calling" after the Twilio intro has played.
 - If the tool returns end_call=true, speak the reply_to_customer, then stop the call naturally.
 - If the tool says booking_created is true, tell the caller they are on the schedule, that a confirmation text will be sent, say goodbye, and end the call.
@@ -2314,6 +2314,11 @@ def _voice_naturalize_reply(reply: str) -> str:
         (r"\bOkay, let me check the details for that [A-Za-z]+ slot\.?", "Got it."),
         (r"\bOkay, let me get that time set for you and finish the booking details\.?", "Got it."),
         (r"\bOkay, let me get the last detail I need to finish scheduling\.?", "Got it."),
+        (r"\bOkay, I(?:'|’)m noting that email for your booking\.?", ""),
+        (r"\bI(?:'|’)m noting that email for your booking\.?", ""),
+        (r"\bOne moment while I finish this\.?", ""),
+        (r"\bLet me finish this\.?", ""),
+        (r"\bI(?:'|’)ll finish this now\.?", ""),
         (r"\bWhat is the best email address for the appointment\??", "What's the best email address for the appointment?"),
         (r"\bIf that is something you(?:'|’)re interested in,\s*", ""),
         (r"\btext you shortly\b", "send you a confirmation text shortly"),
@@ -2349,19 +2354,19 @@ def _voice_naturalize_reply(reply: str) -> str:
     # collapse it into one continuous receptionist-style address prompt.
     text = re.sub(
         r"^\s*(?:Okay,?\s*)?(?:Got it\.\s*)?(?:I can help get this (?:scheduled|started)\.\s*)?(?:Hi[, ]+[A-Z][A-Za-z'\-]{1,24}\.\s*)?(?:We can help with [^.?!]+\.\s*)?(?:To get started,\s*)+(?=(?:what|what's|which|please|can you|tell me)\b)",
-        "I can get your appointment scheduled here, ",
+        "I can get your appointment scheduled here. ",
         text,
         flags=re.I,
     )
     text = re.sub(
         r"^\s*(?:Okay,?\s*)?(?:Got it\.\s*)?(?:I can help get this (?:scheduled|started)\.\s*)+(?:Hi[, ]+[A-Z][A-Za-z'\-]{1,24}\.\s*)?(?=(?:we can help|what|what's|which|please|can you|tell me)\b)",
-        "I can get your appointment scheduled here, ",
+        "I can get your appointment scheduled here. ",
         text,
         flags=re.I,
     )
     text = re.sub(
         r"^\s*I can get your appointment scheduled here,\s*(?:We can help with [^.?!]+\.\s*)?(?:To get started,\s*)?(?=(?:what|what's|which|please|can you|tell me)\b)",
-        "I can get your appointment scheduled here, ",
+        "I can get your appointment scheduled here. ",
         text,
         flags=re.I,
     )
@@ -2371,22 +2376,22 @@ def _voice_naturalize_reply(reply: str) -> str:
     # Desired phone shape:
     # "I can get your appointment scheduled here, what's the house number and street name for the work?"
     # or, when the address was already heard:
-    # "I can get your appointment scheduled here, just to confirm, you're at 45 Main Street, right?"
+    # "I can get your appointment scheduled here. Just to confirm, you're at 45 Main Street, right?"
     text = re.sub(
         r"^\s*(?:Okay,?\s*)?(?:let(?:'|’)s get (?:that|this) (?:request )?(?:set up|started)\.?\s*)?(?:Got it\.\s*)?(?:I can help get this (?:scheduled|started)\.\s*)+(?=(?:what|what's|which|we do|we have|please|can you|tell me|you(?:'|’)re at|you're at)\b)",
-        "I can get your appointment scheduled here, ",
+        "I can get your appointment scheduled here. ",
         text,
         flags=re.I,
     )
     text = re.sub(
         r"^\s*(?:Okay,?\s*)?(?:let(?:'|’)s get (?:that|this) (?:request )?(?:set up|started)\.?\s*)+(?=(?:what|what's|which|we do|we have|please|can you|tell me|you(?:'|’)re at|you're at)\b)",
-        "I can get your appointment scheduled here, ",
+        "I can get your appointment scheduled here. ",
         text,
         flags=re.I,
     )
     text = re.sub(
         r"^\s*I can get your appointment scheduled here,\s*(?:you(?:'|’)re|you're) at\s+",
-        "I can get your appointment scheduled here, just to confirm, you're at ",
+        "I can get your appointment scheduled here. Just to confirm, you're at ",
         text,
         flags=re.I,
     )
@@ -2830,6 +2835,69 @@ def _voice_reply_asks_for_phone(text: str) -> bool:
     low = _intent_text(text)
     return "best phone number" in low or "phone number to reach" in low or "what phone number" in low
 
+
+def _voice_email_fast_path(phone: str, conv: dict, caller_text: str) -> str | None:
+    """When the voice caller gives an email at the end, save it and attempt booking immediately.
+
+    This prevents the live agent from saying a filler phrase like "one moment while I finish this"
+    and then closing after the SMS confirmation is sent.
+    """
+    email = v13_extract_email(caller_text or "")
+    if not email:
+        return None
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    v13_save_email(conv, email)
+    try:
+        recompute_pending_step(profile, sched)
+    except Exception:
+        pass
+
+    first = _voice_profile_first_name(profile)
+    last = _voice_profile_last_name(profile)
+    if not (first and last):
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        return "Thanks. What's your first and last name?"
+
+    if not sched.get("address_verified"):
+        sched["pending_step"] = "need_address"
+        sched["state"] = "waiting_for_address"
+        return "Thanks. What's the full address for the work?"
+
+    if not (sched.get("scheduled_date") and sched.get("scheduled_time")):
+        try:
+            return _voice_naturalize_reply(choose_next_prompt_from_state(conv, inbound_text=caller_text))
+        except Exception:
+            return "Thanks. What day and time works best?"
+
+    try:
+        booking_attempt = maybe_create_square_booking(phone, conv)
+    except Exception as e:
+        try:
+            log_event("VOICE_EMAIL_BOOKING_FAST_PATH_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+        booking_attempt = {"status": "exception"}
+
+    if sched.get("booking_created") and sched.get("square_booking_id"):
+        sched["voice_close_after_reply"] = True
+        sched["voice_booking_completed_close"] = True
+        return _voice_finalize_booking_reply(conv, "")
+
+    status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
+    if status == "missing_identity":
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        return "Thanks. What's your first and last name?"
+    if status in {"address_not_verified", "missing_address", "address_normalization_failed", "address_incomplete"}:
+        sched["pending_step"] = "need_address"
+        sched["state"] = "waiting_for_address"
+        return "Thanks. What's the full address for the work?"
+    # If Square did not complete immediately, keep the caller in a clean text fallback instead of a dead-air close.
+    return "Thanks. I will send you a text so we can finish the last step cleanly."
+
+
 def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
     """Run one spoken customer turn through the existing Prevolt OS brain."""
     phone = (phone or "").replace("whatsapp:", "").strip()
@@ -2952,6 +3020,31 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
         return {"reply_to_customer": offered_slot_reply, "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")), "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
+    # If the caller gives the email at the end, book immediately and speak the final confirmation,
+    # rather than saying a filler phrase and hanging up after the SMS is sent.
+    try:
+        email_fast_reply = _voice_email_fast_path(phone, conv, caller_text)
+    except Exception as e:
+        email_fast_reply = None
+        try:
+            log_event("VOICE_EMAIL_FAST_PATH_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+    if email_fast_reply:
+        email_fast_reply = _voice_naturalize_reply(email_fast_reply)
+        booking_created_email = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+        if booking_created_email:
+            sched["voice_close_after_reply"] = True
+            sched["voice_booking_completed_close"] = True
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": email_fast_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        conv["last_voice_reply"] = email_fast_reply
+        _voice_maybe_send_booking_sms(phone, conv, email_fast_reply)
+        try:
+            log_event("VOICE_EMAIL_FAST_PATH", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(email_fast_reply), "booking_created": booking_created_email, "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": email_fast_reply, "booking_created": booking_created_email, "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": bool(sched.get("voice_close_after_reply"))}
 
     # If the call is dragging, move it back to SMS instead of letting the agent
     # burn minutes or frustrate the customer.
@@ -3279,6 +3372,7 @@ def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: d
             "tool_choice": "none",
             "instructions": (
                 "Say this exact phone reply, word for word, including every question in it, then stop speaking. "
+                "Speak at a natural medium pace. Do not slow down or add dramatic pauses at commas. "
                 "Do not add any acknowledgement, greeting, filler phrase, or extra question. "
                 "Do not stop after the first clause or first sentence; speak the complete exact reply. "
                 "Exact reply: " + json.dumps(exact_reply)
@@ -3398,7 +3492,7 @@ if sock is not None:
                                 conv_local = hydrate_voice_conversation(phone, call_sid)
                                 if conv_local.setdefault("sched", {}).get("voice_close_after_reply"):
                                     # Let the final goodbye finish before closing Twilio's stream.
-                                    time.sleep(1.25)
+                                    time.sleep(2.75)
                                     stop_flag["stop"] = True
                                     try:
                                         ws.close()
