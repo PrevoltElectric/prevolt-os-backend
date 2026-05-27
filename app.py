@@ -1967,7 +1967,10 @@ def _voice_session_update_event() -> dict:
             },
             "instructions": _voice_agent_instructions(),
             "tools": _voice_tools_schema(),
-            "tool_choice": "auto",
+            # Force every caller utterance through Prevolt OS before the model speaks.
+            # This prevents the realtime model from saying a generic partial response
+            # such as "I can help get this scheduled" and then waiting for the caller.
+            "tool_choice": "required",
         },
     }
 
@@ -2060,6 +2063,28 @@ def _voice_naturalize_reply(reply: str) -> str:
     ]
     for pat, repl in replacements:
         text = re.sub(pat, repl, text, flags=re.I)
+
+    # If the SRB/text reply includes a phone-unfriendly preamble like
+    # "I can help get this scheduled. Hi Kyle. We can help with... To get started,"
+    # collapse it into one continuous receptionist-style address prompt.
+    text = re.sub(
+        r"^\s*(?:Okay,?\s*)?(?:Got it\.\s*)?(?:I can help get this (?:scheduled|started)\.\s*)?(?:Hi[, ]+[A-Z][A-Za-z'\-]{1,24}\.\s*)?(?:We can help with [^.?!]+\.\s*)?(?:To get started,\s*)+(?=(?:what|what's|which|please|can you|tell me)\b)",
+        "I can get your appointment scheduled here, ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"^\s*(?:Okay,?\s*)?(?:Got it\.\s*)?(?:I can help get this (?:scheduled|started)\.\s*)+(?:Hi[, ]+[A-Z][A-Za-z'\-]{1,24}\.\s*)?(?=(?:we can help|what|what's|which|please|can you|tell me)\b)",
+        "I can get your appointment scheduled here, ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"^\s*I can get your appointment scheduled here,\s*(?:We can help with [^.?!]+\.\s*)?(?:To get started,\s*)?(?=(?:what|what's|which|please|can you|tell me)\b)",
+        "I can get your appointment scheduled here, ",
+        text,
+        flags=re.I,
+    )
 
     # Voice-only UX cleanup: keep the scheduling-assistant transition, but
     # do not let it become a standalone sentence that can sound like a stall.
@@ -2748,34 +2773,63 @@ def _linear16_to_mulaw(sample: int) -> int:
 
 
 def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
-    """Return an audible but still subtle PCMU/8000 processing cue.
+    """Return a soft, lower-pitched PCMU/8000 processing cue.
 
-    Earlier versions logged that the thinking sound was sent, but the tick was
-    too quiet to survive phone compression. This version uses short decaying
-    pop/click bursts with real G.711 mu-law samples. No WAV headers are used.
+    This is intentionally not a sharp high beep. It uses a short sequence of
+    muted low-mid "boop" chirps with a tiny echo tail and fade-out, encoded as
+    raw G.711 mu-law with no WAV headers for Twilio Media Streams.
     """
-    ms = max(300, min(1400, int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 850)))
-    total = int(8000 * (ms / 1000.0))
+    ms = max(450, min(1600, int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 850)))
+    rate = 8000
+    total = int(rate * (ms / 1000.0))
     silence = _linear16_to_mulaw(0)
-    data = bytearray([silence] * total)
+    pcm = [0] * total
 
-    # Three audible soft pops with a tiny high-frequency texture after each pop.
-    # This should read as "processing", not as static or speech.
-    tick_starts_ms = (80, 300, 520, 740)
-    for start_ms in tick_starts_ms:
-        start = int(8000 * start_ms / 1000.0)
-        tick_len = min(int(8000 * 0.075), max(0, total - start))  # 75ms
-        for i in range(tick_len):
-            decay = math.exp(-4.2 * (i / max(1, tick_len)))
-            # A pop transient plus a short tone component, intentionally louder
-            # than previous versions but still far quieter than speech.
-            transient = 11000 if i < 10 else 0
-            tone = int(6800 * decay * math.sin(2 * math.pi * 1050 * (i / 8000.0)))
-            texture = int(1800 * decay * math.sin(2 * math.pi * 2150 * (i / 8000.0)))
-            sample = max(-15000, min(15000, transient + tone + texture))
-            data[start + i] = _linear16_to_mulaw(sample)
+    # A more organic flutter: lower frequencies, staggered gently, each with
+    # an attack/decay envelope. The later chirps get softer and the whole cue
+    # fades out so it reads as "thinking" rather than a ringtone.
+    starts_ms = [65, 190, 340, 520]
+    freqs = [420, 510, 455, 570]
+    lengths_ms = [145, 125, 155, 210]
+    gains = [0.34, 0.27, 0.22, 0.16]
+    for n, (start_ms, freq, length_ms, gain) in enumerate(zip(starts_ms, freqs, lengths_ms, gains)):
+        start = int(rate * start_ms / 1000.0)
+        length = min(int(rate * length_ms / 1000.0), max(0, total - start))
+        if length <= 0:
+            continue
+        for i in range(length):
+            t = i / rate
+            x = i / max(1, length - 1)
+            # Soft attack, long exponential decay, and a global late fade.
+            attack = min(1.0, i / max(1, int(rate * 0.018)))
+            decay = math.exp(-3.2 * x)
+            late_fade = max(0.0, 1.0 - ((start + i) / max(1, total)) ** 1.8)
+            # Slight vibrato makes it flutter instead of pinging a fixed key.
+            inst_freq = freq + 18 * math.sin(2 * math.pi * 8.0 * t + n)
+            base = math.sin(2 * math.pi * inst_freq * t)
+            # Very light overtone for phone audibility, much lower than the old high ping.
+            overtone = 0.18 * math.sin(2 * math.pi * (inst_freq * 1.55) * t + 0.7)
+            sample = int(12000 * gain * attack * decay * late_fade * (base + overtone))
+            idx = start + i
+            pcm[idx] = max(-16000, min(16000, pcm[idx] + sample))
+
+            # Simple echo/reverb taps, quiet and decaying. This gives the cue a
+            # rounded tail without increasing latency or requiring libraries.
+            for delay_ms, echo_gain in ((46, 0.22), (92, 0.09)):
+                eidx = idx + int(rate * delay_ms / 1000.0)
+                if eidx < total:
+                    pcm[eidx] = max(-16000, min(16000, pcm[eidx] + int(sample * echo_gain)))
+
+    # Very low bed under the first half second to smooth the discrete pops.
+    bed_len = min(total, int(rate * 0.55))
+    for i in range(bed_len):
+        t = i / rate
+        fade = max(0.0, 1.0 - (i / max(1, bed_len)) ** 1.4)
+        sample = int(520 * fade * math.sin(2 * math.pi * 185 * t))
+        pcm[i] = max(-16000, min(16000, pcm[i] + sample))
+
+    data = bytearray(_linear16_to_mulaw(sample) for sample in pcm)
     return base64.b64encode(bytes(data)).decode("ascii")
-
 
 def _send_twilio_thinking_sound(twilio_ws, stream_sid: str, phone: str = "", call_sid: str = "", reason: str = "") -> None:
     if not (VOICE_AGENT_THINKING_SOUND_ENABLED and stream_sid):
