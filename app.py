@@ -108,6 +108,8 @@ VOICE_AGENT_MAX_CUSTOMER_TURNS = int(os.environ.get("VOICE_AGENT_MAX_CUSTOMER_TU
 VOICE_AGENT_HANGUP_SMS_ENABLED = _env_bool("VOICE_AGENT_HANGUP_SMS_ENABLED", True)
 VOICE_AGENT_THINKING_SOUND_ENABLED = _env_bool("VOICE_AGENT_THINKING_SOUND_ENABLED", True)
 VOICE_AGENT_THINKING_SOUND_MS = int(os.environ.get("VOICE_AGENT_THINKING_SOUND_MS") or "650")
+VOICE_AGENT_VAD_SILENCE_MS = int(os.environ.get("VOICE_AGENT_VAD_SILENCE_MS") or "450")
+VOICE_AGENT_VAD_THRESHOLD = float(os.environ.get("VOICE_AGENT_VAD_THRESHOLD") or "0.45")
 
 RULES_FILE = os.environ.get("PREVOLT_RULES_FILE") or os.environ.get("PREVOLT_RULES_PATH")
 
@@ -1873,9 +1875,9 @@ def build_residential_realtime_twiml(phone: str, call_sid: str) -> VoiceResponse
     hydrate_voice_conversation(phone, call_sid)
     response.say(
         '<speak><prosody rate="98%">'
-        "You have reached Prevolt Electric automated scheduling assistant. "
+        "You have reached Pre-volt Electric's automated scheduling assistant. "
         'This call may be recorded to help with scheduling. '
-        "In a couple of words, please tell us why you\'re calling today."
+        "In a couple of words, please tell us why you're calling today."
         '</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
@@ -1901,6 +1903,8 @@ Critical rules:
 - If the caller describes active fire, smoke filling the home, shock/unconscious person, or water touching energized electrical, tell them to call 911 first and stop scheduling until they confirm it is safe.
 - Ask one question at a time.
 - Keep replies short enough for a phone call. No paragraphs.
+- Do not say filler phrases like "let me check", "let me lock that in", "one moment", or "hold on" before the tool returns.
+- Do not wait for the caller to say okay or thanks before asking the next required scheduling question.
 - Do not say phrases that only make sense in SMS, including: "by text", "reply here", "I'll help you here by text", "I can help you right here by text", or "text thread".
 - For every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
 - Never answer directly from your own wording after the caller speaks. Always call the prevolt_os_turn tool first, then speak only reply_to_customer. It has already been converted into phone language.
@@ -1945,7 +1949,7 @@ def _voice_session_update_event() -> dict:
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 650},
+                    "turn_detection": {"type": "server_vad", "threshold": VOICE_AGENT_VAD_THRESHOLD, "prefix_padding_ms": 200, "silence_duration_ms": VOICE_AGENT_VAD_SILENCE_MS},
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
@@ -2031,6 +2035,10 @@ def _voice_naturalize_reply(reply: str) -> str:
         (r"\bSend (?:me )?the house number and street name for the work\.?", "What's the house number and street name for the work?"),
         (r"\bWhat is your first and last name\??", "What's your first and last name?"),
         (r"\bWe can definitely take care of this\.\s*", "Got it. "),
+        (r"\bLet me check the scheduling details for that\.?", ""),
+        (r"\bLet me lock that in and grab the last detail I need\.?", "Got it."),
+        (r"\bWhat is the best email address for the appointment\??", "What's the best email address for the appointment?"),
+        (r"\bIf that is something you(?:'|’)re interested in,\s*", ""),
         (r"\btext you shortly\b", "send you a confirmation text shortly"),
         (r"\bWe will text you shortly\b", "We'll send you a confirmation text shortly"),
         (r"\bWe'll text you shortly\b", "We'll send you a confirmation text shortly"),
@@ -2208,6 +2216,83 @@ def _voice_maybe_send_booking_sms(phone: str, conv: dict, voice_reply: str) -> N
             pass
 
 
+
+def _voice_sanitize_name_fields(profile: dict, sched: dict | None = None) -> None:
+    """Prevent voice filler words from becoming customer last names.
+
+    Realtime transcription often turns "my name is Kyle, and I live..." into
+    a name candidate of "Kyle And". That should never satisfy the full-name
+    requirement or be sent to Square.
+    """
+    bad_last_names = {
+        "and", "or", "in", "at", "from", "with", "for", "about", "because",
+        "regarding", "located", "living", "live", "lives", "need", "needs",
+        "calling", "looking", "trying", "want", "wants", "the", "a", "an",
+    }
+    changed = False
+    for key in ["active_last_name", "last_name", "recognized_last_name", "voicemail_last_name"]:
+        value = (profile.get(key) or "").strip()
+        if value and value.lower() in bad_last_names:
+            profile[key] = None
+            changed = True
+    full = " ".join(str(profile.get("name") or "").strip().split())
+    if full:
+        parts = full.split()
+        if len(parts) >= 2 and parts[-1].lower() in bad_last_names:
+            profile["name"] = " ".join(parts[:-1]).strip() or None
+            changed = True
+    if changed and sched is not None:
+        try:
+            recompute_pending_step(profile, sched)
+        except Exception:
+            pass
+
+
+def _voice_apply_offered_slot_fast_path(conv: dict, caller_text: str) -> str | None:
+    """Run SMS route-level offered-slot guards for voice turns too.
+
+    The normal SMS route locks offered slot choices before the LLM path. Voice
+    bypasses that route, so a date-only reply like "Monday June 1" can otherwise
+    be reinterpreted as a fresh date and get the wrong default time.
+    """
+    sched = conv.setdefault("sched", {})
+    if not (sched.get("awaiting_slot_offer_choice") and (sched.get("offered_slot_options") or [])):
+        return None
+    try:
+        date_change_reply = maybe_handle_new_date_during_offered_slots(conv, caller_text)
+        if date_change_reply:
+            return _voice_naturalize_reply(date_change_reply)
+    except Exception as e:
+        try:
+            log_event("VOICE_OFFERED_SLOT_DATE_CHANGE_ERROR", conv.get("phone") or "", {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+    selected = False
+    try:
+        selected = maybe_apply_offered_slot_selection(conv, caller_text)
+    except Exception as e:
+        try:
+            log_event("VOICE_OFFERED_SLOT_SELECTION_ERROR", conv.get("phone") or "", {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+    if not selected:
+        try:
+            selected = v13_time_only_on_offered_slots(conv, caller_text)
+        except Exception:
+            selected = False
+    if selected:
+        try:
+            profile = conv.setdefault("profile", {})
+            _voice_sanitize_name_fields(profile, sched)
+            recompute_pending_step(profile, sched)
+        except Exception:
+            pass
+        try:
+            return _voice_naturalize_reply(choose_next_prompt_from_state(conv, inbound_text=caller_text))
+        except Exception:
+            return "Got it. What's your first and last name?"
+    return None
+
 def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
     """Run one spoken customer turn through the existing Prevolt OS brain."""
     phone = (phone or "").replace("whatsapp:", "").strip()
@@ -2250,6 +2335,20 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     sched["voice_customer_turn_count"] = int(sched.get("voice_customer_turn_count") or 0) + 1
     if len(caller_text.strip()) >= 4:
         sched["voice_meaningful_customer_turns"] = int(sched.get("voice_meaningful_customer_turns") or 0) + 1
+
+    # Route-level offered-slot handling for voice. This preserves the exact offered time.
+    try:
+        offered_slot_reply = _voice_apply_offered_slot_fast_path(conv, caller_text)
+    except Exception:
+        offered_slot_reply = None
+    if offered_slot_reply:
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": offered_slot_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        conv["last_voice_reply"] = offered_slot_reply
+        try:
+            log_event("VOICE_OFFERED_SLOT_FAST_PATH", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(offered_slot_reply), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": offered_slot_reply, "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")), "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
 
     # If the call is dragging, move it back to SMS instead of letting the agent
     # burn minutes or frustrate the customer.
@@ -2294,6 +2393,10 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             pass
         result = {"sms_body": "Sorry, can you say that again?"}
 
+    try:
+        _voice_sanitize_name_fields(conv.setdefault("profile", {}), sched)
+    except Exception:
+        pass
     reply = _voice_naturalize_reply((result or {}).get("sms_body") or "Sorry, can you say that again?")
     conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
     conv["last_voice_reply"] = reply
@@ -2447,7 +2550,7 @@ def _send_twilio_thinking_sound(twilio_ws, stream_sid: str, phone: str = "", cal
             pass
 
 
-def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: dict, handled_call_ids: set | None = None) -> bool:
+def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: dict, handled_call_ids: set | None = None, twilio_ws=None, stream_sid: str = "") -> bool:
     if not isinstance(item, dict) or item.get("type") != "function_call":
         return False
     name = item.get("name") or ""
@@ -2462,6 +2565,11 @@ def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: d
         args = json.loads(item.get("arguments") or "{}")
     except Exception:
         args = {}
+    try:
+        if twilio_ws is not None and stream_sid:
+            _send_twilio_thinking_sound(twilio_ws, stream_sid, phone, call_sid, "before_tool_processing")
+    except Exception:
+        pass
     output = process_prevolt_voice_turn(phone, call_sid, args.get("caller_text") or "")
     if output.get("end_call"):
         try:
@@ -2480,7 +2588,8 @@ def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: d
         "type": "response.create",
         "response": {
             "output_modalities": ["audio"],
-            "instructions": "Speak only the reply_to_customer from the tool output. Do not add anything else.",
+            "tool_choice": "none",
+            "instructions": "Speak only the reply_to_customer from the tool output. Do not add anything else. Do not add filler phrases or ask for confirmation before the next needed question.",
         },
     })
     return True
@@ -2588,7 +2697,7 @@ if sock is not None:
                         elif etype == "response.done":
                             output = ((event.get("response") or {}).get("output") or [])
                             for item in output:
-                                _handle_realtime_function_call(openai_ws, phone, call_sid, item, handled_function_calls)
+                                _handle_realtime_function_call(openai_ws, phone, call_sid, item, handled_function_calls, ws, stream_sid)
                             try:
                                 conv_local = hydrate_voice_conversation(phone, call_sid)
                                 if conv_local.setdefault("sched", {}).get("voice_close_after_reply"):
@@ -2602,7 +2711,7 @@ if sock is not None:
                             except Exception:
                                 pass
                         elif etype == "response.output_item.done":
-                            _handle_realtime_function_call(openai_ws, phone, call_sid, event.get("item") or {}, handled_function_calls)
+                            _handle_realtime_function_call(openai_ws, phone, call_sid, event.get("item") or {}, handled_function_calls, ws, stream_sid)
                         elif etype in {"error", "invalid_request_error"}:
                             try:
                                 log_event("VOICE_OPENAI_ERROR", phone, {"event": event, "call_sid": call_sid})
@@ -5988,7 +6097,7 @@ def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
     stop_words = {
         "looking", "calling", "trying", "needing", "need", "wanting", "want",
         "with", "for", "about", "because", "regarding", "located", "living",
-        "from", "at", "in", "the", "a", "an"
+        "from", "at", "in", "the", "a", "an", "and", "or"
     }
 
     for pat in patterns:
@@ -6003,6 +6112,8 @@ def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
             continue
         if first.lower() in stop_words:
             continue
+        if last and last.lower() in stop_words:
+            last = ""
 
         return first or None, last or None
 
@@ -9501,6 +9612,8 @@ def monitor_voice_health():
         "voice": OPENAI_REALTIME_VOICE,
         "thinking_sound_enabled": VOICE_AGENT_THINKING_SOUND_ENABLED,
         "max_customer_turns": VOICE_AGENT_MAX_CUSTOMER_TURNS,
+        "vad_silence_ms": VOICE_AGENT_VAD_SILENCE_MS,
+        "vad_threshold": VOICE_AGENT_VAD_THRESHOLD,
     }, (200 if ready else 503)
 
 
