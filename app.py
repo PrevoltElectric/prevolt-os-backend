@@ -2048,7 +2048,17 @@ def _voice_naturalize_reply(reply: str) -> str:
         (r"\bWhat is your first and last name\??", "What's your first and last name?"),
         (r"\bWe can definitely take care of this\.\s*", "Got it. "),
         (r"\bLet me check the scheduling details for that\.?", ""),
+        (r"\bLet me check what details are still needed to finish the booking\.?", ""),
+        (r"\bLet me check the details for that [A-Za-z]+ slot\.?", "Got it."),
+        (r"\bLet me get that time set for you and finish the booking details\.?", "Got it."),
         (r"\bLet me lock that in and grab the last detail I need\.?", "Got it."),
+        (r"\bLet me get the last detail I need to finish scheduling\.?", "Got it."),
+        (r"\bI'm just finishing the booking details with that email now\.?", ""),
+        (r"\bI(?:'|’)m finalizing the booking details now\.?", ""),
+        (r"\bAll right, I(?:'|’)m finalizing the booking details now\.?", ""),
+        (r"\bOkay, let me check the details for that [A-Za-z]+ slot\.?", "Got it."),
+        (r"\bOkay, let me get that time set for you and finish the booking details\.?", "Got it."),
+        (r"\bOkay, let me get the last detail I need to finish scheduling\.?", "Got it."),
         (r"\bWhat is the best email address for the appointment\??", "What's the best email address for the appointment?"),
         (r"\bIf that is something you(?:'|’)re interested in,\s*", ""),
         (r"\btext you shortly\b", "send you a confirmation text shortly"),
@@ -2063,6 +2073,21 @@ def _voice_naturalize_reply(reply: str) -> str:
     ]
     for pat, repl in replacements:
         text = re.sub(pat, repl, text, flags=re.I)
+
+    # Voice-specific price disclosure: make the $195 sound like an evaluation visit,
+    # not simply a fee for a quote.
+    text = re.sub(
+        r"We do charge \$195 for one of our electricians to come out, take a look, and provide you with a quote\.?",
+        "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step.",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"We do charge \$195 for one of our electricians to come out, take a look, and provide you with a written quote\.?",
+        "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step.",
+        text,
+        flags=re.I,
+    )
 
     # If the SRB/text reply includes a phone-unfriendly preamble like
     # "I can help get this scheduled. Hi Kyle. We can help with... To get started,"
@@ -2142,6 +2167,26 @@ def _voice_naturalize_reply(reply: str) -> str:
     if "what town is the work in" in low and ("help get this" in low or "prevolt electric" in low):
         return "What town is the work in?"
     text = _voice_dedupe_consecutive_sentences(text)
+    # Final booking language should clearly restate date/time and mention the confirmation text.
+    text = re.sub(
+        r"You(?:'|’)re all set for ([^.]+?) at ([^.]+?)\.\s*We have you on the schedule\.?",
+        r"You're all set. We have you on the schedule for \1 at \2. You'll receive a text shortly with confirmation.",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"You are all set for ([^.]+?) at ([^.]+?)\.\s*We have you on the schedule\.?",
+        r"You're all set. We have you on the schedule for \1 at \2. You'll receive a text shortly with confirmation.",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"We have you on the schedule\.?$",
+        "You'll receive a text shortly with confirmation.",
+        text,
+        flags=re.I,
+    )
+
     if len(text) > 320:
         parts = re.split(r"(?<=[.!?])\s+", text)
         text = " ".join(parts[:2]).strip()
@@ -2268,6 +2313,31 @@ def _voice_send_drag_handoff_sms(phone: str, conv: dict, reason: str = "") -> No
             log_event("VOICE_DRAG_HANDOFF_SMS_FAILED", phone, {"error": repr(e), "reason": reason}, conv)
         except Exception:
             pass
+
+
+def _voice_format_scheduled_slot_from_state(conv: dict) -> str:
+    sched = (conv or {}).setdefault("sched", {}) if isinstance(conv, dict) else {}
+    date_raw = (sched.get("scheduled_date") or "").strip()
+    time_raw = (sched.get("scheduled_time") or "").strip()
+    try:
+        human_day = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%A, %B %d").replace(" 0", " ")
+    except Exception:
+        human_day = date_raw or "the appointment date"
+    try:
+        human_t = humanize_time(time_raw) or time_raw
+    except Exception:
+        human_t = time_raw
+    if human_day and human_t:
+        return f"{human_day} at {human_t}"
+    return human_day or human_t or "the appointment time"
+
+
+def _voice_finalize_booking_reply(conv: dict, reply: str) -> str:
+    """Force a clean live-call closing after Square booking creation."""
+    slot = _voice_format_scheduled_slot_from_state(conv)
+    base = _voice_to_sms_text(reply)
+    # Prefer a consistent spoken ending over backend/SMS phrasing variants.
+    return f"You're all set. We have you on the schedule for {slot}. You'll receive a text shortly with confirmation."
 
 def _voice_maybe_send_booking_sms(phone: str, conv: dict, voice_reply: str) -> None:
     sched = conv.setdefault("sched", {})
@@ -2637,9 +2707,11 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             sched["pending_step"] = "need_name"
             sched["state"] = "waiting_for_name"
             reply = "What's your last name?"
+    booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+    if booking_created:
+        reply = _voice_finalize_booking_reply(conv, reply)
     conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
     conv["last_voice_reply"] = reply
-    booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
     _voice_maybe_send_booking_sms(phone, conv, reply)
     try:
         log_event("VOICE_OS_TURN", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "booking_created": booking_created, "call_sid": call_sid}, conv)
@@ -4232,7 +4304,7 @@ def prevolt_eval_price_line(appt_type: str) -> str:
         return "Troubleshoot and repair visits are $395."
     if "INSPECTION" in appt:
         return "The whole-home inspection is $395."
-    return "We do charge $195 for one of our electricians to come out, take a look, and provide you with a written quote."
+    return "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step."
 
 
 def format_command_center_slot_list(slots: list[dict]) -> str:
@@ -4279,7 +4351,7 @@ def build_price_and_availability_prompt(conv: dict, appt_type: str = "EVAL_195")
     elif "INSPECTION" in appt:
         intro = "We have availability to come and take a look. The whole-home inspection is $395."
     else:
-        intro = "We can definitely take care of this. We do charge $195 for one of our electricians to come out, take a look, and provide you with a quote."
+        intro = "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step."
 
     if slots:
         sched["awaiting_slot_offer_choice"] = True
@@ -6961,13 +7033,13 @@ def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allo
             else:
                 answer = "It covers sending one of our electricians out, reviewing the work in person, going over the next step with you, and putting together a quote."
         elif any(x in low for x in ["quote", "estimate", "free estimate", "ballpark", "firm number", "rough price"]):
-            answer = "For quote requests, we do charge $195 for one of our electricians to come out, take a look, and provide you with a quote."
+            answer = "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step."
         elif "TROUBLESHOOT" in appt:
             answer = "The $395 is the troubleshoot and repair visit to come out, diagnose the issue, and handle minor repairs if it makes sense on site."
         elif "INSPECTION" in appt:
             answer = "Whole-home inspections are $395, and larger homes can run higher depending on square footage."
         else:
-            answer = "We do charge $195 for one of our electricians to come out, take a look, and provide you with a quote."
+            answer = "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step."
         sched["price_disclosed"] = True
     elif any(x in low for x in ["availability", "available", "openings", "how soon", "come sooner", "earliest", "soonest", "when can you come", "when can you come out"]):
         # Availability questions should never fall into a vague canned response.
