@@ -5,6 +5,9 @@ import time
 import uuid
 import re
 import random
+import base64
+import threading
+import traceback
 from pathlib import Path
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
@@ -14,6 +17,18 @@ from twilio.twiml.voice_response import VoiceResponse, Gather, Dial
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from openai import OpenAI
+
+# Optional voice-agent dependencies. The app stays deployable without them;
+# PREVOLT_VOICE_AGENT_ENABLED must remain false until these are installed.
+try:
+    from flask_sock import Sock
+except Exception:  # pragma: no cover - deploy-time optional dependency
+    Sock = None
+
+try:
+    import websocket as websocket_client
+except Exception:  # pragma: no cover - deploy-time optional dependency
+    websocket_client = None
 
 
 
@@ -69,6 +84,26 @@ twilio_client = (
     if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
     else None
 )
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+# ---------------------------------------------------
+# Realtime Voice Agent Flags
+# ---------------------------------------------------
+# Fail-closed by default. Turning this off returns option 1 to the existing
+# voicemail -> transcription -> SMS flow without touching the SRB list.
+PREVOLT_VOICE_AGENT_ENABLED = _env_bool("PREVOLT_VOICE_AGENT_ENABLED", False)
+PREVOLT_VOICE_AGENT_FAILOVER_TO_VOICEMAIL = _env_bool("PREVOLT_VOICE_AGENT_FAILOVER_TO_VOICEMAIL", True)
+PREVOLT_PUBLIC_BASE_URL = (os.environ.get("PREVOLT_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+OPENAI_REALTIME_MODEL = (os.environ.get("OPENAI_REALTIME_MODEL") or "gpt-realtime-2").strip()
+OPENAI_REALTIME_VOICE = (os.environ.get("OPENAI_REALTIME_VOICE") or "marin").strip()
+OPENAI_REALTIME_WS_URL = (os.environ.get("OPENAI_REALTIME_WS_URL") or "wss://api.openai.com/v1/realtime").strip()
+VOICE_AGENT_MAX_SECONDS = int(os.environ.get("VOICE_AGENT_MAX_SECONDS") or "540")
+VOICE_AGENT_IDLE_SECONDS = int(os.environ.get("VOICE_AGENT_IDLE_SECONDS") or "35")
 
 RULES_FILE = os.environ.get("PREVOLT_RULES_FILE") or os.environ.get("PREVOLT_RULES_PATH")
 
@@ -289,40 +324,15 @@ def v13_looks_like_smoke_detector_install_request(*parts) -> bool:
 
 
 def v13_looks_like_callback_request(*parts) -> bool:
-    """
-    True only when the customer is explicitly requiring a phone call instead
-    of normal text-based scheduling.
-
-    Important: ordinary voicemail closers like "call me back", "give me a
-    call", or "please call when you get a chance" are soft callback language.
-    Almost every voicemail contains that kind of wording, so it must not force
-    manual mode or block the normal address/scheduling flow.
-    """
     low = _intent_text(*parts)
     if not low:
         return False
-
-    hard_patterns = [
-        # Clear opt-out of texting / automation.
-        r"\b(?:do not|don't|dont)\s+text\b",
-        r"\b(?:stop|quit)\s+text(?:ing)?\b",
-        r"\b(?:i\s+)?(?:can't|cant|cannot)\s+text\b",
-        r"\b(?:texting|sms|messages?)\s+(?:does not|doesn't|doesnt|won't|wont)\s+work\b",
-        r"\b(?:call|phone)\s+only\b",
-        r"\bonly\s+(?:call|phone)\b",
-
-        # They are asking to replace the text flow with a phone call.
-        r"\b(?:please\s+)?call\s+(?:me\s+)?instead\b",
-        r"\b(?:can|could|would)\s+you\s+(?:please\s+)?call\s+me\b",
-        r"\b(?:rather|prefer)\s+(?:a\s+)?(?:phone\s+)?call\b",
-        r"\b(?:rather|prefer)\s+(?:to\s+)?(?:talk|speak)\b",
-
-        # They need a human conversation before scheduling can continue.
-        r"\b(?:need|want)\s+to\s+(?:speak|talk)\s+(?:with|to)\s+(?:(?:a|an)\s+)?(?:person|someone|somebody|human|electrician|tech|technician)\b",
-        r"\b(?:need|want)\s+a\s+(?:phone\s+)?call\s+(?:before|prior to)\b",
-        r"\b(?:before|prior to)\s+(?:scheduling|booking).*?\b(?:call|speak|talk)\b",
+    phrases = [
+        "call me", "call back", "call me back", "give me a call", "please call",
+        "can someone call", "could someone call", "rather talk", "talk to someone",
+        "talk on the phone", "phone call", "call instead", "can you call"
     ]
-    return any(re.search(pattern, low, flags=re.I) for pattern in hard_patterns)
+    return any(p in low for p in phrases)
 
 
 def v13_apply_callback_request(conv: dict, inbound_text: str = "") -> str:
@@ -1723,6 +1733,7 @@ def suppress_unbooked_reservation_language(conv: dict, phone: str, inbound_text:
     return choose_next_prompt_from_state(conv, inbound_text=inbound_text)
 
 app = Flask(__name__)
+sock = Sock(app) if Sock is not None else None
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
@@ -1733,6 +1744,529 @@ def home():
 # In-Memory Conversation Store
 # ---------------------------------------------------
 conversations = {}
+
+# ---------------------------------------------------
+# Realtime Voice Agent Helpers (Option 1 Residential)
+# ---------------------------------------------------
+def voice_agent_runtime_ready() -> tuple[bool, str]:
+    """Return whether the live voice path can safely accept calls."""
+    if not PREVOLT_VOICE_AGENT_ENABLED:
+        return False, "voice_agent_disabled"
+    if Sock is None or sock is None:
+        return False, "flask_sock_missing"
+    if websocket_client is None:
+        return False, "websocket_client_missing"
+    if not OPENAI_API_KEY:
+        return False, "openai_api_key_missing"
+    return True, "ready"
+
+
+def _request_public_host() -> str:
+    if PREVOLT_PUBLIC_BASE_URL:
+        return PREVOLT_PUBLIC_BASE_URL.replace("https://", "").replace("http://", "").strip("/")
+    host = (request.headers.get("X-Forwarded-Host") or request.host or "").strip()
+    return host
+
+
+def _voice_ws_url(path: str = "/voice/realtime-media") -> str:
+    host = _request_public_host()
+    return f"wss://{host}{path}"
+
+
+def hydrate_voice_conversation(phone: str, call_sid: str = "") -> dict:
+    key = (phone or "").replace("whatsapp:", "").strip() or (f"call:{call_sid}" if call_sid else "voice:unknown")
+    conv = conversations.setdefault(key, {})
+    conv["source"] = conv.get("source") or "voice_option_1"
+    conv["channel"] = "voice"
+    conv["last_call_sid"] = call_sid or conv.get("last_call_sid")
+    profile = conv.setdefault("profile", {})
+    profile.setdefault("name", None)
+    profile.setdefault("addresses", [])
+    profile.setdefault("upcoming_appointment", None)
+    profile.setdefault("past_jobs", [])
+    profile.setdefault("first_name", None)
+    profile.setdefault("last_name", None)
+    profile.setdefault("email", None)
+    profile.setdefault("recognized_first_name", None)
+    profile.setdefault("recognized_last_name", None)
+    profile.setdefault("recognized_email", None)
+    profile.setdefault("active_first_name", None)
+    profile.setdefault("active_last_name", None)
+    profile.setdefault("active_email", None)
+    profile.setdefault("voicemail_first_name", None)
+    profile.setdefault("voicemail_last_name", None)
+    profile.setdefault("known_people", [])
+    profile.setdefault("identity_source", None)
+    profile.setdefault("square_customer_id", None)
+    profile.setdefault("square_lookup_done", False)
+    profile["customer_type"] = "residential"
+
+    sched = conv.setdefault("sched", {})
+    sched.setdefault("pending_step", None)
+    sched.setdefault("scheduled_date", None)
+    sched.setdefault("scheduled_time", None)
+    sched.setdefault("raw_address", None)
+    sched.setdefault("address_candidate", None)
+    sched.setdefault("address_verified", False)
+    sched.setdefault("address_missing", None)
+    sched.setdefault("address_parts", {})
+    sched.setdefault("appointment_type", None)
+    sched.setdefault("booking_created", False)
+    sched.setdefault("normalized_address", None)
+    sched.setdefault("awaiting_emergency_confirm", False)
+    sched.setdefault("emergency_approved", False)
+    sched.setdefault("manual_only", False)
+    sched.setdefault("booking_allowed", True)
+    sched.setdefault("voice_started", True)
+    return conv
+
+
+def build_residential_voicemail_twiml(reason: str = "") -> VoiceResponse:
+    """Existing residential voicemail path, wrapped so voice failover is safe."""
+    response = VoiceResponse()
+    if reason:
+        try:
+            log_event("VOICE_AGENT_FALLBACK_TO_VOICEMAIL", (request.form.get("From") or request.args.get("From") or "").replace("whatsapp:", "").strip(), {"reason": reason, "call_sid": request.form.get("CallSid") or request.args.get("CallSid")})
+        except Exception:
+            pass
+    response.say(
+        '<speak>'
+            '<prosody rate="95%">'
+                'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
+                'Please leave your name, address, and a brief description of what you need help with.<break time="0.6s"/>'
+                'We will text you shortly.'
+            '</prosody>'
+        '</speak>',
+        voice="Polly.Matthew-Neural"
+    )
+    response.record(
+        max_length=60,
+        play_beep=True,
+        trim="do-not-trim",
+        action="/voicemail-complete",
+        method="POST"
+    )
+    response.hangup()
+    return response
+
+
+def build_residential_realtime_twiml(phone: str, call_sid: str) -> VoiceResponse:
+    """TwiML for the live voice assistant after the caller presses 1."""
+    response = VoiceResponse()
+    ready, reason = voice_agent_runtime_ready()
+    if not ready:
+        if PREVOLT_VOICE_AGENT_FAILOVER_TO_VOICEMAIL:
+            return build_residential_voicemail_twiml(reason)
+        response.say("We are not able to start the scheduling assistant right now. Please call back shortly.")
+        response.hangup()
+        return response
+
+    hydrate_voice_conversation(phone, call_sid)
+    response.say(
+        '<speak><prosody rate="98%">'
+        'Connecting you to Prevolt Electric’s scheduling assistant. Calls may be recorded or transcribed to help with scheduling.'
+        '</prosody></speak>',
+        voice="Polly.Matthew-Neural"
+    )
+    connect = response.connect()
+    stream = connect.stream(url=_voice_ws_url("/voice/realtime-media"))
+    try:
+        stream.parameter(name="from", value=phone or "")
+        stream.parameter(name="callSid", value=call_sid or "")
+    except Exception:
+        pass
+    return response
+
+
+def _voice_agent_instructions() -> str:
+    # Keep the live prompt compact. The existing Prevolt OS backend/SRB matrix is
+    # the source of truth for booking logic; the realtime model is the voice layer.
+    return """
+You are Prevolt Electric's scheduling assistant for callers who pressed 1 for residential service.
+Be calm, natural, brief, and receptionist-like. Do not pretend to be a human. Do not say you are an AI unless asked; say you are Prevolt's scheduling assistant.
+Critical rules:
+- Your first goal is to qualify and collect information for scheduling, not diagnose electrical problems.
+- Never give electrical troubleshooting, breaker-flipping, panel-opening, or DIY safety instructions.
+- If the caller describes active fire, smoke filling the home, shock/unconscious person, or water touching energized electrical, tell them to call 911 first and stop scheduling until they confirm it is safe.
+- For normal residential calls, ask only one question at a time.
+- Keep answers short enough for a phone call.
+- After every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
+- When the tool returns reply_to_customer, speak that reply only, converted naturally for voice. Do not add pricing, promises, diagnosis, or appointment confirmations not included in the tool output.
+- If the tool says booking_created is true, tell the caller they are on the schedule and that a confirmation text will be sent.
+- If the caller asks whether you are automated, answer honestly: "This is Prevolt's scheduling assistant. It helps keep appointments organized while our electricians are in the field."
+Opening behavior:
+Start with: "Thanks for calling Prevolt Electric. What town is the work in?"
+""".strip()
+
+
+def _voice_tools_schema() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "name": "prevolt_os_turn",
+            "description": "Run the caller's latest spoken turn through Prevolt OS/SRB scheduling logic and return the exact safe reply to speak.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "caller_text": {
+                        "type": "string",
+                        "description": "The caller's latest spoken words, transcribed as accurately as possible."
+                    }
+                },
+                "required": ["caller_text"]
+            }
+        }
+    ]
+
+
+def _voice_session_update_event() -> dict:
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "model": OPENAI_REALTIME_MODEL,
+            "output_modalities": ["audio", "text"],
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcmu"},
+                    "turn_detection": {
+                        "type": "semantic_vad",
+                        "interrupt_response": True,
+                        "create_response": True,
+                    },
+                },
+                "output": {
+                    "format": {"type": "audio/pcmu"},
+                    "voice": OPENAI_REALTIME_VOICE,
+                },
+            },
+            "instructions": _voice_agent_instructions(),
+            "tools": _voice_tools_schema(),
+            "tool_choice": "auto",
+        },
+    }
+
+
+def _voice_initial_response_event() -> dict:
+    return {
+        "type": "response.create",
+        "response": {
+            "output_modalities": ["audio"],
+            "instructions": "Say exactly: Thanks for calling Prevolt Electric. What town is the work in?",
+        },
+    }
+
+
+def _voice_to_sms_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _voice_naturalize_reply(reply: str) -> str:
+    """Make an SMS-safe SRB reply sound normal on the phone without changing meaning."""
+    text = _voice_to_sms_text(reply)
+    if not text:
+        return "Sorry, can you say that again?"
+    replacements = [
+        (r"^Hi, this is Prevolt Electric\.\s*", ""),
+        (r"^Hi [A-Za-z]+, this is Prevolt Electric\.\s*", ""),
+        (r"\bWhat’s\b", "What's"),
+        (r"\bWe’ll\b", "We'll"),
+        (r"\byou’re\b", "you're"),
+        (r"\bYou’re\b", "You're"),
+        (r"\btext you shortly\b", "send you a confirmation text shortly"),
+        (r"\breply here\b", "tell me"),
+    ]
+    for pat, repl in replacements:
+        text = re.sub(pat, repl, text, flags=re.I)
+    return text.strip()
+
+
+def _voice_maybe_send_booking_sms(phone: str, conv: dict, voice_reply: str) -> None:
+    sched = conv.setdefault("sched", {})
+    if not (sched.get("booking_created") and sched.get("square_booking_id")):
+        return
+    if sched.get("voice_sms_confirmation_sent"):
+        return
+    if not (twilio_client and TWILIO_FROM_NUMBER and phone):
+        return
+    try:
+        msg = twilio_client.messages.create(
+            body=_voice_to_sms_text(voice_reply),
+            from_=TWILIO_FROM_NUMBER,
+            to=phone,
+        )
+        sched["voice_sms_confirmation_sent"] = True
+        sched["voice_sms_confirmation_sid"] = getattr(msg, "sid", None)
+        conv["last_sms_body"] = _voice_to_sms_text(voice_reply)
+        log_event("VOICE_BOOKING_CONFIRMATION_SMS_SENT", phone, {"sid": getattr(msg, "sid", None), "call_sid": conv.get("last_call_sid")}, conv)
+    except Exception as e:
+        sched["voice_sms_confirmation_error"] = repr(e)
+        try:
+            log_event("VOICE_BOOKING_CONFIRMATION_SMS_FAILED", phone, {"error": repr(e)}, conv)
+        except Exception:
+            pass
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    """Run one spoken customer turn through the existing Prevolt OS brain."""
+    phone = (phone or "").replace("whatsapp:", "").strip()
+    conv = hydrate_voice_conversation(phone, call_sid)
+    caller_text = _voice_to_sms_text(caller_text)
+    conv.setdefault("voice_transcript", []).append({"role": "customer", "text": caller_text, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+
+    if not caller_text:
+        return {"reply_to_customer": "Sorry, can you say that again?", "booking_created": False, "manual_only": False}
+
+    # Preserve a cumulative transcript for monitor visibility and initial classification context.
+    previous = conv.get("cleaned_transcript") or ""
+    conv["cleaned_transcript"] = _voice_to_sms_text((previous + "\n" + caller_text).strip())
+
+    sched = conv.setdefault("sched", {})
+    result = None
+    try:
+        with app.test_request_context(
+            "/voice/realtime-media",
+            method="POST",
+            data={
+                "From": phone,
+                "Body": caller_text,
+                "CallSid": call_sid or conv.get("last_call_sid") or "",
+                "MessageSid": f"voice-{uuid.uuid4()}",
+            },
+        ):
+            result = generate_reply_for_inbound(
+                conv.get("cleaned_transcript") or caller_text,
+                conv.get("category"),
+                sched.get("appointment_type") or conv.get("appointment_type"),
+                conv.get("initial_sms") or "",
+                caller_text,
+                sched.get("scheduled_date"),
+                sched.get("scheduled_time"),
+                sched.get("raw_address") or sched.get("address_candidate"),
+            )
+    except Exception as e:
+        try:
+            log_event("VOICE_OS_TURN_ERROR", phone, {"error": repr(e), "trace": traceback.format_exc(limit=4), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+        result = {"sms_body": "Sorry, can you say that again?"}
+
+    reply = _voice_naturalize_reply((result or {}).get("sms_body") or "Sorry, can you say that again?")
+    conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+    conv["last_voice_reply"] = reply
+    booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+    _voice_maybe_send_booking_sms(phone, conv, reply)
+    try:
+        log_event("VOICE_OS_TURN", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "booking_created": booking_created, "call_sid": call_sid}, conv)
+    except Exception:
+        pass
+    return {
+        "reply_to_customer": reply,
+        "booking_created": booking_created,
+        "manual_only": bool(sched.get("manual_only") or conv.get("thread_type") == "manual_only"),
+        "pending_step": sched.get("pending_step"),
+        "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"),
+    }
+
+
+def _extract_twilio_start_payload(start: dict) -> tuple[str, str, str]:
+    custom = start.get("customParameters") or {}
+    phone = (custom.get("from") or custom.get("From") or "").replace("whatsapp:", "").strip()
+    call_sid = custom.get("callSid") or custom.get("CallSid") or start.get("callSid") or ""
+    stream_sid = start.get("streamSid") or ""
+    return phone, call_sid, stream_sid
+
+
+def _send_openai_event(openai_ws, event: dict) -> None:
+    openai_ws.send(json.dumps(event))
+
+
+def _send_twilio_media(twilio_ws, stream_sid: str, payload: str) -> None:
+    if not (stream_sid and payload):
+        return
+    twilio_ws.send(json.dumps({"event": "media", "streamSid": stream_sid, "media": {"payload": payload}}))
+
+
+def _send_twilio_clear(twilio_ws, stream_sid: str) -> None:
+    if not stream_sid:
+        return
+    try:
+        twilio_ws.send(json.dumps({"event": "clear", "streamSid": stream_sid}))
+    except Exception:
+        pass
+
+
+def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: dict) -> bool:
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return False
+    name = item.get("name") or ""
+    if name != "prevolt_os_turn":
+        return False
+    call_id = item.get("call_id") or item.get("id") or ""
+    try:
+        args = json.loads(item.get("arguments") or "{}")
+    except Exception:
+        args = {}
+    output = process_prevolt_voice_turn(phone, call_sid, args.get("caller_text") or "")
+    _send_openai_event(openai_ws, {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": json.dumps(output),
+        },
+    })
+    _send_openai_event(openai_ws, {
+        "type": "response.create",
+        "response": {
+            "output_modalities": ["audio"],
+            "instructions": "Speak only the reply_to_customer from the tool output. Do not add anything else.",
+        },
+    })
+    return True
+
+
+if sock is not None:
+    @sock.route("/voice/realtime-media")
+    def voice_realtime_media(ws):
+        """Bidirectional bridge: Twilio Media Streams <-> OpenAI Realtime."""
+        openai_ws = None
+        stream_sid = ""
+        phone = ""
+        call_sid = ""
+        started_at = time.time()
+        try:
+            ready, reason = voice_agent_runtime_ready()
+            if not ready:
+                try:
+                    log_event("VOICE_WS_REJECTED", "", {"reason": reason})
+                except Exception:
+                    pass
+                return
+
+            # Twilio sends a start message first. Wait for it before asking
+            # OpenAI to speak, otherwise the first greeting audio can race ahead
+            # before we have a streamSid to send media back to Twilio.
+            first_raw = ws.receive(timeout=10)
+            if not first_raw:
+                try:
+                    log_event("VOICE_START_TIMEOUT", "", {"reason": "no_twilio_start"})
+                except Exception:
+                    pass
+                return
+            first_msg = json.loads(first_raw)
+            if first_msg.get("event") != "start":
+                try:
+                    log_event("VOICE_START_UNEXPECTED", "", {"event": first_msg})
+                except Exception:
+                    pass
+                return
+            phone, call_sid, stream_sid = _extract_twilio_start_payload(first_msg.get("start") or {})
+            hydrate_voice_conversation(phone, call_sid)
+            try:
+                log_event("VOICE_STREAM_STARTED", phone, {"call_sid": call_sid, "stream_sid": stream_sid, "model": OPENAI_REALTIME_MODEL, "voice": OPENAI_REALTIME_VOICE})
+            except Exception:
+                pass
+
+            openai_ws = websocket_client.create_connection(
+                f"{OPENAI_REALTIME_WS_URL}?model={OPENAI_REALTIME_MODEL}",
+                header=[
+                    f"Authorization: Bearer {OPENAI_API_KEY}",
+                    "OpenAI-Beta: realtime=v1",
+                ],
+                timeout=10,
+            )
+            try:
+                # Use the timeout only for connect; after the call starts, an
+                # otherwise healthy phone conversation can have long silences.
+                openai_ws.settimeout(None)
+            except Exception:
+                pass
+            _send_openai_event(openai_ws, _voice_session_update_event())
+            _send_openai_event(openai_ws, _voice_initial_response_event())
+
+            stop_flag = {"stop": False}
+
+            def openai_to_twilio():
+                nonlocal stream_sid, phone, call_sid
+                while not stop_flag["stop"]:
+                    try:
+                        message = openai_ws.recv()
+                        if not message:
+                            break
+                        event = json.loads(message)
+                        etype = event.get("type")
+                        if etype in {"response.output_audio.delta", "response.audio.delta"}:
+                            _send_twilio_media(ws, stream_sid, event.get("delta") or "")
+                        elif etype == "input_audio_buffer.speech_started":
+                            _send_twilio_clear(ws, stream_sid)
+                        elif etype == "response.done":
+                            output = ((event.get("response") or {}).get("output") or [])
+                            for item in output:
+                                _handle_realtime_function_call(openai_ws, phone, call_sid, item)
+                        elif etype == "response.output_item.done":
+                            _handle_realtime_function_call(openai_ws, phone, call_sid, event.get("item") or {})
+                        elif etype in {"error", "invalid_request_error"}:
+                            try:
+                                log_event("VOICE_OPENAI_ERROR", phone, {"event": event, "call_sid": call_sid})
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        if not stop_flag["stop"]:
+                            try:
+                                log_event("VOICE_OPENAI_RECV_ERROR", phone, {"error": repr(e), "call_sid": call_sid})
+                            except Exception:
+                                pass
+                        break
+
+            t = threading.Thread(target=openai_to_twilio, daemon=True)
+            t.start()
+
+            while True:
+                if time.time() - started_at > VOICE_AGENT_MAX_SECONDS:
+                    try:
+                        log_event("VOICE_MAX_DURATION_REACHED", phone, {"call_sid": call_sid, "stream_sid": stream_sid})
+                    except Exception:
+                        pass
+                    break
+                raw = ws.receive(timeout=VOICE_AGENT_IDLE_SECONDS)
+                if raw is None:
+                    try:
+                        log_event("VOICE_IDLE_TIMEOUT", phone, {"call_sid": call_sid, "stream_sid": stream_sid})
+                    except Exception:
+                        pass
+                    break
+                msg = json.loads(raw)
+                event_type = msg.get("event")
+                if event_type == "start":
+                    # Already handled before connecting to OpenAI. Ignore duplicate start messages.
+                    continue
+                elif event_type == "media":
+                    payload = ((msg.get("media") or {}).get("payload") or "")
+                    if payload:
+                        _send_openai_event(openai_ws, {"type": "input_audio_buffer.append", "audio": payload})
+                elif event_type == "stop":
+                    try:
+                        log_event("VOICE_STREAM_STOPPED", phone, {"call_sid": call_sid, "stream_sid": stream_sid})
+                    except Exception:
+                        pass
+                    break
+        except Exception as e:
+            try:
+                log_event("VOICE_WS_FATAL", phone, {"error": repr(e), "trace": traceback.format_exc(limit=6), "call_sid": call_sid, "stream_sid": stream_sid})
+            except Exception:
+                pass
+        finally:
+            try:
+                stop_flag["stop"] = True
+            except Exception:
+                pass
+            try:
+                if openai_ws:
+                    openai_ws.close()
+            except Exception:
+                pass
+
 
 MONITOR_DB_PATH = os.environ.get("PREVOLT_MONITOR_DB_PATH", "/tmp/prevolt_monitor.db")
 
@@ -2562,27 +3096,11 @@ def handle_call_selection():
     if digit == "1":
         profile["customer_type"] = "residential"
 
-        response.say(
-            '<speak>'
-                '<prosody rate="95%">'
-                    'Welcome to PREE-volt Electric’s premium residential service desk.<break time="0.7s"/>'
-                    'Please leave your name, address, and a brief description of what you need help with.<break time="0.6s"/>'
-                    'We will text you shortly.'
-                '</prosody>'
-            '</speak>',
-            voice="Polly.Matthew-Neural"
-        )
-
-        response.record(
-            max_length=60,
-            play_beep=True,
-            trim="do-not-trim",
-            action="/voicemail-complete",
-            method="POST"
-        )
-
-        response.hangup()
-        return Response(str(response), mimetype="text/xml")
+        # Production voice path: keep the IVR robot filter, then start live
+        # voice only after option 1. If the voice runtime is not ready or the
+        # env flag is off, fail closed to the existing voicemail/SMS flow.
+        realtime_response = build_residential_realtime_twiml(phone, call_sid)
+        return Response(str(realtime_response), mimetype="text/xml")
 
     # -----------------------------
     # OPTION 2 → COMMERCIAL / GOV
@@ -8546,6 +9064,19 @@ def maybe_create_square_booking(phone: str, convo: dict):
 def monitor_health():
     return {"ok": True}, 200
 
+
+@app.route("/monitor/voice-health", methods=["GET"])
+def monitor_voice_health():
+    ready, reason = voice_agent_runtime_ready()
+    return {
+        "ok": bool(ready),
+        "reason": reason,
+        "enabled": PREVOLT_VOICE_AGENT_ENABLED,
+        "flask_sock": Sock is not None,
+        "websocket_client": websocket_client is not None,
+        "model": OPENAI_REALTIME_MODEL,
+        "voice": OPENAI_REALTIME_VOICE,
+    }, (200 if ready else 503)
 
 
 # ---------------------------------------------------
