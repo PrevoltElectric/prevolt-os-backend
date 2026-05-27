@@ -1906,6 +1906,8 @@ Critical rules:
 - Keep replies short enough for a phone call. No paragraphs.
 - Do not say filler phrases like "let me check", "let me lock that in", "one moment", or "hold on" before the tool returns.
 - Do not wait for the caller to say okay or thanks before asking the next required scheduling question.
+- If the caller confirms an address you just read from file, do not ask for the address again; continue to dispatch confirmation or the next missing booking detail.
+- If the caller asks what the emergency troubleshoot and repair visit covers, answer once, then ask if they want dispatch. If they say yes, okay, or let's do it, proceed; do not repeat the same dispatch question.
 - Do not say phrases that only make sense in SMS, including: "by text", "reply here", "I'll help you here by text", "I can help you right here by text", or "text thread".
 - For every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
 - Never answer directly from your own wording after the caller speaks. Always call the prevolt_os_turn tool first, then speak only reply_to_customer. It has already been converted into phone language.
@@ -2023,6 +2025,254 @@ def _voice_looks_like_live_person_demand(text: str) -> bool:
     ])
 
 
+
+
+def _voice_last_reply_text(conv: dict) -> str:
+    return str((conv or {}).get("last_voice_reply") or "")
+
+
+def _voice_last_reply_was_known_address_confirm(conv: dict) -> bool:
+    low = _intent_text(_voice_last_reply_text(conv))
+    if not low:
+        return False
+    return (
+        ("on file" in low and "is this for that address" in low)
+        or ("just to confirm" in low and ("youre at" in low or "you're at" in low))
+        or (("youre at" in low or "you're at" in low) and ("right" in low or "correct" in low))
+    )
+
+
+def _voice_extract_address_from_last_reply(conv: dict) -> str | None:
+    """Recover a known/saved address that the voice assistant just asked the caller to confirm."""
+    prompt = _voice_last_reply_text(conv)
+    candidates: list[str] = []
+    for pattern in [
+        r"I have\s+(.+?)\s+on file\.",
+        r"you(?:'|’)?re at\s+(.+?)(?:,?\s+right\??|,?\s+correct\??|\?|$)",
+        r"confirm,\s+you(?:'|’)?re at\s+(.+?)(?:,?\s+right\??|,?\s+correct\??|\?|$)",
+    ]:
+        m = re.search(pattern, prompt, flags=re.I)
+        if m:
+            candidates.append(m.group(1).strip(" ,.?"))
+    try:
+        extracted = extract_service_address_from_text(prompt)
+        if extracted:
+            candidates.append(extracted)
+    except Exception:
+        pass
+    try:
+        profile = conv.setdefault("profile", {})
+        best = _best_saved_address(profile)
+        if best:
+            candidates.append(best)
+    except Exception:
+        pass
+    for c in candidates:
+        c = _voice_to_sms_text(c).strip(" ,.")
+        if c and _address_has_house_number_and_street(c):
+            return c
+    return candidates[0].strip(" ,.") if candidates else None
+
+
+def _voice_force_verified_address(conv: dict, address_text: str) -> bool:
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    raw = _voice_to_sms_text(address_text).strip(" ,.")
+    if not raw:
+        return False
+    try:
+        set_raw_address_safe(sched, raw)
+    except Exception:
+        sched["raw_address"] = raw
+    sched["address_candidate"] = sched.get("raw_address") or raw
+    try:
+        result = normalize_address(sched.get("raw_address") or raw)
+        if isinstance(result, tuple) and len(result) >= 2:
+            status, addr_struct = result[0], result[1]
+            if status == "ok" and isinstance(addr_struct, dict):
+                sched["normalized_address"] = addr_struct
+        elif isinstance(result, dict):
+            sched["normalized_address"] = result
+    except Exception:
+        pass
+    try:
+        update_address_assembly_state(sched)
+    except Exception:
+        pass
+    # Customer explicitly confirmed the address we read back. Trust that confirmation
+    # even if Google parsing is imperfect; otherwise the voice flow loops back to address collection.
+    sched["address_verified"] = True
+    sched["address_missing"] = None
+    if (sched.get("pending_step") or "") == "need_address":
+        sched["pending_step"] = None
+    try:
+        profile.setdefault("addresses", [])
+        if raw not in profile["addresses"]:
+            profile["addresses"].append(raw)
+    except Exception:
+        pass
+    try:
+        recompute_pending_step(profile, sched)
+    except Exception:
+        pass
+    return True
+
+
+def _voice_known_address_confirm_fast_path(conv: dict, caller_text: str) -> str | None:
+    """If caller says yes to an address-on-file confirmation, do not ask for address again."""
+    try:
+        is_yes = yes_text(caller_text) or _intent_text(caller_text) in {"yes", "yeah", "yep", "yup", "correct", "right", "that's right", "thats right"}
+    except Exception:
+        is_yes = _intent_text(caller_text) in {"yes", "yeah", "yep", "yup", "correct", "right", "that's right", "thats right"}
+    if not is_yes or not _voice_last_reply_was_known_address_confirm(conv):
+        return None
+    addr = _voice_extract_address_from_last_reply(conv)
+    if not addr:
+        return None
+    if not _voice_force_verified_address(conv, addr):
+        return None
+    sched = conv.setdefault("sched", {})
+    # Emergency/hazard jobs should proceed to the dispatch confirmation, not loop back to address.
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+    if "TROUBLESHOOT" in appt or sched.get("awaiting_emergency_confirm"):
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        sched["awaiting_emergency_confirm"] = True
+        return _voice_naturalize_reply(
+            "This looks urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
+        )
+    try:
+        nxt = choose_next_prompt_from_state(conv, inbound_text="")
+        if nxt:
+            return _voice_naturalize_reply(nxt)
+    except Exception:
+        pass
+    return "Got it. What day and time works best?"
+
+
+def _voice_last_reply_requested_emergency_dispatch(conv: dict) -> bool:
+    low = _intent_text(_voice_last_reply_text(conv))
+    return bool(
+        "dispatch someone now" in low
+        or ("troubleshoot and repair" in low and "$395" in low)
+        or ("this looks urgent" in low and "send someone" in low)
+    )
+
+
+def _voice_is_emergency_coverage_question(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return any(p in low for p in [
+        "what does that cover", "what's that cover", "what does it cover", "what is included",
+        "what's included", "what am i paying", "what do i get", "what does the 395 cover",
+        "what does $395 cover", "what is the 395", "what is that charge",
+    ])
+
+
+def _voice_is_dispatch_confirmation(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return any(p in low for p in [
+        "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "let's do it", "lets do it",
+        "do it", "send them", "send someone", "dispatch", "send him", "send her", "book it", "schedule it"
+    ])
+
+
+def _voice_set_emergency_dispatch_slot(sched: dict) -> None:
+    try:
+        tz = ZoneInfo("America/New_York")
+    except Exception:
+        tz = timezone(timedelta(hours=-5))
+    now_local = datetime.now(tz)
+    dispatch_dt = now_local + timedelta(hours=1)
+    minute = dispatch_dt.minute
+    if minute == 0:
+        rounded_dt = dispatch_dt.replace(second=0, microsecond=0)
+    elif minute <= 30:
+        rounded_dt = dispatch_dt.replace(minute=30, second=0, microsecond=0)
+    else:
+        rounded_dt = (dispatch_dt + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    sched["emergency_approved"] = True
+    sched["awaiting_emergency_confirm"] = False
+    sched["appointment_type"] = "TROUBLESHOOT_395"
+    sched["scheduled_date"] = rounded_dt.strftime("%Y-%m-%d")
+    sched["scheduled_time"] = rounded_dt.strftime("%H:%M")
+    sched["scheduled_time_source"] = "voice_emergency_dispatch_confirm"
+    sched["pending_step"] = None
+    sched["price_disclosed"] = True
+    sched["booking_attempt_nonce"] = str(uuid.uuid4())
+
+
+def _voice_emergency_dispatch_fast_path(phone: str, conv: dict, caller_text: str) -> str | None:
+    """Handle emergency coverage questions and dispatch acceptance without re-asking the dispatch prompt."""
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+    emergency_context = bool("TROUBLESHOOT" in appt or sched.get("awaiting_emergency_confirm") or _voice_last_reply_requested_emergency_dispatch(conv))
+    if not emergency_context:
+        return None
+
+    if _voice_is_emergency_coverage_question(caller_text):
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        sched["awaiting_emergency_confirm"] = True
+        sched["price_disclosed"] = True
+        return (
+            "The emergency troubleshoot and repair visit covers sending one of our electricians out, "
+            "checking the issue in person, making sure the area is safe, diagnosing the problem, "
+            "and completing the repair during the visit when it can be handled right away. "
+            "If anything larger is needed, we'll explain the next step before moving forward. "
+            "Do you want us to dispatch someone now?"
+        )
+
+    if not _voice_is_dispatch_confirmation(caller_text):
+        return None
+
+    if not sched.get("address_verified"):
+        sched["awaiting_emergency_confirm"] = True
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        return "Got it. What's the address for the work?"
+
+    _voice_set_emergency_dispatch_slot(sched)
+    conv["appointment_type"] = "TROUBLESHOOT_395"
+    try:
+        recompute_pending_step(profile, sched)
+    except Exception:
+        pass
+
+    # If identity is still missing, keep moving toward booking instead of repeating dispatch confirmation.
+    if not ((get_active_first_name(profile) and get_active_last_name(profile)) or profile.get("square_customer_id")):
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        return "Got it. What's your first and last name?"
+
+    try:
+        booking_attempt = maybe_create_square_booking(phone, conv)
+    except Exception as e:
+        try:
+            log_event("VOICE_EMERGENCY_BOOKING_FAST_PATH_ERROR", phone, {"error": repr(e)}, conv)
+        except Exception:
+            pass
+        booking_attempt = {"status": "exception"}
+
+    if sched.get("booking_created") and sched.get("square_booking_id"):
+        sched["voice_close_after_reply"] = True
+        sched["voice_booking_completed_close"] = True
+        return _voice_finalize_booking_reply(conv, "")
+
+    status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
+    if status == "missing_identity":
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        return "Got it. What's your first and last name?"
+    if status in {"address_not_verified", "missing_address", "address_normalization_failed", "address_incomplete"}:
+        sched["pending_step"] = "need_address"
+        return "Got it. What's the full address for the work?"
+    return "Got it. I'm going to send a text so we can finish the emergency dispatch details cleanly."
+
 def _voice_naturalize_reply(reply: str) -> str:
     """Make an SMS-safe SRB reply sound normal on the phone without changing meaning."""
     text = _voice_to_sms_text(reply)
@@ -2048,6 +2298,11 @@ def _voice_naturalize_reply(reply: str) -> str:
         (r"\bWhat is your first and last name\??", "What's your first and last name?"),
         (r"\bWe can definitely take care of this\.\s*", "Got it. "),
         (r"\bLet me check the scheduling details for that\.?", ""),
+        (r"\bLet me think this through for scheduling\.?", ""),
+        (r"\bSure, let me check what(?:\'|’)s included for that visit\.?", ""),
+        (r"\bAll right, let me get this dispatch set up for you\.?", "Got it."),
+        (r"\bOkay, thanks for that detail\.?", "Got it."),
+        (r"\bLet me get the next scheduling step ready\.?", ""),
         (r"\bLet me check what details are still needed to finish the booking\.?", ""),
         (r"\bLet me check the details for that [A-Za-z]+ slot\.?", "Got it."),
         (r"\bLet me get that time set for you and finish the booking details\.?", "Got it."),
@@ -2617,6 +2872,52 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     sched["voice_customer_turn_count"] = int(sched.get("voice_customer_turn_count") or 0) + 1
     if len(caller_text.strip()) >= 4:
         sched["voice_meaningful_customer_turns"] = int(sched.get("voice_meaningful_customer_turns") or 0) + 1
+
+    # If we just asked the caller to confirm a saved/on-file address and they say yes,
+    # trust that confirmation and move forward. Do not ask for the address again.
+    try:
+        address_confirm_reply = _voice_known_address_confirm_fast_path(conv, caller_text)
+    except Exception as e:
+        address_confirm_reply = None
+        try:
+            log_event("VOICE_ADDRESS_CONFIRM_FAST_PATH_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+    if address_confirm_reply:
+        address_confirm_reply = _voice_naturalize_reply(address_confirm_reply)
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": address_confirm_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        conv["last_voice_reply"] = address_confirm_reply
+        try:
+            log_event("VOICE_ADDRESS_CONFIRM_FAST_PATH", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(address_confirm_reply), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": address_confirm_reply, "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")), "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": bool(sched.get("voice_close_after_reply"))}
+
+    # Emergency dispatch acceptance/coverage is a special voice path. Once the customer
+    # says yes/okay/let's do it, do not repeat the $395 dispatch question.
+    try:
+        emergency_fast_reply = _voice_emergency_dispatch_fast_path(phone, conv, caller_text)
+    except Exception as e:
+        emergency_fast_reply = None
+        try:
+            log_event("VOICE_EMERGENCY_FAST_PATH_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+    if emergency_fast_reply:
+        emergency_fast_reply = _voice_naturalize_reply(emergency_fast_reply)
+        booking_created_fast = bool(sched.get("booking_created") and sched.get("square_booking_id"))
+        if booking_created_fast:
+            emergency_fast_reply = _voice_finalize_booking_reply(conv, emergency_fast_reply)
+            sched["voice_close_after_reply"] = True
+            sched["voice_booking_completed_close"] = True
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": emergency_fast_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        conv["last_voice_reply"] = emergency_fast_reply
+        _voice_maybe_send_booking_sms(phone, conv, emergency_fast_reply)
+        try:
+            log_event("VOICE_EMERGENCY_FAST_PATH", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(emergency_fast_reply), "booking_created": booking_created_fast, "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": emergency_fast_reply, "booking_created": booking_created_fast, "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": bool(sched.get("voice_close_after_reply"))}
 
     # If we are waiting for a missing name, handle a one-word last-name reply
     # directly. This prevents loops like: "Prevost" -> "what is your last name?".
