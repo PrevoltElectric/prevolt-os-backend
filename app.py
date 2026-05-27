@@ -100,10 +100,12 @@ PREVOLT_VOICE_AGENT_ENABLED = _env_bool("PREVOLT_VOICE_AGENT_ENABLED", False)
 PREVOLT_VOICE_AGENT_FAILOVER_TO_VOICEMAIL = _env_bool("PREVOLT_VOICE_AGENT_FAILOVER_TO_VOICEMAIL", True)
 PREVOLT_PUBLIC_BASE_URL = (os.environ.get("PREVOLT_PUBLIC_BASE_URL") or "").strip().rstrip("/")
 OPENAI_REALTIME_MODEL = (os.environ.get("OPENAI_REALTIME_MODEL") or "gpt-realtime").strip()
-OPENAI_REALTIME_VOICE = (os.environ.get("OPENAI_REALTIME_VOICE") or "marin").strip()
+OPENAI_REALTIME_VOICE = (os.environ.get("OPENAI_REALTIME_VOICE") or "echo").strip()
 OPENAI_REALTIME_WS_URL = (os.environ.get("OPENAI_REALTIME_WS_URL") or "wss://api.openai.com/v1/realtime").strip()
-VOICE_AGENT_MAX_SECONDS = int(os.environ.get("VOICE_AGENT_MAX_SECONDS") or "540")
-VOICE_AGENT_IDLE_SECONDS = int(os.environ.get("VOICE_AGENT_IDLE_SECONDS") or "35")
+VOICE_AGENT_MAX_SECONDS = int(os.environ.get("VOICE_AGENT_MAX_SECONDS") or "300")
+VOICE_AGENT_IDLE_SECONDS = int(os.environ.get("VOICE_AGENT_IDLE_SECONDS") or "30")
+VOICE_AGENT_MAX_CUSTOMER_TURNS = int(os.environ.get("VOICE_AGENT_MAX_CUSTOMER_TURNS") or "6")
+VOICE_AGENT_HANGUP_SMS_ENABLED = _env_bool("VOICE_AGENT_HANGUP_SMS_ENABLED", True)
 
 RULES_FILE = os.environ.get("PREVOLT_RULES_FILE") or os.environ.get("PREVOLT_RULES_PATH")
 
@@ -1818,6 +1820,11 @@ def hydrate_voice_conversation(phone: str, call_sid: str = "") -> dict:
     sched.setdefault("manual_only", False)
     sched.setdefault("booking_allowed", True)
     sched.setdefault("voice_started", True)
+    sched.setdefault("voice_customer_turn_count", 0)
+    sched.setdefault("voice_meaningful_customer_turns", 0)
+    sched.setdefault("voice_intro_sms_sent", False)
+    sched.setdefault("voice_close_after_reply", False)
+    sched.setdefault("voice_drag_handoff_sent", False)
     return conv
 
 
@@ -1864,7 +1871,7 @@ def build_residential_realtime_twiml(phone: str, call_sid: str) -> VoiceResponse
     hydrate_voice_conversation(phone, call_sid)
     response.say(
         '<speak><prosody rate="98%">'
-        'Connecting you to Prevolt Electric’s scheduling assistant. Calls may be recorded or transcribed to help with scheduling.'
+        'Connecting you to Prevolt Electric’s scheduling assistant. This call may be recorded to help with scheduling.'
         '</prosody></speak>',
         voice="Polly.Matthew-Neural"
     )
@@ -1885,13 +1892,15 @@ def _voice_agent_instructions() -> str:
 You are Prevolt Electric's scheduling assistant for callers who pressed 1 for residential service.
 Be calm, natural, brief, and receptionist-like. Do not pretend to be a human. Do not say you are an AI unless asked; say you are Prevolt's scheduling assistant.
 Critical rules:
-- Your first goal is to qualify and collect information for scheduling, not diagnose electrical problems.
+- Your job is to collect scheduling information, not diagnose electrical problems.
 - Never give electrical troubleshooting, breaker-flipping, panel-opening, or DIY safety instructions.
 - If the caller describes active fire, smoke filling the home, shock/unconscious person, or water touching energized electrical, tell them to call 911 first and stop scheduling until they confirm it is safe.
-- For normal residential calls, ask only one question at a time.
-- Keep answers short enough for a phone call.
-- After every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
-- When the tool returns reply_to_customer, speak that reply only, converted naturally for voice. Do not add pricing, promises, diagnosis, or appointment confirmations not included in the tool output.
+- Ask one question at a time.
+- Keep replies short enough for a phone call. No paragraphs.
+- Do not say phrases that only make sense in SMS, including: "by text", "reply here", "I'll help you here by text", "I can help you right here by text", or "text thread".
+- For every caller utterance that contains scheduling details, job details, address, name, email, price objection, service-area issue, or safety information, call the prevolt_os_turn tool before answering.
+- When the tool returns reply_to_customer, speak only that reply_to_customer. It has already been converted into phone language.
+- If the tool returns end_call=true, speak the reply_to_customer, then stop the call naturally.
 - If the tool says booking_created is true, tell the caller they are on the schedule and that a confirmation text will be sent.
 - If the caller asks whether you are automated, answer honestly: "This is Prevolt's scheduling assistant. It helps keep appointments organized while our electricians are in the field."
 Opening behavior:
@@ -1962,20 +1971,102 @@ def _voice_naturalize_reply(reply: str) -> str:
     text = _voice_to_sms_text(reply)
     if not text:
         return "Sorry, can you say that again?"
+
+    # Remove/rewrite SMS-only openers. The SMS system is still the source of
+    # truth, but phone language cannot say "I'll help you here by text" out loud.
+    text = re.sub(r"^\s*(hello|hi|hey)[, ]+(?:[A-Za-z]+[, ]+)?(?:this is|you(?:'|’)ve reached)\s+Prevolt Electric\.\s*", "", text, flags=re.I)
+    text = re.sub(r"\bI\s+can\s+help\s+you\s+right\s+here\s+by\s+text\.?", "I can help get this started.", text, flags=re.I)
+    text = re.sub(r"\bI(?:'|’)ll\s+help\s+you\s+here\s+by\s+text\.?", "I can help get this scheduled.", text, flags=re.I)
+    text = re.sub(r"\bwe\s+can\s+help\s+you\s+right\s+here\s+by\s+text\.?", "we can help get this started.", text, flags=re.I)
+    text = re.sub(r"\bright\s+here\s+by\s+text\b", "right here", text, flags=re.I)
+    text = re.sub(r"\bhere\s+by\s+text\b", "here", text, flags=re.I)
+
     replacements = [
-        (r"^Hi, this is Prevolt Electric\.\s*", ""),
-        (r"^Hi [A-Za-z]+, this is Prevolt Electric\.\s*", ""),
+        (r"\breply here\b", "tell me"),
+        (r"\breply with\b", "tell me"),
+        (r"\bsend over\b", "tell me"),
+        (r"\btext you shortly\b", "send you a confirmation text shortly"),
+        (r"\bWe will text you shortly\b", "We'll send you a confirmation text shortly"),
+        (r"\bWe'll text you shortly\b", "We'll send you a confirmation text shortly"),
+        (r"\bwhat(?:'|’)s the address for the visit\b", "what's the address for the work"),
+        (r"\bfor the visit\b", "for the work"),
         (r"\bWhat’s\b", "What's"),
         (r"\bWe’ll\b", "We'll"),
         (r"\byou’re\b", "you're"),
         (r"\bYou’re\b", "You're"),
-        (r"\btext you shortly\b", "send you a confirmation text shortly"),
-        (r"\breply here\b", "tell me"),
     ]
     for pat, repl in replacements:
         text = re.sub(pat, repl, text, flags=re.I)
-    return text.strip()
 
+    # Collapse awkward intro leftovers.
+    text = re.sub(r"^\s*(I can help get this started\.|I can help get this scheduled\.)\s*(I can help get this started\.|I can help get this scheduled\.)", r"\1", text, flags=re.I)
+    text = re.sub(r"^\s*(Perfect|Sounds good|Alright|Okay)\.\s*(Perfect|Sounds good|Alright|Okay)\.\s*", r"\1. ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # If the SMS intro got prepended to the first real question, keep the
+    # conversational question and drop the text-only branding.
+    low = _intent_text(text)
+    if "what town is the work in" in low and ("help get this" in low or "prevolt electric" in low):
+        return "What town is the work in?"
+    if len(text) > 320:
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        text = " ".join(parts[:2]).strip()
+    return text or "Sorry, can you say that again?"
+
+
+def _voice_intro_sms_body() -> str:
+    return "Hello, this is Prevolt Electric. I can help you right here by text. What town is the work in, and what electrical issue are you looking to schedule?"
+
+
+def _voice_send_intro_sms_if_abandoned(phone: str, conv: dict, reason: str = "") -> None:
+    """If option 1 connected but the caller hung up before giving details, keep the current SMS intake alive."""
+    if not VOICE_AGENT_HANGUP_SMS_ENABLED:
+        return
+    if not phone or not (twilio_client and TWILIO_FROM_NUMBER):
+        return
+    sched = conv.setdefault("sched", {})
+    if sched.get("voice_intro_sms_sent") or sched.get("booking_created") or sched.get("manual_only"):
+        return
+    if int(sched.get("voice_meaningful_customer_turns") or 0) > 0:
+        return
+    try:
+        body = _voice_intro_sms_body()
+        msg = twilio_client.messages.create(body=body, from_=TWILIO_FROM_NUMBER, to=phone)
+        sched["voice_intro_sms_sent"] = True
+        sched["voice_intro_sms_reason"] = reason
+        conv["last_sms_body"] = body
+        log_event("VOICE_ABANDONED_INTRO_SMS_SENT", phone, {"sid": getattr(msg, "sid", None), "reason": reason, "call_sid": conv.get("last_call_sid")}, conv)
+    except Exception as e:
+        sched["voice_intro_sms_error"] = repr(e)
+        try:
+            log_event("VOICE_ABANDONED_INTRO_SMS_FAILED", phone, {"error": repr(e), "reason": reason}, conv)
+        except Exception:
+            pass
+
+
+def _voice_handoff_sms_body() -> str:
+    return "This is Prevolt Electric. To keep this moving, reply here with the town, address for the work, and a quick description of the electrical issue."
+
+
+def _voice_send_drag_handoff_sms(phone: str, conv: dict, reason: str = "") -> None:
+    if not phone or not (twilio_client and TWILIO_FROM_NUMBER):
+        return
+    sched = conv.setdefault("sched", {})
+    if sched.get("voice_drag_handoff_sent"):
+        return
+    try:
+        body = _voice_handoff_sms_body()
+        msg = twilio_client.messages.create(body=body, from_=TWILIO_FROM_NUMBER, to=phone)
+        sched["voice_drag_handoff_sent"] = True
+        sched["voice_drag_handoff_reason"] = reason
+        conv["last_sms_body"] = body
+        log_event("VOICE_DRAG_HANDOFF_SMS_SENT", phone, {"sid": getattr(msg, "sid", None), "reason": reason, "call_sid": conv.get("last_call_sid")}, conv)
+    except Exception as e:
+        sched["voice_drag_handoff_error"] = repr(e)
+        try:
+            log_event("VOICE_DRAG_HANDOFF_SMS_FAILED", phone, {"error": repr(e), "reason": reason}, conv)
+        except Exception:
+            pass
 
 def _voice_maybe_send_booking_sms(phone: str, conv: dict, voice_reply: str) -> None:
     sched = conv.setdefault("sched", {})
@@ -2011,7 +2102,21 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     conv.setdefault("voice_transcript", []).append({"role": "customer", "text": caller_text, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
 
     if not caller_text:
-        return {"reply_to_customer": "Sorry, can you say that again?", "booking_created": False, "manual_only": False}
+        return {"reply_to_customer": "Sorry, can you say that again?", "booking_created": False, "manual_only": False, "end_call": False}
+
+    sched = conv.setdefault("sched", {})
+    sched["voice_customer_turn_count"] = int(sched.get("voice_customer_turn_count") or 0) + 1
+    if len(caller_text.strip()) >= 4:
+        sched["voice_meaningful_customer_turns"] = int(sched.get("voice_meaningful_customer_turns") or 0) + 1
+
+    # If the call is dragging, move it back to SMS instead of letting the agent
+    # burn minutes or frustrate the customer.
+    if int(sched.get("voice_customer_turn_count") or 0) > VOICE_AGENT_MAX_CUSTOMER_TURNS and not sched.get("booking_created"):
+        sched["voice_close_after_reply"] = True
+        _voice_send_drag_handoff_sms(phone, conv, "max_customer_turns")
+        reply = "I’m going to send you a text so we can keep this moving cleanly. Please reply there with the address and what you need help with."
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "end_call": True}
 
     # Preserve a cumulative transcript for monitor visibility and initial classification context.
     previous = conv.get("cleaned_transcript") or ""
@@ -2062,6 +2167,7 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         "manual_only": bool(sched.get("manual_only") or conv.get("thread_type") == "manual_only"),
         "pending_step": sched.get("pending_step"),
         "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"),
+        "end_call": bool(sched.get("voice_close_after_reply")),
     }
 
 
@@ -2174,6 +2280,11 @@ def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: d
     except Exception:
         args = {}
     output = process_prevolt_voice_turn(phone, call_sid, args.get("caller_text") or "")
+    if output.get("end_call"):
+        try:
+            hydrate_voice_conversation(phone, call_sid).setdefault("sched", {})["voice_close_after_reply"] = True
+        except Exception:
+            pass
     _send_openai_event(openai_ws, {
         "type": "conversation.item.create",
         "item": {
@@ -2292,6 +2403,18 @@ if sock is not None:
                             output = ((event.get("response") or {}).get("output") or [])
                             for item in output:
                                 _handle_realtime_function_call(openai_ws, phone, call_sid, item)
+                            try:
+                                conv_local = hydrate_voice_conversation(phone, call_sid)
+                                if conv_local.setdefault("sched", {}).get("voice_close_after_reply"):
+                                    time.sleep(0.8)
+                                    stop_flag["stop"] = True
+                                    try:
+                                        ws.close()
+                                    except Exception:
+                                        pass
+                                    break
+                            except Exception:
+                                pass
                         elif etype == "response.output_item.done":
                             _handle_realtime_function_call(openai_ws, phone, call_sid, event.get("item") or {})
                         elif etype in {"error", "invalid_request_error"}:
@@ -2314,6 +2437,9 @@ if sock is not None:
             while True:
                 if time.time() - started_at > VOICE_AGENT_MAX_SECONDS:
                     try:
+                        conv = hydrate_voice_conversation(phone, call_sid)
+                        conv.setdefault("sched", {})["voice_close_after_reply"] = True
+                        _voice_send_drag_handoff_sms(phone, conv, "max_duration")
                         log_event("VOICE_MAX_DURATION_REACHED", phone, {"call_sid": call_sid, "stream_sid": stream_sid})
                     except Exception:
                         pass
@@ -2321,6 +2447,8 @@ if sock is not None:
                 raw = ws.receive(timeout=VOICE_AGENT_IDLE_SECONDS)
                 if raw is None:
                     try:
+                        conv = hydrate_voice_conversation(phone, call_sid)
+                        _voice_send_intro_sms_if_abandoned(phone, conv, "idle_timeout_no_customer_details")
                         log_event("VOICE_IDLE_TIMEOUT", phone, {"call_sid": call_sid, "stream_sid": stream_sid})
                     except Exception:
                         pass
@@ -2336,12 +2464,17 @@ if sock is not None:
                         _send_openai_event(openai_ws, {"type": "input_audio_buffer.append", "audio": payload})
                 elif event_type == "stop":
                     try:
+                        conv = hydrate_voice_conversation(phone, call_sid)
+                        _voice_send_intro_sms_if_abandoned(phone, conv, "caller_hung_up")
                         log_event("VOICE_STREAM_STOPPED", phone, {"call_sid": call_sid, "stream_sid": stream_sid})
                     except Exception:
                         pass
                     break
         except Exception as e:
             try:
+                conv = hydrate_voice_conversation(phone, call_sid) if (phone or call_sid) else {}
+                if phone and conv:
+                    _voice_send_intro_sms_if_abandoned(phone, conv, "voice_ws_fatal")
                 log_event("VOICE_WS_FATAL", phone, {"error": repr(e), "trace": traceback.format_exc(limit=6), "call_sid": call_sid, "stream_sid": stream_sid})
             except Exception:
                 pass
