@@ -2144,24 +2144,46 @@ if sock is not None:
                     pass
                 return
 
-            # Twilio sends a start message first. Wait for it before asking
-            # OpenAI to speak, otherwise the first greeting audio can race ahead
-            # before we have a streamSid to send media back to Twilio.
-            first_raw = ws.receive(timeout=10)
-            if not first_raw:
-                try:
-                    log_event("VOICE_START_TIMEOUT", "", {"reason": "no_twilio_start"})
-                except Exception:
-                    pass
-                return
-            first_msg = json.loads(first_raw)
-            if first_msg.get("event") != "start":
+            # Twilio Media Streams sends a `connected` message first, then the
+            # `start` message with streamSid/customParameters. Do not reject the
+            # initial connected event or the call will immediately hang up.
+            start_msg = None
+            start_deadline = time.time() + 10
+            while time.time() < start_deadline:
+                remaining = max(1, int(start_deadline - time.time()))
+                first_raw = ws.receive(timeout=remaining)
+                if not first_raw:
+                    continue
+                first_msg = json.loads(first_raw)
+                first_event = first_msg.get("event")
+                if first_event == "connected":
+                    try:
+                        log_event("VOICE_TWILIO_CONNECTED", "", {"event": first_msg})
+                    except Exception:
+                        pass
+                    continue
+                if first_event == "start":
+                    start_msg = first_msg
+                    break
+                if first_event == "stop":
+                    try:
+                        log_event("VOICE_STREAM_STOPPED_BEFORE_START", "", {"event": first_msg})
+                    except Exception:
+                        pass
+                    return
                 try:
                     log_event("VOICE_START_UNEXPECTED", "", {"event": first_msg})
                 except Exception:
                     pass
+
+            if not start_msg:
+                try:
+                    log_event("VOICE_START_TIMEOUT", "", {"reason": "no_twilio_start_after_connected"})
+                except Exception:
+                    pass
                 return
-            phone, call_sid, stream_sid = _extract_twilio_start_payload(first_msg.get("start") or {})
+
+            phone, call_sid, stream_sid = _extract_twilio_start_payload(start_msg.get("start") or {})
             hydrate_voice_conversation(phone, call_sid)
             try:
                 log_event("VOICE_STREAM_STARTED", phone, {"call_sid": call_sid, "stream_sid": stream_sid, "model": OPENAI_REALTIME_MODEL, "voice": OPENAI_REALTIME_VOICE})
@@ -2172,7 +2194,7 @@ if sock is not None:
                 f"{OPENAI_REALTIME_WS_URL}?model={OPENAI_REALTIME_MODEL}",
                 header=[
                     f"Authorization: Bearer {OPENAI_API_KEY}",
-                    "OpenAI-Beta: realtime=v1",
+                    "OpenAI-Safety-Identifier: prevolt-os-phone-agent",
                 ],
                 timeout=10,
             )
