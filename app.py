@@ -11446,3 +11446,283 @@ def monitor_conversation_note():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+# ---------------------------------------------------
+# Voice Agent v26 hardening overrides
+# Appended after v25 so process_prevolt_voice_turn resolves these globals at runtime.
+# ---------------------------------------------------
+
+def _voice_looks_like_true_hazard(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    # Smoke detector / smoke alarm installation or replacement is ordinary evaluation work,
+    # not an active smoke/fire emergency.
+    if re.search(r"\b(?:smoke|co|carbon monoxide)\s+(?:detector|alarm)s?\b", low) and re.search(r"\b(?:install|installed|replace|replaced|change|changed|hardwire|quote|estimate)\b", low):
+        return False
+    hazard_terms = [
+        r"smoke\s+(?:coming|pouring|from|out|filling)", r"started\s+smoking", r"caught\s+fire", r"active\s+fire",
+        r"burning\s+(?:smell|odor)", r"smells?\s+like\s+smoke", r"burnt\s+(?:wire|outlet|breaker|panel)",
+        r"hot\s+to\s+the\s+touch", r"hot\s+(?:outlet|panel|breaker|device|plug)",
+        r"sparking|sparks|arcing|melted", r"panel\s+is\s+hot", r"outlet\s+is\s+hot",
+        r"no\s+power", r"partial\s+outage", r"half\s+the\s+house\s+has\s+no\s+power",
+        r"breaker\s+(?:won'?t|will\s+not|keeps?)\s+(?:reset|tripping)",
+        r"water\s+(?:in|inside|got\s+into|leaking\s+into)\s+(?:the\s+)?(?:panel|breaker|electrical)",
+        r"(?:panel|breaker|electrical)\s+(?:is\s+)?wet", r"flood(?:ing)?\s+(?:near|around)\s+(?:outlets?|panel|electrical)",
+        r"service\s+(?:drop|entrance)\s+(?:ripped|torn|down)", r"meter\s+(?:socket\s+)?(?:ripped|damaged)",
+        r"power\s+line\s+down", r"tree\s+ripped\s+wires", r"ev\s+charger\s+(?:plug\s+)?melted",
+    ]
+    return any(re.search(p, low, flags=re.I) for p in hazard_terms)
+
+
+def _voice_looks_like_multiple_addresses(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return bool(
+        re.search(r"\b(?:multiple|several|different|many|various|four|three|two|five|couple|few|5|4|3|2)\s+(?:different\s+)?(?:rental\s+)?(?:addresses|properties|units|apartments|locations|houses|buildings|condos)\b", low)
+        or re.search(r"\b(?:a\s+couple|a\s+few)\s+(?:of\s+)?(?:apartments|properties|rentals|units|addresses|locations|houses|buildings)\b", low)
+        or re.search(r"\b(?:several|multiple)\s+(?:rental\s+)?(?:properties|apartments|units|addresses|locations|buildings)\b", low)
+        or "more than one address" in low
+        or "multiple addresses" in low
+        or "different addresses" in low
+        or "i have four" in low
+        or "i have several" in low
+        or "rental properties" in low and any(x in low for x in ["several", "multiple", "couple", "few", "two", "three", "four", "5", "4", "3", "2"])
+    )
+
+
+def _voice_looks_like_live_person_demand(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return any(p in low for p in [
+        "speak to a person", "speak to a human", "speak with a person", "speak with a human",
+        "talk to a person", "talk to a human", "talk with a person", "talk with a human",
+        "real person", "live person", "human being", "representative", "operator", "customer service", "live rep", "service rep",
+        "connect me to someone", "transfer me", "get someone on the phone", "i want a person", "i need a person",
+        "i want to talk to someone", "i need to talk to someone", "call me back", "call me", "can kyle call", "have kyle call",
+    ])
+
+
+def _voice_yes_no_text(text: str) -> str | None:
+    low = _intent_text(text)
+    if not low:
+        return None
+    yes_exact = {"yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "right", "fine", "yes please", "absolutely", "sounds good", "that works", "works for me"}
+    if low in yes_exact or any(p in low for p in [
+        "that works", "works for me", "go ahead", "let's do it", "lets do it", "let s do it", "book it", "schedule it",
+        "move forward", "move ahead", "send someone", "dispatch", "yes please", "sounds good", "that is fine", "that's fine", "sure thing"
+    ]):
+        return "yes"
+    no_exact = {"no", "nope", "nah", "no thanks", "not interested", "pass"}
+    if low in no_exact or any(p in low for p in [
+        "too much", "i'll pass", "ill pass", "not interested", "no thanks", "doesn't work", "does not work", "free quote",
+        "i don't pay", "i dont pay", "do not pay", "won't pay", "wont pay", "no charge", "free estimate"
+    ]):
+        return "no"
+    return None
+
+
+def v13_extract_email(text: str) -> str | None:
+    raw = str(text or "").strip()
+    m = re.search(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", raw, flags=re.I)
+    if m:
+        return m.group(1).strip()
+    # Speech transcripts often produce "name at gmail dot com".
+    spoken = raw.lower()
+    spoken = re.sub(r"\s+at\s+", "@", spoken)
+    spoken = re.sub(r"\s+dot\s+", ".", spoken)
+    spoken = re.sub(r"\s+", "", spoken)
+    m = re.search(r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})", spoken, flags=re.I)
+    return m.group(1).strip() if m else None
+
+
+def _voice_remove_filler_sentences(text: str) -> str:
+    t = _voice_to_sms_text(text)
+    if not t:
+        return t
+    # Remove full internal-process narration sentences before applying original-style cleanup.
+    filler_patterns = [
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*that sounds (?:serious|urgent|dangerous)\.\s*Let me [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)m going to focus on safety [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let(?:'|’)s focus on immediate safety [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me check what we still need [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me check [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I'll just clarify [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)ll just clarify [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*One moment [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Thanks for hanging on [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)ll move ahead [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)ll get dispatch started [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me move ahead [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me set up [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me get [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*The scheduling system [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)m gonna route [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I'm going to route [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*Let me respond [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*with scheduling in mind [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I(?:'|’)m noting [^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Got it|Alright|Sure)?,?\s*I'll confirm the plan [^.?!]*(?:[.?!]|$)",
+    ]
+    for pat in filler_patterns:
+        t = re.sub(pat, "", t, flags=re.I)
+    sentences = re.split(r"(?<=[.!?])\s+", t.strip())
+    out=[]; urgent_seen=False
+    for sent in sentences:
+        low=_intent_text(sent)
+        if any(x in low for x in ["sounds urgent", "sounds serious", "sounds dangerous", "looks urgent"]):
+            if urgent_seen:
+                continue
+            urgent_seen=True
+        if low in {"okay", "ok", "got it", "all right", "alright", "sure", "thanks", "thank you"}:
+            continue
+        if any(x in low for x in ["let me think", "let me check", "one moment", "scheduling system", "move ahead", "thanks for hanging on", "finish booking"]):
+            continue
+        out.append(sent.strip())
+    return re.sub(r"\s+", " ", " ".join(out)).strip()
+
+# ---------------------------------------------------
+# Voice Agent v27 chaos-test hardening overrides
+# ---------------------------------------------------
+
+def _voice_yes_no_text(text: str) -> str | None:
+    low = _intent_text(text)
+    raw = str(text or "").lower()
+    if not low and not raw:
+        return None
+    yes_exact = {"yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "right", "fine", "yes please", "absolutely", "sounds good", "that works", "works for me"}
+    yes_phrases = [
+        "that works", "works for me", "go ahead", "let's do it", "lets do it", "let’s do it", "book it", "schedule it",
+        "move forward", "send someone", "dispatch", "yes please", "sounds good", "that is fine", "that's fine", "sure thing", "works", "do it"
+    ]
+    if low in yes_exact or any(p in low for p in yes_phrases) or any(p in raw for p in ["let’s do it", "that’s fine"]):
+        return "yes"
+    no_exact = {"no", "nope", "nah", "no thanks", "not interested", "pass"}
+    no_phrases = [
+        "too much", "i'll pass", "ill pass", "not interested", "no thanks", "doesn't work", "does not work", "free quote",
+        "i don't pay", "i dont pay", "do not pay", "won't pay", "wont pay", "no charge", "free estimate"
+    ]
+    if low in no_exact or any(p in low for p in no_phrases) or any(p in raw for p in ["don’t pay", "doesn’t work", "won’t pay"]):
+        return "no"
+    return None
+
+
+def _voice_looks_like_live_person_demand(text: str) -> bool:
+    low = _intent_text(text)
+    raw = str(text or "").lower()
+    if not low and not raw:
+        return False
+    phrases = [
+        "speak to a person", "speak to a human", "speak with a person", "speak with a human",
+        "talk to a person", "talk to a human", "talk with a person", "talk with a human",
+        "real person", "live person", "human being", "representative", "operator", "customer service", "live rep", "service rep",
+        "connect me to someone", "transfer me", "get someone on the phone", "i want a person", "i need a person",
+        "i want to talk to someone", "i need to talk to someone", "call me back", "call me", "can kyle call", "have kyle call",
+        "do not want a bot", "don't want a bot", "dont want a bot", "do not want ai", "don't want ai", "dont want ai",
+        "not talking to a bot", "not talking to ai", "live agent", "human agent"
+    ]
+    return any(p in low for p in phrases) or any(p in raw for p in ["don’t want a bot", "don’t want ai"])
+
+
+def _voice_looks_like_multiple_addresses(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return bool(
+        re.search(r"\b(?:multiple|several|different|many|various|four|three|two|five|couple|few|5|4|3|2)\s+(?:different\s+)?(?:rental\s+)?(?:addresses|properties|units|apartments|locations|houses|buildings|condos)\b", low)
+        or re.search(r"\b(?:a\s+couple|a\s+few)\s+(?:of\s+)?(?:apartments|properties|rentals|units|addresses|locations|houses|buildings)\b", low)
+        or re.search(r"\b(?:several|multiple)\s+(?:rental\s+)?(?:properties|apartments|units|addresses|locations|buildings)\b", low)
+        or "more than one address" in low
+        or "multiple addresses" in low
+        or "different addresses" in low
+        or "property portfolio" in low
+        or "portfolio" in low and any(w in low for w in ["property", "properties", "rental", "rentals", "addresses"])
+        or "i have four" in low
+        or "i have several" in low
+        or "rental properties" in low and any(x in low for x in ["several", "multiple", "couple", "few", "two", "three", "four", "5", "4", "3", "2"])
+    )
+
+
+def _voice_looks_like_slot_choice_text(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return bool(
+        re.search(r"\b(?:first|second|third|1st|2nd|3rd|option\s*[123]|one|two|three)\b", low)
+        or re.search(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|may\s*28|may\s*29|june\s*1)\b", low)
+        or re.search(r"\b\d{1,2}\s*(?:am|pm|a m|p m)\b", low)
+    )
+
+
+def _voice_eval_price_confirm_fast_path(conv: dict, caller_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    if not sched.get("awaiting_eval_price_confirm"):
+        return None
+    yn = _voice_yes_no_text(caller_text)
+    # Some callers answer the pending slot choice immediately ("the second one", "Thursday")
+    # after hearing/remembering openings. Treat that as price acceptance plus slot selection.
+    if yn != "no" and _voice_looks_like_slot_choice_text(caller_text):
+        sched["awaiting_eval_price_confirm"] = False
+        try:
+            slot_reply = _voice_apply_offered_slot_fast_path(conv, caller_text)
+            if slot_reply:
+                return slot_reply
+        except Exception:
+            pass
+        slots = (sched.get("voice_pending_slot_offer_reply") or "").strip()
+        return slots or "Which one works best for you?"
+    if yn == "no":
+        sched["voice_close_after_reply"] = True
+        sched["closed_reason"] = "declined_eval_price"
+        return "No problem. We won't schedule the visit right now. Thank you for calling Prevolt Electric. Goodbye."
+    if yn != "yes":
+        return "The on-site evaluation visit is $195. Does that work for you?"
+    sched["awaiting_eval_price_confirm"] = False
+    slots = (sched.get("voice_pending_slot_offer_reply") or "").strip()
+    if slots:
+        return slots
+    if sched.get("awaiting_slot_offer_choice") and sched.get("offered_slot_options"):
+        return f"Which one works best for you — {_format_slot_options((sched.get('offered_slot_options') or [])[:3])}?"
+    return "What day and time works best for you?"
+
+# ---------------------------------------------------
+# Voice Agent v28 name pre-capture override
+# ---------------------------------------------------
+_ORIGINAL_PROCESS_PREVOLT_VOICE_TURN_V28 = process_prevolt_voice_turn
+
+def _voice_precapture_name_from_intro(conv: dict, caller_text: str) -> None:
+    profile = conv.setdefault("profile", {})
+    if profile.get("active_first_name"):
+        return
+    raw = str(caller_text or "")
+    patterns = [
+        r"\bmy\s+name\s+is\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+        r"\bthis\s+is\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+        r"\bit(?:'|’)s\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+        r"\bi\s+am\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+        r"\bi(?:'|’)m\s+([A-Za-z][A-Za-z'\-]+)(?:\s+([A-Za-z][A-Za-z'\-]+))?\b",
+    ]
+    stop = {"and", "calling", "looking", "from", "in", "with", "for", "need", "have", "we", "i"}
+    for pat in patterns:
+        m = re.search(pat, raw, flags=re.I)
+        if not m:
+            continue
+        first = (m.group(1) or "").strip().title()
+        last = (m.group(2) or "").strip().title()
+        if first and first.lower() not in stop:
+            profile["active_first_name"] = first
+            profile["first_name"] = first
+            profile["name_source"] = "voice_intro_precapture"
+        if last and last.lower() not in stop:
+            profile["active_last_name"] = last
+            profile["last_name"] = last
+        return
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    conv = hydrate_voice_conversation((phone or "").replace("whatsapp:", "").strip(), call_sid)
+    try:
+        _voice_precapture_name_from_intro(conv, caller_text)
+    except Exception:
+        pass
+    return _ORIGINAL_PROCESS_PREVOLT_VOICE_TURN_V28(phone, call_sid, caller_text)
