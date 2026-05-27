@@ -2252,8 +2252,34 @@ def _voice_is_dispatch_confirmation(text: str) -> bool:
         return False
     return any(p in low for p in [
         "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "let's do it", "lets do it",
-        "do it", "send them", "send someone", "dispatch", "send him", "send her", "book it", "schedule it"
+        "do it", "send them", "send someone", "dispatch", "send him", "send her", "book it", "schedule it",
+        "let's move forward", "lets move forward", "come out", "send somebody", "send an electrician"
     ])
+
+
+def _voice_transcript_has_urgent_dispatch_context(conv: dict) -> bool:
+    """True when the live-call context is clearly an emergency/hazard dispatch thread.
+
+    This keeps follow-up replies like "okay" or "what does that include" anchored
+    to the emergency dispatch question even if the realtime model inserted filler or
+    the last spoken reply was not stored exactly.
+    """
+    sched = (conv or {}).setdefault("sched", {})
+    appt = (sched.get("appointment_type") or (conv or {}).get("appointment_type") or "").upper()
+    if "TROUBLESHOOT" in appt or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
+        return True
+    haystack = _intent_text(
+        (conv or {}).get("cleaned_transcript"),
+        (conv or {}).get("initial_sms"),
+        (conv or {}).get("last_voice_reply"),
+        (conv or {}).get("last_sms_body"),
+    )
+    urgent_terms = [
+        "smoke", "smoking", "fire", "caught fire", "hot to the touch", "hot panel",
+        "burning", "burnt", "sparking", "spark", "arcing", "electrical panel",
+        "panel", "as soon as possible", "asap", "right away", "urgent", "emergency",
+    ]
+    return any(term in haystack for term in urgent_terms) and any(term in haystack for term in ["smoke", "fire", "hot", "burning", "spark", "panel", "urgent", "as soon as possible", "asap"])
 
 
 def _voice_set_emergency_dispatch_slot(sched: dict) -> None:
@@ -2286,7 +2312,7 @@ def _voice_emergency_dispatch_fast_path(phone: str, conv: dict, caller_text: str
     sched = conv.setdefault("sched", {})
     profile = conv.setdefault("profile", {})
     appt = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-    emergency_context = bool("TROUBLESHOOT" in appt or sched.get("awaiting_emergency_confirm") or _voice_last_reply_requested_emergency_dispatch(conv))
+    emergency_context = bool("TROUBLESHOOT" in appt or sched.get("awaiting_emergency_confirm") or _voice_last_reply_requested_emergency_dispatch(conv) or _voice_transcript_has_urgent_dispatch_context(conv))
     if not emergency_context:
         return None
 
@@ -2297,10 +2323,10 @@ def _voice_emergency_dispatch_fast_path(phone: str, conv: dict, caller_text: str
         sched["price_disclosed"] = True
         return (
             "The emergency troubleshoot and repair visit covers sending one of our electricians out, "
-            "checking the issue in person, making sure the area is safe, diagnosing the problem, "
+            "checking the issue in person, making the area safe, diagnosing the problem, "
             "and completing the repair during the visit when it can be handled right away. "
             "If anything larger is needed, we'll explain the next step before moving forward. "
-            "Do you want us to dispatch someone now?"
+            "Should we dispatch someone now?"
         )
 
     if not _voice_is_dispatch_confirmation(caller_text):
@@ -2314,6 +2340,11 @@ def _voice_emergency_dispatch_fast_path(phone: str, conv: dict, caller_text: str
 
     _voice_set_emergency_dispatch_slot(sched)
     conv["appointment_type"] = "TROUBLESHOOT_395"
+    # Once the caller has approved emergency dispatch, the dispatch question is complete.
+    # Do not let downstream SRB logic ask the same dispatch question again.
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = True
+    sched["price_disclosed"] = True
     try:
         recompute_pending_step(profile, sched)
     except Exception:
@@ -2340,6 +2371,14 @@ def _voice_emergency_dispatch_fast_path(phone: str, conv: dict, caller_text: str
         return _voice_finalize_booking_reply(conv, "")
 
     status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
+    if status in {"created", "success", "booked"} or (isinstance(booking_attempt, dict) and booking_attempt.get("booking_id")):
+        sched["booking_created"] = True
+        if isinstance(booking_attempt, dict) and booking_attempt.get("booking_id"):
+            sched["square_booking_id"] = booking_attempt.get("booking_id")
+        sched["voice_close_after_reply"] = True
+        sched["voice_booking_completed_close"] = True
+        return _voice_finalize_booking_reply(conv, "")
+
     if status == "missing_identity":
         sched["pending_step"] = "need_name"
         sched["state"] = "waiting_for_name"
@@ -2377,6 +2416,12 @@ def _voice_naturalize_reply(reply: str) -> str:
         (r"\bLet me think this through for scheduling\.?", ""),
         (r"\bSure, let me check what(?:\'|’)s included for that visit\.?", ""),
         (r"\bAll right, let me get this dispatch set up for you\.?", "Got it."),
+        (r"\bI(?:'|’)m going to get the right safety first next step for this\.?", "This sounds urgent."),
+        (r"\bOkay, let(?:'|’)s keep this safe and get the next step lined up\.?", "Got it."),
+        (r"\bLet me quickly explain what that visit[^.?!]*[.?!]?", ""),
+        (r"\bThanks for hanging on\.\s*I(?:'|’)m still waiting for the exact coverage details to come through\.?", ""),
+        (r"\bSure, let me quickly explain what that visit[^.?!]*[.?!]?", ""),
+        (r"\bGot it\.\s*Let(?:'|’)s move ahead with the next scheduling step now\.?", "Got it."),
         (r"\bOkay, thanks for that detail\.?", "Got it."),
         (r"\bLet me get the next scheduling step ready\.?", ""),
         (r"\bLet me check what details are still needed to finish the booking\.?", ""),
@@ -2680,8 +2725,16 @@ def _voice_format_scheduled_slot_from_state(conv: dict) -> str:
 def _voice_finalize_booking_reply(conv: dict, reply: str) -> str:
     """Force a clean live-call closing after Square booking creation."""
     slot = _voice_format_scheduled_slot_from_state(conv)
+    sched = (conv or {}).setdefault("sched", {})
+    appt = (sched.get("appointment_type") or (conv or {}).get("appointment_type") or "").upper()
     # Prefer a consistent spoken ending over backend/SMS phrasing variants.
     # Include goodbye because the WebSocket will close after this response finishes.
+    if "TROUBLESHOOT" in appt or sched.get("emergency_approved"):
+        return (
+            f"You're all set. We have you on the schedule for emergency dispatch at {slot}. "
+            "You'll receive a confirmation text shortly. "
+            "Thank you for calling Prevolt Electric. Goodbye."
+        )
     return (
         f"You're all set. We have you on the schedule for {slot}. "
         "You'll receive a confirmation text shortly. "
@@ -2971,6 +3024,14 @@ def _voice_email_fast_path(phone: str, conv: dict, caller_text: str) -> str | No
         return _voice_finalize_booking_reply(conv, "")
 
     status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
+    if status in {"created", "success", "booked"} or (isinstance(booking_attempt, dict) and booking_attempt.get("booking_id")):
+        sched["booking_created"] = True
+        if isinstance(booking_attempt, dict) and booking_attempt.get("booking_id"):
+            sched["square_booking_id"] = booking_attempt.get("booking_id")
+        sched["voice_close_after_reply"] = True
+        sched["voice_booking_completed_close"] = True
+        return _voice_finalize_booking_reply(conv, "")
+
     if status == "missing_identity":
         sched["pending_step"] = "need_name"
         sched["state"] = "waiting_for_name"
@@ -3481,7 +3542,8 @@ def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: d
             "output_modalities": ["audio"],
             "tool_choice": "none",
             "instructions": (
-                "Say this exact phone reply, word for word, including every question in it, then stop speaking. "
+                "Say ONLY this exact phone reply, word for word, including every question in it, then stop speaking. "
+                "Do not say anything before it. Do not say you are checking, thinking, waiting, or finishing. "
                 "Speak at a natural medium pace. Do not slow down or add dramatic pauses at commas. "
                 "Do not add any acknowledgement, greeting, filler phrase, or extra question. "
                 "Do not stop after the first clause or first sentence; speak the complete exact reply. "
