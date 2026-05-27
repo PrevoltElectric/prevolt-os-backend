@@ -2080,6 +2080,76 @@ def _extract_twilio_start_payload(start: dict) -> tuple[str, str, str]:
 def _send_openai_event(openai_ws, event: dict) -> None:
     openai_ws.send(json.dumps(event))
 
+def _wait_for_openai_session_updated(openai_ws, phone: str = "", call_sid: str = "", timeout_seconds: int = 8) -> None:
+    """Wait until OpenAI confirms the session update before creating audio output.
+
+    Without this handshake, the first response can be generated using the default
+    PCM audio format. Twilio expects raw mulaw/8000, so default PCM played back
+    through Twilio sounds like loud static.
+    """
+    deadline = time.time() + max(1, int(timeout_seconds or 8))
+    original_timeout_set = False
+    try:
+        while time.time() < deadline:
+            remaining = max(0.5, deadline - time.time())
+            try:
+                openai_ws.settimeout(remaining)
+                original_timeout_set = True
+            except Exception:
+                pass
+            raw = openai_ws.recv()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except Exception:
+                try:
+                    log_event("VOICE_OPENAI_HANDSHAKE_NON_JSON", phone, {"raw": str(raw)[:500], "call_sid": call_sid})
+                except Exception:
+                    pass
+                continue
+
+            etype = event.get("type")
+            if etype == "session.updated":
+                try:
+                    session = event.get("session") or {}
+                    audio = session.get("audio") or {}
+                    log_event("VOICE_OPENAI_SESSION_UPDATED", phone, {
+                        "call_sid": call_sid,
+                        "input_format": (((audio.get("input") or {}).get("format") or {}).get("type")),
+                        "output_format": (((audio.get("output") or {}).get("format") or {}).get("type")),
+                        "voice": ((audio.get("output") or {}).get("voice")),
+                    })
+                except Exception:
+                    pass
+                return
+
+            if etype in {"error", "invalid_request_error"}:
+                try:
+                    log_event("VOICE_OPENAI_SESSION_UPDATE_ERROR", phone, {"event": event, "call_sid": call_sid})
+                except Exception:
+                    pass
+                raise RuntimeError(f"OpenAI rejected session update: {event}")
+
+            # Ignore non-critical early server events, but keep a breadcrumb.
+            try:
+                log_event("VOICE_OPENAI_HANDSHAKE_EVENT", phone, {"type": etype, "call_sid": call_sid})
+            except Exception:
+                pass
+
+        try:
+            log_event("VOICE_OPENAI_SESSION_UPDATE_TIMEOUT", phone, {"call_sid": call_sid})
+        except Exception:
+            pass
+        raise TimeoutError("Timed out waiting for OpenAI session.updated")
+    finally:
+        if original_timeout_set:
+            try:
+                openai_ws.settimeout(None)
+            except Exception:
+                pass
+
+
 
 def _send_twilio_media(twilio_ws, stream_sid: str, payload: str) -> None:
     if not (stream_sid and payload):
@@ -2205,7 +2275,7 @@ if sock is not None:
             except Exception:
                 pass
             _send_openai_event(openai_ws, _voice_session_update_event())
-            _send_openai_event(openai_ws, _voice_initial_response_event())
+            _wait_for_openai_session_updated(openai_ws, phone, call_sid, timeout_seconds=8)
 
             stop_flag = {"stop": False}
 
@@ -2243,6 +2313,7 @@ if sock is not None:
 
             t = threading.Thread(target=openai_to_twilio, daemon=True)
             t.start()
+            _send_openai_event(openai_ws, _voice_initial_response_event())
 
             while True:
                 if time.time() - started_at > VOICE_AGENT_MAX_SECONDS:
