@@ -5,6 +5,7 @@ import time
 import uuid
 import re
 import random
+import math
 import base64
 import threading
 import traceback
@@ -108,8 +109,8 @@ VOICE_AGENT_MAX_CUSTOMER_TURNS = int(os.environ.get("VOICE_AGENT_MAX_CUSTOMER_TU
 VOICE_AGENT_HANGUP_SMS_ENABLED = _env_bool("VOICE_AGENT_HANGUP_SMS_ENABLED", True)
 VOICE_AGENT_THINKING_SOUND_ENABLED = _env_bool("VOICE_AGENT_THINKING_SOUND_ENABLED", True)
 VOICE_AGENT_THINKING_SOUND_MS = int(os.environ.get("VOICE_AGENT_THINKING_SOUND_MS") or "650")
-VOICE_AGENT_VAD_SILENCE_MS = int(os.environ.get("VOICE_AGENT_VAD_SILENCE_MS") or "450")
-VOICE_AGENT_VAD_THRESHOLD = float(os.environ.get("VOICE_AGENT_VAD_THRESHOLD") or "0.45")
+VOICE_AGENT_VAD_SILENCE_MS = int(os.environ.get("VOICE_AGENT_VAD_SILENCE_MS") or "300")
+VOICE_AGENT_VAD_THRESHOLD = float(os.environ.get("VOICE_AGENT_VAD_THRESHOLD") or "0.35")
 
 RULES_FILE = os.environ.get("PREVOLT_RULES_FILE") or os.environ.get("PREVOLT_RULES_PATH")
 
@@ -1875,7 +1876,7 @@ def build_residential_realtime_twiml(phone: str, call_sid: str) -> VoiceResponse
     hydrate_voice_conversation(phone, call_sid)
     response.say(
         '<speak><prosody rate="98%">'
-        "You have reached Pre-volt Electric's automated scheduling assistant. "
+        "You have reached Pree-volt Electric&apos;s automated scheduling assistant. "
         'This call may be recorded to help with scheduling. '
         "In a couple of words, please tell us why you're calling today."
         '</prosody></speak>',
@@ -1901,7 +1902,7 @@ Critical rules:
 - Your job is to collect scheduling information, not diagnose electrical problems.
 - Never give electrical troubleshooting, breaker-flipping, panel-opening, or DIY safety instructions.
 - If the caller describes active fire, smoke filling the home, shock/unconscious person, or water touching energized electrical, tell them to call 911 first and stop scheduling until they confirm it is safe.
-- Ask one question at a time.
+- Ask one question at a time. Do not ask for the phone number; caller ID already provides it.
 - Keep replies short enough for a phone call. No paragraphs.
 - Do not say filler phrases like "let me check", "let me lock that in", "one moment", or "hold on" before the tool returns.
 - Do not wait for the caller to say okay or thanks before asking the next required scheduling question.
@@ -1949,7 +1950,14 @@ def _voice_session_update_event() -> dict:
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad", "threshold": VOICE_AGENT_VAD_THRESHOLD, "prefix_padding_ms": 200, "silence_duration_ms": VOICE_AGENT_VAD_SILENCE_MS},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": VOICE_AGENT_VAD_THRESHOLD,
+                        "prefix_padding_ms": 120,
+                        "silence_duration_ms": VOICE_AGENT_VAD_SILENCE_MS,
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
@@ -2051,6 +2059,14 @@ def _voice_naturalize_reply(reply: str) -> str:
     ]
     for pat, repl in replacements:
         text = re.sub(pat, repl, text, flags=re.I)
+
+    # Voice-specific cleanup: do not prefix name questions with the first name;
+    # phone TTS creates an awkward long pause after the comma. Also never ask
+    # for the phone number on a live call when Twilio already supplied caller ID.
+    text = re.sub(r"^\s*[A-Z][A-Za-z'\-]{1,24},\s*(?:what(?:'| is|’s)? your last name\??)", "What's your last name?", text, flags=re.I)
+    text = re.sub(r"\bWhat is your last name\??", "What's your last name?", text, flags=re.I)
+    text = re.sub(r"\bWhat is the best phone number to reach you about the appointment\??", "What's the best email address for the appointment?", text, flags=re.I)
+    text = re.sub(r"\bWhat(?:'|’)?s the best phone number to reach you about the appointment\??", "What's the best email address for the appointment?", text, flags=re.I)
 
     # Collapse awkward intro leftovers.
     text = re.sub(r"^\s*(I can help get this started\.|I can help get this scheduled\.)\s*(I can help get this started\.|I can help get this scheduled\.)", r"\1", text, flags=re.I)
@@ -2293,6 +2309,135 @@ def _voice_apply_offered_slot_fast_path(conv: dict, caller_text: str) -> str | N
             return "Got it. What's your first and last name?"
     return None
 
+
+def _voice_profile_first_name(profile: dict) -> str:
+    return normalize_person_name(
+        profile.get("active_first_name")
+        or profile.get("first_name")
+        or profile.get("recognized_first_name")
+        or profile.get("voicemail_first_name")
+        or ""
+    )
+
+
+def _voice_profile_last_name(profile: dict) -> str:
+    return normalize_person_name(
+        profile.get("active_last_name")
+        or profile.get("last_name")
+        or profile.get("recognized_last_name")
+        or profile.get("voicemail_last_name")
+        or ""
+    )
+
+
+def _voice_extract_name_words(text: str) -> tuple[str, str]:
+    """Extract a first/last name from a short spoken name reply.
+
+    This is intentionally conservative and only runs while the booking state is
+    waiting for a name. It prevents replies like "Prevost" from being sent back
+    through the full SMS engine and repeatedly producing "what is your last name?".
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ("", "")
+    if v13_extract_email(raw) or re.search(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", raw):
+        return ("", "")
+    cleaned = re.sub(r"\b(?:my\s+name\s+is|this\s+is|it\s+is|it's|its|last\s+name\s+is|my\s+last\s+name\s+is|first\s+name\s+is|my\s+first\s+name\s+is)\b", " ", raw, flags=re.I)
+    cleaned = re.sub(r"[^A-Za-z'\- ]", " ", cleaned).strip()
+    words = [normalize_person_name(w) for w in cleaned.split() if normalize_person_name(w)]
+    bad = {
+        "and", "or", "in", "at", "from", "with", "for", "about", "because", "the", "a", "an",
+        "customer", "service", "representative", "operator", "person", "human", "phone", "number",
+        "street", "avenue", "ave", "road", "rd", "drive", "dr", "lane", "ln", "windsor", "locks",
+        "connecticut", "massachusetts", "framingham", "springfield", "enfield", "suffield",
+    }
+    words = [w for w in words if w.lower() not in bad]
+    if not words:
+        return ("", "")
+    if len(words) == 1:
+        return ("", words[0])
+    return (words[0], words[-1])
+
+
+def _voice_has_email(conv: dict) -> bool:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    return bool(profile.get("active_email") or profile.get("email") or sched.get("email"))
+
+
+def _voice_after_name_reply(conv: dict) -> str:
+    """After voice captures the missing name, choose the next spoken prompt."""
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    try:
+        recompute_pending_step(profile, sched)
+    except Exception:
+        pass
+    # Phone number is already known from Twilio caller ID. Do not ask for it.
+    if not _voice_has_email(conv):
+        sched["pending_step"] = "need_email"
+        sched["state"] = "waiting_for_email"
+        return "Thanks. What's the best email address for the appointment?"
+    try:
+        nxt = choose_next_prompt_from_state(conv, inbound_text="")
+        if nxt:
+            return _voice_naturalize_reply(nxt)
+    except Exception:
+        pass
+    return "Thanks. We'll send a confirmation text shortly."
+
+
+def _voice_name_fast_path(conv: dict, caller_text: str) -> str | None:
+    """Handle missing-name replies before they hit the SMS engine.
+
+    In live voice, customers often answer a last-name prompt with only one word
+    such as "Prevost". The SMS name engine expects a fuller text exchange and can
+    loop. This fast path stores that last name and moves to email immediately.
+    """
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    step = (sched.get("pending_step") or "").strip().lower()
+    state = (sched.get("state") or "").strip().lower()
+    name_engine_state = (sched.get("name_engine_state") or "").strip().lower()
+    waiting_for_name = step == "need_name" or state in {"waiting_for_name", "need_name"} or "last_name" in name_engine_state or "name" in name_engine_state
+    if not waiting_for_name:
+        return None
+
+    first_known = _voice_profile_first_name(profile)
+    last_known = _voice_profile_last_name(profile)
+    # If a phone number is spoken while we still need the name, ignore it and ask the actual missing field.
+    if re.search(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", caller_text or "") and not last_known:
+        return "What's your last name?"
+
+    first, last = _voice_extract_name_words(caller_text)
+    if first and not first_known:
+        profile["active_first_name"] = first
+        profile["first_name"] = first
+        first_known = first
+    if last and not last_known:
+        profile["active_last_name"] = last
+        profile["last_name"] = last
+        last_known = last
+    if first_known and last_known:
+        profile["name"] = f"{first_known} {last_known}".strip()
+        sched["name_engine_state"] = None
+        sched["pending_step"] = None
+        try:
+            upsert_known_person(profile, first_name=first_known, last_name=last_known, email=profile.get("active_email") or profile.get("email") or "", square_customer_id=None)
+        except Exception:
+            pass
+        return _voice_after_name_reply(conv)
+    if first_known and not last_known:
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        return "What's your last name?"
+    return None
+
+
+def _voice_reply_asks_for_phone(text: str) -> bool:
+    low = _intent_text(text)
+    return "best phone number" in low or "phone number to reach" in low or "what phone number" in low
+
 def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
     """Run one spoken customer turn through the existing Prevolt OS brain."""
     phone = (phone or "").replace("whatsapp:", "").strip()
@@ -2335,6 +2480,26 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     sched["voice_customer_turn_count"] = int(sched.get("voice_customer_turn_count") or 0) + 1
     if len(caller_text.strip()) >= 4:
         sched["voice_meaningful_customer_turns"] = int(sched.get("voice_meaningful_customer_turns") or 0) + 1
+
+    # If we are waiting for a missing name, handle a one-word last-name reply
+    # directly. This prevents loops like: "Prevost" -> "what is your last name?".
+    try:
+        name_fast_reply = _voice_name_fast_path(conv, caller_text)
+    except Exception as e:
+        name_fast_reply = None
+        try:
+            log_event("VOICE_NAME_FAST_PATH_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+    if name_fast_reply:
+        name_fast_reply = _voice_naturalize_reply(name_fast_reply)
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": name_fast_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+        conv["last_voice_reply"] = name_fast_reply
+        try:
+            log_event("VOICE_NAME_FAST_PATH", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(name_fast_reply), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+        return {"reply_to_customer": name_fast_reply, "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")), "manual_only": bool(sched.get("manual_only")), "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
 
     # Route-level offered-slot handling for voice. This preserves the exact offered time.
     try:
@@ -2398,6 +2563,17 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     except Exception:
         pass
     reply = _voice_naturalize_reply((result or {}).get("sms_body") or "Sorry, can you say that again?")
+    if _voice_reply_asks_for_phone(reply) and phone:
+        profile_local = conv.setdefault("profile", {})
+        if _voice_profile_first_name(profile_local) and _voice_profile_last_name(profile_local):
+            if not _voice_has_email(conv):
+                sched["pending_step"] = "need_email"
+                sched["state"] = "waiting_for_email"
+                reply = "What's the best email address for the appointment?"
+        elif _voice_profile_first_name(profile_local):
+            sched["pending_step"] = "need_name"
+            sched["state"] = "waiting_for_name"
+            reply = "What's your last name?"
     conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
     conv["last_voice_reply"] = reply
     booking_created = bool(sched.get("booking_created") and sched.get("square_booking_id"))
@@ -2513,24 +2689,53 @@ def _send_twilio_clear(twilio_ws, stream_sid: str) -> None:
         pass
 
 
-def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
-    """Return a short, quiet PCMU/8000 processing sound for Twilio Media Streams.
+def _linear16_to_mulaw(sample: int) -> int:
+    """Small local G.711 mu-law encoder so we do not depend on audioop."""
+    sample = max(-32768, min(32767, int(sample)))
+    BIAS = 0x84
+    CLIP = 32635
+    sign = 0x80 if sample < 0 else 0
+    if sample < 0:
+        sample = -sample
+    if sample > CLIP:
+        sample = CLIP
+    sample += BIAS
+    exponent = 7
+    mask = 0x4000
+    while exponent > 0 and not (sample & mask):
+        mask >>= 1
+        exponent -= 1
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    return (~(sign | (exponent << 4) | mantissa)) & 0xFF
 
-    Twilio outbound media must be raw audio/x-mulaw at 8000 Hz, base64 encoded.
-    0xFF is silence in u-law. We insert very short low-frequency ticks separated
-    by silence so the caller hears an intentional soft processing cue, not static.
+
+def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
+    """Return an audible but still subtle PCMU/8000 processing cue.
+
+    Earlier versions logged that the thinking sound was sent, but the tick was
+    too quiet to survive phone compression. This version uses short decaying
+    pop/click bursts with real G.711 mu-law samples. No WAV headers are used.
     """
-    ms = max(120, min(1200, int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 650)))
+    ms = max(300, min(1400, int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 850)))
     total = int(8000 * (ms / 1000.0))
-    data = bytearray([0xFF] * total)
-    # Three very small click groups. Keep them sparse and low duty-cycle.
-    for start_ms in (70, 250, 430):
+    silence = _linear16_to_mulaw(0)
+    data = bytearray([silence] * total)
+
+    # Three audible soft pops with a tiny high-frequency texture after each pop.
+    # This should read as "processing", not as static or speech.
+    tick_starts_ms = (80, 310, 540)
+    for start_ms in tick_starts_ms:
         start = int(8000 * start_ms / 1000.0)
-        if start >= total:
-            continue
-        for i in range(0, min(28, total - start)):
-            # Alternate quiet-ish u-law values to avoid a harsh square blast.
-            data[start + i] = 0xE8 if i % 2 == 0 else 0xFF
+        tick_len = min(int(8000 * 0.075), max(0, total - start))  # 75ms
+        for i in range(tick_len):
+            decay = math.exp(-4.2 * (i / max(1, tick_len)))
+            # A pop transient plus a short tone component, intentionally louder
+            # than previous versions but still far quieter than speech.
+            transient = 9000 if i < 8 else 0
+            tone = int(5200 * decay * math.sin(2 * math.pi * 1150 * (i / 8000.0)))
+            texture = int(1200 * decay * math.sin(2 * math.pi * 2300 * (i / 8000.0)))
+            sample = max(-14000, min(14000, transient + tone + texture))
+            data[start + i] = _linear16_to_mulaw(sample)
     return base64.b64encode(bytes(data)).decode("ascii")
 
 
@@ -2693,7 +2898,10 @@ if sock is not None:
                         elif etype == "input_audio_buffer.speech_started":
                             _send_twilio_clear(ws, stream_sid)
                         elif etype == "input_audio_buffer.speech_stopped":
-                            _send_twilio_thinking_sound(ws, stream_sid, phone, call_sid, "speech_stopped")
+                            # Wait until the backend tool actually starts. Sending
+                            # a cue here and again before tool processing caused
+                            # duplicate buffered sounds and sometimes got swallowed.
+                            pass
                         elif etype == "response.done":
                             output = ((event.get("response") or {}).get("output") or [])
                             for item in output:
