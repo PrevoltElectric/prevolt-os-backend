@@ -11726,3 +11726,375 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     except Exception:
         pass
     return _ORIGINAL_PROCESS_PREVOLT_VOICE_TURN_V28(phone, call_sid, caller_text)
+
+
+# ---------------------------------------------------
+# Voice Agent v29 production hardening overrides
+# Focus: eliminate phone filler, enforce price consent, multiple-address first-location flow,
+# and use Twilio TwiML for the final booked confirmation so the caller hears the goodbye.
+# ---------------------------------------------------
+
+try:
+    # Live callers routinely need more room than 10-16 turns when they ask coverage/price questions
+    # or have multiple addresses. Do not let a low Render env prematurely kill a legitimate call.
+    VOICE_AGENT_MAX_CUSTOMER_TURNS = max(int(VOICE_AGENT_MAX_CUSTOMER_TURNS or 0), 24)
+except Exception:
+    VOICE_AGENT_MAX_CUSTOMER_TURNS = 24
+
+
+def _voice_remove_filler_sentences(text: str) -> str:
+    """Aggressively remove internal process narration from spoken replies.
+
+    The phone assistant should sound like a receptionist asking the next needed
+    question, not like an AI narrating its reasoning. This runs after SRB logic
+    produces the reply, so it does not change the scheduling state.
+    """
+    t = _voice_to_sms_text(text)
+    if not t:
+        return t
+
+    # Remove common internal-process clauses even when they appear mid-reply.
+    filler_patterns = [
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*that sounds (?:serious|urgent|dangerous)\.\s*Let me (?:think|check|respond|look)[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*this sounds (?:urgent|serious|dangerous)\.\s*Let me (?:think|check|respond|look)[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I(?:'|’)m going to focus on safety[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'm going to focus on safety[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let(?:'|’)s focus on immediate safety[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let me check what (?:we|I) still need[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let me check the next detail[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let me check the details[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let me check[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'll just clarify[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I(?:'|’)ll just clarify[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*One moment[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Thanks for hanging on[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I(?:'|’)ll move ahead[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'll move ahead[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I(?:'|’)ll get dispatch started[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'll get dispatch started[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let me move ahead[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let me set up[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let me get[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*The scheduling system[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I(?:'|’)m gonna route[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'm going to route[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Let me respond[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'll confirm the plan[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'll use that email[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'm finalizing[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I'm noting[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*I've got your name[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Next,? I just need[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Thanks for that address[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Thanks for confirming[^.?!]*(?:[.?!]|$)",
+        r"(?:Okay|Ok|Got it|Alright|All right|Sure|Thanks)?,?\s*Perfect\.\s*Thanks[^.?!]*(?:[.?!]|$)",
+    ]
+    for pat in filler_patterns:
+        t = re.sub(pat, "", t, flags=re.I)
+
+    # Sentence-level cleanup: keep one urgent acknowledgement max, remove pure acknowledgements.
+    sentences = re.split(r"(?<=[.!?])\s+", t.strip())
+    out = []
+    urgent_seen = False
+    for sent in sentences:
+        s = sent.strip(" ,")
+        if not s:
+            continue
+        low = _intent_text(s)
+        if not low:
+            continue
+        if any(x in low for x in ["sounds urgent", "sounds serious", "sounds dangerous", "looks urgent", "sounds dangerous"]):
+            if urgent_seen:
+                continue
+            urgent_seen = True
+            # Keep only the short sentence, not any appended reasoning.
+            if low not in {"this sounds urgent", "that sounds urgent", "this looks urgent", "okay that sounds urgent"}:
+                s = "This sounds urgent."
+        if low in {"okay", "ok", "got it", "all right", "alright", "sure", "thanks", "thank you", "perfect"}:
+            continue
+        if any(x in low for x in [
+            "let me think", "let me check", "one moment", "scheduling system", "move ahead",
+            "thanks for hanging on", "finish booking", "finish getting", "last detail", "next detail",
+            "i'll use that email", "i will use that email", "i've got your name", "i have got your name"
+        ]):
+            continue
+        out.append(s)
+    cleaned = re.sub(r"\s+", " ", " ".join(out)).strip()
+    return cleaned or "Sorry, can you say that again?"
+
+
+def _voice_naturalize_reply(reply: str) -> str:
+    text = _voice_remove_filler_sentences(_voice_to_sms_text(reply))
+    if not text:
+        return "Sorry, can you say that again?"
+    # SMS-to-phone wording cleanup.
+    text = re.sub(r"^\s*(hello|hi|hey)[, ]+(?:[A-Za-z]+[, ]+)?(?:this is|you(?:'|’)ve reached)\s+Prevolt Electric\.\s*", "", text, flags=re.I)
+    replacements = [
+        (r"\bI\s+can\s+help\s+you\s+right\s+here\s+by\s+text\.?", "I can help get this started."),
+        (r"\bI(?:'|’)ll\s+help\s+you\s+here\s+by\s+text\.?", "I can help get this scheduled."),
+        (r"\bright\s+here\s+by\s+text\b", "right here"),
+        (r"\breply here\b", "tell me"),
+        (r"\breply with\b", "tell me"),
+        (r"\bsend over\b", "tell me"),
+        (r"\bplease send (?:me )?the house number and street name for the work\.?", "what's the house number and street name for the work?"),
+        (r"\bsend (?:me )?the house number and street name for the work\.?", "what's the house number and street name for the work?"),
+        (r"\bWhat number is it on [^?]+\?", "What's the house number and street name for the work?"),
+        (r"\bWe do charge \$195 for one of our electricians to come out, take a look, and provide you with a quote\.",
+         "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step."),
+        (r"\bWhat is your first and last name\?", "What's your first and last name?"),
+        (r"\bWhat is the best email address for the appointment\?", "What's the best email address for the appointment?"),
+    ]
+    for pat, repl in replacements:
+        text = re.sub(pat, repl, text, flags=re.I)
+    # Prevent double scheduling lead-ins.
+    text = re.sub(r"\bI can help get this scheduled\.\s*I can get your appointment scheduled here\.", "I can get your appointment scheduled here.", text, flags=re.I)
+    text = re.sub(r"\bI can get your appointment scheduled here\.\s*I can get your appointment scheduled here\.", "I can get your appointment scheduled here.", text, flags=re.I)
+    text = _voice_remove_filler_sentences(text)
+    text = _voice_dedupe_consecutive_sentences(text)
+    return re.sub(r"\s+", " ", text).strip() or "Sorry, can you say that again?"
+
+
+def _voice_split_eval_price_and_slots(text: str) -> tuple[str, str | None]:
+    raw = _voice_to_sms_text(text)
+    if not raw or not re.search(r"\$?195\b", raw):
+        return raw, None
+    patterns = [
+        r"\bWhich one works best for you\??\s*.*$",
+        r"\bWe have\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)[^.?!]*(?:\?|\.)?.*$",
+        r"\b(?:The next openings are|Our next openings are)\s+.*$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, raw, flags=re.I | re.S)
+        if m:
+            price = raw[:m.start()].strip(" ,.;")
+            slots = raw[m.start():].strip()
+            return price, slots
+    return raw.strip(), None
+
+
+def _voice_hold_eval_price_for_confirmation(conv: dict, reply: str) -> str:
+    """Always ask for explicit consent after $195 before offering slots."""
+    sched = conv.setdefault("sched", {})
+    if sched.get("awaiting_eval_price_confirm"):
+        return _voice_naturalize_reply(reply)
+    natural = _voice_naturalize_reply(reply)
+    if not re.search(r"\$?195\b", natural or ""):
+        return natural
+    if re.search(r"does that work for you\?", natural, flags=re.I):
+        sched["awaiting_eval_price_confirm"] = True
+        return natural
+    price, slots = _voice_split_eval_price_and_slots(natural)
+    sched["awaiting_eval_price_confirm"] = True
+    if slots:
+        sched["voice_pending_slot_offer_reply"] = _voice_naturalize_reply(slots)
+    price = price.strip(" ,.;")
+    if not price:
+        price = "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step"
+    if not price.endswith(('.', '?', '!')):
+        price += "."
+    return price + " Does that work for you?"
+
+
+def _voice_looks_like_multiple_addresses(text: str) -> bool:
+    low = _intent_text(text)
+    if not low:
+        return False
+    return bool(
+        re.search(r"\b(?:multiple|several|different|many|various|four|three|two|five|six|seven|eight|nine|ten|couple|few|\d+)\s+(?:different\s+)?(?:rental\s+)?(?:addresses|properties|units|apartments|locations|houses|buildings|condos|stores|sites)\b", low)
+        or re.search(r"\b(?:a\s+couple|a\s+few)\s+(?:of\s+)?(?:apartments|properties|rentals|units|addresses|locations|houses|buildings|condos)\b", low)
+        or re.search(r"\b(?:several|multiple|many|various)\s+(?:rental\s+)?(?:properties|apartments|units|addresses|locations|buildings|condos|sites)\b", low)
+        or "more than one address" in low
+        or "multiple addresses" in low
+        or "different addresses" in low
+        or "property portfolio" in low
+        or ("portfolio" in low and any(w in low for w in ["property", "properties", "rental", "rentals", "addresses"]))
+        or ("rental properties" in low and any(x in low for x in ["several", "multiple", "couple", "few", "two", "three", "four", "5", "4", "3", "2"]))
+    )
+
+
+def _voice_multiple_address_reply(conv: dict, caller_text: str) -> str | None:
+    if not _voice_looks_like_multiple_addresses(caller_text):
+        return None
+    sched = conv.setdefault("sched", {})
+    sched["multiple_addresses"] = True
+    sched["pending_step"] = "need_address"
+    sched["state"] = "waiting_for_address"
+    return (
+        "We can start with the first address and get that visit scheduled. "
+        "The $195 evaluation applies to the first location, and we can handle additional addresses after that. "
+        "What's the first address for the work?"
+    )
+
+
+def _voice_call_update_with_final_twiml(call_sid: str, reply: str, phone: str = "") -> bool:
+    """Use Twilio itself to play the final confirmation and hang up.
+
+    This avoids the recurring bug where the booking is created and the SMS is sent,
+    but the realtime audio stream closes before the caller hears the final booked
+    confirmation. Twilio owns this final Say/Hangup step.
+    """
+    if not (twilio_client and call_sid and reply):
+        return False
+    try:
+        vr = VoiceResponse()
+        vr.say(_voice_to_sms_text(reply), voice="Polly.Matthew-Neural")
+        vr.hangup()
+        twilio_client.calls(call_sid).update(twiml=str(vr))
+        try:
+            log_event("VOICE_FINAL_TWIML_UPDATE_SENT", phone, {"call_sid": call_sid, "reply": _safe_monitor_text(reply, 500)})
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        try:
+            log_event("VOICE_FINAL_TWIML_UPDATE_FAILED", phone, {"call_sid": call_sid, "error": repr(e), "reply": _safe_monitor_text(reply, 500)})
+        except Exception:
+            pass
+        return False
+
+
+_ORIGINAL_PROCESS_PREVOLT_VOICE_TURN_V29 = process_prevolt_voice_turn
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    conv = hydrate_voice_conversation((phone or "").replace("whatsapp:", "").strip(), call_sid)
+    sched = conv.setdefault("sched", {})
+    # Highest-priority deterministic multi-address handler. Do this before the
+    # generic SRB address gate can loop on "what's the house number".
+    try:
+        multi = _voice_multiple_address_reply(conv, caller_text)
+        if multi:
+            multi = _voice_naturalize_reply(multi)
+            conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": multi, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+            conv["last_voice_reply"] = multi
+            try:
+                log_event("VOICE_MULTIPLE_ADDRESS_FAST_PATH_V29", phone, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(multi), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return {"reply_to_customer": multi, "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_MULTIPLE_ADDRESS_FAST_PATH_ERROR_V29", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+
+    output = _ORIGINAL_PROCESS_PREVOLT_VOICE_TURN_V29(phone, call_sid, caller_text)
+    try:
+        reply = str(output.get("reply_to_customer") or "")
+        # Remove backend/openai-style filler one last time and force the $195 consent question.
+        if reply:
+            reply = _voice_naturalize_reply(reply)
+            if not output.get("booking_created") and not output.get("end_call"):
+                reply = _voice_hold_eval_price_for_confirmation(conv, reply)
+            output["reply_to_customer"] = reply
+            conv["last_voice_reply"] = reply
+        # If this turn created a booking, force our clean final phrase every time.
+        if bool(conv.setdefault("sched", {}).get("booking_created") and conv.setdefault("sched", {}).get("square_booking_id")):
+            final_reply = _voice_finalize_booking_reply(conv, "")
+            output["reply_to_customer"] = final_reply
+            output["booking_created"] = True
+            output["end_call"] = True
+            conv["last_voice_reply"] = final_reply
+            conv.setdefault("sched", {})["voice_close_after_reply"] = True
+            conv.setdefault("sched", {})["voice_booking_completed_close"] = True
+    except Exception as e:
+        try:
+            log_event("VOICE_POSTPROCESS_ERROR_V29", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+    return output
+
+
+_ORIGINAL_HANDLE_REALTIME_FUNCTION_CALL_V29 = _handle_realtime_function_call
+
+def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: dict, handled_call_ids: set | None = None, twilio_ws=None, stream_sid: str = "") -> bool:
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return False
+    name = item.get("name") or ""
+    if name != "prevolt_os_turn":
+        return False
+    call_id = item.get("call_id") or item.get("id") or ""
+    if handled_call_ids is not None and call_id:
+        if call_id in handled_call_ids:
+            return True
+        handled_call_ids.add(call_id)
+    try:
+        args = json.loads(item.get("arguments") or "{}")
+    except Exception:
+        args = {}
+    try:
+        if twilio_ws is not None and stream_sid:
+            _send_twilio_thinking_sound(twilio_ws, stream_sid, phone, call_sid, "before_tool_processing")
+    except Exception:
+        pass
+
+    output = process_prevolt_voice_turn(phone, call_sid, args.get("caller_text") or "")
+    exact_reply = _voice_to_sms_text(str(output.get("reply_to_customer") or "Sorry, can you say that again?"))
+    booking_final = bool(output.get("end_call") and output.get("booking_created"))
+
+    # Always return the tool result so OpenAI's function call can complete cleanly.
+    try:
+        _send_openai_event(openai_ws, {
+            "type": "conversation.item.create",
+            "item": {"type": "function_call_output", "call_id": call_id, "output": json.dumps(output)},
+        })
+    except Exception:
+        pass
+
+    if booking_final and _voice_call_update_with_final_twiml(call_sid, exact_reply, phone):
+        # Twilio is now responsible for saying the final confirmation and hanging up.
+        # Do not also ask OpenAI to speak it, which has repeatedly caused cutoffs/races.
+        try:
+            conv = hydrate_voice_conversation(phone, call_sid)
+            conv.setdefault("sched", {})["voice_close_after_reply"] = True
+            conv.setdefault("sched", {})["voice_final_twiML_sent"] = True
+        except Exception:
+            pass
+        return True
+
+    if output.get("end_call"):
+        try:
+            sched_local = hydrate_voice_conversation(phone, call_sid).setdefault("sched", {})
+            sched_local["voice_close_after_reply"] = True
+            sched_local["voice_waiting_for_final_audio_done"] = True
+        except Exception:
+            pass
+
+    _send_openai_event(openai_ws, {
+        "type": "response.create",
+        "response": {
+            "output_modalities": ["audio"],
+            "tool_choice": "none",
+            "instructions": (
+                "Say ONLY this exact phone reply, word for word, including every question in it, then stop speaking. "
+                "Do not say anything before it. Do not say you are checking, thinking, waiting, routing, processing, or finishing. "
+                "Speak at a natural medium pace. Do not slow down or add dramatic pauses at commas. "
+                "Do not add any acknowledgement, greeting, filler phrase, or extra question. "
+                "Do not stop after the first clause or first sentence; speak the complete exact reply. "
+                "Exact reply: " + json.dumps(exact_reply)
+            ),
+        },
+    })
+    return True
+
+
+# ---------------------------------------------------
+# Voice Agent v30 small cleanup override
+# Avoid repeating the exact multi-address policy when the caller pushes back.
+# ---------------------------------------------------
+
+def _voice_multiple_address_reply(conv: dict, caller_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    low = _intent_text(caller_text)
+    if not _voice_looks_like_multiple_addresses(caller_text):
+        return None
+    sched["multiple_addresses"] = True
+    sched["pending_step"] = "need_address"
+    sched["state"] = "waiting_for_address"
+    if sched.get("voice_multi_address_explained"):
+        return "I understand. For scheduling, we will start with the first property first. What's the first address for the work?"
+    sched["voice_multi_address_explained"] = True
+    return (
+        "We can start with the first address and get that visit scheduled. "
+        "The $195 evaluation applies to the first location, and we can handle additional addresses after that. "
+        "What's the first address for the work?"
+    )
