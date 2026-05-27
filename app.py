@@ -2186,6 +2186,48 @@ def _voice_text_contains_real_address(text: str) -> bool:
     return bool(addr and _address_has_house_number_and_street(addr))
 
 
+def _best_saved_address(profile_obj: dict) -> str | None:
+    """Return the best usable saved Square/customer address for voice flows.
+
+    This must be global because emergency and saved-address fast paths call it
+    before the normal SMS reply generator's nested helpers exist. The prior v22
+    bug defined this only inside the SMS reply function, which made emergency
+    voice calls with a known Square customer fall back to asking for address.
+    """
+    if not isinstance(profile_obj, dict):
+        return None
+    addresses = profile_obj.get("addresses") or []
+    # Prefer complete-looking street + city/state addresses.
+    best_partial = None
+    for raw in addresses:
+        addr = " ".join(str(raw or "").replace("\n", " ").split()).strip(" ,.")
+        if not addr:
+            continue
+        if not re.match(r"^\d{1,6}\b", addr):
+            continue
+        if not best_partial:
+            best_partial = addr
+        has_street = _address_has_house_number_and_street(addr)
+        has_state = bool(re.search(r"\b(?:CT|Connecticut|MA|Massachusetts)\b", addr, flags=re.I))
+        has_city_tail = bool(re.search(r"\b(?:[A-Za-z]+(?:\s+[A-Za-z]+)*)\s*,?\s*(?:CT|Connecticut|MA|Massachusetts)\b", addr, flags=re.I))
+        if has_street and (has_state or has_city_tail):
+            return addr
+    return best_partial
+
+
+def _saved_address_for_town(profile_obj: dict, town_hint: str) -> str | None:
+    """Return saved address matching town when possible; otherwise best saved address."""
+    if not isinstance(profile_obj, dict):
+        return None
+    town_hint = (town_hint or "").strip().lower()
+    if town_hint:
+        for raw in profile_obj.get("addresses") or []:
+            addr = " ".join(str(raw or "").replace("\n", " ").split()).strip(" ,.")
+            if addr and re.match(r"^\d{1,6}\b", addr) and town_hint in addr.lower():
+                return addr
+    return _best_saved_address(profile_obj)
+
+
 def _voice_hazard_intake_fast_path(phone: str, conv: dict, caller_text: str) -> str | None:
     """Prevent hazard descriptions from being misread as addresses and move to emergency flow."""
     if not _voice_looks_like_true_hazard(caller_text):
