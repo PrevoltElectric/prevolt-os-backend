@@ -14224,3 +14224,411 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return out
+
+
+# =============================
+# v39 VOICE HOTFIX LAYER
+# =============================
+# Targets the live failure after v38:
+# - Google Maps normalization may fail if ASR hears a street name wrong (ex: Dickerman -> Tickerman).
+# - If the caller already gave town/state, do not ask "What town is that in?" again.
+# - When town/state is known but Google cannot verify the address, ask for the street name again instead of looping.
+# - If the heard street is a close match to the configured dispatch origin address, correct it safely.
+# - Make the processing cue more audible, warmer, and calmer.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V39 = process_prevolt_voice_turn
+_ORIG_VOICE_THINKING_CLICK_PAYLOAD_V39 = _voice_thinking_click_payload
+
+
+def _v39_norm_word(value: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", str(value or "").lower()).strip()
+
+
+def _v39_state_from_text(text: str) -> str | None:
+    low = _v39_norm_word(text)
+    if re.search(r"\b(ct|connecticut)\b", low):
+        return "CT"
+    if re.search(r"\b(ma|mass|massachusetts)\b", low):
+        return "MA"
+    return None
+
+
+def _v39_extract_town_from_text(text: str) -> str | None:
+    raw = str(text or "")
+    # Prefer common explicit forms.
+    m = re.search(r"\b(?:in|at|from)\s+([A-Za-z][A-Za-z .'-]{2,40})\s*,?\s*(?:CT|Connecticut|MA|Massachusetts|Mass)\b", raw, flags=re.I)
+    if m:
+        town = re.sub(r"\b(?:connecticut|massachusetts|mass|ct|ma)\b", "", m.group(1), flags=re.I).strip(" ,.")
+        if town:
+            return " ".join(w.capitalize() for w in town.split())
+    # Fallback: town immediately before state.
+    m = re.search(r"\b([A-Za-z][A-Za-z .'-]{2,40})\s*,?\s*(?:CT|Connecticut|MA|Massachusetts|Mass)\b", raw, flags=re.I)
+    if m:
+        town = m.group(1).strip(" ,.")
+        # Avoid swallowing the whole street line as a town; use text after the last comma if available.
+        if "," in town:
+            town = town.split(",")[-1].strip()
+        town = re.sub(r"^.*?\b(?:ave|avenue|st|street|rd|road|dr|drive|ln|lane|ct|court)\b\s+", "", town, flags=re.I).strip(" ,.")
+        if town:
+            return " ".join(w.capitalize() for w in town.split())
+    return None
+
+
+def _v39_line_parts(value: str) -> tuple[str | None, str | None, str | None]:
+    """Return (house_number, street_name_core, street_type) for a line like '45 Tickerman Ave'."""
+    s = _v38_clean_addr_text(value)
+    m = re.search(r"\b(\d{1,6})\s+([A-Za-z0-9 .'-]+?)\s*(\b(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|ct|court|blvd|boulevard|way|pkwy|parkway|ter|terrace|cir|circle)\b)?(?:,|$)", s, flags=re.I)
+    if not m:
+        return None, None, None
+    num = m.group(1)
+    street = re.sub(r"\b(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|ct|court|blvd|boulevard|way|pkwy|parkway|ter|terrace|cir|circle)\b", "", m.group(2) or "", flags=re.I)
+    street = _v39_norm_word(street)
+    typ = (m.group(3) or "").strip()
+    return num, street, typ
+
+
+def _v39_parse_origin_struct() -> dict | None:
+    origin = _v38_origin_address()
+    if not origin:
+        return None
+    # Try the real normalizer first when available.
+    try:
+        got = _v38_normalize_attempt(origin, None)
+        if got and _v38_complete_addr_struct(got):
+            return got
+    except Exception:
+        pass
+    # Parse the configured origin env value as a fallback.
+    m = re.search(r"^\s*(\d{1,6}\s+[^,]+)\s*,\s*([^,]+)\s*,\s*(CT|MA|Connecticut|Massachusetts)\s*(\d{5})?", origin, flags=re.I)
+    if not m:
+        return None
+    st = m.group(3).upper()
+    if st.startswith("CONNECTICUT"):
+        st = "CT"
+    if st.startswith("MASS"):
+        st = "MA"
+    return {
+        "address_line_1": m.group(1).strip(),
+        "locality": m.group(2).strip(),
+        "administrative_district_level_1": st,
+        "postal_code": (m.group(4) or "").strip(),
+        "country": "US",
+    }
+
+
+def _v39_town_state_known(text: str, sched: dict | None = None) -> tuple[str | None, str | None]:
+    text = str(text or "")
+    town = _v39_extract_town_from_text(text)
+    state = _v39_state_from_text(text)
+    sched = sched or {}
+    if not town:
+        town = sched.get("voice_town_hint") or None
+    if not state:
+        state = sched.get("voice_state_hint") or None
+    return town, state
+
+
+def _v39_candidate_with_town_state(raw: str, caller_text: str, sched: dict) -> str:
+    base = _v38_clean_addr_text(raw)
+    town, state = _v39_town_state_known(" ".join([str(raw or ""), str(caller_text or "")]), sched)
+    if town and state and town.lower() not in base.lower():
+        return f"{base}, {town}, {state}"
+    if state and re.search(r"\b(?:ct|ma|connecticut|massachusetts|mass)\b", base, flags=re.I) is None:
+        return f"{base}, {state}"
+    return base
+
+
+def _v39_try_origin_fuzzy_correction(raw: str, caller_text: str, sched: dict) -> dict | None:
+    """Correct obvious ASR street-name errors only against the configured dispatch origin.
+
+    This is intentionally narrow: house number must match, town/state must match when known,
+    and the street name must be very similar. It is for cases like Dickerman heard as Tickerman.
+    """
+    try:
+        from difflib import SequenceMatcher
+        origin = _v39_parse_origin_struct()
+        if not origin:
+            return None
+        origin_line = origin.get("address_line_1") or ""
+        raw_full = _v39_candidate_with_town_state(raw, caller_text, sched)
+        raw_num, raw_street, raw_type = _v39_line_parts(raw_full)
+        origin_num, origin_street, origin_type = _v39_line_parts(origin_line)
+        if not (raw_num and origin_num and raw_street and origin_street):
+            return None
+        if raw_num != origin_num:
+            return None
+        town, state = _v39_town_state_known(raw_full + " " + str(caller_text or ""), sched)
+        origin_town = _v39_norm_word(origin.get("locality") or "")
+        origin_state = (origin.get("administrative_district_level_1") or "").upper()
+        # Do not fuzzy-correct to the origin unless the caller gave a matching town/state context.
+        if town and _v39_norm_word(town) != origin_town:
+            return None
+        if state and state.upper() != origin_state:
+            return None
+        if not town and not state:
+            return None
+        ratio = SequenceMatcher(None, raw_street, origin_street).ratio()
+        if ratio < 0.82:
+            return None
+        fixed = dict(origin)
+        fixed.setdefault("country", "US")
+        return fixed
+    except Exception:
+        return None
+
+
+def _v39_apply_street_only_repair_if_needed(conv: dict, caller_text: str) -> bool:
+    """If we asked the caller to repeat the street name, combine it with saved house/town."""
+    sched = conv.setdefault("sched", {})
+    raw = str(sched.get("raw_address") or sched.get("address_candidate") or "")
+    if not raw or not re.search(r"\b\d{1,6}\b", raw):
+        return False
+    txt = str(caller_text or "").strip()
+    if not txt or re.search(r"\b\d{1,6}\b", txt):
+        return False
+    # Avoid treating normal answers as street corrections.
+    if len(txt.split()) > 4 or re.search(r"@|yes|no|okay|ok|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday", txt, flags=re.I):
+        return False
+    raw_num, raw_street, raw_type = _v39_line_parts(raw)
+    if not raw_num:
+        return False
+    town, state = _v39_town_state_known(raw, sched)
+    if not town or not state:
+        return False
+    street_type = raw_type or "Ave"
+    cleaned_street = re.sub(r"[^A-Za-z0-9 .'-]", " ", txt).strip()
+    if not cleaned_street:
+        return False
+    new_raw = f"{raw_num} {cleaned_street} {street_type}, {town}, {state}"
+    sched["raw_address"] = new_raw
+    sched["address_candidate"] = new_raw
+    sched["address_missing"] = "confirm"
+    return True
+
+
+def _v39_resolve_robust_address(conv: dict, caller_text: str, reply: str | None = None) -> tuple[bool, dict | None, str]:
+    sched = conv.setdefault("sched", {})
+    if sched.get("address_verified"):
+        return False, None, "already_verified"
+    try:
+        _v39_apply_street_only_repair_if_needed(conv, caller_text)
+    except Exception:
+        pass
+    raw = _v38_clean_addr_text(sched.get("raw_address") or sched.get("address_candidate") or "")
+    if not raw or not _address_has_house_number_and_street(raw):
+        return False, None, "not_house_street"
+
+    # First try the v38 Google pipeline on the saved raw address.
+    addr, reason = _v38_google_resolve_partial_address(raw)
+    if addr:
+        _v38_apply_normalized_address(conv, addr, "google_maps_v39_raw")
+        return True, addr, "google_maps_raw"
+
+    # Then try combining the saved street with town/state heard anywhere in the call turn.
+    combined = _v39_candidate_with_town_state(raw, caller_text, sched)
+    if combined != raw:
+        addr, reason2 = _v38_google_resolve_partial_address(combined)
+        if addr:
+            _v38_apply_normalized_address(conv, addr, "google_maps_v39_combined")
+            return True, addr, "google_maps_combined"
+        # Also try the normalizer directly, since the combined string may already be complete.
+        st = _v39_state_from_text(combined)
+        direct = _v38_normalize_attempt(combined, st) if st else _v38_normalize_attempt(combined, None)
+        if direct and _v38_complete_addr_struct(direct):
+            _v38_apply_normalized_address(conv, direct, "google_maps_v39_direct_combined")
+            return True, direct, "google_maps_direct_combined"
+
+    # Last safe fallback: a very narrow ASR correction against the configured dispatch origin.
+    fixed = _v39_try_origin_fuzzy_correction(raw, caller_text, sched)
+    if fixed:
+        _v38_apply_normalized_address(conv, fixed, "dispatch_origin_fuzzy_v39")
+        return True, fixed, "dispatch_origin_fuzzy"
+
+    return False, None, reason or "unresolved"
+
+
+def _v39_address_already_has_town_state(conv: dict, caller_text: str = "") -> bool:
+    sched = conv.setdefault("sched", {})
+    raw = str(sched.get("raw_address") or sched.get("address_candidate") or "")
+    town, state = _v39_town_state_known(raw + " " + str(caller_text or ""), sched)
+    return bool(town and state)
+
+
+def _v39_unverified_address_reply(conv: dict, caller_text: str) -> str:
+    sched = conv.setdefault("sched", {})
+    raw = _v39_candidate_with_town_state(str(sched.get("raw_address") or sched.get("address_candidate") or ""), caller_text, sched)
+    raw = _v38_clean_addr_text(raw)
+    if raw:
+        return f"I heard {raw}, but I couldn't verify that address. Can you repeat just the street name, or spell it?"
+    return "I couldn't verify that address. Can you repeat the house number and street name?"
+
+
+def _v39_clean_reply_more(reply: str) -> str:
+    r = str(reply or "")
+    patterns = [
+        r"\bOkay,?\s+thanks for sharing that\.\s*",
+        r"\bLet me get this set up for you\.\s*",
+        r"\bGot it\.\s+Thanks for that\.\s*",
+        r"\bLet me get the next scheduling detail from you\.\s*",
+        r"\bLet me think through[^.?!]*[.?!]\s*",
+    ]
+    for pat in patterns:
+        r = re.sub(pat, "", r, flags=re.I)
+    r = re.sub(r"\s+", " ", r).strip()
+    return r
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V39(phone, call_sid, caller_text)
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+        reply = _v39_clean_reply_more(_voice_naturalize_reply(str(out.get("reply_to_customer") or "")))
+
+        # Try robust Google/fuzzy address resolution any time the backend is still waiting on address.
+        if not sched.get("address_verified") and (sched.get("pending_step") == "need_address" or sched.get("state") == "waiting_for_address" or sched.get("address_missing")):
+            ok, addr, reason = _v39_resolve_robust_address(conv, caller_text, reply)
+            if ok and addr:
+                try:
+                    log_event("VOICE_GOOGLE_ADDRESS_RESOLVED_V39", p, {
+                        "reason": reason,
+                        "raw_address": _safe_monitor_text(sched.get("raw_address") or ""),
+                        "resolved": f"{addr.get('address_line_1')}, {addr.get('locality')}, {addr.get('administrative_district_level_1')} {addr.get('postal_code')}",
+                        "call_sid": call_sid,
+                    }, conv)
+                except Exception:
+                    pass
+
+                # Out-of-area gate immediately after address resolution.
+                too_far, travel_minutes = _voice_residential_address_too_far(conv)
+                if too_far:
+                    out["reply_to_customer"] = _voice_out_of_area_reply(travel_minutes)
+                    out["booking_created"] = False
+                    out["end_call"] = True
+                    return out
+
+                # Feed city/state through the stable original flow so it advances normally.
+                synthetic = f"{addr.get('locality')}, {addr.get('administrative_district_level_1')}"
+                out2 = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V39(phone, call_sid, synthetic)
+                try:
+                    conv2 = hydrate_voice_conversation(p, call_sid)
+                    conv2["phone"] = p
+                    _v38_apply_normalized_address(conv2, addr, "google_maps_v39_final")
+                    reply2 = _v39_clean_reply_more(_voice_naturalize_reply(str(out2.get("reply_to_customer") or "")))
+                    # If the stable flow still asks town, override with the next deterministic prompt.
+                    if _v37_is_town_question(reply2):
+                        try:
+                            recompute_pending_step(conv2.setdefault("profile", {}), conv2.setdefault("sched", {}))
+                            reply2 = choose_next_prompt_from_state(conv2, inbound_text=synthetic)
+                            reply2 = _v39_clean_reply_more(_voice_naturalize_reply(reply2))
+                        except Exception:
+                            reply2 = "We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step. Does that work for you?"
+                    out2["reply_to_customer"] = reply2
+                    out2["end_call"] = False if not out2.get("booking_created") else out2.get("end_call")
+                    conv2["last_voice_reply"] = reply2
+                except Exception as e:
+                    try:
+                        log_event("VOICE_V39_POST_RESOLVE_ERROR", p, {"error": repr(e), "call_sid": call_sid}, conv)
+                    except Exception:
+                        pass
+                return out2
+
+            # If town/state is already present but maps could not verify, do not ask town again.
+            if _v39_address_already_has_town_state(conv, caller_text) and (_v37_is_town_question(reply) or "what town" in _intent_text(reply)):
+                reply = _v39_unverified_address_reply(conv, caller_text)
+                out["reply_to_customer"] = reply
+                out["end_call"] = False
+                conv["last_voice_reply"] = reply
+                try:
+                    log_event("VOICE_ADDRESS_UNVERIFIED_NO_TOWN_LOOP_V39", p, {"reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+                return out
+
+        # Keep the v33 actionable-reply guard after our cleanup.
+        try:
+            reply = _v33_fix_generic_reply(conv, reply)
+        except Exception:
+            pass
+        out["reply_to_customer"] = reply
+        conv["last_voice_reply"] = reply
+        if not sched.get("booking_created") and not out.get("booking_created") and _v33_has_customer_facing_question(reply):
+            out["end_call"] = False
+    except Exception as e:
+        try:
+            log_event("VOICE_V39_MAPS_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
+
+
+# v39: warmer/more audible thinking cue. Still calm, but less likely to disappear on phone audio.
+def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
+    try:
+        requested = int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 1800)
+    except Exception:
+        requested = 1800
+    ms = max(1300, min(2600, requested))
+    rate = 8000
+    total = int(rate * (ms / 1000.0))
+    pcm = [0] * total
+
+    # Calm overlapping boop/flutter phrase, lower and warmer than earlier versions.
+    events = [
+        (30, 164, 600, 0.085),
+        (250, 208, 720, 0.095),
+        (520, 188, 740, 0.082),
+        (830, 238, 760, 0.068),
+        (1120, 196, 650, 0.048),
+    ]
+    for n, (start_ms, freq, length_ms, gain) in enumerate(events):
+        start = int(rate * start_ms / 1000.0)
+        length = min(int(rate * length_ms / 1000.0), max(0, total - start))
+        phase = n * 0.73
+        for i in range(length):
+            idx = start + i
+            t = i / rate
+            x = i / max(1, length - 1)
+            attack = min(1.0, i / max(1, int(rate * 0.075)))
+            release = (1.0 - x) ** 2.2
+            global_fade = max(0.0, 1.0 - (idx / max(1, total)) ** 1.65)
+            flutter = 9.0 * math.sin(2 * math.pi * 3.4 * t + phase)
+            tone = math.sin(2 * math.pi * (freq + flutter) * t + phase)
+            tone += 0.10 * math.sin(2 * math.pi * (freq * 1.52) * t + phase + 1.3)
+            sample = int(16000 * gain * attack * release * global_fade * tone)
+            pcm[idx] = max(-14500, min(14500, pcm[idx] + sample))
+            for delay_ms, eg in ((92, 0.30), (188, 0.18), (320, 0.095), (510, 0.055), (720, 0.028)):
+                eidx = idx + int(rate * delay_ms / 1000.0)
+                if eidx < total:
+                    pcm[eidx] = max(-14500, min(14500, pcm[eidx] + int(sample * eg)))
+
+    # Soft pad to keep it present through phone compression without sounding like static.
+    for i in range(total):
+        t = i / rate
+        fade = max(0.0, 1.0 - (i / max(1, total)) ** 1.25)
+        pad = int(430 * fade * (math.sin(2 * math.pi * 118 * t) + 0.34 * math.sin(2 * math.pi * 176 * t)))
+        pcm[i] = max(-14500, min(14500, pcm[i] + pad))
+
+    return base64.b64encode(bytes(_linear16_to_mulaw(s) for s in pcm)).decode("ascii")
+
+
+def _v33_start_thinking_loop(twilio_ws, stream_sid: str, phone: str, call_sid: str, stop_evt) -> None:
+    if not (VOICE_AGENT_THINKING_SOUND_ENABLED and twilio_ws is not None and stream_sid):
+        return
+    next_send = 0.0
+    while not stop_evt.is_set():
+        now = time.time()
+        if now >= next_send:
+            try:
+                _send_twilio_media(twilio_ws, stream_sid, _voice_thinking_click_payload(1800))
+                try:
+                    log_event("VOICE_THINKING_SOUND_SENT", phone, {"reason": "processing_loop_v39", "call_sid": call_sid, "stream_sid": stream_sid})
+                except Exception:
+                    pass
+            except Exception:
+                return
+            # overlap slightly with reverb so there is not a dead gap on long tool calls
+            next_send = now + 1.05
+        stop_evt.wait(0.06)
