@@ -3005,7 +3005,19 @@ def _voice_send_resume_sms_if_needed(phone: str, conv: dict, reason: str = "") -
         return
 
     step = (sched.get("pending_step") or "").strip().lower()
-    if sched.get("awaiting_slot_offer_choice") and sched.get("offered_slot_options"):
+    emergency_resume = bool(
+        sched.get("hard_emergency_detected")
+        or sched.get("awaiting_emergency_confirm")
+        or sched.get("emergency_approved")
+        or str(sched.get("state") or "").lower() == "emergency"
+    )
+    if emergency_resume and sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
+        body = "This is Prevolt Electric. We got started over the phone. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Reply YES if you want us to dispatch someone now."
+    elif emergency_resume and step == "need_name":
+        body = "This is Prevolt Electric. We got the emergency dispatch started over the phone. Please reply with your first and last name so we can finish booking."
+    elif emergency_resume and step == "need_email":
+        body = "This is Prevolt Electric. We got the emergency dispatch started over the phone. Please reply with your email address so we can finish booking."
+    elif sched.get("awaiting_slot_offer_choice") and sched.get("offered_slot_options"):
         try:
             body = f"This is Prevolt Electric. We got started over the phone. Which appointment option works best — {_format_slot_options((sched.get('offered_slot_options') or [])[:3])}?"
         except Exception:
@@ -3047,8 +3059,20 @@ def _voice_handoff_sms_body(conv: dict | None = None) -> str:
     has_name = bool(profile.get("active_first_name") or profile.get("first_name") or profile.get("name"))
     has_email = bool(profile.get("active_email") or profile.get("email") or sched.get("email"))
 
+    emergency_handoff = bool(
+        sched.get("hard_emergency_detected")
+        or sched.get("awaiting_emergency_confirm")
+        or sched.get("emergency_approved")
+        or str(sched.get("state") or "").lower() == "emergency"
+    )
+    if emergency_handoff and sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
+        return "This is Prevolt Electric. We got started over the phone. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Reply YES if you want us to dispatch someone now."
+    if emergency_handoff and (step == "need_name" or not has_name):
+        return "This is Prevolt Electric. We got the emergency dispatch started over the phone. Please reply with your first and last name so we can finish booking."
     if step == "need_name" or not has_name:
         return "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your first and last name so we can finish booking."
+    if emergency_handoff and (step == "need_email" or not has_email):
+        return "This is Prevolt Electric. We got the emergency dispatch started over the phone. Please reply with your email address so we can finish booking."
     if step == "need_email" or not has_email:
         return "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your email address so we can finish booking."
     if not has_address or step == "need_address":
@@ -15781,6 +15805,8 @@ def _v44_after_slot_prompt(conv: dict) -> str:
 
 def _v44_scheduled_troubleshoot_slot_fast_path(conv: dict, caller_text: str) -> str | None:
     sched = conv.setdefault("sched", {})
+    if sched.get("hard_emergency_detected") or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved") or str(sched.get("state") or "").lower() == "emergency":
+        return None
     if not _v44_is_scheduled_troubleshoot_context(conv, caller_text):
         return None
     if not (sched.get("awaiting_slot_offer_choice") and (sched.get("offered_slot_options") or [])):
@@ -15828,7 +15854,13 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         conv["phone"] = p
         sched = conv.setdefault("sched", {})
         _v44_sanitize_date_words_from_name(conv)
-        if _v44_is_scheduled_troubleshoot_context(conv, caller_text):
+        emergencyish_post = bool(
+            sched.get("hard_emergency_detected")
+            or sched.get("awaiting_emergency_confirm")
+            or sched.get("emergency_approved")
+            or str(sched.get("state") or "").lower() == "emergency"
+        )
+        if (not emergencyish_post) and _v44_is_scheduled_troubleshoot_context(conv, caller_text):
             reply = str(out.get("reply_to_customer") or "")
             low_reply = _v44_low(reply)
             if "this sounds urgent" in low_reply or "send someone now" in low_reply or "dispatch someone now" in low_reply:
@@ -16376,7 +16408,14 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         conv_pre["phone"] = p
         sched_pre = conv_pre.setdefault("sched", {})
         last_reply_pre = str(conv_pre.get("last_voice_reply") or sched_pre.get("last_voice_reply") or "")
-        awaiting_eval = bool(sched_pre.get("awaiting_eval_price_confirm")) or (_v46_is_eval_price_prompt(last_reply_pre) and "TROUBLESHOOT" not in str(sched_pre.get("appointment_type") or conv_pre.get("appointment_type") or "").upper())
+        emergencyish_pre = bool(
+            sched_pre.get("hard_emergency_detected")
+            or sched_pre.get("awaiting_emergency_confirm")
+            or sched_pre.get("emergency_approved")
+            or str(sched_pre.get("state") or "").lower() == "emergency"
+            or "TROUBLESHOOT" in str(sched_pre.get("appointment_type") or conv_pre.get("appointment_type") or "").upper()
+        )
+        awaiting_eval = (bool(sched_pre.get("awaiting_eval_price_confirm")) or (_v46_is_eval_price_prompt(last_reply_pre) and "TROUBLESHOOT" not in str(sched_pre.get("appointment_type") or conv_pre.get("appointment_type") or "").upper())) and not emergencyish_pre
         if awaiting_eval:
             if _v45_no(caller_text):
                 reply = _v46_eval_price_declined(conv_pre)
@@ -16441,7 +16480,14 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
                 return out
 
         # E) If the reply is a $195 gate, remember that the next yes means offer slots, not repeat price.
-        if _v46_is_eval_price_prompt(reply) and "TROUBLESHOOT" not in str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper():
+        emergencyish = bool(
+            sched.get("hard_emergency_detected")
+            or sched.get("awaiting_emergency_confirm")
+            or sched.get("emergency_approved")
+            or str(sched.get("state") or "").lower() == "emergency"
+            or "TROUBLESHOOT" in str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+        )
+        if _v46_is_eval_price_prompt(reply) and not emergencyish and "TROUBLESHOOT" not in str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper():
             _v46_hold_eval_price_gate(conv, reply)
             out["appointment_type"] = "EVAL_195"
             out["pending_step"] = sched.get("pending_step")
@@ -16449,7 +16495,7 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
 
         # F) If lower layers still repeated $195 after a yes, replace it with slot options.
         last_reply = str(conv.get("last_voice_reply") or sched.get("last_voice_reply") or "")
-        if _v45_yes(caller_text) and _v46_is_eval_price_prompt(reply) and (_v46_is_eval_price_prompt(last_reply) or sched.get("awaiting_eval_price_confirm")):
+        if (not emergencyish) and _v45_yes(caller_text) and _v46_is_eval_price_prompt(reply) and (_v46_is_eval_price_prompt(last_reply) or sched.get("awaiting_eval_price_confirm")):
             reply2 = _v46_offer_eval_slots(conv)
             out["reply_to_customer"] = reply2
             out["booking_created"] = False
@@ -17488,6 +17534,34 @@ def _v50_reply_after_explicit_address(conv: dict, caller_text: str) -> str:
         too_far, travel_minutes = False, None
     if too_far:
         return _voice_out_of_area_reply()
+
+    # Integrated emergency guard:
+    # If v51 or an earlier voice hazard layer has already marked this call as a hard emergency,
+    # verifying the address must lead to the $395 emergency dispatch prompt, not the normal
+    # $195 evaluation gate and not normal next-three slot offers.
+    appt_existing = str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+    state_existing = str(sched.get("state") or "").lower()
+    if (
+        sched.get("hard_emergency_detected")
+        or sched.get("awaiting_emergency_confirm")
+        or sched.get("emergency_approved")
+        or (state_existing == "emergency" and "TROUBLESHOOT" in appt_existing)
+    ):
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        sched["hard_emergency_detected"] = True
+        sched["state"] = "emergency"
+        sched["price_disclosed"] = True
+        sched["awaiting_eval_price_confirm"] = False
+        sched["awaiting_troubleshoot_price_confirm"] = False
+        sched["awaiting_slot_offer_choice"] = False
+        sched["offered_slot_options"] = []
+        if not sched.get("emergency_approved"):
+            sched["awaiting_emergency_confirm"] = True
+            sched["pending_step"] = "need_date"
+            return "The address is verified in our system. This sounds urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
+        return "The address is verified in our system. We have this marked as an emergency dispatch."
+
     # EV/install/evaluation stays $195; power loss stays $395.
     if _v49_issue_needs_troubleshoot(conv, caller_text):
         sched["appointment_type"] = "TROUBLESHOOT_395"
@@ -17503,6 +17577,7 @@ def _v50_reply_after_explicit_address(conv: dict, caller_text: str) -> str:
     sched["awaiting_eval_price_confirm"] = True
     sched["awaiting_troubleshoot_price_confirm"] = False
     return "The address is verified in our system. We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step. Does that work for you?"
+
 
 
 def _v50_customer_town_state_override(conv: dict, caller_text: str) -> str | None:
@@ -17716,17 +17791,211 @@ def _v51_apply_address_if_possible(conv: dict, caller_text: str, allow_customer_
     return False
 
 
-def _v51_emergency_prompt(conv: dict) -> str:
+def _v51_clear_normal_scheduling_state(sched: dict) -> None:
+    """Emergency calls must not keep normal eval/slot-offer state alive."""
+    if not isinstance(sched, dict):
+        return
+    sched["awaiting_eval_price_confirm"] = False
+    sched["eval_price_accepted"] = False
+    sched["awaiting_troubleshoot_price_confirm"] = False
+    sched["troubleshoot_price_accepted"] = False
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+
+
+def _v51_is_emergency_conversation(conv: dict, caller_text: str = "") -> bool:
+    """True once this voice call has been classified as a real hard-hazard emergency."""
+    if not isinstance(conv, dict):
+        return bool(_v51_hard_hazard_text(caller_text))
     sched = conv.setdefault("sched", {})
+    appt = str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+    state = str(sched.get("state") or "").lower()
+    if _v51_hard_hazard_text(caller_text):
+        return True
+    if sched.get("hard_emergency_detected") or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
+        return True
+    if state == "emergency" and "TROUBLESHOOT" in appt:
+        return True
+    return False
+
+
+def _v51_mark_emergency(conv: dict, caller_text: str = "", pending_step: str | None = None) -> None:
+    """Lock the conversation into the emergency troubleshoot path without appending a wrapper layer."""
+    sched = conv.setdefault("sched", {})
+    if caller_text and _v51_hard_hazard_text(caller_text):
+        sched["last_customer_issue"] = caller_text
     sched["appointment_type"] = "TROUBLESHOOT_395"
     conv["appointment_type"] = "TROUBLESHOOT_395"
-    sched["awaiting_emergency_confirm"] = True
-    sched["emergency_approved"] = False
     sched["hard_emergency_detected"] = True
-    sched["price_disclosed"] = True
-    sched["pending_step"] = "need_date"
     sched["state"] = "emergency"
+    sched["price_disclosed"] = True
+    sched["booking_allowed"] = True
+    _v51_clear_normal_scheduling_state(sched)
+    if pending_step:
+        sched["pending_step"] = pending_step
+
+
+def _v51_emergency_prompt(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    _v51_mark_emergency(conv, pending_step="need_date")
+    if sched.get("emergency_approved"):
+        sched["awaiting_emergency_confirm"] = False
+    else:
+        sched["awaiting_emergency_confirm"] = True
     return "This sounds urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
+
+
+def _v51_emergency_decline_reply(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    sched["customer_hard_stop"] = True
+    sched["booking_allowed"] = False
+    sched["closed_reason"] = "declined_emergency_dispatch"
+    sched["voice_close_after_reply"] = True
+    return "No problem. We will not dispatch anyone right now. If there is active fire or smoke, please call 911. Goodbye."
+
+
+def _v51_emergency_after_dispatch_accept(phone: str, conv: dict) -> str:
+    """After the caller approves emergency dispatch, collect only missing booking fields."""
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    _v51_mark_emergency(conv)
+
+    try:
+        _voice_set_emergency_dispatch_slot(sched)
+    except Exception:
+        try:
+            tz = ZoneInfo("America/New_York")
+        except Exception:
+            tz = timezone(timedelta(hours=-5))
+        rounded_dt = (datetime.now(tz) + timedelta(hours=1)).replace(second=0, microsecond=0)
+        sched["scheduled_date"] = rounded_dt.strftime("%Y-%m-%d")
+        sched["scheduled_time"] = rounded_dt.strftime("%H:%M")
+        sched["scheduled_time_source"] = "voice_v51_emergency_dispatch_confirm"
+        sched["booking_attempt_nonce"] = str(uuid.uuid4())
+
+    sched["appointment_type"] = "TROUBLESHOOT_395"
+    conv["appointment_type"] = "TROUBLESHOOT_395"
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = True
+    sched["state"] = "emergency"
+    _v51_clear_normal_scheduling_state(sched)
+
+    first = _voice_profile_first_name(profile) if "_voice_profile_first_name" in globals() else str(profile.get("active_first_name") or profile.get("first_name") or "").strip()
+    last = _voice_profile_last_name(profile) if "_voice_profile_last_name" in globals() else str(profile.get("active_last_name") or profile.get("last_name") or "").strip()
+
+    if not (first and last):
+        sched["pending_step"] = "need_name"
+        return "Got it. We’ll dispatch this as an emergency. What’s your first and last name?"
+
+    if not (_voice_has_email(conv) if "_voice_has_email" in globals() else bool(profile.get("active_email") or profile.get("email") or sched.get("email"))):
+        sched["pending_step"] = "need_email"
+        return "Got it. We’ll dispatch this as an emergency. What’s the best email address for the appointment?"
+
+    try:
+        booking_attempt = maybe_create_square_booking(phone, conv)
+    except Exception as e:
+        try:
+            log_event("VOICE_V51_EMERGENCY_BOOKING_ERROR", phone, {"error": repr(e)}, conv)
+        except Exception:
+            pass
+        booking_attempt = {"status": "exception"}
+
+    status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
+    if sched.get("booking_created") and sched.get("square_booking_id"):
+        sched["voice_close_after_reply"] = True
+        sched["voice_booking_completed_close"] = True
+        try:
+            return _voice_finalize_booking_reply(conv, "")
+        except Exception:
+            return "You're all set. We are dispatching someone now, and you'll receive a confirmation text. Goodbye."
+
+    if status == "missing_identity":
+        sched["pending_step"] = "need_name"
+        return "Got it. We’ll dispatch this as an emergency. What’s your first and last name?"
+    if status in {"missing_email", "customer_email_missing"}:
+        sched["pending_step"] = "need_email"
+        return "Got it. We’ll dispatch this as an emergency. What’s the best email address for the appointment?"
+
+    return "Got it. We have this marked as an emergency dispatch. We’ll text you the next step shortly."
+
+
+def _v51_existing_emergency_turn(phone: str, conv: dict, caller_text: str) -> str | None:
+    """Integrated emergency state machine for v51/v52.
+
+    This replaces the old behavior where address, eval-price, and slot-offer layers
+    could pull a hard hazard back into the normal $195 evaluation flow.
+    """
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+
+    if not _v51_is_emergency_conversation(conv, caller_text):
+        return None
+
+    _v51_mark_emergency(conv, caller_text)
+
+    # Address is the first required field. An address turn should move directly
+    # to the $395 dispatch confirmation, never to the $195 evaluation prompt.
+    if not sched.get("address_verified"):
+        try:
+            _v51_apply_address_if_possible(conv, caller_text)
+        except Exception:
+            pass
+        if not sched.get("address_verified"):
+            saved = _best_saved_address(profile)
+            if saved and not _voice_text_contains_real_address(caller_text):
+                sched["address_candidate"] = saved
+                sched["raw_address"] = saved
+                sched["address_missing"] = "confirm"
+                sched["pending_step"] = "need_address"
+                return f"This sounds urgent. I have {saved} on file. Is this for that address?"
+            sched["pending_step"] = "need_address"
+            sched["address_missing"] = "street"
+            return "If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what is the full address for the work?"
+        return _v51_emergency_prompt(conv)
+
+    # If the dispatch price/ETA question is pending, only yes/no/coverage answers
+    # are handled here. A name or email should not re-trigger this question.
+    if sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
+        if _voice_is_emergency_coverage_question(caller_text):
+            sched["awaiting_emergency_confirm"] = True
+            return (
+                "The emergency troubleshoot and repair visit covers sending one of our electricians out, "
+                "checking the issue in person, making the area safe, diagnosing the problem, "
+                "and completing the repair during the visit when it can be handled right away. "
+                "If anything larger is needed, we'll explain the next step before moving forward. "
+                "Should we dispatch someone now?"
+            )
+        yn = _voice_yes_no_text(caller_text) if "_voice_yes_no_text" in globals() else None
+        if yn == "no":
+            return _v51_emergency_decline_reply(conv)
+        if yn == "yes" or _voice_is_dispatch_confirmation(caller_text):
+            return _v51_emergency_after_dispatch_accept(phone, conv)
+        return _v51_emergency_prompt(conv)
+
+    # After dispatch is approved, never ask the dispatch confirmation again.
+    if sched.get("emergency_approved"):
+        step = (sched.get("pending_step") or "").strip().lower()
+
+        if step == "need_name" or not (_voice_profile_first_name(profile) and _voice_profile_last_name(profile)):
+            name_reply = _voice_name_fast_path(conv, caller_text) if "_voice_name_fast_path" in globals() else None
+            if name_reply:
+                return name_reply
+            sched["pending_step"] = "need_name"
+            return "What’s your first and last name?"
+
+        if step == "need_email" or not (_voice_has_email(conv) if "_voice_has_email" in globals() else bool(profile.get("active_email") or profile.get("email") or sched.get("email"))):
+            email_reply = _voice_email_fast_path(phone, conv, caller_text) if "_voice_email_fast_path" in globals() else None
+            if email_reply:
+                return email_reply
+            sched["pending_step"] = "need_email"
+            return "What’s the best email address for the appointment?"
+
+        return _v51_emergency_after_dispatch_accept(phone, conv)
+
+    return _v51_emergency_prompt(conv)
 
 
 def _v51_append_reply(conv: dict, reply: str) -> None:
@@ -17735,6 +18004,7 @@ def _v51_append_reply(conv: dict, reply: str) -> None:
     except Exception:
         pass
     conv["last_voice_reply"] = reply
+    conv["last_sms_body"] = reply
 
 
 def _v51_output(conv: dict, reply: str, end_call: bool = False) -> dict:
@@ -17767,51 +18037,36 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     except Exception:
         pass
 
-    # Pre-layer 1: hard emergency/hazard always wins. Never let smoke/fire/hot/arcing/water go to $195.
+    # Integrated v51 emergency state machine.
+    # This is intentionally inside the v51 function, not appended as another final wrapper.
+    # Once a true hard-hazard call is detected, address collection, dispatch approval,
+    # name collection, email collection, and Square booking stay inside the emergency path.
     try:
-        if _v51_hard_hazard_text(text):
-            conv = hydrate_voice_conversation(p, call_sid)
-            conv["phone"] = p
-            sched = conv.setdefault("sched", {})
-            sched["last_customer_issue"] = text
-            _v51_apply_address_if_possible(conv, text)
-            # If no verified address and the caller has a saved Square address, confirm it.
-            if not sched.get("address_verified"):
-                saved = _best_saved_address(conv.setdefault("profile", {}))
-                if saved:
-                    sched["appointment_type"] = "TROUBLESHOOT_395"
-                    conv["appointment_type"] = "TROUBLESHOOT_395"
-                    sched["awaiting_emergency_confirm"] = False
-                    sched["hard_emergency_detected"] = True
-                    sched["pending_step"] = "need_address"
-                    sched["address_candidate"] = saved
-                    sched["raw_address"] = saved
-                    reply = f"This sounds urgent. I have {saved} on file. Is this for that address?"
-                    try:
-                        log_event("VOICE_V51_EMERGENCY_SAVED_ADDRESS_CONFIRM", p, {"caller_text": _safe_monitor_text(text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
-                    except Exception:
-                        pass
-                    return _v51_output(conv, reply, False)
-                sched["appointment_type"] = "TROUBLESHOOT_395"
-                conv["appointment_type"] = "TROUBLESHOOT_395"
-                sched["pending_step"] = "need_address"
-                sched["address_missing"] = "street"
-                sched["hard_emergency_detected"] = True
-                reply = "If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what is the full address for the work?"
-                return _v51_output(conv, reply, False)
-            reply = _v51_emergency_prompt(conv)
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        emergency_reply = _v51_existing_emergency_turn(p, conv, text)
+        if emergency_reply:
             try:
-                log_event("VOICE_V51_HARD_EMERGENCY_OVERRIDE", p, {"caller_text": _safe_monitor_text(text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+                log_event(
+                    "VOICE_V51_INTEGRATED_EMERGENCY_TURN",
+                    p,
+                    {
+                        "caller_text": _safe_monitor_text(text),
+                        "reply": _safe_monitor_text(emergency_reply),
+                        "call_sid": call_sid,
+                    },
+                    conv,
+                )
             except Exception:
                 pass
-            return _v51_output(conv, reply, False)
+            return _v51_output(conv, emergency_reply, bool(conv.setdefault("sched", {}).get("voice_close_after_reply")))
     except Exception as e:
         try:
-            log_event("VOICE_V51_EMERGENCY_PRE_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
+            log_event("VOICE_V51_INTEGRATED_EMERGENCY_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
         except Exception:
             pass
 
-    # Pre-layer 2: explicit far-away towns close cleanly before Google guesses or slot state can run.
+    # Explicit far-away towns close cleanly before Google guesses or slot state can run.
     try:
         if _v51_is_explicit_far_town(text):
             conv = hydrate_voice_conversation(p, call_sid)
@@ -17835,7 +18090,10 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             line, town, state = _v51_extract_line_town_state(text, conv)
             if line and town and state and _v50_known_local_town(town, state):
                 _v50_apply_explicit_customer_address(conv, line, town, state, "v51_post_local_recovery")
-                recovered = _v50_reply_after_explicit_address(conv, text)
+                if _v51_is_emergency_conversation(conv, text):
+                    recovered = _v51_emergency_prompt(conv)
+                else:
+                    recovered = _v50_reply_after_explicit_address(conv, text)
                 try:
                     log_event("VOICE_V51_LOCAL_ADDRESS_RECOVERY", p, {"old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(recovered), "caller_text": _safe_monitor_text(text), "call_sid": call_sid}, conv)
                 except Exception:
@@ -17853,11 +18111,15 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             conv = hydrate_voice_conversation(p, call_sid)
             conv["phone"] = p
             sched = conv.setdefault("sched", {})
+            _v51_mark_emergency(conv, text)
             bad_reply = str(out.get("reply_to_customer") or "") if isinstance(out, dict) else ""
             if "195" in _v51_low(bad_reply) or "evaluation" in _v51_low(bad_reply) or "what day" in _v51_low(bad_reply):
-                sched["appointment_type"] = "TROUBLESHOOT_395"
-                conv["appointment_type"] = "TROUBLESHOOT_395"
-                reply = _v51_emergency_prompt(conv) if sched.get("address_verified") else "If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what is the full address for the work?"
+                if sched.get("address_verified"):
+                    reply = _v51_emergency_prompt(conv)
+                else:
+                    sched["pending_step"] = "need_address"
+                    sched["address_missing"] = "street"
+                    reply = "If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what is the full address for the work?"
                 return _v51_output(conv, reply, False)
     except Exception:
         pass
@@ -17920,584 +18182,4 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             log_event("VOICE_V52_POST_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
         except Exception:
             pass
-    return out
-
-
-# =============================
-# v53 EMERGENCY STICKY LOCK HOTFIX
-# =============================
-# Purpose:
-# - Hard hazard / true emergency language must remain emergency for the rest of the voice call.
-# - Later availability, address override, eval price, or slot-offer layers must never downgrade it to EVAL_195.
-# - Emergency flow must ask address first, then $395 dispatch confirmation, then name/email, then same Square booking path.
-# - No normal "next three openings" during a true emergency.
-
-_ORIG_PROCESS_PREVOLT_VOICE_TURN_V53 = process_prevolt_voice_turn
-
-
-def _v53_low(text: str) -> str:
-    try:
-        if "_intent_text" in globals():
-            return _intent_text(text or "")
-    except Exception:
-        pass
-    return re.sub(r"\s+", " ", str(text or "").strip().lower())
-
-
-def _v53_yes(text: str) -> bool:
-    low = _v53_low(text)
-    return low in {
-        "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct",
-        "that works", "works for me", "send them", "send him", "send someone",
-        "dispatch", "dispatch them", "dispatch him", "go ahead", "do it",
-        "lets do it", "let's do it", "book it"
-    } or any(p in low for p in [
-        "yes please", "that works", "works for me", "go ahead",
-        "send someone", "send them", "send him", "dispatch now",
-        "come now", "do it", "let's do it", "lets do it"
-    ])
-
-
-def _v53_no(text: str) -> bool:
-    low = _v53_low(text)
-    return low in {"no", "nope", "nah", "no thanks", "not right now"} or any(p in low for p in [
-        "do not dispatch", "don't dispatch", "dont dispatch",
-        "do not send", "don't send", "dont send",
-        "never mind", "nevermind", "cancel"
-    ])
-
-
-def _v53_immediate_request(text: str) -> bool:
-    low = _v53_low(text)
-    return any(p in low for p in [
-        "now", "right now", "immediately", "asap", "as soon as possible",
-        "send someone now", "need somebody now", "need someone now",
-        "come now", "dispatch now", "today", "today please",
-    ])
-
-
-def _v53_hard_hazard_text(text: str) -> bool:
-    low = _v53_low(text)
-    if not low:
-        return False
-
-    # Do not treat normal detector install/quote work as a fire emergency.
-    if re.search(r"\b(?:smoke|co|carbon monoxide)\s+(?:detector|alarm)s?\b", low) and re.search(
-        r"\b(?:install|installed|replace|replaced|change|changed|hardwire|quote|estimate)\b",
-        low,
-        flags=re.I,
-    ):
-        return False
-
-    hard_patterns = [
-        r"\b(?:caught\s+fire|on\s+fire|active\s+fire|electrical\s+fire|panel\s+fire)\b",
-        r"\b(?:flame|flames|smoke\s+coming|smoke\s+from|smoke\s+filling|smoking)\b",
-        r"\b(?:burning\s+smell|burnt\s+smell|smells?\s+like\s+smoke|burnt\s+wire|burnt\s+outlet|burnt\s+breaker|burnt\s+panel)\b",
-        r"\b(?:hot\s+to\s+the\s+touch|hot\s+panel|panel\s+is\s+hot|hot\s+breaker|breaker\s+is\s+hot|hot\s+outlet|outlet\s+is\s+hot|hot\s+plug)\b",
-        r"\b(?:sparking|sparked|sparks|arcing|arc\s+flash|crackling|popping|sizzling|melted)\b",
-        r"\b(?:water\s+in\s+(?:the\s+)?panel|water\s+inside\s+(?:the\s+)?panel|water\s+got\s+into\s+(?:the\s+)?panel|flooded\s+panel)\b",
-        r"\b(?:service\s+(?:drop|entrance|mast)\s+(?:ripped|torn|down|damaged)|meter\s+(?:socket\s+)?(?:ripped|pulled|sparking|damaged))\b",
-        r"\b(?:power\s+line\s+down|tree\s+ripped\s+wires?)\b",
-    ]
-    return any(re.search(p, low, flags=re.I) for p in hard_patterns)
-
-
-def _v53_conversation_hazard_memory(conv: dict, caller_text: str = "") -> bool:
-    """Recover the emergency lock even if a later layer temporarily changed appointment_type back to EVAL_195."""
-    if not isinstance(conv, dict):
-        return _v53_hard_hazard_text(caller_text)
-
-    sched = conv.setdefault("sched", {})
-
-    parts = [
-        caller_text,
-        sched.get("last_customer_issue"),
-        sched.get("voice_last_caller_text_norm"),
-        conv.get("cleaned_transcript"),
-        conv.get("initial_sms"),
-        conv.get("last_voice_reply"),
-        conv.get("last_sms_body"),
-    ]
-
-    try:
-        for item in conv.get("voice_transcript") or []:
-            if isinstance(item, dict):
-                parts.append(item.get("text"))
-            else:
-                parts.append(str(item))
-    except Exception:
-        pass
-
-    return _v53_hard_hazard_text(" ".join(str(p or "") for p in parts))
-
-
-def _v53_is_emergency_locked(conv: dict, caller_text: str = "") -> bool:
-    if not isinstance(conv, dict):
-        return _v53_hard_hazard_text(caller_text)
-
-    sched = conv.setdefault("sched", {})
-    appt = str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-    state = str(sched.get("state") or "").lower()
-
-    if sched.get("v53_emergency_sticky_lock"):
-        return True
-    if sched.get("hard_emergency_detected"):
-        return True
-    if sched.get("emergency_approved"):
-        return True
-    if sched.get("awaiting_emergency_confirm"):
-        return True
-    if state == "emergency" and "TROUBLESHOOT" in appt:
-        return True
-    if _v53_conversation_hazard_memory(conv, caller_text):
-        return True
-
-    return False
-
-
-def _v53_clear_normal_scheduling_artifacts(sched: dict) -> None:
-    """Remove normal eval/slot state that later layers may have injected."""
-    if not isinstance(sched, dict):
-        return
-
-    sched["awaiting_slot_offer_choice"] = False
-    sched["offered_slot_options"] = []
-    sched["last_slot_unavailable_message"] = None
-
-    sched["awaiting_eval_price_confirm"] = False
-    sched["eval_price_accepted"] = False
-
-    # Keep troubleshoot/emergency confirmation separate.
-    sched["awaiting_troubleshoot_price_confirm"] = False
-    sched["troubleshoot_price_accepted"] = False
-
-
-def _v53_apply_emergency_lock(conv: dict, caller_text: str = "", reason: str = "v53_emergency_lock") -> None:
-    sched = conv.setdefault("sched", {})
-
-    if caller_text and _v53_hard_hazard_text(caller_text):
-        sched["last_customer_issue"] = caller_text
-
-    sched["v53_emergency_sticky_lock"] = True
-    sched["hard_emergency_detected"] = True
-    sched["appointment_type"] = "TROUBLESHOOT_395"
-    conv["appointment_type"] = "TROUBLESHOOT_395"
-    sched["state"] = "emergency"
-    sched["price_disclosed"] = True
-    sched["booking_allowed"] = True
-
-    _v53_clear_normal_scheduling_artifacts(sched)
-
-    if sched.get("address_verified"):
-        if not sched.get("emergency_approved"):
-            sched["awaiting_emergency_confirm"] = True
-            sched["v53_awaiting_dispatch_confirm"] = True
-            # Leave pending_step compatible with older state machines, but do not allow slot logic.
-            sched["pending_step"] = "need_date"
-    else:
-        sched["awaiting_emergency_confirm"] = False
-        sched["v53_awaiting_dispatch_confirm"] = False
-        sched["pending_step"] = "need_address"
-
-    try:
-        log_event(
-            "VOICE_V53_EMERGENCY_LOCK_APPLIED",
-            conv.get("phone") or "",
-            {
-                "reason": reason,
-                "caller_text": _safe_monitor_text(caller_text) if "_safe_monitor_text" in globals() else caller_text,
-            },
-            conv,
-        )
-    except Exception:
-        pass
-
-
-def _v53_append_reply(conv: dict, reply: str) -> None:
-    try:
-        conv.setdefault("voice_transcript", []).append({
-            "role": "assistant",
-            "text": reply,
-            "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
-        })
-    except Exception:
-        pass
-
-    conv["last_voice_reply"] = reply
-    # This also protects hangup/resume SMS from using stale normal slot prompts.
-    conv["last_sms_body"] = reply
-
-
-def _v53_output(conv: dict, reply: str, end_call: bool = False) -> dict:
-    sched = conv.setdefault("sched", {})
-    _v53_append_reply(conv, reply)
-
-    return {
-        "reply_to_customer": reply,
-        "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")),
-        "manual_only": bool(sched.get("manual_only")),
-        "pending_step": sched.get("pending_step"),
-        "appointment_type": "TROUBLESHOOT_395",
-        "end_call": bool(end_call or sched.get("voice_close_after_reply")),
-    }
-
-
-def _v53_emergency_dispatch_prompt(conv: dict) -> str:
-    sched = conv.setdefault("sched", {})
-    _v53_apply_emergency_lock(conv, reason="v53_dispatch_prompt")
-    sched["awaiting_emergency_confirm"] = True
-    sched["v53_awaiting_dispatch_confirm"] = True
-    return (
-        "Got it. This sounds urgent. We can send someone now, and arrival is usually within one to two hours. "
-        "The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
-    )
-
-
-def _v53_emergency_address_prompt(conv: dict) -> str:
-    sched = conv.setdefault("sched", {})
-    _v53_apply_emergency_lock(conv, reason="v53_address_prompt")
-    sched["pending_step"] = "need_address"
-
-    try:
-        prompt = build_address_prompt(sched)
-    except Exception:
-        prompt = "What is the full address for the work?"
-
-    return (
-        "I'm sorry that happened. If there is active fire or smoke filling the home, please call 911 first. "
-        f"If it is safe for us to come out, {prompt}"
-    )
-
-
-def _v53_set_dispatch_slot(conv: dict) -> None:
-    sched = conv.setdefault("sched", {})
-
-    try:
-        if "_voice_set_emergency_dispatch_slot" in globals():
-            _voice_set_emergency_dispatch_slot(sched)
-        else:
-            raise RuntimeError("missing _voice_set_emergency_dispatch_slot")
-    except Exception:
-        try:
-            tz = ZoneInfo("America/New_York")
-        except Exception:
-            tz = timezone(timedelta(hours=-5))
-
-        now_local = datetime.now(tz)
-        dispatch_dt = now_local + timedelta(hours=1)
-        minute = dispatch_dt.minute
-
-        if minute == 0:
-            rounded_dt = dispatch_dt.replace(second=0, microsecond=0)
-        elif minute <= 30:
-            rounded_dt = dispatch_dt.replace(minute=30, second=0, microsecond=0)
-        else:
-            rounded_dt = (dispatch_dt + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-
-        sched["scheduled_date"] = rounded_dt.strftime("%Y-%m-%d")
-        sched["scheduled_time"] = rounded_dt.strftime("%H:%M")
-        sched["scheduled_time_source"] = "voice_v53_emergency_dispatch_confirm"
-        sched["booking_attempt_nonce"] = str(uuid.uuid4())
-
-    sched["appointment_type"] = "TROUBLESHOOT_395"
-    conv["appointment_type"] = "TROUBLESHOOT_395"
-    sched["emergency_approved"] = True
-    sched["awaiting_emergency_confirm"] = False
-    sched["v53_awaiting_dispatch_confirm"] = False
-    sched["v53_emergency_sticky_lock"] = True
-    sched["hard_emergency_detected"] = True
-    sched["price_disclosed"] = True
-    sched["state"] = "emergency"
-    _v53_clear_normal_scheduling_artifacts(sched)
-
-
-def _v53_profile_first_last_email(conv: dict) -> tuple[str, str, bool]:
-    profile = conv.setdefault("profile", {})
-    sched = conv.setdefault("sched", {})
-
-    try:
-        first = _voice_profile_first_name(profile) if "_voice_profile_first_name" in globals() else ""
-    except Exception:
-        first = ""
-    try:
-        last = _voice_profile_last_name(profile) if "_voice_profile_last_name" in globals() else ""
-    except Exception:
-        last = ""
-
-    first = first or str(profile.get("active_first_name") or profile.get("first_name") or "").strip()
-    last = last or str(profile.get("active_last_name") or profile.get("last_name") or "").strip()
-
-    try:
-        has_email = bool(_voice_has_email(conv)) if "_voice_has_email" in globals() else False
-    except Exception:
-        has_email = False
-
-    has_email = has_email or bool(
-        profile.get("active_email")
-        or profile.get("email")
-        or sched.get("email")
-    )
-
-    return first, last, has_email
-
-
-def _v53_after_dispatch_confirm(conv: dict, phone: str) -> str:
-    sched = conv.setdefault("sched", {})
-    profile = conv.setdefault("profile", {})
-
-    _v53_set_dispatch_slot(conv)
-
-    first, last, has_email = _v53_profile_first_last_email(conv)
-
-    if not first or not last:
-        sched["pending_step"] = "need_name"
-        sched["state"] = "emergency"
-        return "Got it. We’ll dispatch this as an emergency. What’s your first and last name?"
-
-    if not has_email:
-        sched["pending_step"] = "need_email"
-        sched["state"] = "emergency"
-        return "Got it. We’ll dispatch this as an emergency. What’s the best email address for the appointment?"
-
-    # Same Square booking path, but with emergency dispatch time already set.
-    try:
-        if "maybe_create_square_booking" in globals():
-            maybe_create_square_booking(phone, conv)
-    except Exception as e:
-        try:
-            log_event("VOICE_V53_EMERGENCY_BOOKING_ATTEMPT_ERROR", phone, {"error": repr(e)}, conv)
-        except Exception:
-            pass
-
-    if sched.get("booking_created") and sched.get("square_booking_id"):
-        sched["voice_close_after_reply"] = True
-        return (
-            "You’re all set. We are dispatching someone now, and arrival is usually within one to two hours. "
-            "You’ll receive a confirmation text. Goodbye."
-        )
-
-    sched["pending_step"] = None
-    sched["state"] = "emergency"
-    return (
-        "Got it. We have this marked as an emergency dispatch. "
-        "We’ll text you the next step shortly."
-    )
-
-
-def _v53_reply_is_bad_emergency_downgrade(reply: str, out: dict, conv: dict) -> bool:
-    low = _v53_low(reply)
-    sched = conv.setdefault("sched", {})
-    appt_out = str((out or {}).get("appointment_type") or "").upper()
-    appt_sched = str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-
-    if "195" in low or "on-site evaluation" in low or "evaluation visit" in low:
-        return True
-    if "which one works best" in low:
-        return True
-    if "great we have" in low or "we have thursday" in low or "next openings" in low:
-        return True
-    if sched.get("awaiting_slot_offer_choice") or sched.get("offered_slot_options"):
-        return True
-    if appt_out == "EVAL_195" or appt_sched == "EVAL_195":
-        return True
-    if str(sched.get("state") or "").lower() == "waiting_for_date" and sched.get("v53_emergency_sticky_lock"):
-        return True
-
-    return False
-
-
-def _v53_try_apply_address(conv: dict, caller_text: str) -> None:
-    """Let existing address helpers do the work, but call them before deciding the emergency prompt."""
-    sched = conv.setdefault("sched", {})
-
-    if sched.get("address_verified"):
-        return
-
-    try:
-        if "_v51_apply_address_if_possible" in globals():
-            _v51_apply_address_if_possible(conv, caller_text)
-    except Exception:
-        pass
-
-    if sched.get("address_verified"):
-        return
-
-    try:
-        if "_v50_apply_town_state_if_possible" in globals():
-            _v50_apply_town_state_if_possible(conv, caller_text)
-    except Exception:
-        pass
-
-    try:
-        update_address_assembly_state(sched)
-    except Exception:
-        pass
-
-
-def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
-    p = (phone or "").replace("whatsapp:", "").strip()
-    text = caller_text or ""
-
-    # PRE-INTERCEPT:
-    # If we already asked the emergency dispatch confirmation, never let older layers handle "yes"
-    # as eval-price acceptance or slot selection.
-    try:
-        conv_pre = hydrate_voice_conversation(p, call_sid)
-        conv_pre["phone"] = p
-        sched_pre = conv_pre.setdefault("sched", {})
-
-        if _v53_hard_hazard_text(text):
-            _v53_apply_emergency_lock(conv_pre, text, reason="v53_pre_hard_hazard")
-            _v53_try_apply_address(conv_pre, text)
-
-        if _v53_is_emergency_locked(conv_pre, text):
-            _v53_apply_emergency_lock(conv_pre, text, reason="v53_pre_existing_lock")
-
-            # If the customer says no to dispatch, close politely.
-            if sched_pre.get("awaiting_emergency_confirm") and _v53_no(text):
-                sched_pre["voice_close_after_reply"] = True
-                sched_pre["closed_reason"] = "declined_emergency_dispatch"
-                reply = "No problem. We will not dispatch anyone right now. If there is active fire or smoke, please call 911. Goodbye."
-                try:
-                    log_event("VOICE_V53_EMERGENCY_DECLINED", p, {"caller_text": _safe_monitor_text(text)}, conv_pre)
-                except Exception:
-                    pass
-                return _v53_output(conv_pre, reply, end_call=True)
-
-            # Only a yes after our emergency dispatch question confirms dispatch.
-            if (
-                sched_pre.get("address_verified")
-                and (sched_pre.get("awaiting_emergency_confirm") or sched_pre.get("v53_awaiting_dispatch_confirm"))
-                and _v53_yes(text)
-            ):
-                reply = _v53_after_dispatch_confirm(conv_pre, p)
-                try:
-                    log_event("VOICE_V53_EMERGENCY_DISPATCH_ACCEPTED_PRE", p, {"caller_text": _safe_monitor_text(text), "reply": _safe_monitor_text(reply)}, conv_pre)
-                except Exception:
-                    pass
-                return _v53_output(conv_pre, reply, end_call=bool(sched_pre.get("voice_close_after_reply")))
-
-            # If address is verified and they say "I need somebody now", ask the correct $395 dispatch question.
-            if sched_pre.get("address_verified") and _v53_immediate_request(text) and not sched_pre.get("emergency_approved"):
-                reply = _v53_emergency_dispatch_prompt(conv_pre)
-                try:
-                    log_event("VOICE_V53_IMMEDIATE_REQUEST_REPROMPT", p, {"caller_text": _safe_monitor_text(text), "reply": _safe_monitor_text(reply)}, conv_pre)
-                except Exception:
-                    pass
-                return _v53_output(conv_pre, reply, end_call=False)
-
-    except Exception as e:
-        try:
-            log_event("VOICE_V53_PRE_INTERCEPT_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
-        except Exception:
-            pass
-
-    # Let the existing v52 stack run.
-    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V53(phone, call_sid, caller_text)
-
-    # POST-INTERCEPT:
-    # Final safety net. If any prior layer produced $195, normal slots, or EVAL_195 after emergency memory,
-    # override it before the customer hears it and clean the stored state for resume SMS.
-    try:
-        conv = hydrate_voice_conversation(p, call_sid)
-        conv["phone"] = p
-        sched = conv.setdefault("sched", {})
-
-        reply = str((out or {}).get("reply_to_customer") or "")
-
-        if _v53_hard_hazard_text(text) or _v53_is_emergency_locked(conv, text):
-            _v53_apply_emergency_lock(conv, text, reason="v53_post_lock")
-            _v53_try_apply_address(conv, text)
-
-            bad_downgrade = _v53_reply_is_bad_emergency_downgrade(reply, out, conv)
-
-            # No verified address yet: address is the only allowed next step.
-            if not sched.get("address_verified"):
-                _v53_clear_normal_scheduling_artifacts(sched)
-
-                if bad_downgrade or "address" not in _v53_low(reply):
-                    new_reply = _v53_emergency_address_prompt(conv)
-                    try:
-                        log_event(
-                            "VOICE_V53_BLOCKED_EMERGENCY_DOWNGRADE_NEED_ADDRESS",
-                            p,
-                            {
-                                "caller_text": _safe_monitor_text(text),
-                                "old_reply": _safe_monitor_text(reply),
-                                "new_reply": _safe_monitor_text(new_reply),
-                                "call_sid": call_sid,
-                            },
-                            conv,
-                        )
-                    except Exception:
-                        pass
-                    return _v53_output(conv, new_reply, end_call=False)
-
-                # Existing reply is already an address prompt. Keep it, but keep the emergency lock.
-                _v53_append_reply(conv, reply)
-                out["appointment_type"] = "TROUBLESHOOT_395"
-                out["pending_step"] = sched.get("pending_step")
-                out["end_call"] = False
-                return out
-
-            # Verified address and not approved: the only allowed next customer-facing step is $395 dispatch confirmation.
-            if not sched.get("emergency_approved"):
-                if bad_downgrade or not (
-                    "395" in _v53_low(reply)
-                    and "dispatch" in _v53_low(reply)
-                ):
-                    new_reply = _v53_emergency_dispatch_prompt(conv)
-                    try:
-                        log_event(
-                            "VOICE_V53_BLOCKED_EMERGENCY_DOWNGRADE_DISPATCH_PROMPT",
-                            p,
-                            {
-                                "caller_text": _safe_monitor_text(text),
-                                "old_reply": _safe_monitor_text(reply),
-                                "new_reply": _safe_monitor_text(new_reply),
-                                "call_sid": call_sid,
-                            },
-                            conv,
-                        )
-                    except Exception:
-                        pass
-                    return _v53_output(conv, new_reply, end_call=False)
-
-                # Existing reply is already correct emergency dispatch prompt.
-                _v53_clear_normal_scheduling_artifacts(sched)
-                sched["awaiting_emergency_confirm"] = True
-                sched["v53_awaiting_dispatch_confirm"] = True
-                sched["appointment_type"] = "TROUBLESHOOT_395"
-                conv["appointment_type"] = "TROUBLESHOOT_395"
-                _v53_append_reply(conv, reply)
-                out["appointment_type"] = "TROUBLESHOOT_395"
-                out["pending_step"] = sched.get("pending_step")
-                out["end_call"] = False
-                return out
-
-            # Already approved emergency: do not allow normal slots or $195 to leak.
-            if bad_downgrade:
-                new_reply = _v53_after_dispatch_confirm(conv, p)
-                try:
-                    log_event(
-                        "VOICE_V53_BLOCKED_POST_APPROVAL_DOWNGRADE",
-                        p,
-                        {
-                            "caller_text": _safe_monitor_text(text),
-                            "old_reply": _safe_monitor_text(reply),
-                            "new_reply": _safe_monitor_text(new_reply),
-                            "call_sid": call_sid,
-                        },
-                        conv,
-                    )
-                except Exception:
-                    pass
-                return _v53_output(conv, new_reply, end_call=bool(sched.get("voice_close_after_reply")))
-
-    except Exception as e:
-        try:
-            log_event("VOICE_V53_POST_INTERCEPT_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
-        except Exception:
-            pass
-
     return out
