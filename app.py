@@ -15854,3 +15854,309 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return out
+
+
+# =============================
+# v45 STABILIZATION HOTFIX LAYER
+# =============================
+# Targets live v44 failure:
+# - Generic scheduled troubleshoot phrasing like "outlets that don't work" / "troubleshooted"
+#   bypassed the $395 consent gate and asked for a day/time.
+# - Offered slot choices must be intercepted before older emergency/name/date layers.
+# - Keep generic troubleshooting out of the emergency-dispatch script unless there are hard hazard words.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V45 = process_prevolt_voice_turn
+
+
+def _v45_low(text: str) -> str:
+    try:
+        return _intent_text(text or "")
+    except Exception:
+        return str(text or "").lower()
+
+
+def _v45_hard_hazard(text: str) -> bool:
+    try:
+        return bool(_v42_hard_hazard_text(text))
+    except Exception:
+        low = _v45_low(text)
+        return bool(re.search(r"\b(smoke|smoking|fire|flames?|burning|burnt|sparking|sparked|arcing|hot\s+to\s+the\s+touch|panel\s+hot|water\s+in\s+(?:the\s+)?panel)\b", low, flags=re.I))
+
+
+def _v45_generic_troubleshoot_text(text: str) -> bool:
+    """Broad scheduled-troubleshoot detector. Does not include hard emergency hazards."""
+    low = _v45_low(text)
+    if _v45_hard_hazard(low):
+        return False
+    patterns = [
+        r"\btroubleshoot(?:ing|ed)?\b",
+        r"\bdiagnos(?:e|ing|tic)\b",
+        r"\bpower\s+issues?\b",
+        r"\b(?:outlets?|receptacles?|plugs?)\s+(?:that\s+)?(?:do\s+not|don't|dont|won't|wont)\s+(?:work|have\s+power)\b",
+        r"\b(?:outlets?|receptacles?|plugs?)\s+(?:are\s+)?(?:dead|not\s+working|without\s+power|no\s+power)\b",
+        r"\b(?:lost|no)\s+power\s+(?:to|at|in)\s+(?:a\s+few\s+)?(?:outlets?|rooms?|circuits?)\b",
+        r"\b(?:lights?|fixtures?)\s+(?:do\s+not|don't|dont|won't|wont|not)\s+(?:work|turn\s+on)\b",
+        r"\bbreaker(?:s)?\s+(?:tripping|keeps?\s+tripping|won't\s+reset|wont\s+reset)\b",
+    ]
+    return any(re.search(p, low, flags=re.I) for p in patterns)
+
+
+def _v45_yes(text: str) -> bool:
+    try:
+        return bool(_v43_yes(text))
+    except Exception:
+        pass
+    try:
+        return _v41_yes_no(text) == "yes"
+    except Exception:
+        return bool(re.search(r"\b(yes|yeah|yep|ok|okay|sure|that works|sounds good|let'?s do it)\b", _v45_low(text), flags=re.I))
+
+
+def _v45_no(text: str) -> bool:
+    try:
+        return bool(_v43_no(text))
+    except Exception:
+        pass
+    try:
+        return _v41_yes_no(text) == "no"
+    except Exception:
+        return bool(re.search(r"\b(no|nope|nah|never mind|not now|too much|don'?t)\b", _v45_low(text), flags=re.I))
+
+
+def _v45_reply_is_generic_schedule_ask(reply: str) -> bool:
+    low = _v45_low(reply)
+    generic_bits = [
+        "what day and time work",
+        "what day and time works",
+        "what date and time",
+        "what time work",
+        "what time works",
+        "what weekday and time",
+        "what day time",
+        "day and time that works",
+        "get your appointment scheduled here",
+        "get this scheduled",
+        "scheduling details sorted",
+        "next scheduling detail",
+    ]
+    return any(bit in low for bit in generic_bits)
+
+
+def _v45_is_troubleshoot_appt(conv: dict, out: dict | None = None) -> bool:
+    sched = conv.setdefault("sched", {})
+    out = out or {}
+    appt = str(sched.get("appointment_type") or conv.get("appointment_type") or out.get("appointment_type") or "").upper()
+    return "TROUBLESHOOT" in appt
+
+
+def _v45_force_scheduled_troubleshoot(conv: dict, pending: str = "need_date") -> None:
+    try:
+        _v44_force_scheduled_troubleshoot_state(conv, pending)
+    except Exception:
+        sched = conv.setdefault("sched", {})
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        sched["awaiting_emergency_confirm"] = False
+        sched["emergency_approved"] = False
+        sched["hard_emergency_detected"] = False
+        sched["pending_step"] = pending
+        sched["state"] = "waiting_for_date"
+
+
+def _v45_troubleshoot_price_gate(conv: dict, caller_text: str = "") -> str:
+    sched = conv.setdefault("sched", {})
+    _v45_force_scheduled_troubleshoot(conv, "need_date")
+    sched["awaiting_troubleshoot_price_confirm"] = True
+    sched["troubleshoot_price_accepted"] = False
+    sched["awaiting_eval_price_confirm"] = False
+    sched["awaiting_slot_offer_choice"] = False
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    try:
+        reply = _v43_troubleshoot_price_prompt(conv, caller_text)
+    except Exception:
+        prefix = "The address is verified in our system. " if sched.get("address_verified") else ""
+        reply = prefix + "Troubleshoot and repair visits are $395. That covers sending one of our electricians out to diagnose the issue and repair it on site when possible. Does that work for you?"
+    conv["last_voice_reply"] = reply
+    return reply
+
+
+def _v45_offer_troubleshoot_slots(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    _v45_force_scheduled_troubleshoot(conv, "need_date")
+    sched["awaiting_troubleshoot_price_confirm"] = False
+    sched["troubleshoot_price_accepted"] = True
+    sched["awaiting_eval_price_confirm"] = False
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    try:
+        reply = _v43_offer_slots_for_troubleshoot(conv)
+    except Exception:
+        try:
+            reply = _v42_slot_offer_reply_for(conv, "TROUBLESHOOT_395")
+        except Exception:
+            reply = "Great. What weekday and time work best for you?"
+    conv["last_voice_reply"] = reply
+    return reply
+
+
+def _v45_decline_troubleshoot(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    sched["awaiting_troubleshoot_price_confirm"] = False
+    sched["troubleshoot_price_accepted"] = False
+    sched["closed_reason"] = "declined_troubleshoot_price"
+    sched["voice_close_after_reply"] = True
+    reply = "No problem. We will not schedule the visit right now. Thank you for calling Prevolt Electric. Goodbye."
+    conv["last_voice_reply"] = reply
+    return reply
+
+
+def _v45_any_offered_slot_choice_fast_path(conv: dict, caller_text: str) -> str | None:
+    """Intercept offered-slot choices for all appointment types before older layers can parse dates as names."""
+    sched = conv.setdefault("sched", {})
+    if not (sched.get("awaiting_slot_offer_choice") and (sched.get("offered_slot_options") or [])):
+        return None
+    # Do not treat a plain yes/no as a slot choice unless only one option exists.
+    if (_v45_yes(caller_text) or _v45_no(caller_text)) and len(sched.get("offered_slot_options") or []) > 1:
+        return None
+    try:
+        chosen = _v44_select_offered_slot_direct(conv, caller_text)
+    except Exception:
+        chosen = None
+    if not chosen:
+        return None
+    try:
+        _v44_apply_selected_slot(conv, chosen)
+    except Exception:
+        sched["scheduled_date"] = chosen.get("date")
+        sched["scheduled_time"] = chosen.get("time")
+        for k in ["start_at", "team_member_id", "service_variation_id", "service_variation_version", "duration_minutes"]:
+            if chosen.get(k) is not None:
+                sched[k] = chosen.get(k)
+        sched["awaiting_slot_offer_choice"] = False
+        sched["offered_slot_options"] = []
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+    # Keep scheduled troubleshoot out of emergency dispatch after the slot is selected.
+    if _v45_is_troubleshoot_appt(conv):
+        sched["awaiting_emergency_confirm"] = False
+        sched["emergency_approved"] = False
+        sched["hard_emergency_detected"] = False
+        sched["troubleshoot_price_accepted"] = True
+    try:
+        _v44_sanitize_date_words_from_name(conv)
+    except Exception:
+        pass
+    try:
+        reply = _v44_after_slot_prompt(conv)
+    except Exception:
+        reply = "What is your last name?"
+    conv["last_voice_reply"] = reply
+    return reply
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+
+    # 1) Highest priority: slot choice. This prevents date words from becoming names
+    # and prevents generic troubleshoot from reopening emergency-dispatch language.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        try:
+            _v44_sanitize_date_words_from_name(conv_pre)
+        except Exception:
+            pass
+        slot_reply = _v45_any_offered_slot_choice_fast_path(conv_pre, caller_text)
+        if slot_reply:
+            slot_reply = _voice_naturalize_reply(slot_reply)
+            try:
+                log_event("VOICE_V45_OFFERED_SLOT_DIRECT", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(slot_reply), "call_sid": call_sid}, conv_pre)
+            except Exception:
+                pass
+            return {"reply_to_customer": slot_reply, "booking_created": False, "manual_only": False, "pending_step": conv_pre.setdefault("sched", {}).get("pending_step"), "appointment_type": conv_pre.setdefault("sched", {}).get("appointment_type") or conv_pre.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V45_SLOT_PRE_INTERCEPT_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    # 2) Price confirmation lane for scheduled troubleshoot.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        sched_pre = conv_pre.setdefault("sched", {})
+        if sched_pre.get("awaiting_troubleshoot_price_confirm"):
+            if _v45_no(caller_text):
+                reply = _v45_decline_troubleshoot(conv_pre)
+                try:
+                    log_event("VOICE_V45_TROUBLESHOOT_PRICE_DECLINED", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv_pre)
+                except Exception:
+                    pass
+                return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": "TROUBLESHOOT_395", "end_call": True}
+            if _v45_yes(caller_text) or (_v42_availability_request_text(caller_text) if "_v42_availability_request_text" in globals() else False):
+                reply = _v45_offer_troubleshoot_slots(conv_pre)
+                try:
+                    log_event("VOICE_V45_TROUBLESHOOT_PRICE_ACCEPTED_OFFER_SLOTS", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv_pre)
+                except Exception:
+                    pass
+                return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": "TROUBLESHOOT_395", "end_call": False}
+            reply = _v45_troubleshoot_price_gate(conv_pre, caller_text)
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": "TROUBLESHOOT_395", "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V45_PRICE_PRE_INTERCEPT_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V45(phone, call_sid, caller_text)
+
+    # 3) Postprocess stabilization: if older layers routed a generic troubleshoot to date collection
+    # or emergency dispatch without the $395 consent gate, replace the reply with the correct gate.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+        reply = str(out.get("reply_to_customer") or "")
+        low_reply = _v45_low(reply)
+        generic_ts = _v45_generic_troubleshoot_text(caller_text) or (_v45_is_troubleshoot_appt(conv, out) and not _v45_hard_hazard(caller_text))
+        price_already_accepted = bool(sched.get("troubleshoot_price_accepted"))
+        already_asking_price = _v43_is_troubleshoot_price_prompt(reply) if "_v43_is_troubleshoot_price_prompt" in globals() else ("395" in low_reply and "does that work" in low_reply)
+
+        if generic_ts and not price_already_accepted and not already_asking_price:
+            if _v45_reply_is_generic_schedule_ask(reply) or "this sounds urgent" in low_reply or "send someone now" in low_reply or "dispatch someone now" in low_reply:
+                reply2 = _v45_troubleshoot_price_gate(conv, caller_text)
+                out["reply_to_customer"] = _voice_naturalize_reply(reply2)
+                out["booking_created"] = False
+                out["manual_only"] = False
+                out["pending_step"] = sched.get("pending_step")
+                out["appointment_type"] = "TROUBLESHOOT_395"
+                out["end_call"] = False
+                try:
+                    log_event("VOICE_V45_TROUBLESHOOT_PRICE_GATE_FORCED", p, {"caller_text": _safe_monitor_text(caller_text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(out["reply_to_customer"]), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+                return out
+
+        # If older layers output the price prompt, make sure the next turn is held in the price-confirm lane.
+        if generic_ts and already_asking_price and not price_already_accepted:
+            _v45_force_scheduled_troubleshoot(conv, "need_date")
+            sched["awaiting_troubleshoot_price_confirm"] = True
+            sched["awaiting_emergency_confirm"] = False
+            sched["emergency_approved"] = False
+            out["appointment_type"] = "TROUBLESHOOT_395"
+            out["pending_step"] = sched.get("pending_step")
+            out["end_call"] = False
+            conv["last_voice_reply"] = out.get("reply_to_customer") or reply
+
+        # Final cleanup: date words cannot remain as last names.
+        try:
+            _v44_sanitize_date_words_from_name(conv)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            log_event("VOICE_V45_POST_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
