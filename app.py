@@ -12837,3 +12837,308 @@ def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: d
     })
     return True
 
+
+# =============================
+# v34 VOICE HOTFIX LAYER
+# =============================
+# Targets live failures observed after v33:
+# - generic first reply stalling after "I can get your appointment scheduled here"
+# - weekday/month words becoming last names (Matthew Monday)
+# - actual last-name reply not overwriting bad/date last name
+# - duplicate email confirmation after caller already said yes
+# - offered-slot choice falling back to the first offered slot
+
+_V34_DATE_WORDS = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "today", "tomorrow", "morning", "afternoon", "evening", "night", "noon", "pm", "am",
+}
+
+_ORIG_VOICE_SANITIZE_NAME_FIELDS_V34 = _voice_sanitize_name_fields
+_ORIG_VOICE_NAME_FAST_PATH_V34 = _voice_name_fast_path
+_ORIG_VOICE_APPLY_OFFERED_SLOT_FAST_PATH_V34 = _voice_apply_offered_slot_fast_path
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V34 = process_prevolt_voice_turn
+
+
+def _v34_clean_single_name_word(text: str) -> str:
+    """Return a clean one-word/spelled surname when the caller is answering a name prompt."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if "@" in raw or re.search(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", raw):
+        return ""
+    # Prefer spelled-last-name conversion from v32 when available: B-A-C-O-N -> Bacon.
+    try:
+        spelled = _v32_spelled_name_to_word(raw)
+        if spelled:
+            raw_word = spelled
+        else:
+            raw_word = raw
+    except Exception:
+        raw_word = raw
+    raw_word = re.sub(r"\b(?:my\s+last\s+name\s+is|last\s+name\s+is|it\s+is|it's|its|this\s+is)\b", " ", raw_word, flags=re.I)
+    words = [normalize_person_name(w) for w in re.findall(r"[A-Za-z][A-Za-z'\-]*", raw_word) if normalize_person_name(w)]
+    if not words:
+        return ""
+    # If caller says "Bacon B-A-C-O-N", use the first normal word.
+    candidate = words[0]
+    bad = set(_V34_DATE_WORDS) | set(globals().get("_V32_LASTNAME_STOPWORDS", set())) | {
+        "yes", "yeah", "okay", "ok", "sure", "correct", "works", "thanks", "thank", "you",
+        "ev", "charger", "outlet", "installed", "repair", "replace", "windsor", "locks", "connecticut", "massachusetts",
+    }
+    if candidate.lower() in bad:
+        return ""
+    if len(candidate) < 2 or len(candidate) > 32:
+        return ""
+    return candidate[:1].upper() + candidate[1:].lower()
+
+
+def _v34_bad_last_name(value: str) -> bool:
+    v = normalize_person_name(str(value or "")).strip().lower()
+    if not v:
+        return False
+    if v in _V34_DATE_WORDS:
+        return True
+    try:
+        if _v32_name_is_malformed(v):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _voice_sanitize_name_fields(profile: dict, sched: dict | None = None) -> None:
+    try:
+        _ORIG_VOICE_SANITIZE_NAME_FIELDS_V34(profile, sched)
+    except Exception:
+        pass
+    changed = False
+    for key in ["active_last_name", "last_name", "recognized_last_name", "voicemail_last_name"]:
+        if _v34_bad_last_name(profile.get(key) or ""):
+            profile[key] = None
+            changed = True
+    full = " ".join(str(profile.get("name") or "").strip().split())
+    if full:
+        parts = [p for p in re.findall(r"[A-Za-z][A-Za-z'\-]*", full)]
+        if len(parts) >= 2 and _v34_bad_last_name(parts[-1]):
+            profile["name"] = parts[0]
+            profile["active_first_name"] = profile.get("active_first_name") or parts[0]
+            profile["first_name"] = profile.get("first_name") or parts[0]
+            changed = True
+        elif len(parts) >= 5:
+            first = profile.get("active_first_name") or profile.get("first_name") or (parts[0] if parts else "")
+            if first:
+                profile["name"] = first
+                profile["active_first_name"] = first
+                profile["first_name"] = first
+                profile["active_last_name"] = None
+                profile["last_name"] = None
+                changed = True
+    if changed and sched is not None:
+        try:
+            recompute_pending_step(profile, sched)
+        except Exception:
+            pass
+
+
+def _voice_name_fast_path(conv: dict, caller_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    step = str(sched.get("pending_step") or "").lower()
+    state = str(sched.get("state") or "").lower()
+    name_engine_state = str(sched.get("name_engine_state") or "").lower()
+    waiting_for_name = step == "need_name" or state in {"waiting_for_name", "need_name"} or "name" in name_engine_state
+    if waiting_for_name:
+        try:
+            _voice_sanitize_name_fields(profile, sched)
+        except Exception:
+            pass
+        first_known = _voice_profile_first_name(profile)
+        candidate = _v34_clean_single_name_word(caller_text)
+        if first_known and candidate:
+            # Overwrite any date/weekday or stale last name while the system is explicitly asking for last name.
+            profile["active_last_name"] = candidate
+            profile["last_name"] = candidate
+            profile["name"] = f"{first_known} {candidate}".strip()
+            sched["name_engine_state"] = None
+            sched["pending_step"] = None
+            try:
+                recompute_pending_step(profile, sched)
+            except Exception:
+                pass
+            return _voice_after_name_reply(conv)
+        if first_known and not _voice_profile_last_name(profile):
+            sched["pending_step"] = "need_name"
+            sched["state"] = "waiting_for_name"
+            return "What's your last name?"
+    return _ORIG_VOICE_NAME_FAST_PATH_V34(conv, caller_text)
+
+
+def _v34_text_tokens(s: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", _intent_text(s or "")))
+
+
+def _v34_apply_offered_slot_selection(conv: dict, inbound_text: str) -> bool:
+    """Conservative offered-slot lock that strongly matches the spoken option before the generic SMS path."""
+    sched = conv.setdefault("sched", {})
+    options = sched.get("offered_slot_options") or []
+    if not (sched.get("awaiting_slot_offer_choice") and options):
+        return False
+    low = _intent_text(inbound_text or "")
+    explicit_time = extract_explicit_time_from_text(inbound_text or "") if "extract_explicit_time_from_text" in globals() else ""
+    chosen = None
+
+    # Ordinal choice.
+    for idx, keys in enumerate([["first", "1st", "one"], ["second", "2nd", "two"], ["third", "3rd", "three"]]):
+        if idx < len(options) and any(re.search(rf"\b{re.escape(k)}\b", low) for k in keys):
+            chosen = options[idx]
+            break
+
+    # Match by weekday/month/day/time from the slot label/date.
+    if chosen is None:
+        matches = []
+        for opt in options:
+            try:
+                d = datetime.strptime(str(opt.get("date") or ""), "%Y-%m-%d")
+                weekday = d.strftime("%A").lower()
+                month = d.strftime("%B").lower()
+                day = str(int(d.strftime("%d")))
+                opt_time = str(opt.get("time") or "")
+                label = str(opt.get("label") or "")
+                label_tokens = _v34_text_tokens(label)
+                score = 0
+                if re.search(rf"\b{weekday}\b", low): score += 2
+                if re.search(rf"\b{month}\b", low): score += 2
+                if re.search(rf"\b{day}(?:st|nd|rd|th)?\b", low): score += 2
+                if explicit_time and opt_time == explicit_time: score += 3
+                if label_tokens and label_tokens.issubset(_v34_text_tokens(low)): score += 4
+                if score >= 2:
+                    matches.append((score, opt))
+            except Exception:
+                continue
+        if matches:
+            matches.sort(key=lambda x: x[0], reverse=True)
+            if len(matches) == 1 or matches[0][0] > matches[1][0]:
+                chosen = matches[0][1]
+
+    if chosen is None:
+        return False
+
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+    sched["appointment_type"] = appt
+    conv["appointment_type"] = appt
+    sched["scheduled_date"] = chosen.get("date")
+    sched["scheduled_time"] = chosen.get("time")
+    sched["scheduled_time_source"] = "voice_offered_slot_v34"
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    sched["slot_choice_locked"] = True
+    sched["booking_attempt_nonce"] = str(uuid.uuid4())
+    return True
+
+
+def _voice_apply_offered_slot_fast_path(conv: dict, caller_text: str) -> str | None:
+    try:
+        selected = _v34_apply_offered_slot_selection(conv, caller_text)
+    except Exception:
+        selected = False
+    if selected:
+        profile = conv.setdefault("profile", {})
+        sched = conv.setdefault("sched", {})
+        try:
+            _voice_sanitize_name_fields(profile, sched)
+            recompute_pending_step(profile, sched)
+        except Exception:
+            pass
+        return _voice_naturalize_reply(choose_next_prompt_from_state(conv, inbound_text=caller_text))
+    return _ORIG_VOICE_APPLY_OFFERED_SLOT_FAST_PATH_V34(conv, caller_text)
+
+
+def _v34_force_actionable_reply(conv: dict, reply: str) -> str:
+    r = _voice_naturalize_reply(reply or "")
+    sched = conv.setdefault("sched", {})
+    if sched.get("booking_created"):
+        return r
+    low = _intent_text(r)
+    has_question = "?" in r or any(p in low for p in ["what's", "what is", "which town", "which one", "does that work", "do you want", "is this for"])
+    generic_only = bool(re.fullmatch(r"(?:I can get your appointment scheduled here\.?|I can help get this scheduled\.?)", r.strip(), flags=re.I))
+    if has_question and not generic_only:
+        return r
+    pending = str(sched.get("pending_step") or "").lower()
+    state = str(sched.get("state") or "").lower()
+    missing = str(sched.get("address_missing") or "").lower()
+    prompt = ""
+    if pending == "need_address" or state == "waiting_for_address" or missing:
+        prompt = "Which town is it in, and is that Connecticut or Massachusetts?" if missing in {"town", "city", "state", "confirm"} else "What's the house number and street name for the work?"
+    elif pending == "need_name" or state == "waiting_for_name":
+        first = _voice_profile_first_name(conv.setdefault("profile", {}))
+        last = _voice_profile_last_name(conv.setdefault("profile", {}))
+        prompt = "What's your last name?" if first and not last else "What's your first and last name?"
+    elif pending == "need_email" or state == "waiting_for_email":
+        prompt = "What's the best email address for the appointment?"
+    elif pending in {"need_date", "need_time"} or state == "waiting_for_date":
+        prompt = "Which appointment option works best, or what day and time are you available?"
+    if prompt:
+        base = "I can get your appointment scheduled here." if generic_only or not r else r.rstrip(" .") + "."
+        if prompt.lower() not in base.lower():
+            return f"{base} {prompt}".strip()
+    return r
+
+
+def _v34_dedupe_email_confirmation(conv: dict, reply: str, caller_text: str) -> str:
+    sched = conv.setdefault("sched", {})
+    yn = _voice_yes_no_text(caller_text) if "_voice_yes_no_text" in globals() else ""
+    if yn == "yes" and sched.get("voice_email_confirmed") and "is that correct" in _intent_text(reply or ""):
+        # If the caller just confirmed the email, don't ask the same confirmation again.
+        return "Thanks. I'll finish the booking now."
+    return reply
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    try:
+        conv0 = hydrate_voice_conversation(p, call_sid)
+        _v32_apply_name_repairs(conv0, caller_text)
+        _voice_sanitize_name_fields(conv0.setdefault("profile", {}), conv0.setdefault("sched", {}))
+    except Exception:
+        pass
+    output = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V34(phone, call_sid, caller_text)
+    try:
+        # IMPORTANT: rehydrate after the wrapped function; it may have updated state in storage.
+        conv = hydrate_voice_conversation(p, call_sid)
+        sched = conv.setdefault("sched", {})
+        profile = conv.setdefault("profile", {})
+        try:
+            _v32_apply_name_repairs(conv, caller_text)
+            _voice_sanitize_name_fields(profile, sched)
+        except Exception:
+            pass
+        # Do not let a day/month survive as a last name after a date-selection turn.
+        if _v34_bad_last_name(profile.get("active_last_name") or profile.get("last_name") or ""):
+            profile["active_last_name"] = None
+            profile["last_name"] = None
+            first = _voice_profile_first_name(profile)
+            profile["name"] = first or None
+            try:
+                recompute_pending_step(profile, sched)
+            except Exception:
+                pass
+        reply = _v34_force_actionable_reply(conv, str(output.get("reply_to_customer") or ""))
+        reply = _v34_dedupe_email_confirmation(conv, reply, caller_text)
+        output["reply_to_customer"] = reply
+        conv["last_voice_reply"] = reply
+        if not sched.get("booking_created") and not output.get("booking_created") and ("?" in reply):
+            output["end_call"] = False
+        try:
+            log_event("VOICE_V34_POSTPROCESS", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "pending_step": sched.get("pending_step"), "state": sched.get("state"), "name": profile.get("name"), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            log_event("VOICE_V34_POSTPROCESS_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return output
