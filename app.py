@@ -14946,3 +14946,173 @@ def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
     data = bytearray(_linear16_to_mulaw(sample) for sample in pcm)
     return base64.b64encode(bytes(data)).decode("ascii")
 
+
+
+# =============================
+# v41 VOICE HOTFIX LAYER
+# =============================
+# Targets live failure after v40:
+# - Address verification can take several seconds; after an embedded address is verified,
+#   acknowledge it so the caller understands what just happened.
+# - After the caller says yes to the $195 evaluation visit, NEVER repeat the $195 consent prompt.
+#   Offer the concrete slots already stored in offered_slot_options.
+# - Preserve the stable v36-v40 name/email/address corrections.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V41 = process_prevolt_voice_turn
+
+
+def _v41_yes_no(text: str) -> str | None:
+    try:
+        return _voice_yes_no_text(text)
+    except Exception:
+        low = _intent_text(text or "")
+        if re.search(r"\b(yes|yeah|yep|ok|okay|sure|that works|sounds good|fine|lets do it|let's do it)\b", low):
+            return "yes"
+        if re.search(r"\b(no|nope|nah|not really|too much|free quote|do not want|don't want)\b", low):
+            return "no"
+    return None
+
+
+def _v41_reply_is_eval_price_prompt(reply: str) -> bool:
+    low = _intent_text(reply or "")
+    return bool(
+        ("195" in low or "evaluation visit" in low or "onsite evaluation" in low or "on site evaluation" in low)
+        and ("does that work" in low or "interested" in low or "evaluation visit is" in low)
+    )
+
+
+def _v41_slot_options_reply(sched: dict) -> str:
+    opts = (sched.get("offered_slot_options") or [])[:3]
+    if opts:
+        try:
+            return f"Great. We have {_format_slot_options(opts)}. Which one works best?"
+        except Exception:
+            labels = []
+            for opt in opts:
+                if isinstance(opt, dict):
+                    labels.append(str(opt.get("label") or "").strip())
+            labels = [x for x in labels if x]
+            if labels:
+                if len(labels) == 1:
+                    return f"Great. We have {labels[0]}. Does that time work?"
+                if len(labels) == 2:
+                    return f"Great. We have {labels[0]} or {labels[1]}. Which one works best?"
+                return f"Great. We have {labels[0]}, {labels[1]}, or {labels[2]}. Which one works best?"
+    pending = (sched.get("voice_pending_slot_offer_reply") or "").strip()
+    if pending:
+        pending = _voice_naturalize_reply(pending)
+        if "which one" not in _intent_text(pending):
+            pending = pending.rstrip(" .") + ". Which one works best?"
+        return pending
+    return "Great. What day and time works best for you?"
+
+
+def _v41_embedded_address_in_text(caller_text: str) -> bool:
+    try:
+        return bool(_v40_extract_embedded_address(caller_text))
+    except Exception:
+        pass
+    low = str(caller_text or "")
+    return bool(re.search(r"\b\d{1,6}\s+[A-Za-z0-9.'#\- ]+\b(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place)\b", low, flags=re.I))
+
+
+def _v41_add_address_verified_notice_if_needed(conv: dict, caller_text: str, reply: str) -> str:
+    sched = conv.setdefault("sched", {})
+    if not reply or not _v41_reply_is_eval_price_prompt(reply):
+        return reply
+    if not sched.get("address_verified"):
+        return reply
+    if sched.get("voice_address_verified_notice_sent"):
+        return reply
+    # Only add this when the caller gave the address in the same long opening/turn.
+    # This makes a long Google Maps verification delay feel intentional without
+    # adding filler to every normal scheduling step.
+    if not _v41_embedded_address_in_text(caller_text):
+        return reply
+    sched["voice_address_verified_notice_sent"] = True
+    cleaned = _v39_clean_reply_more(reply) if "_v39_clean_reply_more" in globals() else reply
+    return "I verified the address in our system. " + cleaned
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V41(phone, call_sid, caller_text)
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+
+        reply = _voice_naturalize_reply(str(out.get("reply_to_customer") or ""))
+
+        # If the previous step was the $195 consent gate and the customer says yes,
+        # the next spoken thing MUST be concrete availability, not another price prompt.
+        yn = _v41_yes_no(caller_text)
+        has_slots = bool(sched.get("offered_slot_options") or sched.get("voice_pending_slot_offer_reply"))
+        waiting_for_date = (
+            str(sched.get("pending_step") or "").lower() == "need_date"
+            or str(sched.get("state") or "").lower() == "waiting_for_date"
+        )
+        if yn == "yes" and waiting_for_date and has_slots:
+            # Accept the evaluation price once and advance.
+            sched["awaiting_eval_price_confirm"] = False
+            sched["awaiting_slot_offer_choice"] = True
+            reply2 = _v41_slot_options_reply(sched)
+            out["reply_to_customer"] = reply2
+            out["booking_created"] = False
+            out["end_call"] = False
+            out["pending_step"] = sched.get("pending_step") or "need_date"
+            conv["last_voice_reply"] = reply2
+            try:
+                log_event("VOICE_V41_PRICE_ACCEPTED_OFFER_SLOTS", p, {
+                    "caller_text": _safe_monitor_text(caller_text),
+                    "reply": _safe_monitor_text(reply2),
+                    "call_sid": call_sid,
+                    "offered_count": len(sched.get("offered_slot_options") or []),
+                }, conv)
+            except Exception:
+                pass
+            return out
+
+        # Do not let any postprocessor repeat the $195 prompt when slots are ready.
+        if _v41_reply_is_eval_price_prompt(reply) and waiting_for_date and has_slots and not sched.get("awaiting_eval_price_confirm"):
+            reply2 = _v41_slot_options_reply(sched)
+            out["reply_to_customer"] = reply2
+            out["end_call"] = False
+            conv["last_voice_reply"] = reply2
+            try:
+                log_event("VOICE_V41_SUPPRESSED_DUPLICATE_PRICE_PROMPT", p, {
+                    "caller_text": _safe_monitor_text(caller_text),
+                    "old_reply": _safe_monitor_text(reply),
+                    "new_reply": _safe_monitor_text(reply2),
+                    "call_sid": call_sid,
+                }, conv)
+            except Exception:
+                pass
+            return out
+
+        # Add a useful address-verification acknowledgement after a slow embedded-address lookup.
+        reply2 = _v41_add_address_verified_notice_if_needed(conv, caller_text, reply)
+        if reply2 != reply:
+            out["reply_to_customer"] = reply2
+            out["end_call"] = False
+            conv["last_voice_reply"] = reply2
+            try:
+                log_event("VOICE_V41_ADDRESS_VERIFIED_NOTICE", p, {
+                    "caller_text": _safe_monitor_text(caller_text),
+                    "reply": _safe_monitor_text(reply2),
+                    "call_sid": call_sid,
+                    "address": _safe_monitor_text(sched.get("raw_address") or ""),
+                }, conv)
+            except Exception:
+                pass
+            return out
+
+        out["reply_to_customer"] = _v39_clean_reply_more(reply) if "_v39_clean_reply_more" in globals() else reply
+        if not sched.get("booking_created") and not out.get("booking_created"):
+            out["end_call"] = False
+    except Exception as e:
+        try:
+            log_event("VOICE_V41_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
