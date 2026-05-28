@@ -13407,3 +13407,336 @@ try:
     app.view_functions["incoming_sms"] = incoming_sms_v35
 except Exception:
     pass
+
+# =============================
+# v36 VOICE HOTFIX LAYER
+# =============================
+# Corrects v35 strategy: stay in the voice booking lane for email corrections.
+# No SMS handoff just because an email readback was wrong. The assistant should
+# calmly ask for the full email again or apply a clear segment correction.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V36 = process_prevolt_voice_turn
+_ORIG_VOICE_NATURALIZE_REPLY_V36 = _voice_naturalize_reply
+
+_V36_EXTRA_FILLER_PATTERNS = [
+    r"\bOkay,?\s+let me\s+[^.?!]*?(?:sort|check|get|grab|process|run|confirm|update|wrap|finish)[^.?!]*[.?!]\s*",
+    r"\bThanks,?\s+let me\s+[^.?!]*?(?:sort|check|get|grab|process|run|confirm|update|wrap|finish)[^.?!]*[.?!]\s*",
+    r"\bGot it,?\s+let me\s+[^.?!]*?(?:sort|check|get|grab|process|run|confirm|update|wrap|finish)[^.?!]*[.?!]\s*",
+    r"\bI(?:'|’)?m\s+(?:going to|gonna)\s+[^.?!]*?(?:sort|check|get|grab|process|run|confirm|update|wrap|finish)[^.?!]*[.?!]\s*",
+    r"\bI(?:'|’)?ll\s+[^.?!]*?(?:move ahead|use that email|update that spelling|confirm|wrap|finish)[^.?!]*[.?!]\s*",
+]
+
+
+def _voice_naturalize_reply(reply: str) -> str:
+    r = _ORIG_VOICE_NATURALIZE_REPLY_V36(reply or "")
+    changed = True
+    while changed:
+        old = r
+        for pat in _V36_EXTRA_FILLER_PATTERNS:
+            r = re.sub(pat, "", r, flags=re.I)
+        r = re.sub(r"\s+", " ", r).strip()
+        changed = (r != old)
+    # Keep price copy clean.
+    r = r.replace("If that is something you're interested in. Does that work for you?", "Does that work for you?")
+    return r
+
+
+_V36_LETTER_WORDS = dict(globals().get("_V32_LETTER_WORDS", {}))
+_V36_LETTER_WORDS.update({
+    "boy": "b", "bravo": "b", "victor": "v", "voicemail": "v", "yellow": "y", "yankee": "y",
+    "kilo": "k", "okay": "o", "zero": "0", "one": "1", "two": "2", "three": "3",
+    "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+})
+
+
+def _v36_compact_letters(tokens: list[str]) -> str:
+    out = []
+    for tok in tokens:
+        t = re.sub(r"[^a-z0-9]", "", str(tok or "").lower())
+        if not t:
+            continue
+        if len(t) == 1 and (t.isalnum()):
+            out.append(t)
+        elif t in _V36_LETTER_WORDS:
+            out.append(_V36_LETTER_WORDS[t])
+        elif len(t) > 1:
+            out.append(t)
+    return "".join(out)
+
+
+def _v36_normalize_spoken_email_text(text: str) -> str:
+    s = str(text or "").strip().lower()
+    s = s.replace(" at the rate of ", " at ")
+    s = re.sub(r"\b(period|dot)\b", " . ", s)
+    s = re.sub(r"\b(at|at sign)\b", " @ ", s)
+    s = re.sub(r"\bg mail\b", " gmail ", s)
+    s = re.sub(r"\bgee mail\b", " gmail ", s)
+    s = s.replace("dash", "-").replace("underscore", "_")
+    s = s.replace("hyphen", "-")
+    # Remove obvious correction chatter before parsing.
+    s = re.sub(r"\b(no|nope|wrong|incorrect|not correct|that's wrong|thats wrong|it is|it's|its|the email is|email is)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _v36_tokens_to_email(tokens: list[str]) -> str:
+    parts = []
+    for tok in tokens:
+        t = str(tok or "").lower().strip()
+        if not t:
+            continue
+        if t in {"@", "at"}:
+            parts.append("@")
+        elif t in {".", "dot", "period"}:
+            parts.append(".")
+        elif t in {"dash", "hyphen"}:
+            parts.append("-")
+        elif t in {"underscore"}:
+            parts.append("_")
+        elif re.fullmatch(r"[a-z0-9]", t):
+            parts.append(t)
+        elif t in _V36_LETTER_WORDS:
+            parts.append(_V36_LETTER_WORDS[t])
+        elif re.fullmatch(r"[a-z0-9][a-z0-9._%+\-]*", t):
+            parts.append(t)
+    email = "".join(parts)
+    email = email.replace("@@", "@")
+    email = re.sub(r"\.+", ".", email)
+    email = email.strip(" .")
+    if re.fullmatch(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", email):
+        return email.lower()
+    return ""
+
+
+def _v36_parse_spoken_email(text: str, pending_email: str = "") -> str:
+    """Best-effort email parser for voice correction without leaving the call."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    direct = v13_extract_email(raw) if "v13_extract_email" in globals() else None
+    if direct:
+        return direct.lower()
+
+    s = _v36_normalize_spoken_email_text(raw)
+    # Pattern: amy dot m dot boyko at gmail dot com
+    tokens = re.findall(r"@|\.|[a-z0-9]+", s)
+    email = _v36_tokens_to_email(tokens)
+    if email:
+        return email
+
+    pending = (pending_email or "").strip().lower()
+    if pending and "@" in pending:
+        local, domain = pending.split("@", 1)
+        local_parts = local.split(".")
+        # Pattern: "the last part is B O Y K O" or "last part B-O-Y-K-O at gmail".
+        if re.search(r"\blast\s+part\b|\blast\s+piece\b|\bend\b|\bending\b", s):
+            after = re.split(r"\blast\s+part\s*(?:is)?\b|\blast\s+piece\s*(?:is)?\b|\bending\s*(?:is)?\b|\bend\s*(?:is)?\b", s, maxsplit=1)
+            segment_text = after[-1] if len(after) > 1 else s
+            # Drop domain words if present.
+            segment_text = re.split(r"\s+@\s+|\s+at\s+", segment_text, maxsplit=1)[0]
+            seg_tokens = re.findall(r"[a-z0-9]+", segment_text)
+            seg = _v36_compact_letters(seg_tokens)
+            if seg and len(seg) >= 2:
+                local_parts[-1] = seg
+                return (".".join(local_parts) + "@" + domain).lower()
+        # Pattern: caller gives just a trailing chunk like "Y K O" while pending is boiko.
+        short_tokens = re.findall(r"[a-z0-9]+", s)
+        short = _v36_compact_letters(short_tokens)
+        if short and 2 <= len(short) <= 8 and not any(w in s for w in ["gmail", "yahoo", "hotmail", "outlook", "@"]):
+            last = local_parts[-1] if local_parts else local
+            if len(short) < len(last):
+                local_parts[-1] = last[: max(0, len(last) - len(short))] + short
+            else:
+                local_parts[-1] = short
+            return (".".join(local_parts) + "@" + domain).lower()
+    return ""
+
+
+def _v36_spell_email_for_voice(email: str) -> str:
+    e = str(email or "").strip().lower()
+    if not e:
+        return ""
+    chunks = []
+    for ch in e:
+        if ch == ".":
+            chunks.append("dot")
+        elif ch == "@":
+            chunks.append("at")
+        elif ch == "-":
+            chunks.append("dash")
+        elif ch == "_":
+            chunks.append("underscore")
+        elif ch == "b":
+            chunks.append("B as in boy")
+        elif ch == "v":
+            chunks.append("V as in Victor")
+        else:
+            chunks.append(ch.upper() if ch.isalpha() else ch)
+    return ", ".join(chunks)
+
+
+def _v36_email_confirmation_reply(email: str, attempt: int = 0) -> str:
+    spoken = _v36_spell_email_for_voice(email)
+    if attempt <= 1:
+        return f"I heard {spoken}. Is that correct?"
+    return f"I have {spoken}. Is that correct?"
+
+
+def _v36_confirmed_email_save_and_book(phone: str, conv: dict, email: str) -> dict:
+    sched = conv.setdefault("sched", {})
+    sched["voice_email_confirmed"] = True
+    sched["voice_awaiting_email_confirm"] = False
+    sched["voice_pending_email"] = None
+    return _voice_save_confirmed_email_and_maybe_book_v31(phone, conv, email)
+
+
+# Revert the v35 email-to-text handoff behavior. Keep correction in voice lane.
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    conv = hydrate_voice_conversation(p, call_sid)
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    low = _intent_text(caller_text or "")
+    yn = _voice_yes_no_text(caller_text) if "_voice_yes_no_text" in globals() else ""
+
+    try:
+        _v32_apply_name_repairs(conv, caller_text)
+        _voice_sanitize_name_fields(profile, sched)
+    except Exception:
+        pass
+
+    # If we're waiting for email confirmation, stay on the voice call.
+    if sched.get("voice_awaiting_email_confirm"):
+        pending = str(sched.get("voice_pending_email") or "").strip().lower()
+        attempt = int(sched.get("voice_email_correction_attempts") or 0)
+        if yn == "yes" and pending:
+            out = _v36_confirmed_email_save_and_book(p, conv, pending)
+            out["reply_to_customer"] = _voice_naturalize_reply(out.get("reply_to_customer") or "")
+            conv["last_voice_reply"] = out["reply_to_customer"]
+            return out
+        if yn == "no" or any(x in low for x in ["wrong", "not correct", "incorrect", "nope", "never mind", "not it"]):
+            corrected = _v36_parse_spoken_email(caller_text, pending)
+            if corrected and corrected != pending:
+                sched["voice_pending_email"] = corrected
+                sched["voice_email_correction_attempts"] = attempt + 1
+                reply = _v36_email_confirmation_reply(corrected, attempt + 1)
+            else:
+                sched["voice_email_correction_attempts"] = attempt + 1
+                if attempt == 0:
+                    reply = "No problem. Please say the full email from the beginning, one character at a time. Say dot for a period and at for the at sign."
+                else:
+                    reply = "Let's do the full email one more time from the beginning. Please say each character slowly, including dot and at."
+            conv["last_voice_reply"] = reply
+            sched["pending_step"] = "need_email"
+            sched["state"] = "waiting_for_email"
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+        corrected = _v36_parse_spoken_email(caller_text, pending)
+        if corrected:
+            sched["voice_pending_email"] = corrected
+            reply = _v36_email_confirmation_reply(corrected, attempt)
+            conv["last_voice_reply"] = reply
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+        # Unclear response while confirming email: ask a concise yes/no.
+        reply = _v36_email_confirmation_reply(pending, attempt) if pending else "Please say the full email address again."
+        conv["last_voice_reply"] = reply
+        return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
+    # If waiting for email and caller gives one by voice, confirm it. Do not book yet.
+    if str(sched.get("pending_step") or "").lower() == "need_email" or "email" in str(sched.get("state") or "").lower():
+        incoming = _v36_parse_spoken_email(caller_text, "")
+        if incoming and not sched.get("voice_email_confirmed"):
+            sched["voice_pending_email"] = incoming
+            sched["voice_awaiting_email_confirm"] = True
+            sched["voice_email_correction_attempts"] = 0
+            sched["pending_step"] = "need_email"
+            sched["state"] = "waiting_for_email"
+            reply = _v36_email_confirmation_reply(incoming, 0)
+            conv["last_voice_reply"] = reply
+            try:
+                log_event("VOICE_EMAIL_CONFIRM_PROMPT_V36", p, {"email": incoming, "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
+    # For all non-email-correction turns, use the previous v35 behavior, then force the reply/actionability.
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V36(phone, call_sid, caller_text)
+    try:
+        conv2 = hydrate_voice_conversation(p, call_sid)
+        sched2 = conv2.setdefault("sched", {})
+        profile2 = conv2.setdefault("profile", {})
+        try:
+            _v32_apply_name_repairs(conv2, caller_text)
+            _voice_sanitize_name_fields(profile2, sched2)
+        except Exception:
+            pass
+        reply = _voice_naturalize_reply(str(out.get("reply_to_customer") or ""))
+        if "_v34_force_actionable_reply" in globals():
+            reply = _v34_force_actionable_reply(conv2, reply)
+        # Remove accidental duplicated email-confirmation prompt if it somehow leaks.
+        if sched2.get("voice_email_confirmed") and "is that correct" in _intent_text(reply):
+            reply = "Thanks. I'll finish the booking now."
+        out["reply_to_customer"] = reply
+        conv2["last_voice_reply"] = reply
+    except Exception as e:
+        try:
+            log_event("VOICE_V36_POSTPROCESS_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+    return out
+
+
+# Make the processing cue calmer: soft two-tone flutter with a longer reverb tail.
+def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
+    try:
+        requested = int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 1700)
+    except Exception:
+        requested = 1700
+    ms = max(1200, min(2400, requested))
+    rate = 8000
+    total = int(rate * (ms / 1000.0))
+    pcm = [0] * total
+
+    # Smooth overlapping notes: more calm IVR/assistant cue, less sharp ping.
+    events = [
+        (45, 176, 520, 0.052),
+        (250, 221, 620, 0.060),
+        (490, 196, 650, 0.050),
+        (760, 247, 700, 0.040),
+    ]
+    for n, (start_ms, freq, length_ms, gain) in enumerate(events):
+        start = int(rate * start_ms / 1000.0)
+        length = min(int(rate * length_ms / 1000.0), max(0, total - start))
+        phase = n * 0.83
+        for i in range(length):
+            idx = start + i
+            t = i / rate
+            x = i / max(1, length - 1)
+            attack = min(1.0, i / max(1, int(rate * 0.09)))
+            release = (1.0 - x) ** 2.6
+            global_fade = max(0.0, 1.0 - (idx / max(1, total)) ** 1.55)
+            flutter = 7.0 * math.sin(2 * math.pi * 3.1 * t + phase)
+            tone = math.sin(2 * math.pi * (freq + flutter) * t + phase)
+            tone += 0.08 * math.sin(2 * math.pi * (freq * 2.0) * t + phase + 1.2)
+            sample = int(15000 * gain * attack * release * global_fade * tone)
+            pcm[idx] = max(-12000, min(12000, pcm[idx] + sample))
+            # Reverb tail delays; soft enough not to sound like static.
+            for delay_ms, eg in ((86, 0.24), (171, 0.15), (286, 0.075), (430, 0.04)):
+                eidx = idx + int(rate * delay_ms / 1000.0)
+                if eidx < total:
+                    pcm[eidx] = max(-12000, min(12000, pcm[eidx] + int(sample * eg)))
+
+    # Gentle warm bed underneath.
+    for i in range(total):
+        t = i / rate
+        fade = max(0.0, 1.0 - (i / max(1, total)) ** 1.2)
+        pad = int(220 * fade * (math.sin(2 * math.pi * 118 * t) + 0.25 * math.sin(2 * math.pi * 164 * t)))
+        pcm[i] = max(-12000, min(12000, pcm[i] + pad))
+
+    fade_samples = int(rate * 0.08)
+    for i in range(min(fade_samples, total)):
+        mult = i / max(1, fade_samples)
+        pcm[i] = int(pcm[i] * mult)
+        j = total - 1 - i
+        pcm[j] = int(pcm[j] * mult)
+    return base64.b64encode(bytes(_linear16_to_mulaw(s) for s in pcm)).decode("ascii")
+
