@@ -17309,3 +17309,282 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return out
+
+
+# ===================================================
+# Voice stabilization v50 — explicit town/state address correction
+# ===================================================
+# Fixes the "1 Main Street" + "Windsor, Connecticut" failure where Google/older
+# layers kept a previously guessed town such as Danbury and then closed the call
+# as out of area. Customer-provided town/state now overrides a prior ambiguous
+# street-only geocode before any out-of-area decision is allowed.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V50 = process_prevolt_voice_turn
+
+
+def _v50_low(value: str) -> str:
+    return " ".join(str(value or "").lower().replace("’", "'").split())
+
+
+def _v50_state_code(value: str | None) -> str | None:
+    s = _v50_low(value or "")
+    if re.search(r"\b(?:ct|c\.t\.|connecticut)\b", s, flags=re.I):
+        return "CT"
+    if re.search(r"\b(?:ma|m\.a\.|massachusetts|mass\.)\b", s, flags=re.I):
+        return "MA"
+    return None
+
+
+def _v50_clean_town(value: str | None) -> str | None:
+    raw = " ".join(str(value or "").replace("\n", " ").split()).strip(" ,.")
+    if not raw:
+        return None
+    raw = re.sub(r"^(?:it'?s|it is|that'?s|that is|the town is|town is|in|at)\s+", "", raw, flags=re.I).strip(" ,.")
+    raw = re.sub(r"\b(?:ct|c\.t\.|connecticut|ma|m\.a\.|massachusetts|mass\.)\b", "", raw, flags=re.I).strip(" ,.")
+    raw = re.sub(r"\b(?:please|thanks|thank you|yes|yeah|yep|okay|ok)\b", "", raw, flags=re.I).strip(" ,.")
+    # Keep only a sane town-length phrase.
+    parts = raw.split()
+    if not parts or len(parts) > 4:
+        return None
+    return " ".join(p.capitalize() if not p.isupper() else p for p in parts)
+
+
+def _v50_extract_town_state(text: str) -> tuple[str | None, str | None]:
+    """Extract explicit town/state from turns like 'Windsor, Connecticut'."""
+    raw = " ".join(str(text or "").replace("\n", " ").split()).strip()
+    if not raw:
+        return (None, None)
+    state = _v50_state_code(raw)
+    if not state:
+        return (None, None)
+    # Prefer the phrase immediately before the state word.
+    m = re.search(
+        r"(?P<town>[A-Za-z][A-Za-z .'-]{1,45}?)\s*,?\s*(?:CT|C\.T\.|Connecticut|MA|M\.A\.|Massachusetts|Mass\.)\b",
+        raw,
+        flags=re.I,
+    )
+    if not m:
+        return (None, state)
+    town = _v50_clean_town(m.group("town"))
+    return (town, state)
+
+
+def _v50_canon_town(value: str | None) -> str:
+    s = _v50_low(value or "")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _v50_known_local_town(value: str | None, state: str | None = None) -> bool:
+    town = _v50_canon_town(value)
+    st = (state or "").upper()
+    if not town:
+        return False
+    if town in {"worcester", "worcestor", "boston", "malden"}:
+        return False
+    # Core CT/MA radius towns Kyle commonly services/tests. This is not a substitute
+    # for Google distance; it only prevents a bad geocode from turning Windsor into Danbury.
+    local_ct = {
+        "windsor", "windsor locks", "east windsor", "south windsor", "suffield", "enfield",
+        "east granby", "granby", "simsbury", "avon", "canton", "bloomfield", "hartford",
+        "west hartford", "east hartford", "manchester", "vernon", "ellington", "somers",
+        "tolland", "farmington", "plainville", "bristol", "newington", "wethersfield",
+        "glastonbury", "rocky hill", "cromwell", "berlin", "new britain", "west suffield",
+    }
+    local_ma = {"longmeadow", "east longmeadow", "springfield", "west springfield", "agawam", "feeding hills"}
+    if st == "CT":
+        return town in local_ct
+    if st == "MA":
+        return town in local_ma
+    return town in local_ct or town in local_ma
+
+
+def _v50_street_line_from_sched_or_text(conv: dict, text: str = "") -> str | None:
+    sched = conv.setdefault("sched", {})
+    pool = [text, sched.get("raw_address"), sched.get("address_candidate")]
+    norm = sched.get("normalized_address")
+    if isinstance(norm, dict) and norm.get("address_line_1"):
+        pool.append(str(norm.get("address_line_1")))
+    for item in pool:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        sample = item.strip().replace(", in ", ", ")
+        try:
+            line, _town, _state = _v47_extract_address_candidate(sample)
+            if line and _address_has_house_number_and_street(line):
+                return line
+        except Exception:
+            pass
+        # Fallback: take the address-looking first segment.
+        first = sample.split(",")[0].strip()
+        m = re.search(
+            r"\b\d{1,6}\s+[A-Za-z0-9.'#\- ]+?\s+(?:ave(?:nue)?|st(?:reet)?|rd|road|dr(?:ive)?|ln|lane|ct|court|blvd|boulevard|way|pl|place|cir|circle|ter|terrace)\b",
+            first,
+            flags=re.I,
+        )
+        if m:
+            try:
+                line, _town, _state = _v47_extract_address_candidate(m.group(0))
+                return line or m.group(0).title()
+            except Exception:
+                return m.group(0).title()
+    return None
+
+
+def _v50_locality_matches(addr: dict | None, town: str | None, state: str | None) -> bool:
+    if not isinstance(addr, dict) or not town:
+        return False
+    a_town = _v50_canon_town(addr.get("locality"))
+    want = _v50_canon_town(town)
+    a_state = str(addr.get("administrative_district_level_1") or "").upper()
+    if state and a_state and a_state != state.upper():
+        return False
+    return bool(a_town and want and a_town == want)
+
+
+def _v50_apply_explicit_customer_address(conv: dict, line: str, town: str, state: str, source: str = "customer_explicit_town_state_v50") -> None:
+    """Apply an explicit customer-provided address without letting old Google guesses win."""
+    sched = conv.setdefault("sched", {})
+    raw = f"{line}, {town}, {state}".strip(" ,")
+    addr = None
+    try:
+        result = normalize_address(raw, forced_state=state)
+        if isinstance(result, tuple) and len(result) >= 2 and result[0] == "ok" and _v50_locality_matches(result[1], town, state):
+            addr = result[1]
+    except Exception:
+        addr = None
+    if isinstance(addr, dict):
+        _v38_apply_normalized_address(conv, addr, source)
+    else:
+        # If Google returns another town (for example Danbury) for a generic street like
+        # 1 Main Street, do NOT accept that guessed town. Keep the exact customer town.
+        sched["normalized_address"] = {
+            "address_line_1": line,
+            "locality": town,
+            "administrative_district_level_1": state,
+            "postal_code": "",
+            "country": "US",
+            "verification_source": source + "_customer_supplied",
+        }
+        sched["raw_address"] = raw
+        sched["address_candidate"] = raw
+        sched["address_verified"] = True
+        sched["address_missing"] = None
+        sched["address_parts"] = {"street": True, "number": True, "city": True, "state": True, "zip": False, "source": source}
+    if sched.get("pending_step") == "need_address":
+        sched["pending_step"] = None
+    conv["appointment_type"] = sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195"
+
+
+def _v50_reply_after_explicit_address(conv: dict, caller_text: str) -> str:
+    sched = conv.setdefault("sched", {})
+    # Enforce far-away explicit towns only after the corrected town/state has been applied.
+    if _voice_is_out_of_area_town(_voice_destination_from_sched(sched)):
+        return _voice_out_of_area_reply()
+    try:
+        too_far, travel_minutes = _voice_residential_address_too_far(conv)
+    except Exception:
+        too_far, travel_minutes = False, None
+    if too_far:
+        return _voice_out_of_area_reply()
+    # EV/install/evaluation stays $195; power loss stays $395.
+    if _v49_issue_needs_troubleshoot(conv, caller_text):
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        sched["awaiting_troubleshoot_price_confirm"] = True
+        sched["awaiting_eval_price_confirm"] = False
+        try:
+            return _v45_troubleshoot_price_gate(conv, caller_text)
+        except Exception:
+            return "The address is verified in our system. Troubleshoot and repair visits are $395. That covers sending one of our electricians out to diagnose the issue and repair it on site when possible. Does that work for you?"
+    sched["appointment_type"] = sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195"
+    conv["appointment_type"] = sched["appointment_type"]
+    sched["awaiting_eval_price_confirm"] = True
+    sched["awaiting_troubleshoot_price_confirm"] = False
+    return "The address is verified in our system. We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step. Does that work for you?"
+
+
+def _v50_customer_town_state_override(conv: dict, caller_text: str) -> str | None:
+    """When caller supplies town/state after a street-only address, override stale/guessed town."""
+    town, state = _v50_extract_town_state(caller_text)
+    if not (town and state):
+        return None
+    line = _v50_street_line_from_sched_or_text(conv, caller_text)
+    if not line:
+        return None
+    # Explicit no-go towns still close. Local towns proceed. Unknown towns are left to old flow.
+    if _voice_is_out_of_area_town(town):
+        return _voice_out_of_area_reply()
+    if not _v50_known_local_town(town, state):
+        # Unknown town: do not override, let the Google/distance layer decide.
+        return None
+    _v50_apply_explicit_customer_address(conv, line, town, state, "town_state_override_v50")
+    return _v50_reply_after_explicit_address(conv, caller_text)
+
+
+def _v50_force_closed_output(phone: str, conv: dict, reply: str, reason: str = "residential_out_of_area_address") -> dict:
+    """Return a final answer that cannot fall through into an old scheduling prompt."""
+    sched = conv.setdefault("sched", {})
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["pending_step"] = None
+    return _voice_close_with_reply(phone, conv, reply, reason)
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    # Pre-layer: if the previous turn collected a street-only address and this turn gives
+    # the town/state, correct the stored destination before any older Google guess can close it.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        pre_reply = _v50_customer_town_state_override(conv_pre, caller_text or "")
+        if pre_reply:
+            if "do not schedule residential repairs" in pre_reply:
+                try:
+                    log_event("VOICE_V50_EXPLICIT_TOWN_CLOSE", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(pre_reply), "call_sid": call_sid}, conv_pre)
+                except Exception:
+                    pass
+                return _v50_force_closed_output(p, conv_pre, pre_reply, "residential_out_of_area_explicit_town_v50")
+            conv_pre.setdefault("voice_transcript", []).append({"role": "assistant", "text": pre_reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+            conv_pre["last_voice_reply"] = pre_reply
+            try:
+                log_event("VOICE_V50_TOWN_STATE_ADDRESS_OVERRIDE", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(pre_reply), "stored_address": _safe_monitor_text(conv_pre.setdefault('sched', {}).get('raw_address')), "call_sid": call_sid}, conv_pre)
+            except Exception:
+                pass
+            return {"reply_to_customer": pre_reply, "booking_created": False, "manual_only": False, "pending_step": conv_pre.setdefault("sched", {}).get("pending_step"), "appointment_type": conv_pre.setdefault("sched", {}).get("appointment_type") or conv_pre.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V50_PRE_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V50(phone, call_sid, caller_text)
+
+    # Post-layer: never allow a local explicit town/state turn to close using a stale guessed town.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        reply = str(out.get("reply_to_customer") or "")
+        if "do not schedule residential repairs" in reply:
+            town, state = _v50_extract_town_state(caller_text or "")
+            if town and state and _v50_known_local_town(town, state):
+                line = _v50_street_line_from_sched_or_text(conv, caller_text or "")
+                if line:
+                    _v50_apply_explicit_customer_address(conv, line, town, state, "post_close_recovery_v50")
+                    recovered = _v50_reply_after_explicit_address(conv, caller_text or "")
+                    out = {"reply_to_customer": recovered, "booking_created": False, "manual_only": False, "pending_step": conv.setdefault("sched", {}).get("pending_step"), "appointment_type": conv.setdefault("sched", {}).get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+                    try:
+                        log_event("VOICE_V50_PREVENTED_FALSE_OUT_OF_AREA", p, {"old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(recovered), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid}, conv)
+                    except Exception:
+                        pass
+                    return out
+            # If it is truly out of area, make it final and clear slot state.
+            return _v50_force_closed_output(p, conv, reply, "residential_out_of_area_address")
+    except Exception as e:
+        try:
+            log_event("VOICE_V50_POST_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
