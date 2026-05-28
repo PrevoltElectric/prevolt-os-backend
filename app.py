@@ -13740,3 +13740,487 @@ def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
         pcm[j] = int(pcm[j] * mult)
     return base64.b64encode(bytes(_linear16_to_mulaw(s) for s in pcm)).decode("ascii")
 
+
+# =============================
+# v37 VOICE HOTFIX LAYER
+# =============================
+# Targets the final minor live issue after v36:
+# - If caller says a local town in the opening description ("I live in Windsor")
+#   and then gives only the house number/street, do not ask the town/state again.
+#   Reuse the earlier town hint and advance the existing address-normalization flow.
+# - Keep this intentionally narrow to avoid disturbing the now-stable name/email/date paths.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V37 = process_prevolt_voice_turn
+_ORIG_VOICE_NATURALIZE_REPLY_V37 = _voice_naturalize_reply
+
+# Local towns that are safe to infer as Connecticut when spoken without a state.
+# Keep this conservative. These are the common Prevolt CT service-area towns where
+# asking "Connecticut or Massachusetts?" feels dumb to the caller.
+_V37_LOCAL_CT_TOWN_HINTS = [
+    "windsor locks", "south windsor", "east windsor", "west hartford", "east hartford",
+    "wethersfield", "rocky hill", "newington", "new britain", "bristol",
+    "plainville", "southington", "farmington", "avon", "simsbury", "canton",
+    "bloomfield", "granby", "east granby", "suffield", "enfield", "ellington",
+    "vernon", "tolland", "manchester", "glastonbury", "hartford", "windsor",
+]
+
+
+def _v37_state_from_text(text: str, default: str = "CT") -> str:
+    low = _intent_text(text or "")
+    if re.search(r"\b(?:massachusetts|ma)\b", low):
+        return "MA"
+    if re.search(r"\b(?:connecticut|ct)\b", low):
+        return "CT"
+    return default
+
+
+def _v37_extract_opening_town_hint(text: str) -> tuple[str, str] | tuple[None, None]:
+    """Extract a conservative town/state hint from natural caller speech.
+
+    Examples:
+      "I live in Windsor and need an EV charger" -> ("Windsor", "CT")
+      "I'm in South Windsor" -> ("South Windsor", "CT")
+
+    This intentionally does NOT try to parse arbitrary towns; it only handles
+    known local towns to avoid incorrectly skipping town/state confirmation.
+    """
+    raw = str(text or "")
+    low = _intent_text(raw)
+    if not low:
+        return None, None
+    # Prefer longer names first so "South Windsor" wins before "Windsor".
+    for town in sorted(_V37_LOCAL_CT_TOWN_HINTS, key=len, reverse=True):
+        # Require either a location cue or a very clear standalone local-town mention.
+        loc_cue = rf"\b(?:i live in|we live in|i am in|i'm in|we are in|we're in|located in|property is in|work is in|house is in|home is in|in)\s+{re.escape(town)}\b"
+        standalone = rf"\b{re.escape(town)}\s*,?\s*(?:connecticut|ct)\b"
+        if re.search(loc_cue, low) or re.search(standalone, low):
+            clean = " ".join(w.capitalize() for w in town.split())
+            return clean, _v37_state_from_text(raw, "CT")
+    return None, None
+
+
+def _v37_store_town_hint(conv: dict, caller_text: str) -> None:
+    town, state = _v37_extract_opening_town_hint(caller_text)
+    if not town:
+        return
+    sched = conv.setdefault("sched", {})
+    # Do not overwrite a verified address. This is only a hint for partial street addresses.
+    if sched.get("address_verified"):
+        return
+    sched["voice_town_hint"] = town
+    sched["voice_state_hint"] = state or "CT"
+    try:
+        log_event("VOICE_TOWN_HINT_CAPTURED_V37", conv.get("phone") or "", {"town": town, "state": state, "caller_text": _safe_monitor_text(caller_text), "call_sid": conv.get("last_call_sid")}, conv)
+    except Exception:
+        pass
+
+
+def _v37_is_town_question(reply: str) -> bool:
+    low = _intent_text(reply or "")
+    return (
+        "which town is it in" in low
+        or "what town is it in" in low
+        or "which town is this in" in low
+        or "what town is this in" in low
+        or "connecticut or massachusetts" in low
+        or "ct or ma" in low
+    )
+
+
+def _v37_has_partial_street(conv: dict) -> bool:
+    sched = conv.setdefault("sched", {})
+    raw = str(sched.get("raw_address") or sched.get("address_candidate") or sched.get("normalized_address") or "")
+    if not raw:
+        return False
+    try:
+        if _address_has_house_number_and_street(raw):
+            return True
+    except Exception:
+        pass
+    return bool(re.search(r"\b\d{1,6}\s+[A-Za-z0-9][A-Za-z0-9 .'-]*(?:ave|avenue|st|street|rd|road|dr|drive|ln|lane|ct|court|way|blvd|boulevard|circle|cir|terrace|ter)\b", raw, flags=re.I))
+
+
+def _v37_should_auto_apply_town_hint(conv: dict, reply: str) -> bool:
+    sched = conv.setdefault("sched", {})
+    if sched.get("address_verified") or sched.get("voice_town_hint_used"):
+        return False
+    if not _v37_is_town_question(reply):
+        return False
+    if not sched.get("voice_town_hint"):
+        return False
+    return _v37_has_partial_street(conv)
+
+
+def _voice_naturalize_reply(reply: str) -> str:
+    r = _ORIG_VOICE_NATURALIZE_REPLY_V37(reply or "")
+    # One more conservative filler cleanup from the latest successful call.
+    r = re.sub(r"\b(?:Okay,?\s*)?(?:Got it,?\s*)?(?:Thanks,?\s*)?Let me think through the next scheduling details with you\.\s*", "", r, flags=re.I)
+    r = re.sub(r"\b(?:Okay,?\s*)?(?:Got it,?\s*)?(?:Thanks,?\s*)?Let me get the next detail we need to finish scheduling\.\s*", "", r, flags=re.I)
+    r = re.sub(r"\s+", " ", r).strip()
+    return r
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        _v37_store_town_hint(conv_pre, caller_text)
+    except Exception as e:
+        try:
+            log_event("VOICE_V37_TOWN_HINT_PRE_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V37(phone, call_sid, caller_text)
+
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        _v37_store_town_hint(conv, caller_text)
+        reply = _voice_naturalize_reply(str(out.get("reply_to_customer") or ""))
+
+        # If the caller already gave a local town in the opening description, and
+        # the only missing address piece is town/state, silently feed that town
+        # into the existing backend flow and return the next real prompt.
+        if _v37_should_auto_apply_town_hint(conv, reply):
+            sched = conv.setdefault("sched", {})
+            town = str(sched.get("voice_town_hint") or "").strip()
+            state = str(sched.get("voice_state_hint") or "CT").strip() or "CT"
+            sched["voice_town_hint_used"] = True
+            synthetic = f"{town}, {'Connecticut' if state.upper() == 'CT' else 'Massachusetts'}"
+            try:
+                log_event("VOICE_TOWN_HINT_APPLIED_V37", p, {"synthetic_town": synthetic, "previous_reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            out2 = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V37(phone, call_sid, synthetic)
+            try:
+                conv2 = hydrate_voice_conversation(p, call_sid)
+                reply2 = _voice_naturalize_reply(str(out2.get("reply_to_customer") or ""))
+                out2["reply_to_customer"] = reply2
+                conv2["last_voice_reply"] = reply2
+            except Exception:
+                pass
+            return out2
+
+        out["reply_to_customer"] = reply
+        conv["last_voice_reply"] = reply
+    except Exception as e:
+        try:
+            log_event("VOICE_V37_POSTPROCESS_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
+
+
+
+# =============================
+# v38 MAPS ADDRESS + DISTANCE HOTFIX LAYER
+# =============================
+# Targets the issue Kyle identified after v37:
+# - Do not rely on a tiny hard-coded town list when a caller gives a partial street address.
+# - Use Google Maps Geocoding to resolve partial addresses like "45 Dickerman Ave" when
+#   the result is complete and unambiguous in CT/MA.
+# - Use Google Maps Distance Matrix to enforce residential travel distance from the dispatch origin.
+# - Keep this as a narrow wrapper around the now-stable v36/v37 voice flow.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V38 = process_prevolt_voice_turn
+
+
+def _v38_clean_addr_text(value: str) -> str:
+    return " ".join(str(value or "").replace("\n", " ").split()).strip(" ,.;")
+
+
+def _v38_address_line_key(value: str) -> str:
+    low = _intent_text(value or "")
+    low = re.sub(r"\b(?:street|st)\b", "st", low)
+    low = re.sub(r"\b(?:avenue|ave)\b", "ave", low)
+    low = re.sub(r"\b(?:road|rd)\b", "rd", low)
+    low = re.sub(r"\b(?:drive|dr)\b", "dr", low)
+    low = re.sub(r"\b(?:lane|ln)\b", "ln", low)
+    low = re.sub(r"\b(?:court|ct)\b", "ct", low)
+    low = re.sub(r"\b(?:boulevard|blvd)\b", "blvd", low)
+    low = re.sub(r"\b(?:circle|cir)\b", "cir", low)
+    low = re.sub(r"\b(?:terrace|ter)\b", "ter", low)
+    low = re.sub(r"[^a-z0-9 ]+", " ", low)
+    return re.sub(r"\s+", " ", low).strip()
+
+
+def _v38_complete_addr_struct(a: dict | None) -> bool:
+    return bool(
+        isinstance(a, dict)
+        and (a.get("address_line_1") or "").strip()
+        and (a.get("locality") or "").strip()
+        and (a.get("administrative_district_level_1") or "").strip()
+        and (a.get("postal_code") or "").strip()
+        and re.match(r"^\d{1,6}\b", (a.get("address_line_1") or "").strip())
+    )
+
+
+def _v38_addr_key(a: dict) -> tuple[str, str, str, str]:
+    return (
+        _v38_address_line_key(a.get("address_line_1") or ""),
+        _intent_text(a.get("locality") or ""),
+        (a.get("administrative_district_level_1") or "").strip().upper(),
+        (a.get("postal_code") or "").strip(),
+    )
+
+
+def _v38_raw_line_matches_normalized(raw: str, a: dict) -> bool:
+    """Guard against Google returning a vague/nearby result for a partial address."""
+    raw_key = _v38_address_line_key(raw)
+    line_key = _v38_address_line_key(a.get("address_line_1") or "")
+    if not raw_key or not line_key:
+        return False
+    raw_num = re.match(r"^(\d{1,6})\b", raw_key)
+    line_num = re.match(r"^(\d{1,6})\b", line_key)
+    if raw_num and line_num and raw_num.group(1) != line_num.group(1):
+        return False
+    # Street name tokens after the number must substantially overlap.
+    raw_tokens = [t for t in raw_key.split() if not t.isdigit()]
+    line_tokens = [t for t in line_key.split() if not t.isdigit()]
+    if not raw_tokens or not line_tokens:
+        return False
+    shared = set(raw_tokens) & set(line_tokens)
+    return bool(shared) and (raw_key in line_key or line_key in raw_key or len(shared) >= min(2, len(raw_tokens)))
+
+
+def _v38_normalize_attempt(raw: str, forced_state: str | None = None) -> dict | None:
+    try:
+        result = normalize_address(raw, forced_state=forced_state) if forced_state else normalize_address(raw)
+    except Exception as e:
+        try:
+            print("[WARN] v38 normalize attempt failed:", repr(e))
+        except Exception:
+            pass
+        return None
+    status = None
+    addr = None
+    if isinstance(result, tuple) and len(result) >= 2:
+        status, addr = result[0], result[1]
+    elif isinstance(result, dict):
+        status, addr = "ok", result
+    if status == "ok" and _v38_complete_addr_struct(addr):
+        return addr
+    return None
+
+
+def _v38_google_resolve_partial_address(raw_address: str) -> tuple[dict | None, str]:
+    """
+    Resolve a partial address using Google Geocoding.
+
+    Rules:
+      - Direct geocode can win if it returns a complete CT/MA street address.
+      - Otherwise, try CT and MA constrained geocodes.
+      - Accept only a single unique CT/MA match that still matches the raw street line.
+      - If CT and MA both produce plausible distinct matches, ask for state instead of guessing.
+    """
+    raw = _v38_clean_addr_text(raw_address)
+    if not raw or not _address_has_house_number_and_street(raw):
+        return None, "not_house_number_and_street"
+
+    candidates: list[dict] = []
+
+    direct = _v38_normalize_attempt(raw, None)
+    if direct and (direct.get("administrative_district_level_1") or "").upper() in {"CT", "MA"} and _v38_raw_line_matches_normalized(raw, direct):
+        candidates.append(direct)
+
+    for st in ("CT", "MA"):
+        forced = _v38_normalize_attempt(raw, st)
+        if forced and (forced.get("administrative_district_level_1") or "").upper() == st and _v38_raw_line_matches_normalized(raw, forced):
+            candidates.append(forced)
+
+    unique: dict[tuple[str, str, str, str], dict] = {}
+    for c in candidates:
+        unique[_v38_addr_key(c)] = c
+
+    vals = list(unique.values())
+    if len(vals) == 1:
+        return vals[0], "unique_google_match"
+
+    if len(vals) > 1:
+        # If direct and forced produced duplicates of the same address, unique would be 1.
+        # Multiple remaining results means the same partial address may exist in both CT and MA,
+        # so keep the confirmation question.
+        return None, "ambiguous_ct_ma_matches"
+
+    return None, "no_google_match"
+
+
+def _v38_apply_normalized_address(conv: dict, addr: dict, source: str) -> None:
+    sched = conv.setdefault("sched", {})
+    sched["normalized_address"] = dict(addr)
+    sched["raw_address"] = (
+        f"{addr.get('address_line_1')}, {addr.get('locality')}, "
+        f"{addr.get('administrative_district_level_1')} {addr.get('postal_code')}"
+    ).strip(" ,")
+    sched["address_candidate"] = sched["raw_address"]
+    sched["address_verified"] = True
+    sched["address_missing"] = None
+    sched["address_parts"] = {
+        "street": True,
+        "number": True,
+        "city": True,
+        "state": True,
+        "zip": True,
+        "source": source,
+    }
+    sched["pending_step"] = None if sched.get("pending_step") == "need_address" else sched.get("pending_step")
+
+
+def _v38_should_maps_resolve(conv: dict, reply: str | None = None) -> bool:
+    sched = conv.setdefault("sched", {})
+    if sched.get("address_verified"):
+        return False
+    raw = _v38_clean_addr_text(sched.get("raw_address") or sched.get("address_candidate") or "")
+    if not raw or not _address_has_house_number_and_street(raw):
+        return False
+    if reply and not _v37_is_town_question(reply):
+        return False
+    return True
+
+
+def _v38_try_maps_resolve_for_voice(conv: dict, reply: str | None = None) -> tuple[bool, dict | None, str]:
+    if not _v38_should_maps_resolve(conv, reply):
+        return False, None, "not_needed"
+    sched = conv.setdefault("sched", {})
+    raw = _v38_clean_addr_text(sched.get("raw_address") or sched.get("address_candidate") or "")
+    addr, reason = _v38_google_resolve_partial_address(raw)
+    if not addr:
+        return False, None, reason
+    _v38_apply_normalized_address(conv, addr, "google_maps_v38")
+    return True, addr, reason
+
+
+# Define/override travel-time calculation so the residential out-of-area gate uses Google Maps.
+def compute_travel_time_minutes(origin: str, destination: str) -> int | None:
+    if not GOOGLE_MAPS_API_KEY or not origin or not destination:
+        return None
+    try:
+        params = {
+            "origins": origin,
+            "destinations": destination,
+            "mode": "driving",
+            "units": "imperial",
+            "key": GOOGLE_MAPS_API_KEY,
+        }
+        # Add traffic-aware duration when Google accepts it.
+        try:
+            params["departure_time"] = "now"
+        except Exception:
+            pass
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/distancematrix/json",
+            params=params,
+            timeout=8,
+        )
+        data = resp.json()
+        if data.get("status") != "OK":
+            print("[WARN] Distance Matrix status:", data.get("status"))
+            return None
+        rows = data.get("rows") or []
+        elements = (rows[0].get("elements") if rows else []) or []
+        if not elements or elements[0].get("status") != "OK":
+            print("[WARN] Distance Matrix element status:", elements[0].get("status") if elements else None)
+            return None
+        elem = elements[0]
+        dur = elem.get("duration_in_traffic") or elem.get("duration") or {}
+        seconds = dur.get("value")
+        if not seconds:
+            return None
+        return int(round(float(seconds) / 60.0))
+    except Exception as e:
+        print("[ERROR] compute_travel_time_minutes:", repr(e))
+        return None
+
+
+def _v38_origin_address() -> str:
+    return (TECH_CURRENT_ADDRESS or DISPATCH_ORIGIN_ADDRESS or os.environ.get("VOICE_DISPATCH_ORIGIN_ADDRESS") or "Windsor Locks, CT").strip()
+
+
+def _voice_residential_address_too_far(conv: dict) -> tuple[bool, int | None]:
+    """v38: Google Maps travel-time gate for residential voice calls."""
+    sched = conv.setdefault("sched", {})
+    dest = _voice_destination_from_sched(sched)
+    if not dest:
+        return (False, None)
+    if _voice_is_out_of_area_town(dest):
+        return (True, None)
+    origin = _v38_origin_address()
+    if not origin:
+        return (False, None)
+    minutes = compute_travel_time_minutes(origin, dest)
+    if minutes is not None and minutes > VOICE_RESIDENTIAL_MAX_TRAVEL_MINUTES:
+        return (True, int(minutes))
+    return (False, int(minutes) if minutes is not None else None)
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V38(phone, call_sid, caller_text)
+
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        reply = _voice_naturalize_reply(str(out.get("reply_to_customer") or ""))
+
+        # If the existing flow asks town/state after a partial street address, let Google Maps
+        # try to complete it first. If it is unique in CT/MA, silently advance to the next step.
+        ok, addr, reason = _v38_try_maps_resolve_for_voice(conv, reply)
+        if ok and addr:
+            try:
+                log_event(
+                    "VOICE_GOOGLE_ADDRESS_RESOLVED_V38",
+                    p,
+                    {
+                        "raw_address": _safe_monitor_text(caller_text),
+                        "resolved": f"{addr.get('address_line_1')}, {addr.get('locality')}, {addr.get('administrative_district_level_1')} {addr.get('postal_code')}",
+                        "reason": reason,
+                        "call_sid": call_sid,
+                    },
+                    conv,
+                )
+            except Exception:
+                pass
+
+            # Feed a harmless synthetic city/state confirmation into the original stable flow
+            # so it returns the next real scheduling prompt (usually the $195 evaluation consent).
+            synthetic = f"{addr.get('locality')}, {addr.get('administrative_district_level_1')}"
+            out2 = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V38(phone, call_sid, synthetic)
+            try:
+                conv2 = hydrate_voice_conversation(p, call_sid)
+                conv2["phone"] = p
+                _v38_apply_normalized_address(conv2, addr, "google_maps_v38")
+                # Run the out-of-area travel check immediately after Google resolves the destination.
+                too_far, travel_minutes = _voice_residential_address_too_far(conv2)
+                if too_far:
+                    reply_far = _voice_out_of_area_reply(travel_minutes)
+                    out2["reply_to_customer"] = reply_far
+                    out2["booking_created"] = False
+                    try:
+                        log_event("VOICE_OUT_OF_AREA_GOOGLE_V38", p, {"travel_minutes": travel_minutes, "call_sid": call_sid, "reply": _safe_monitor_text(reply_far)}, conv2)
+                    except Exception:
+                        pass
+                    return out2
+                reply2 = _voice_naturalize_reply(str(out2.get("reply_to_customer") or ""))
+                out2["reply_to_customer"] = reply2
+            except Exception as e:
+                try:
+                    log_event("VOICE_V38_POST_RESOLVE_ERROR", p, {"error": repr(e), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+            return out2
+
+        # If Google could not safely resolve it, keep the normal prompt.
+        if reason and reason not in {"not_needed", "no_google_match"}:
+            try:
+                log_event("VOICE_GOOGLE_ADDRESS_NOT_RESOLVED_V38", p, {"reason": reason, "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+        out["reply_to_customer"] = reply
+    except Exception as e:
+        try:
+            log_event("VOICE_V38_MAPS_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
