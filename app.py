@@ -18540,6 +18540,401 @@ def _v52_text_has_explicit_far_town(text: str) -> bool:
     return bool(re.search(r"\b(?:worcester|worcestor|boston|malden|danbury|new\s+haven|stamford)\b", low, flags=re.I))
 
 
+
+
+# =============================
+# Voice stabilization v59 — no early price leak + no email spellback
+# =============================
+# Root fixes:
+# 1. Do not disclose or partially leak price/coverage language before the address is verified.
+#    The customer should hear the price only after the system knows the address can be serviced.
+# 2. Do not read a long spelled email back to the caller if a complete valid email was extracted.
+#    Save it and finish the booking instead.
+
+
+
+
+# =============================
+# Voice stabilization v60 — confirm email + smoother partial address flow
+# =============================
+# Root fixes:
+# 1. Email is billing-critical. A voice-captured email must be confirmed before booking.
+#    Do NOT auto-accept a guessed/transcribed email.
+#    Do NOT use long NATO-style spellback. Use a short confirmation instead:
+#       "I have kprevost92@gmail.com. Is that correct?"
+# 2. If the caller gives a street-only address such as "40 Arch Street",
+#    ask "What town and state is that in?" instead of saying "I couldn't verify that address."
+
+
+def _v60_yes(text: str) -> bool:
+    low = _intent_text(text or "") if "_intent_text" in globals() else str(text or "").strip().lower()
+    return low in {"yes", "yeah", "yep", "yup", "correct", "that's correct", "that is correct", "right", "yes correct", "yes that's correct", "yes that is correct", "sure", "ok", "okay"}
+
+
+def _v60_no(text: str) -> bool:
+    low = _intent_text(text or "") if "_intent_text" in globals() else str(text or "").strip().lower()
+    return low in {"no", "nope", "nah", "incorrect", "not correct", "that's wrong", "that is wrong", "wrong"} or "no " == (low + " ")[:3]
+
+
+def _v60_valid_email_from_text(text: str) -> str | None:
+    try:
+        email = v13_extract_email(text or "") if "v13_extract_email" in globals() else None
+    except Exception:
+        email = None
+
+    if not email:
+        return None
+
+    email = str(email or "").strip().lower().strip(".,;: ")
+    if not re.fullmatch(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", email):
+        return None
+
+    return email
+
+
+def _v60_email_waiting_context(conv: dict) -> bool:
+    sched = conv.setdefault("sched", {})
+    return bool(
+        str(sched.get("pending_step") or "").lower() in {"need_email", "need_email_confirm", "confirm_email"}
+        or str(sched.get("state") or "").lower() in {"waiting_for_email", "waiting_for_email_confirm"}
+        or sched.get("voice_awaiting_email_confirm")
+        or re.search(r"email", str(conv.get("last_voice_reply") or ""), flags=re.I)
+    )
+
+
+def _v60_short_email_confirmation(email: str) -> str:
+    # Keep the actual email in the text so the customer can confirm it,
+    # but do not force NATO-style letter-by-letter spellback.
+    return f"I have {email}. Is that correct?"
+
+
+def _v60_email_output(conv: dict, reply: str, booking_created: bool = False, end_call: bool = False) -> dict:
+    sched = conv.setdefault("sched", {})
+    conv["last_voice_reply"] = reply
+    try:
+        conv.setdefault("voice_transcript", []).append({
+            "role": "assistant",
+            "text": reply,
+            "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+    return {
+        "reply_to_customer": _voice_naturalize_reply(reply) if "_voice_naturalize_reply" in globals() else reply,
+        "booking_created": bool(booking_created),
+        "manual_only": bool(sched.get("manual_only")),
+        "pending_step": sched.get("pending_step"),
+        "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"),
+        "end_call": bool(end_call),
+    }
+
+
+def _v60_handle_email_turn(phone: str, conv: dict, caller_text: str) -> dict | None:
+    sched = conv.setdefault("sched", {})
+
+    if not _v60_email_waiting_context(conv):
+        return None
+
+    pending_email = str(sched.get("voice_pending_email") or sched.get("pending_email") or "").strip().lower()
+
+    # If we are confirming an email, handle yes/no before any lower layer can treat
+    # "yes" as some other acceptance.
+    if sched.get("voice_awaiting_email_confirm") and pending_email:
+        if _v60_yes(caller_text):
+            sched["voice_awaiting_email_confirm"] = False
+            sched["voice_email_confirmed"] = True
+            try:
+                if "_voice_save_confirmed_email_and_maybe_book_v31" in globals():
+                    out = _voice_save_confirmed_email_and_maybe_book_v31(phone, conv, pending_email)
+                else:
+                    v13_save_email(conv, pending_email)
+                    out = {"reply_to_customer": "Thanks. I’m finalizing the booking details now.", "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+            except Exception as e:
+                try:
+                    log_event("VOICE_V60_CONFIRMED_EMAIL_BOOK_ERROR", phone, {"error": repr(e), "email": pending_email}, conv)
+                except Exception:
+                    pass
+                return _v60_email_output(conv, "Thanks. I have the email confirmed. I’m finalizing the booking details now.", False, False)
+
+            reply = str((out or {}).get("reply_to_customer") or "").strip()
+            low = _intent_text(reply) if "_intent_text" in globals() else reply.lower()
+
+            # Prevent lower layers from doing another email spellback after confirmation.
+            if not reply or (low.startswith("i heard") and "correct" in low):
+                if sched.get("booking_created") and sched.get("square_booking_id"):
+                    try:
+                        reply = _voice_finalize_booking_reply(conv, "") if "_voice_finalize_booking_reply" in globals() else "You’re all set. You’ll receive a confirmation text shortly. Thank you for calling Prevolt Electric. Goodbye."
+                        sched["voice_close_after_reply"] = True
+                        out["booking_created"] = True
+                        out["end_call"] = True
+                    except Exception:
+                        reply = "Thanks. I’m finalizing the booking details now."
+                else:
+                    reply = "Thanks. I’m finalizing the booking details now."
+
+            out["reply_to_customer"] = _voice_naturalize_reply(reply) if "_voice_naturalize_reply" in globals() else reply
+            out["pending_step"] = sched.get("pending_step")
+            out["appointment_type"] = sched.get("appointment_type") or conv.get("appointment_type")
+            try:
+                log_event("VOICE_V60_EMAIL_CONFIRMED_AND_SAVED", phone, {"email": pending_email, "reply": _safe_monitor_text(out["reply_to_customer"]), "booking_created": bool(out.get("booking_created"))}, conv)
+            except Exception:
+                pass
+            return out
+
+        if _v60_no(caller_text):
+            sched["voice_pending_email"] = None
+            sched["pending_email"] = None
+            sched["voice_awaiting_email_confirm"] = False
+            sched["voice_email_confirmed"] = False
+            sched["pending_step"] = "need_email"
+            sched["state"] = "waiting_for_email"
+            try:
+                log_event("VOICE_V60_EMAIL_REJECTED_REASK", phone, {"old_email": pending_email}, conv)
+            except Exception:
+                pass
+            return _v60_email_output(conv, "Okay, what is the best email address for the appointment?", False, False)
+
+        # If they didn't answer yes/no but gave a new email, capture the new one.
+        new_email = _v60_valid_email_from_text(caller_text)
+        if new_email:
+            sched["voice_pending_email"] = new_email
+            sched["pending_email"] = new_email
+            sched["voice_awaiting_email_confirm"] = True
+            sched["pending_step"] = "need_email_confirm"
+            sched["state"] = "waiting_for_email_confirm"
+            reply = _v60_short_email_confirmation(new_email)
+            try:
+                log_event("VOICE_V60_EMAIL_REPLACED_FOR_CONFIRMATION", phone, {"email": new_email, "reply": _safe_monitor_text(reply)}, conv)
+            except Exception:
+                pass
+            return _v60_email_output(conv, reply, False, False)
+
+        return _v60_email_output(conv, "Please say the email address one more time.", False, False)
+
+    # First time hearing a complete email: capture it and confirm. Do not book yet.
+    email = _v60_valid_email_from_text(caller_text)
+    if email:
+        sched["voice_pending_email"] = email
+        sched["pending_email"] = email
+        sched["voice_awaiting_email_confirm"] = True
+        sched["voice_email_confirmed"] = False
+        sched["pending_step"] = "need_email_confirm"
+        sched["state"] = "waiting_for_email_confirm"
+        reply = _v60_short_email_confirmation(email)
+        try:
+            log_event("VOICE_V60_EMAIL_CAPTURED_FOR_CONFIRMATION", phone, {"email": email, "reply": _safe_monitor_text(reply)}, conv)
+        except Exception:
+            pass
+        return _v60_email_output(conv, reply, False, False)
+
+    return None
+
+
+def _v60_customer_gave_street_without_town_state(text: str) -> bool:
+    raw = " ".join(str(text or "").replace("\n", " ").split()).strip(" ,.")
+    if not raw:
+        return False
+
+    # Must at least look like a house number + street.
+    try:
+        line = extract_service_address_from_text(raw)
+    except Exception:
+        line = None
+    if not line:
+        line = raw
+
+    try:
+        if not _address_has_house_number_and_street(line):
+            return False
+    except Exception:
+        if not re.search(r"\b\d{1,6}\s+[a-z0-9 .'-]+(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|way|court|ct|circle|cir|boulevard|blvd|place|pl)\b", raw, flags=re.I):
+            return False
+
+    # If customer already supplied clear state, this is not the partial-address case.
+    if re.search(r"\b(?:ct|connecticut|ma|massachusetts|m a|c t)\b", raw, flags=re.I):
+        return False
+
+    # If the v58 guard says it still needs locality, we should ask for town/state.
+    try:
+        allowed, _safe_raw, _forced_state, _town, why = _v58_prepare_address_for_maps(raw)
+        if not allowed and why in {"missing_town", "unknown_town_without_state", "needs_customer_town_state:missing_town"}:
+            return True
+    except Exception:
+        pass
+
+    # Also catch plain "40 Arch Street" style input.
+    return bool(re.search(r"\b\d{1,6}\s+[a-z0-9 .'-]+(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|way|court|ct|circle|cir|boulevard|blvd|place|pl)\b", raw, flags=re.I))
+
+
+def _v60_partial_address_town_state_reply(conv: dict) -> dict:
+    sched = conv.setdefault("sched", {})
+    sched["address_verified"] = False
+    sched["address_missing"] = "state"
+    sched["pending_step"] = "need_address"
+    sched["state"] = "waiting_for_address"
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    reply = "What town and state is that in?"
+    return _v59_output(conv, reply, booking_created=False, end_call=False)
+
+
+
+def _v59_reply_has_price_or_coverage_leak(reply: str) -> bool:
+    low = _intent_text(reply or "") if "_intent_text" in globals() else str(reply or "").lower()
+    if not low:
+        return False
+    return bool(
+        re.search(r"\b(?:195|395)\b", low)
+        or "that covers sending one of our electricians" in low
+        or "covers sending one of our electricians" in low
+        or "reviewing the work in person" in low
+        or "checking what is needed" in low
+        or "troubleshoot and repair visits are" in low
+        or "on site evaluation visit" in low
+        or "on-site evaluation visit" in low
+        or ("does that work for you" in low and ("evaluation" in low or "troubleshoot" in low or "repair visit" in low))
+    )
+
+
+def _v59_still_collecting_address(conv: dict) -> bool:
+    sched = conv.setdefault("sched", {})
+    if sched.get("address_verified"):
+        return False
+    state = str(sched.get("state") or "").lower()
+    pending = str(sched.get("pending_step") or "").lower()
+    missing = str(sched.get("address_missing") or "").lower()
+    return bool(
+        pending == "need_address"
+        or state == "waiting_for_address"
+        or missing in {"street", "number", "city", "state", "confirm", "zip"}
+    )
+
+
+def _v59_address_collection_reply(conv: dict, caller_text: str = "") -> str:
+    sched = conv.setdefault("sched", {})
+
+    # Keep known emergency behavior untouched.
+    try:
+        if "_v51_is_emergency_conversation" in globals() and _v51_is_emergency_conversation(conv, caller_text):
+            return "If it is safe for us to come out, what is the full address for the work?"
+    except Exception:
+        pass
+
+    # Reset price/date gates until address is actually verified.
+    sched["awaiting_eval_price_confirm"] = False
+    sched["eval_price_accepted"] = False
+    sched["awaiting_troubleshoot_price_confirm"] = False
+    sched["troubleshoot_price_accepted"] = False
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["pending_step"] = "need_address"
+    sched["state"] = "waiting_for_address"
+    sched["address_verified"] = False
+
+    try:
+        if "_v46_power_loss_troubleshoot_text" in globals() and _v46_power_loss_troubleshoot_text(caller_text or ""):
+            sched["appointment_type"] = "TROUBLESHOOT_395"
+            return "Got it. What is the full address for the work, including the town and state?"
+    except Exception:
+        pass
+
+    return "I can get that started. What is the full address for the work, including the town and state?"
+
+
+def _v59_output(conv: dict, reply: str, booking_created: bool = False, end_call: bool = False) -> dict:
+    sched = conv.setdefault("sched", {})
+    conv["last_voice_reply"] = reply
+    try:
+        conv.setdefault("voice_transcript", []).append({
+            "role": "assistant",
+            "text": reply,
+            "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+    return {
+        "reply_to_customer": reply,
+        "booking_created": bool(booking_created),
+        "manual_only": bool(sched.get("manual_only")),
+        "pending_step": sched.get("pending_step"),
+        "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"),
+        "end_call": bool(end_call),
+    }
+
+
+def _v59_auto_accept_complete_email(phone: str, conv: dict, caller_text: str) -> dict | None:
+    """If the caller gives a complete email, do not spell it back over voice."""
+    try:
+        email = v13_extract_email(caller_text or "") if "v13_extract_email" in globals() else None
+    except Exception:
+        email = None
+
+    if not email:
+        return None
+
+    email = str(email or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", email):
+        return None
+
+    sched = conv.setdefault("sched", {})
+
+    waiting_for_email = bool(
+        str(sched.get("pending_step") or "").lower() == "need_email"
+        or str(sched.get("state") or "").lower() == "waiting_for_email"
+        or sched.get("voice_awaiting_email_confirm")
+        or re.search(r"email", str(conv.get("last_voice_reply") or ""), flags=re.I)
+    )
+    if not waiting_for_email:
+        return None
+
+    sched["voice_pending_email"] = None
+    sched["voice_awaiting_email_confirm"] = False
+    sched["voice_email_confirmed"] = True
+
+    try:
+        if "_voice_save_confirmed_email_and_maybe_book_v31" in globals():
+            out = _voice_save_confirmed_email_and_maybe_book_v31(phone, conv, email)
+        else:
+            v13_save_email(conv, email)
+            out = {"reply_to_customer": "Thanks. I’m finalizing the booking details now.", "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V59_AUTO_EMAIL_BOOK_ERROR", phone, {"error": repr(e), "email": email}, conv)
+        except Exception:
+            pass
+        return None
+
+    reply = str((out or {}).get("reply_to_customer") or "").strip()
+    if not reply:
+        reply = "Thanks. I’m finalizing the booking details now."
+
+    low = _intent_text(reply) if "_intent_text" in globals() else reply.lower()
+    if low.startswith("i heard") and "correct" in low:
+        if sched.get("booking_created") and sched.get("square_booking_id"):
+            try:
+                reply = _voice_finalize_booking_reply(conv, "") if "_voice_finalize_booking_reply" in globals() else "You’re all set. You’ll receive a confirmation text shortly. Thank you for calling Prevolt Electric. Goodbye."
+                sched["voice_close_after_reply"] = True
+                out["booking_created"] = True
+                out["end_call"] = True
+            except Exception:
+                reply = "Thanks. I’m finalizing the booking details now."
+        else:
+            reply = "Thanks. I’m finalizing the booking details now."
+            out["booking_created"] = False
+            out["end_call"] = False
+
+    out["reply_to_customer"] = _voice_naturalize_reply(reply) if "_voice_naturalize_reply" in globals() else reply
+    out["pending_step"] = sched.get("pending_step")
+    out["appointment_type"] = sched.get("appointment_type") or conv.get("appointment_type")
+    conv["last_voice_reply"] = out["reply_to_customer"]
+    try:
+        log_event("VOICE_V59_AUTO_ACCEPTED_EMAIL_NO_SPELLBACK", phone, {"email": email, "reply": _safe_monitor_text(out["reply_to_customer"]), "booking_created": bool(out.get("booking_created"))}, conv)
+    except Exception:
+        pass
+    return out
+
+
+
 def _v52_stale_verify_reply(reply: str) -> bool:
     return bool(re.search(r"couldn[’']?t verify|repeat just the street|spell it", str(reply or ""), flags=re.I))
 
@@ -18559,6 +18954,30 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
     except Exception:
         pass
 
+    # v60 pre-intercepts:
+    # 1. Email is billing-critical. Capture then confirm; never auto-accept voice email.
+    # 2. Street-only address should naturally ask for town/state.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+
+        email_out = _v60_handle_email_turn(p, conv_pre, text)
+        if email_out:
+            return email_out
+
+        if _v59_still_collecting_address(conv_pre) and _v60_customer_gave_street_without_town_state(text):
+            try:
+                log_event("VOICE_V60_PARTIAL_ADDRESS_ASK_TOWN_STATE_PRE", p, {"caller_text": _safe_monitor_text(text), "call_sid": call_sid}, conv_pre)
+            except Exception:
+                pass
+            return _v60_partial_address_town_state_reply(conv_pre)
+
+    except Exception as e:
+        try:
+            log_event("VOICE_V60_PRE_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
+        except Exception:
+            pass
+
     out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V52(phone, call_sid, text)
 
     # If lower layers actually verified the address but left a stale "couldn't verify"
@@ -18568,6 +18987,19 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         conv["phone"] = p
         sched = conv.setdefault("sched", {})
         reply = str(out.get("reply_to_customer") or "") if isinstance(out, dict) else ""
+
+        # v60 post: replace clunky street-only address failure with natural town/state prompt.
+        if (
+            _v59_still_collecting_address(conv)
+            and _v60_customer_gave_street_without_town_state(text)
+            and re.search(r"(couldn.?t verify|full address|town and state|address)", reply, flags=re.I)
+        ):
+            try:
+                log_event("VOICE_V60_PARTIAL_ADDRESS_ASK_TOWN_STATE_POST", p, {"caller_text": _safe_monitor_text(text), "old_reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return _v60_partial_address_town_state_reply(conv)
+
         if _v52_stale_verify_reply(reply) and sched.get("address_verified"):
             recovered = _v50_reply_after_explicit_address(conv, text)
             try:
@@ -18575,9 +19007,28 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             except Exception:
                 pass
             return _v51_output(conv, recovered, False)
+
+        # v59 root guard: price/coverage language is never allowed while address
+        # collection is still active. Price comes only after address verification.
+        if _v59_still_collecting_address(conv) and _v59_reply_has_price_or_coverage_leak(reply):
+            cleaned = _v59_address_collection_reply(conv, text)
+            try:
+                log_event("VOICE_V59_BLOCKED_EARLY_PRICE_BEFORE_ADDRESS", p, {"caller_text": _safe_monitor_text(text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(cleaned), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return _v59_output(conv, cleaned, booking_created=False, end_call=False)
+
+        # v60 post: if a lower layer already created an email spellback prompt on a
+        # complete email, replace it with short confirmation or confirmation handling.
+        if isinstance(out, dict) and re.search(r"^\s*I heard\b.*\bcorrect\?", reply, flags=re.I):
+            email_out = _v60_handle_email_turn(p, conv, text)
+            if email_out:
+                return email_out
+
     except Exception as e:
         try:
-            log_event("VOICE_V52_POST_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
+            log_event("VOICE_V60_POST_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
         except Exception:
             pass
+
     return out
