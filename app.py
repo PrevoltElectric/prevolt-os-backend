@@ -10815,6 +10815,156 @@ def is_weekend(date_str: str) -> bool:
 #   ✅ Only sets booking_created / square_booking_id AFTER verify+accept succeeds
 #   ✅ Prevents stale booking flags from causing ghost confirmations
 # ---------------------------------------------------
+
+
+# =============================
+# Voice/SMS stabilization v61 — internal booking alert SMS
+# =============================
+# Sends Kyle a loud-trigger SMS whenever any Square appointment is successfully booked.
+# MacroDroid should watch for the exact phrase:
+#     NEW APPOINTMENT BOOKED
+#
+# Default destination is Kyle's requested phone number, but Render can override it with:
+#     BOOKING_ALERT_TO_NUMBER=+18609701727
+
+
+BOOKING_ALERT_TO_NUMBER = (os.environ.get("BOOKING_ALERT_TO_NUMBER") or "+18609701727").strip()
+
+
+def _v61_booking_alert_type_label(appt_type: str | None) -> str:
+    appt = str(appt_type or "").upper()
+    if "TROUBLESHOOT" in appt or "REPAIR" in appt:
+        return "$395 Troubleshoot and Repair"
+    if "INSPECTION" in appt:
+        return "$395 Home Inspection"
+    if "EVAL" in appt:
+        return "$195 Evaluation / Quote"
+    return str(appt_type or "Appointment")
+
+
+def _v61_booking_alert_customer_name(profile: dict, sched: dict) -> str:
+    first = str(profile.get("active_first_name") or profile.get("first_name") or "").strip()
+    last = str(profile.get("active_last_name") or profile.get("last_name") or "").strip()
+    name = " ".join(x for x in [first, last] if x).strip()
+    if name:
+        return name
+    name = str(profile.get("name") or sched.get("name") or "").strip()
+    return name or "Unknown customer"
+
+
+def _v61_booking_alert_address(addr_struct: dict | None, sched: dict) -> str:
+    if isinstance(addr_struct, dict):
+        line1 = str(addr_struct.get("address_line_1") or "").strip()
+        line2 = str(addr_struct.get("address_line_2") or "").strip()
+        town = str(addr_struct.get("locality") or "").strip()
+        state = str(addr_struct.get("administrative_district_level_1") or "").strip()
+        postal = str(addr_struct.get("postal_code") or "").strip()
+        pieces = []
+        if line1:
+            pieces.append(line1)
+        if line2:
+            pieces.append(line2)
+        town_state = ", ".join(x for x in [town, state] if x).strip()
+        if postal:
+            town_state = f"{town_state} {postal}".strip()
+        if town_state:
+            pieces.append(town_state)
+        full = ", ".join(pieces).strip()
+        if full:
+            return full
+    return str(sched.get("raw_address") or sched.get("address") or "Unknown address").strip()
+
+
+def _v61_booking_alert_when(sched: dict) -> str:
+    date_str = str(sched.get("scheduled_date") or "").strip()
+    time_str = str(sched.get("scheduled_time") or "").strip()
+    try:
+        date_label = _humanize_date_for_sms(date_str) if "_humanize_date_for_sms" in globals() else date_str
+    except Exception:
+        date_label = date_str
+    try:
+        time_label = humanize_time(time_str) if "humanize_time" in globals() else time_str
+    except Exception:
+        time_label = time_str
+
+    when = " ".join(x for x in [date_label, f"at {time_label}" if time_label else ""] if x).strip()
+    return when or "Unknown date/time"
+
+
+def _v61_send_internal_booking_alert(phone: str, convo: dict, booking_id: str | None = None) -> None:
+    """Send one internal SMS after a successful Square booking.
+
+    This function is intentionally side-effect safe: if the alert fails, it logs the
+    failure but never breaks or rolls back the customer's booking.
+    """
+    sched = convo.setdefault("sched", {})
+    profile = convo.setdefault("profile", {})
+
+    dest = (BOOKING_ALERT_TO_NUMBER or "").strip()
+    if not dest:
+        return
+
+    actual_booking_id = str(booking_id or sched.get("square_booking_id") or "").strip()
+    alert_key = actual_booking_id or f"{phone}-{sched.get('scheduled_date')}-{sched.get('scheduled_time')}-{sched.get('appointment_type')}"
+
+    if sched.get("internal_booking_alert_sent") and sched.get("internal_booking_alert_key") == alert_key:
+        return
+
+    addr_struct = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+
+    customer_name = _v61_booking_alert_customer_name(profile, sched)
+    address = _v61_booking_alert_address(addr_struct, sched)
+    appt_label = _v61_booking_alert_type_label(sched.get("appointment_type"))
+    when = _v61_booking_alert_when(sched)
+
+    body = (
+        "NEW APPOINTMENT BOOKED\n"
+        f"Customer: {customer_name}\n"
+        f"Address: {address}\n"
+        f"Type: {appt_label}\n"
+        f"Date: {when}"
+    )
+
+    # Customer phone is useful in the alert, but keep the requested fields first.
+    customer_phone = str(phone or "").strip()
+    if customer_phone:
+        body += f"\nPhone: {customer_phone}"
+
+    try:
+        send_sms(dest, body)
+        sched["internal_booking_alert_sent"] = True
+        sched["internal_booking_alert_key"] = alert_key
+        sched["internal_booking_alert_to"] = dest
+        try:
+            log_event(
+                "INTERNAL_BOOKING_ALERT_SMS_SENT",
+                dest,
+                {
+                    "booking_id": actual_booking_id,
+                    "customer_phone": customer_phone,
+                    "customer_name": customer_name,
+                    "address": address,
+                    "appointment_type": appt_label,
+                    "when": when,
+                },
+                convo,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        sched["internal_booking_alert_error"] = repr(e)
+        try:
+            log_event(
+                "INTERNAL_BOOKING_ALERT_SMS_FAILED",
+                dest,
+                {"error": repr(e), "booking_id": actual_booking_id, "customer_phone": customer_phone},
+                convo,
+            )
+        except Exception:
+            pass
+
+
+
 def maybe_create_square_booking(phone: str, convo: dict):
     try:
         log_event("BOOKING_ATTEMPT", phone, {}, convo)
@@ -11145,6 +11295,15 @@ def maybe_create_square_booking(phone: str, convo: dict):
             })
 
         print("[SUCCESS] Booking created and accepted:", booking_id)
+        try:
+            _v61_send_internal_booking_alert(phone, convo, booking_id)
+        except Exception as e:
+            # Internal alert failure must never break a successful customer booking.
+            print("[WARN] Internal booking alert failed:", repr(e))
+            try:
+                log_event("INTERNAL_BOOKING_ALERT_SMS_EXCEPTION", phone, {"error": repr(e), "booking_id": booking_id}, convo)
+            except Exception:
+                pass
         return _monitor_booking_return(phone, "booked", {"status": "booked", "booking_id": booking_id}, convo)
 
     except Exception as e:
