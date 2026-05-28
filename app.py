@@ -15528,3 +15528,329 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return out
+
+
+# =============================
+# v44 STABILIZATION HOTFIX LAYER
+# =============================
+# Targets live v43 failure:
+# - Generic troubleshoot accepted price -> offered slots -> caller chooses Monday June 1 at 3 PM.
+# - Older offered-slot/emergency layers selected the first slot, reopened emergency dispatch language,
+#   and polluted customer last name with "Monday".
+#
+# Keep this narrow: intercept offered-slot choices for scheduled troubleshoot calls before older
+# emergency/date/name layers can touch the turn. Also hard-sanitize date words from name fields.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V44 = process_prevolt_voice_turn
+
+_V44_DATE_NAME_WORDS = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "today", "tomorrow", "tonight", "morning", "afternoon", "evening",
+}
+
+
+def _v44_low(text: str) -> str:
+    try:
+        return _intent_text(text or "")
+    except Exception:
+        return str(text or "").lower()
+
+
+def _v44_is_hard_hazard(text: str) -> bool:
+    try:
+        return bool(_v42_hard_hazard_text(text))
+    except Exception:
+        low = _v44_low(text)
+        return bool(re.search(r"\b(smoke|smoking|fire|burning|burnt|hot\s+panel|panel\s+hot|arcing|arc|sparking|sparked|water\s+in\s+the\s+panel)\b", low))
+
+
+def _v44_sanitize_date_words_from_name(conv: dict) -> None:
+    try:
+        profile = conv.setdefault("profile", {})
+        sched = conv.setdefault("sched", {})
+        for key in ["active_last_name", "last_name", "recognized_last_name", "voicemail_last_name"]:
+            val = str(profile.get(key) or "").strip()
+            if val and val.lower() in _V44_DATE_NAME_WORDS:
+                profile[key] = None
+        full = " ".join(str(profile.get("name") or "").strip().split())
+        if full:
+            parts = full.split()
+            while len(parts) >= 2 and parts[-1].lower().strip(".,") in _V44_DATE_NAME_WORDS:
+                parts.pop()
+            profile["name"] = " ".join(parts).strip() or None
+        try:
+            recompute_pending_step(profile, sched)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _v44_is_scheduled_troubleshoot_context(conv: dict, caller_text: str = "") -> bool:
+    sched = conv.setdefault("sched", {})
+    appt = str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+    if "TROUBLESHOOT" not in appt:
+        return False
+    # True emergencies must stay on the emergency-dispatch lane.
+    if _v44_is_hard_hazard(caller_text):
+        return False
+    if sched.get("emergency_approved") or sched.get("awaiting_emergency_confirm"):
+        return False
+    return True
+
+
+def _v44_force_scheduled_troubleshoot_state(conv: dict, pending: str = "need_date") -> None:
+    sched = conv.setdefault("sched", {})
+    sched["appointment_type"] = "TROUBLESHOOT_395"
+    conv["appointment_type"] = "TROUBLESHOOT_395"
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    sched["emergency_price_confirmed"] = False
+    sched["hard_emergency_detected"] = False
+    if pending:
+        sched["pending_step"] = pending
+    # This call type is a scheduled troubleshoot, not emergency dispatch.
+    sched["state"] = "waiting_for_date" if pending == "need_date" else ("waiting_for_name" if pending == "need_name" else "waiting_for_email")
+
+
+def _v44_time_text_matches(opt_time: str, caller_text: str) -> bool:
+    opt_time = str(opt_time or "").strip()
+    if not opt_time:
+        return False
+    try:
+        explicit = extract_explicit_time_from_text(caller_text or "")
+        if explicit and explicit == opt_time:
+            return True
+    except Exception:
+        pass
+    low = _v44_low(caller_text)
+    try:
+        hh, mm = opt_time.split(":")[:2]
+        h = int(hh)
+        minute = int(mm)
+        h12 = h % 12 or 12
+        ampm = "am" if h < 12 else "pm"
+        patterns = [
+            rf"\b{h12}\s*{ampm}\b",
+            rf"\b{h12}:?{minute:02d}\s*{ampm}\b",
+            rf"\b{h}:?{minute:02d}\b",
+        ]
+        if minute == 0:
+            patterns.append(rf"\b{h12}\s*o'?clock\s*{ampm}\b")
+        return any(re.search(p, low) for p in patterns)
+    except Exception:
+        return False
+
+
+def _v44_date_score_for_option(opt: dict, caller_text: str) -> int:
+    low = _v44_low(caller_text)
+    score = 0
+    opt_date = str(opt.get("date") or "").strip()
+    opt_time = str(opt.get("time") or "").strip()
+    try:
+        requested_date = salvage_relative_date_from_text(caller_text or "")
+    except Exception:
+        requested_date = None
+    if requested_date and requested_date == opt_date:
+        score += 8
+    try:
+        d = datetime.strptime(opt_date, "%Y-%m-%d")
+        day_full = d.strftime("%A").lower()
+        day_abbr = d.strftime("%a").lower()
+        month_full = d.strftime("%B").lower()
+        month_abbr = d.strftime("%b").lower()
+        day_num = d.day
+        if re.search(rf"\b{re.escape(day_full)}\b", low) or re.search(rf"\b{re.escape(day_abbr)}\b", low):
+            score += 4
+        if re.search(rf"\b{re.escape(month_full)}\b", low) or re.search(rf"\b{re.escape(month_abbr)}\b", low):
+            score += 3
+        ordinal = str(day_num)
+        suffix = "th"
+        if day_num % 10 == 1 and day_num % 100 != 11:
+            suffix = "st"
+        elif day_num % 10 == 2 and day_num % 100 != 12:
+            suffix = "nd"
+        elif day_num % 10 == 3 and day_num % 100 != 13:
+            suffix = "rd"
+        if re.search(rf"\b{day_num}\b", low) or re.search(rf"\b{day_num}{suffix}\b", low):
+            score += 2
+    except Exception:
+        pass
+    if _v44_time_text_matches(opt_time, caller_text):
+        score += 4
+    label = str(opt.get("label") or "").strip().lower()
+    if label and label in low:
+        score += 10
+    return score
+
+
+def _v44_select_offered_slot_direct(conv: dict, caller_text: str) -> dict | None:
+    sched = conv.setdefault("sched", {})
+    options = sched.get("offered_slot_options") or []
+    if not (sched.get("awaiting_slot_offer_choice") and options):
+        return None
+    low = _v44_low(caller_text)
+
+    # Explicit ordinal choices only. Do NOT treat "June 1st" as "first option".
+    ordinal_idx = None
+    ordinal_patterns = [
+        (0, r"\b(first\s+one|first\s+option|option\s+1|number\s+1|the\s+first)\b"),
+        (1, r"\b(second\s+one|second\s+option|option\s+2|number\s+2|the\s+second)\b"),
+        (2, r"\b(third\s+one|third\s+option|option\s+3|number\s+3|the\s+third|last\s+one|the\s+last)\b"),
+    ]
+    for idx, pat in ordinal_patterns:
+        if re.search(pat, low):
+            ordinal_idx = idx
+            break
+    if ordinal_idx is not None and ordinal_idx < len(options):
+        return dict(options[ordinal_idx])
+
+    scored = []
+    for i, opt in enumerate(options):
+        try:
+            scored.append((_v44_date_score_for_option(opt, caller_text), i, opt))
+        except Exception:
+            scored.append((0, i, opt))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    if not scored or scored[0][0] < 4:
+        return None
+    # Require a clear winner unless only one has any score.
+    if len(scored) > 1 and scored[0][0] == scored[1][0] and scored[1][0] > 0:
+        return None
+    return dict(scored[0][2])
+
+
+def _v44_apply_selected_slot(conv: dict, chosen: dict) -> None:
+    sched = conv.setdefault("sched", {})
+    sched["appointment_type"] = "TROUBLESHOOT_395" if "TROUBLESHOOT" in str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper() else (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195")
+    conv["appointment_type"] = sched["appointment_type"]
+    sched["scheduled_date"] = chosen.get("date")
+    sched["scheduled_time"] = chosen.get("time")
+    sched["scheduled_time_source"] = "voice_v44_direct_offered_slot"
+    for k in ["start_at", "team_member_id", "service_variation_id", "service_variation_version", "duration_minutes"]:
+        if chosen.get(k) is not None:
+            sched[k] = chosen.get(k)
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    sched["final_confirmation_sent"] = False
+    sched["final_confirmation_accepted"] = False
+    sched["last_final_confirmation_key"] = None
+    sched["slot_choice_locked"] = True
+    sched["booking_attempt_nonce"] = str(uuid.uuid4())
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    if "TROUBLESHOOT" in str(sched.get("appointment_type") or "").upper():
+        sched["state"] = "waiting_for_name"
+    try:
+        recompute_pending_step(conv.setdefault("profile", {}), sched)
+    except Exception:
+        pass
+
+
+def _v44_after_slot_prompt(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    _v44_sanitize_date_words_from_name(conv)
+    first = _voice_profile_first_name(profile) if "_voice_profile_first_name" in globals() else str(profile.get("active_first_name") or profile.get("first_name") or "").strip()
+    last = _voice_profile_last_name(profile) if "_voice_profile_last_name" in globals() else str(profile.get("active_last_name") or profile.get("last_name") or "").strip()
+    email_ok = _voice_has_email(conv) if "_voice_has_email" in globals() else bool(profile.get("active_email") or profile.get("email") or sched.get("email"))
+    if first and not last:
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        return "What is your last name?"
+    if not first or not last:
+        sched["pending_step"] = "need_name"
+        sched["state"] = "waiting_for_name"
+        return "What's your first and last name?"
+    if not email_ok:
+        sched["pending_step"] = "need_email"
+        sched["state"] = "waiting_for_email"
+        return "What's the best email address for the appointment?"
+    try:
+        nxt = choose_next_prompt_from_state(conv, inbound_text="")
+        return _voice_naturalize_reply(nxt) if nxt else "Got it. I'll finish booking that now."
+    except Exception:
+        return "Got it. I'll finish booking that now."
+
+
+def _v44_scheduled_troubleshoot_slot_fast_path(conv: dict, caller_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    if not _v44_is_scheduled_troubleshoot_context(conv, caller_text):
+        return None
+    if not (sched.get("awaiting_slot_offer_choice") and (sched.get("offered_slot_options") or [])):
+        return None
+    chosen = _v44_select_offered_slot_direct(conv, caller_text)
+    if not chosen:
+        return None
+    _v44_apply_selected_slot(conv, chosen)
+    # Keep it out of the emergency-dispatch language lane.
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    return _v44_after_slot_prompt(conv)
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    # Pre-intercept offered slot choices for scheduled troubleshoot/repair calls.
+    # This is before all older emergency/date/name layers.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        sched_pre = conv_pre.setdefault("sched", {})
+        _v44_sanitize_date_words_from_name(conv_pre)
+        slot_reply = _v44_scheduled_troubleshoot_slot_fast_path(conv_pre, caller_text)
+        if slot_reply:
+            slot_reply = _voice_naturalize_reply(slot_reply)
+            conv_pre["last_voice_reply"] = slot_reply
+            try:
+                log_event("VOICE_V44_TROUBLESHOOT_OFFERED_SLOT_DIRECT", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(slot_reply), "call_sid": call_sid}, conv_pre)
+            except Exception:
+                pass
+            return {"reply_to_customer": slot_reply, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": sched_pre.get("appointment_type") or conv_pre.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V44_PRE_INTERCEPT_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V44(phone, call_sid, caller_text)
+
+    # Post-cleanup: if older layers still managed to mark a scheduled troubleshoot as emergency or
+    # attach a weekday/month as a last name, clean it before the next turn/Square booking.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+        _v44_sanitize_date_words_from_name(conv)
+        if _v44_is_scheduled_troubleshoot_context(conv, caller_text):
+            reply = str(out.get("reply_to_customer") or "")
+            low_reply = _v44_low(reply)
+            if "this sounds urgent" in low_reply or "send someone now" in low_reply or "dispatch someone now" in low_reply:
+                # Do not let generic troubleshoot reopen emergency dispatch after a scheduled slot choice.
+                if sched.get("scheduled_date") and sched.get("scheduled_time"):
+                    reply2 = _v44_after_slot_prompt(conv)
+                else:
+                    _v44_force_scheduled_troubleshoot_state(conv, "need_date")
+                    reply2 = _v42_slot_offer_reply_for(conv, "TROUBLESHOOT_395") if "_v42_slot_offer_reply_for" in globals() else "What weekday and time works best?"
+                out["reply_to_customer"] = _voice_naturalize_reply(reply2)
+                out["booking_created"] = False
+                out["end_call"] = False
+                out["appointment_type"] = "TROUBLESHOOT_395"
+                out["pending_step"] = sched.get("pending_step")
+                conv["last_voice_reply"] = out["reply_to_customer"]
+                try:
+                    log_event("VOICE_V44_SUPPRESSED_FALSE_EMERGENCY_REOPEN", p, {"caller_text": _safe_monitor_text(caller_text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(out["reply_to_customer"]), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+    except Exception as e:
+        try:
+            log_event("VOICE_V44_POST_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
