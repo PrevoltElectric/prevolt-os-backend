@@ -2507,7 +2507,10 @@ def _voice_transcript_has_urgent_dispatch_context(conv: dict) -> bool:
     """
     sched = (conv or {}).setdefault("sched", {})
     appt = (sched.get("appointment_type") or (conv or {}).get("appointment_type") or "").upper()
-    if "TROUBLESHOOT" in appt or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
+    # Scheduled troubleshoot/repair also uses TROUBLESHOOT_395, so appointment_type alone
+    # must not be treated as emergency dispatch. Only hard-hazard flags or the actual
+    # emergency confirmation state should activate the dispatch lane.
+    if sched.get("hard_emergency_detected") or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
         return True
     haystack = _intent_text(
         (conv or {}).get("cleaned_transcript"),
@@ -2515,12 +2518,13 @@ def _voice_transcript_has_urgent_dispatch_context(conv: dict) -> bool:
         (conv or {}).get("last_voice_reply"),
         (conv or {}).get("last_sms_body"),
     )
-    urgent_terms = [
-        "smoke", "smoking", "fire", "caught fire", "hot to the touch", "hot panel",
-        "burning", "burnt", "sparking", "spark", "arcing", "electrical panel",
-        "panel", "as soon as possible", "asap", "right away", "urgent", "emergency",
-    ]
-    return any(term in haystack for term in urgent_terms) and any(term in haystack for term in ["smoke", "fire", "hot", "burning", "spark", "panel", "urgent", "as soon as possible", "asap"])
+    return bool(re.search(
+        r"\b(?:caught\s+fire|on\s+fire|active\s+fire|smoke|smoking|burning|burnt|burned|"
+        r"hot\s+to\s+the\s+touch|hot\s+panel|panel\s+is\s+hot|sparking|sparked|"
+        r"arcing|arc\s+flash|crackling|popping|sizzling|melted|water\s+in\s+(?:the\s+)?panel)\b",
+        haystack,
+        flags=re.I,
+    ))
 
 
 def _voice_set_emergency_dispatch_slot(sched: dict) -> None:
@@ -2553,7 +2557,16 @@ def _voice_emergency_dispatch_fast_path(phone: str, conv: dict, caller_text: str
     sched = conv.setdefault("sched", {})
     profile = conv.setdefault("profile", {})
     appt = (sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
-    emergency_context = bool("TROUBLESHOOT" in appt or sched.get("awaiting_emergency_confirm") or _voice_last_reply_requested_emergency_dispatch(conv) or _voice_transcript_has_urgent_dispatch_context(conv))
+    # TROUBLESHOOT_395 is used for both scheduled troubleshoot visits and true emergency
+    # dispatch. Do not let a normal outlet/power-loss troubleshoot yes turn become an
+    # emergency dispatch acceptance just because appointment_type is TROUBLESHOOT_395.
+    emergency_context = bool(
+        sched.get("hard_emergency_detected")
+        or sched.get("awaiting_emergency_confirm")
+        or sched.get("emergency_approved")
+        or _voice_last_reply_requested_emergency_dispatch(conv)
+        or _voice_transcript_has_urgent_dispatch_context(conv)
+    )
     if not emergency_context:
         return None
 
@@ -3009,7 +3022,6 @@ def _voice_send_resume_sms_if_needed(phone: str, conv: dict, reason: str = "") -
         sched.get("hard_emergency_detected")
         or sched.get("awaiting_emergency_confirm")
         or sched.get("emergency_approved")
-        or str(sched.get("state") or "").lower() == "emergency"
     )
     if emergency_resume and sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
         body = "This is Prevolt Electric. We got started over the phone. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Reply YES if you want us to dispatch someone now."
@@ -3063,7 +3075,6 @@ def _voice_handoff_sms_body(conv: dict | None = None) -> str:
         sched.get("hard_emergency_detected")
         or sched.get("awaiting_emergency_confirm")
         or sched.get("emergency_approved")
-        or str(sched.get("state") or "").lower() == "emergency"
     )
     if emergency_handoff and sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
         return "This is Prevolt Electric. We got started over the phone. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Reply YES if you want us to dispatch someone now."
@@ -3127,7 +3138,12 @@ def _voice_finalize_booking_reply(conv: dict, reply: str) -> str:
     appt = (sched.get("appointment_type") or (conv or {}).get("appointment_type") or "").upper()
     # Prefer a consistent spoken ending over backend/SMS phrasing variants.
     # Include goodbye because the WebSocket will close after this response finishes.
-    if "TROUBLESHOOT" in appt or sched.get("emergency_approved"):
+    true_emergency_booking = bool(
+        sched.get("hard_emergency_detected")
+        or sched.get("awaiting_emergency_confirm")
+        or sched.get("emergency_approved")
+    )
+    if true_emergency_booking:
         return (
             f"You're all set. We have you on the schedule for emergency dispatch at {slot}. "
             "You'll receive a confirmation text shortly. "
@@ -4319,7 +4335,7 @@ def _monitor_state_label(conv: dict) -> str:
         return "booked"
     if sched.get("manual_only") or thread_type in {"manual_only", "employment_inquiry", "commercial_bid_contact"}:
         return "manual"
-    if "TROUBLESHOOT" in appt or sched.get("emergency_approved") or sched.get("awaiting_emergency_confirm"):
+    if sched.get("hard_emergency_detected") or sched.get("emergency_approved") or sched.get("awaiting_emergency_confirm"):
         return "emergency"
     step = (sched.get("pending_step") or "").strip().lower()
     mapping = {
@@ -13600,7 +13616,10 @@ def _v36_spell_email_for_voice(email: str) -> str:
 
 
 def _v36_email_confirmation_reply(email: str, attempt: int = 0) -> str:
-    spoken = _v36_spell_email_for_voice(email)
+    cleaned = str(email or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", cleaned):
+        return "Please say the full email address again, including the at sign and dot com."
+    spoken = _v36_spell_email_for_voice(cleaned)
     if attempt <= 1:
         return f"I heard {spoken}. Is that correct?"
     return f"I have {spoken}. Is that correct?"
@@ -13645,6 +13664,10 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
                 sched["voice_email_correction_attempts"] = attempt + 1
                 reply = _v36_email_confirmation_reply(corrected, attempt + 1)
             else:
+                # The caller rejected the heard email and did not provide a complete
+                # replacement in the same utterance. Clear the bad pending value so
+                # we do not keep repeating a malformed partial such as kyle.prevost.
+                sched["voice_pending_email"] = None
                 sched["voice_email_correction_attempts"] = attempt + 1
                 if attempt == 0:
                     reply = "No problem. Please say the full email from the beginning, one character at a time. Say dot for a period and at for the at sign."
@@ -15805,7 +15828,7 @@ def _v44_after_slot_prompt(conv: dict) -> str:
 
 def _v44_scheduled_troubleshoot_slot_fast_path(conv: dict, caller_text: str) -> str | None:
     sched = conv.setdefault("sched", {})
-    if sched.get("hard_emergency_detected") or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved") or str(sched.get("state") or "").lower() == "emergency":
+    if sched.get("hard_emergency_detected") or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
         return None
     if not _v44_is_scheduled_troubleshoot_context(conv, caller_text):
         return None
@@ -16046,15 +16069,53 @@ def _v45_decline_troubleshoot(conv: dict) -> str:
 def _v45_any_offered_slot_choice_fast_path(conv: dict, caller_text: str) -> str | None:
     """Intercept offered-slot choices for all appointment types before older layers can parse dates as names."""
     sched = conv.setdefault("sched", {})
-    if not (sched.get("awaiting_slot_offer_choice") and (sched.get("offered_slot_options") or [])):
+    options = sched.get("offered_slot_options") or []
+    last_reply = str(conv.get("last_voice_reply") or sched.get("last_voice_reply") or conv.get("last_sms_body") or "")
+
+    # If a previous layer already staged a single date/time and the caller says
+    # "that works", accept that staged slot instead of re-offering three options.
+    if not (sched.get("awaiting_slot_offer_choice") and options):
+        if (
+            _v45_yes(caller_text)
+            and sched.get("scheduled_date")
+            and sched.get("scheduled_time")
+            and not sched.get("awaiting_troubleshoot_price_confirm")
+            and not sched.get("awaiting_eval_price_confirm")
+            and re.search(r"\b(?:we have|appointment time|confirm that appointment|that appointment)\b", last_reply, flags=re.I)
+        ):
+            sched["awaiting_slot_offer_choice"] = False
+            sched["offered_slot_options"] = []
+            sched["last_slot_unavailable_message"] = None
+            sched["slot_choice_locked"] = True
+            sched["booking_attempt_nonce"] = str(uuid.uuid4())
+            if _v45_is_troubleshoot_appt(conv):
+                sched["awaiting_emergency_confirm"] = False
+                sched["emergency_approved"] = False
+                sched["hard_emergency_detected"] = False
+                sched["troubleshoot_price_accepted"] = True
+                sched["state"] = "waiting_for_name"
+            try:
+                recompute_pending_step(conv.setdefault("profile", {}), sched)
+            except Exception:
+                sched["pending_step"] = "need_name"
+            try:
+                reply = _v44_after_slot_prompt(conv)
+            except Exception:
+                reply = "What's your first and last name?"
+            conv["last_voice_reply"] = reply
+            return reply
         return None
+
     # Do not treat a plain yes/no as a slot choice unless only one option exists.
-    if (_v45_yes(caller_text) or _v45_no(caller_text)) and len(sched.get("offered_slot_options") or []) > 1:
+    if (_v45_yes(caller_text) or _v45_no(caller_text)) and len(options) > 1:
         return None
-    try:
-        chosen = _v44_select_offered_slot_direct(conv, caller_text)
-    except Exception:
-        chosen = None
+    if _v45_yes(caller_text) and len(options) == 1:
+        chosen = dict(options[0])
+    else:
+        try:
+            chosen = _v44_select_offered_slot_direct(conv, caller_text)
+        except Exception:
+            chosen = None
     if not chosen:
         return None
     try:
@@ -17545,7 +17606,6 @@ def _v50_reply_after_explicit_address(conv: dict, caller_text: str) -> str:
         sched.get("hard_emergency_detected")
         or sched.get("awaiting_emergency_confirm")
         or sched.get("emergency_approved")
-        or (state_existing == "emergency" and "TROUBLESHOOT" in appt_existing)
     ):
         sched["appointment_type"] = "TROUBLESHOOT_395"
         conv["appointment_type"] = "TROUBLESHOOT_395"
@@ -17815,8 +17875,8 @@ def _v51_is_emergency_conversation(conv: dict, caller_text: str = "") -> bool:
         return True
     if sched.get("hard_emergency_detected") or sched.get("awaiting_emergency_confirm") or sched.get("emergency_approved"):
         return True
-    if state == "emergency" and "TROUBLESHOOT" in appt:
-        return True
+    # Do not infer true emergency from state + TROUBLESHOOT_395 alone.
+    # Normal scheduled troubleshoot visits use the same Square service.
     return False
 
 
