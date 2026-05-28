@@ -13142,3 +13142,268 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return output
+
+# =============================
+# v35 VOICE HOTFIX LAYER
+# =============================
+# Targets live failures observed after v34:
+# - email correction by voice can spiral into an impossible confirmation loop.
+#   If the first email confirmation is rejected, move the remaining email capture
+#   to SMS where the customer can type it exactly.
+# - inbound SMS email after a voice handoff must not be interpreted as a last name
+#   such as "Matthew Amy".
+# - filler still leaked into phone replies.
+# - processing cue should be calmer and more continuous, not irritating.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V35 = process_prevolt_voice_turn
+_ORIG_INCOMING_SMS_V35 = incoming_sms
+_ORIG_VOICE_NATURALIZE_REPLY_V35 = _voice_naturalize_reply
+
+_V35_FILLER_PATTERNS = [
+    r"\bOkay,?\s+thanks,?\s*[^.?!]*?(?:next detail|one more detail|keep this moving|finish scheduling|finish this|wrap this up|sort out|best next step)[^.?!]*[.?!]\s*",
+    r"\bOkay,?\s+let me\s+[^.?!]*?(?:check|grab|sort|process|run|confirm|update|finalize|wrap|move|finish)[^.?!]*[.?!]\s*",
+    r"\bThanks,?\s+I(?:'|’)m\s+[^.?!]*?(?:grabbing|using|updating|confirming|checking)[^.?!]*[.?!]\s*",
+    r"\bGot it,?\s+I(?:'|’)m\s+[^.?!]*?(?:using|checking|updating|confirming|finishing|wrapping)[^.?!]*[.?!]\s*",
+    r"\bPerfect,?\s+I(?:'|’)ll\s+use\s+that\s+time\s+and\s+just\s+need\s+one\s+more\s+detail\.\s*",
+    r"\bLet me\s+[^.?!]*?(?:think|check|grab|sort|process|run|confirm|update|finalize|wrap|move|finish)[^.?!]*[.?!]\s*",
+    r"\bI(?:'|’)ll\s+(?:move ahead|use that email|confirm the last name spelling|update that spelling|wrap up|finish)[^.?!]*[.?!]\s*",
+]
+
+
+def _voice_naturalize_reply(reply: str) -> str:
+    r = _ORIG_VOICE_NATURALIZE_REPLY_V35(reply or "")
+    changed = True
+    while changed:
+        old = r
+        for pat in _V35_FILLER_PATTERNS:
+            r = re.sub(pat, "", r, flags=re.I)
+        changed = (r != old)
+    r = re.sub(r"\bIf that is something you(?:'|’)?re interested in\.\s*Does that work for you\?", "Does that work for you?", r, flags=re.I)
+    r = re.sub(r"\bBefore choosing a time,\s*", "", r, flags=re.I)
+    r = re.sub(r"\bBefore I finalize your appointment[^.?!]*,\s*", "", r, flags=re.I)
+    r = re.sub(r"\s+", " ", r).strip()
+    return r
+
+
+def _v35_send_email_capture_sms(phone: str, conv: dict, reason: str = "email_voice_correction_failed") -> None:
+    if not phone or not (twilio_client and TWILIO_FROM_NUMBER):
+        return
+    sched = conv.setdefault("sched", {})
+    if sched.get("voice_email_text_handoff_sent"):
+        return
+    body = "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with the correct email address so we can finish booking."
+    try:
+        msg = twilio_client.messages.create(body=body, from_=TWILIO_FROM_NUMBER, to=phone)
+        sched["voice_email_text_handoff_sent"] = True
+        sched["voice_email_text_handoff_reason"] = reason
+        sched["pending_step"] = "need_email"
+        sched["state"] = "waiting_for_email"
+        sched["voice_awaiting_email_confirm"] = False
+        sched["voice_pending_email"] = None
+        conv["last_sms_body"] = body
+        log_event("VOICE_EMAIL_TEXT_HANDOFF_SMS_SENT", phone, {"sid": getattr(msg, "sid", None), "reason": reason, "call_sid": conv.get("last_call_sid")}, conv)
+    except Exception as e:
+        sched["voice_email_text_handoff_error"] = repr(e)
+        try:
+            log_event("VOICE_EMAIL_TEXT_HANDOFF_SMS_FAILED", phone, {"error": repr(e), "reason": reason}, conv)
+        except Exception:
+            pass
+
+
+def _v35_clean_last_from_spelled_text(text: str) -> str | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    # Examples: "Bacon, B-A-C-O-N" -> Bacon; "B-A-C-O-N" -> Bacon.
+    m = re.search(r"\b([A-Za-z][A-Za-z'\-]{1,30})\b\s*,?\s*(?:[A-Za-z]\s*[- ]\s*){2,}[A-Za-z]\b", raw)
+    if m:
+        return normalize_person_name(m.group(1)) or None
+    letters = re.findall(r"\b[A-Za-z]\b", raw)
+    if len(letters) >= 3 and re.fullmatch(r"[A-Za-z](?:\s*[- ]\s*[A-Za-z]){2,}", raw):
+        return normalize_person_name("".join(letters)) or None
+    return None
+
+
+def _v35_email_handoff_voice_reply(phone: str, conv: dict, reason: str = "email_rejected") -> dict:
+    sched = conv.setdefault("sched", {})
+    _v35_send_email_capture_sms(phone, conv, reason)
+    reply = "No problem. I sent you a text so you can type the email address exactly. Once you reply, we will finish the booking there. Thank you for calling Prevolt Electric. Goodbye."
+    sched["pending_step"] = "need_email"
+    sched["state"] = "waiting_for_email"
+    sched["voice_close_after_reply"] = True
+    sched["voice_email_text_handoff"] = True
+    conv["last_voice_reply"] = reply
+    return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": "need_email", "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": True}
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    conv = hydrate_voice_conversation(p, call_sid)
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    low = _intent_text(caller_text or "")
+    yn = _voice_yes_no_text(caller_text) if "_voice_yes_no_text" in globals() else ""
+
+    # If we asked the caller to confirm an email and they reject it, do not keep
+    # looping by voice. Email is the highest ASR-risk field. Move it to text.
+    if sched.get("voice_awaiting_email_confirm"):
+        if yn == "no" or any(pat in low for pat in ["wrong", "not correct", "incorrect", "nope", "never mind"]):
+            return _v35_email_handoff_voice_reply(p, conv, "email_rejected_or_unclear")
+        # If the caller tries to correct by spelling the last part, that is still too risky.
+        # Send SMS instead of transforming phrases like "the last part is B O Y K O" into a bogus email.
+        if any(pat in low for pat in ["last part", "starts with", "ends with", "spell", "spelled", "period", "dot"]) and not v13_extract_email(caller_text or ""):
+            return _v35_email_handoff_voice_reply(p, conv, "email_correction_by_voice")
+
+    # If the system is waiting for a last name and the caller spells it, store the clean form.
+    step = str(sched.get("pending_step") or "").lower()
+    state = str(sched.get("state") or "").lower()
+    if step == "need_name" or state == "waiting_for_name":
+        first = _voice_profile_first_name(profile) if "_voice_profile_first_name" in globals() else (profile.get("active_first_name") or profile.get("first_name"))
+        clean_last = _v35_clean_last_from_spelled_text(caller_text)
+        if first and clean_last:
+            profile["active_last_name"] = clean_last
+            profile["last_name"] = clean_last
+            profile["name"] = f"{first} {clean_last}".strip()
+            try:
+                recompute_pending_step(profile, sched)
+            except Exception:
+                pass
+            reply = _voice_naturalize_reply(_voice_after_name_reply(conv) if "_voice_after_name_reply" in globals() else "What's the best email address for the appointment?")
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched.get("pending_step"), "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V35(phone, call_sid, caller_text)
+    try:
+        conv2 = hydrate_voice_conversation(p, call_sid)
+        reply = _voice_naturalize_reply(str(out.get("reply_to_customer") or ""))
+        # Final safety: do not allow another email confirmation after a yes.
+        if yn == "yes" and conv2.setdefault("sched", {}).get("voice_email_confirmed") and "is that correct" in _intent_text(reply):
+            reply = "Thanks. I'll finish the booking now."
+        out["reply_to_customer"] = reply
+        conv2["last_voice_reply"] = reply
+    except Exception as e:
+        try:
+            log_event("VOICE_V35_POSTPROCESS_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
+
+
+def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
+    """Calmer, lower, fluttering PCMU/8000 processing cue.
+
+    Intent: reassure the caller that the assistant is processing without sounding
+    like a sharp notification ping. Softer low-mid boops, reverb tail, fade-out.
+    """
+    try:
+        requested = int(duration_ms or VOICE_AGENT_THINKING_SOUND_MS or 1700)
+    except Exception:
+        requested = 1700
+    ms = max(900, min(2200, requested))
+    rate = 8000
+    total = int(rate * (ms / 1000.0))
+    pcm = [0] * total
+
+    # One smooth phrase, not separate pings.
+    starts_ms = [40, 210, 380, 570, 790]
+    freqs = [185, 242, 214, 276, 232]
+    lengths_ms = [360, 380, 420, 440, 500]
+    gains = [0.075, 0.085, 0.070, 0.060, 0.045]
+
+    for n, (start_ms, freq, length_ms, gain) in enumerate(zip(starts_ms, freqs, lengths_ms, gains)):
+        start = int(rate * start_ms / 1000.0)
+        length = min(int(rate * length_ms / 1000.0), max(0, total - start))
+        if length <= 0:
+            continue
+        phase_offset = n * 0.91
+        for i in range(length):
+            idx = start + i
+            t = i / rate
+            x = i / max(1, length - 1)
+            attack = min(1.0, i / max(1, int(rate * 0.055)))
+            release = (1.0 - x) ** 2.05
+            global_fade = max(0.0, 1.0 - (idx / max(1, total)) ** 1.9)
+            vibrato = 12 * math.sin(2 * math.pi * 4.0 * t + phase_offset)
+            tone = math.sin(2 * math.pi * (freq + vibrato) * t + phase_offset)
+            tone += 0.13 * math.sin(2 * math.pi * (freq * 1.5) * t + 1.7)
+            sample = int(15500 * gain * attack * release * global_fade * tone)
+            pcm[idx] = max(-13000, min(13000, pcm[idx] + sample))
+            for delay_ms, echo_gain in ((58, 0.28), (123, 0.16), (205, 0.075), (310, 0.035)):
+                eidx = idx + int(rate * delay_ms / 1000.0)
+                if eidx < total:
+                    pcm[eidx] = max(-13000, min(13000, pcm[eidx] + int(sample * echo_gain)))
+
+    # warm low pad underneath, very soft.
+    for i in range(total):
+        t = i / rate
+        fade = max(0.0, 1.0 - (i / max(1, total)) ** 1.35)
+        pad = int(280 * fade * (math.sin(2 * math.pi * 132 * t) + 0.35 * math.sin(2 * math.pi * 198 * t)))
+        pcm[i] = max(-13000, min(13000, pcm[i] + pad))
+
+    fade_samples = int(rate * 0.055)
+    for i in range(min(fade_samples, total)):
+        mult = i / max(1, fade_samples)
+        pcm[i] = int(pcm[i] * mult)
+        j = total - 1 - i
+        pcm[j] = int(pcm[j] * mult)
+    data = bytearray(_linear16_to_mulaw(sample) for sample in pcm)
+    return base64.b64encode(bytes(data)).decode("ascii")
+
+
+def incoming_sms_v35():
+    inbound_text = request.form.get("Body", "") or ""
+    phone_raw = request.form.get("From", "")
+    phone = (phone_raw or "").replace("whatsapp:", "")
+    email = v13_extract_email(inbound_text or "")
+    conv = conversations.setdefault(phone, {})
+    sched = conv.setdefault("sched", {})
+    profile = conv.setdefault("profile", {})
+    # Voice email handoff: do not let the generic SMS handler parse the email local part as a name.
+    if email and (sched.get("voice_email_text_handoff") or sched.get("voice_email_text_handoff_sent") or sched.get("pending_step") == "need_email" or sched.get("state") == "waiting_for_email"):
+        v13_save_email(conv, email)
+        try:
+            _voice_sanitize_name_fields(profile, sched)
+            _v32_apply_name_repairs(conv, profile.get("name") or "")
+            recompute_pending_step(profile, sched)
+        except Exception:
+            pass
+        first = _voice_profile_first_name(profile) if "_voice_profile_first_name" in globals() else (profile.get("active_first_name") or profile.get("first_name"))
+        last = _voice_profile_last_name(profile) if "_voice_profile_last_name" in globals() else (profile.get("active_last_name") or profile.get("last_name"))
+        if first and not last:
+            sched["pending_step"] = "need_name"
+            sched["state"] = "waiting_for_name"
+            body = "Got it, thank you. What is your last name so we can finish booking?"
+        elif not first:
+            sched["pending_step"] = "need_name"
+            sched["state"] = "waiting_for_name"
+            body = "Got it, thank you. What is your first and last name so we can finish booking?"
+        else:
+            try:
+                booking_attempt = maybe_create_square_booking(phone, conv)
+            except Exception as e:
+                try:
+                    log_event("SMS_EMAIL_HANDOFF_BOOKING_ERROR_V35", phone, {"error": repr(e)}, conv)
+                except Exception:
+                    pass
+                booking_attempt = {"status": "exception"}
+            status = booking_attempt.get("status") if isinstance(booking_attempt, dict) else None
+            if sched.get("booking_created") and sched.get("square_booking_id") or status in {"created", "success", "booked"}:
+                body = _voice_to_sms_text(_voice_finalize_booking_reply(conv, "")) if "_voice_finalize_booking_reply" in globals() else "You're all set. We have you on the schedule."
+            else:
+                try:
+                    body = _voice_to_sms_text(_voice_naturalize_reply(choose_next_prompt_from_state(conv, inbound_text=inbound_text)))
+                except Exception:
+                    body = "Got it, thank you. We have your email and will finish getting you on the schedule."
+        conv["last_sms_body"] = body
+        try:
+            log_event("SMS_EMAIL_HANDOFF_V35", phone, {"email": email, "body": _safe_monitor_text(body), "name": profile.get("name")}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(body)
+        return Response(str(tw), mimetype="text/xml")
+    return _ORIG_INCOMING_SMS_V35()
+
+try:
+    app.view_functions["incoming_sms"] = incoming_sms_v35
+except Exception:
+    pass
