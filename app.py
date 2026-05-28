@@ -17588,3 +17588,336 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return out
+
+
+# =============================
+# Voice stabilization v51 — hard emergency override + explicit address recovery
+# =============================
+# Targets v50 1,200-test failures:
+# - Hard hazard/emergency phrases were falling into the normal $195 evaluation lane.
+# - Embedded local addresses that Google could not verify on the first try could still ask for spelling
+#   instead of moving forward when the caller supplied town/state.
+# - Explicit out-of-area towns such as Boston/Worcester/Malden/Danbury must close cleanly.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V51 = process_prevolt_voice_turn
+
+
+def _v51_low(value: str) -> str:
+    try:
+        return _intent_text(value or "")
+    except Exception:
+        return str(value or "").lower().strip()
+
+
+def _v51_hard_hazard_text(text: str) -> bool:
+    """Hard emergency detector for voice. This must override every normal booking lane."""
+    low = _v51_low(text)
+    if not low:
+        return False
+    hard_patterns = [
+        r"\bsmoke\b", r"\bsmoking\b", r"\bcaught\s+fire\b", r"\bon\s+fire\b", r"\bfire\b",
+        r"\bburning\b", r"\bburnt\b", r"\bburned\b", r"\bburning\s+smell\b", r"\bsmells?\s+like\s+(?:smoke|burning)\b",
+        r"\bhot\s+to\s+the\s+touch\b", r"\bpanel\s+is\s+hot\b", r"\bhot\s+panel\b", r"\boutlet\s+is\s+hot\b", r"\bhot\s+outlet\b",
+        r"\bspark(?:ed|ing|s)?\b", r"\barc(?:ed|ing|s)?\b", r"\barcing\b",
+        r"\bcrackl(?:e|ing)\b", r"\bpopp(?:ed|ing)?\b", r"\bbuzz(?:ing)?\b",
+        r"\bwater\b.*\b(?:panel|breaker|electrical|outlet)\b", r"\b(?:panel|breaker|electrical|outlet)\b.*\bwater\b",
+    ]
+    return any(re.search(p, low, flags=re.I) for p in hard_patterns)
+
+
+def _v51_state_from_text(text: str) -> str | None:
+    low = _v51_low(text)
+    if re.search(r"\b(?:ct|connecticut)\b", low):
+        return "CT"
+    if re.search(r"\b(?:ma|massachusetts|mass)\b", low):
+        return "MA"
+    return None
+
+
+def _v51_extract_line_town_state(text: str, conv: dict | None = None) -> tuple[str | None, str | None, str | None]:
+    """Return (street_line, town, state) from spoken text, correcting known ASR variants first."""
+    conv = conv or {}
+    fixed = text or ""
+    try:
+        fixed, _did = _v49_apply_dickerman_asr_lexicon(fixed)
+    except Exception:
+        pass
+    line = town = state = None
+    try:
+        line, town, state = _v47_extract_address_candidate(fixed)
+    except Exception:
+        try:
+            line = extract_service_address_from_text(fixed)
+        except Exception:
+            line = None
+    try:
+        town2, state2 = _v50_extract_town_state(fixed)
+        town = town or town2
+        state = state or state2
+    except Exception:
+        pass
+    if not state:
+        state = _v51_state_from_text(fixed)
+    # Reuse stored town hint if the turn only had a street line.
+    try:
+        sched = conv.setdefault("sched", {}) if isinstance(conv, dict) else {}
+        town = town or sched.get("voice_town_hint") or sched.get("town_hint") or sched.get("locality")
+        state = state or sched.get("voice_state_hint") or sched.get("state_hint")
+    except Exception:
+        pass
+    if line:
+        line = " ".join(str(line).replace("Ticker man", "Dickerman").replace("Tickerman", "Dickerman").split()).strip(" ,.")
+    if town:
+        town = re.sub(r"\b(?:ct|connecticut|ma|massachusetts|mass)\b", "", str(town), flags=re.I).strip(" ,.")
+        town = " ".join(town.split()[:3]).title()
+    if state:
+        state = "CT" if str(state).strip().lower() in {"ct", "connecticut"} else ("MA" if str(state).strip().lower() in {"ma", "massachusetts", "mass"} else str(state).strip().upper())
+    return line, town, state
+
+
+def _v51_apply_address_if_possible(conv: dict, caller_text: str, allow_customer_local_fallback: bool = True) -> bool:
+    """Apply a complete local explicit address from the caller before old Google guesses can win."""
+    sched = conv.setdefault("sched", {})
+    if sched.get("address_verified"):
+        return True
+    line, town, state = _v51_extract_line_town_state(caller_text, conv)
+    if not line:
+        return False
+    # Full customer town/state is the safest path and must override stale guesses.
+    if town and state:
+        if _voice_is_out_of_area_town(town) or _v51_low(town) in {"danbury", "new haven", "stamford"}:
+            return False
+        if allow_customer_local_fallback and _v50_known_local_town(town, state):
+            _v50_apply_explicit_customer_address(conv, line, town, state, "v51_explicit_address")
+            return bool(sched.get("address_verified"))
+        # Unknown but structured CT/MA town: try Google; accept only if it preserves town/state.
+        try:
+            raw = f"{line}, {town}, {state}"
+            result = normalize_address(raw, forced_state=state)
+            if isinstance(result, tuple) and len(result) >= 2 and result[0] == "ok" and _v50_locality_matches(result[1], town, state):
+                _v38_apply_normalized_address(conv, result[1], "v51_explicit_google")
+                return True
+        except Exception:
+            pass
+        return False
+    # Street-only fallback. This helps known local streets like Dickerman and normal partial maps.
+    try:
+        if _v47_apply_normalized_if_possible(conv, line):
+            return bool(sched.get("address_verified"))
+    except Exception:
+        pass
+    try:
+        addr, _reason = _v38_google_resolve_partial_address(line)
+        if addr:
+            _v38_apply_normalized_address(conv, addr, "v51_partial_google")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _v51_emergency_prompt(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    sched["appointment_type"] = "TROUBLESHOOT_395"
+    conv["appointment_type"] = "TROUBLESHOOT_395"
+    sched["awaiting_emergency_confirm"] = True
+    sched["emergency_approved"] = False
+    sched["hard_emergency_detected"] = True
+    sched["price_disclosed"] = True
+    sched["pending_step"] = "need_date"
+    sched["state"] = "emergency"
+    return "This sounds urgent. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Do you want us to dispatch someone now?"
+
+
+def _v51_append_reply(conv: dict, reply: str) -> None:
+    try:
+        conv.setdefault("voice_transcript", []).append({"role": "assistant", "text": reply, "ts": _monitor_now_iso() if "_monitor_now_iso" in globals() else datetime.now(timezone.utc).isoformat()})
+    except Exception:
+        pass
+    conv["last_voice_reply"] = reply
+
+
+def _v51_output(conv: dict, reply: str, end_call: bool = False) -> dict:
+    sched = conv.setdefault("sched", {})
+    _v51_append_reply(conv, reply)
+    if end_call:
+        sched["voice_close_after_reply"] = True
+    return {
+        "reply_to_customer": reply,
+        "booking_created": bool(sched.get("booking_created") and sched.get("square_booking_id")),
+        "manual_only": bool(sched.get("manual_only")),
+        "pending_step": sched.get("pending_step"),
+        "appointment_type": sched.get("appointment_type") or conv.get("appointment_type"),
+        "end_call": bool(end_call or sched.get("voice_close_after_reply")),
+    }
+
+
+def _v51_is_explicit_far_town(text: str) -> bool:
+    low = _v51_low(text)
+    return bool(re.search(r"\b(?:worcester|worcestor|boston|malden|danbury|new\s+haven|stamford)\b", low, flags=re.I))
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    text = caller_text or ""
+    try:
+        fixed_text, did_fix = _v49_apply_dickerman_asr_lexicon(text)
+        if did_fix:
+            text = fixed_text
+    except Exception:
+        pass
+
+    # Pre-layer 1: hard emergency/hazard always wins. Never let smoke/fire/hot/arcing/water go to $195.
+    try:
+        if _v51_hard_hazard_text(text):
+            conv = hydrate_voice_conversation(p, call_sid)
+            conv["phone"] = p
+            sched = conv.setdefault("sched", {})
+            sched["last_customer_issue"] = text
+            _v51_apply_address_if_possible(conv, text)
+            # If no verified address and the caller has a saved Square address, confirm it.
+            if not sched.get("address_verified"):
+                saved = _best_saved_address(conv.setdefault("profile", {}))
+                if saved:
+                    sched["appointment_type"] = "TROUBLESHOOT_395"
+                    conv["appointment_type"] = "TROUBLESHOOT_395"
+                    sched["awaiting_emergency_confirm"] = False
+                    sched["hard_emergency_detected"] = True
+                    sched["pending_step"] = "need_address"
+                    sched["address_candidate"] = saved
+                    sched["raw_address"] = saved
+                    reply = f"This sounds urgent. I have {saved} on file. Is this for that address?"
+                    try:
+                        log_event("VOICE_V51_EMERGENCY_SAVED_ADDRESS_CONFIRM", p, {"caller_text": _safe_monitor_text(text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+                    except Exception:
+                        pass
+                    return _v51_output(conv, reply, False)
+                sched["appointment_type"] = "TROUBLESHOOT_395"
+                conv["appointment_type"] = "TROUBLESHOOT_395"
+                sched["pending_step"] = "need_address"
+                sched["address_missing"] = "street"
+                sched["hard_emergency_detected"] = True
+                reply = "If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what is the full address for the work?"
+                return _v51_output(conv, reply, False)
+            reply = _v51_emergency_prompt(conv)
+            try:
+                log_event("VOICE_V51_HARD_EMERGENCY_OVERRIDE", p, {"caller_text": _safe_monitor_text(text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return _v51_output(conv, reply, False)
+    except Exception as e:
+        try:
+            log_event("VOICE_V51_EMERGENCY_PRE_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    # Pre-layer 2: explicit far-away towns close cleanly before Google guesses or slot state can run.
+    try:
+        if _v51_is_explicit_far_town(text):
+            conv = hydrate_voice_conversation(p, call_sid)
+            conv["phone"] = p
+            town, state = _v50_extract_town_state(text)
+            if _voice_is_out_of_area_town(text) or _v51_low(town or text) in {"danbury", "new haven", "stamford"}:
+                reply = _voice_out_of_area_reply()
+                return _v50_force_closed_output(p, conv, reply, "residential_out_of_area_explicit_v51")
+    except Exception:
+        pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V51(phone, call_sid, text)
+
+    # Post-layer 1: if older logic could not verify an embedded local full address, apply it and continue.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+        reply = str(out.get("reply_to_customer") or "") if isinstance(out, dict) else ""
+        if re.search(r"couldn[’']?t verify|repeat just the street|spell it|which town", reply, flags=re.I):
+            line, town, state = _v51_extract_line_town_state(text, conv)
+            if line and town and state and _v50_known_local_town(town, state):
+                _v50_apply_explicit_customer_address(conv, line, town, state, "v51_post_local_recovery")
+                recovered = _v50_reply_after_explicit_address(conv, text)
+                try:
+                    log_event("VOICE_V51_LOCAL_ADDRESS_RECOVERY", p, {"old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(recovered), "caller_text": _safe_monitor_text(text), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+                return _v51_output(conv, recovered, False)
+    except Exception as e:
+        try:
+            log_event("VOICE_V51_POST_ADDRESS_RECOVERY_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    # Post-layer 2: hard guard. If a hard hazard somehow escaped, rewrite the reply to emergency language.
+    try:
+        if _v51_hard_hazard_text(text):
+            conv = hydrate_voice_conversation(p, call_sid)
+            conv["phone"] = p
+            sched = conv.setdefault("sched", {})
+            bad_reply = str(out.get("reply_to_customer") or "") if isinstance(out, dict) else ""
+            if "195" in _v51_low(bad_reply) or "evaluation" in _v51_low(bad_reply) or "what day" in _v51_low(bad_reply):
+                sched["appointment_type"] = "TROUBLESHOOT_395"
+                conv["appointment_type"] = "TROUBLESHOOT_395"
+                reply = _v51_emergency_prompt(conv) if sched.get("address_verified") else "If there is active fire or smoke filling the home, please call 911 first. If it is safe for us to come out, what is the full address for the work?"
+                return _v51_output(conv, reply, False)
+    except Exception:
+        pass
+
+    return out
+
+
+# =============================
+# Voice stabilization v52 — cleanup after v51 emergency pass
+# =============================
+# Fixes the two remaining v51 intake harness failure classes:
+# - Old layers can have a verified address + loaded slots but still speak a stale "couldn't verify" prompt.
+# - Danbury/New Haven/Stamford explicit addresses must close as out-of-area, not ask for spelling.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V52 = process_prevolt_voice_turn
+
+
+def _v52_text_has_explicit_far_town(text: str) -> bool:
+    low = _v51_low(text)
+    return bool(re.search(r"\b(?:worcester|worcestor|boston|malden|danbury|new\s+haven|stamford)\b", low, flags=re.I))
+
+
+def _v52_stale_verify_reply(reply: str) -> bool:
+    return bool(re.search(r"couldn[’']?t verify|repeat just the street|spell it", str(reply or ""), flags=re.I))
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    text = caller_text or ""
+
+    # Explicit far-town close. This is intentionally before v51/v50 so Google cannot
+    # temporarily normalize "1 Main Street" into some other local-looking value.
+    try:
+        if _v52_text_has_explicit_far_town(text) and not re.search(r"\b(?:windsor|windsor\s+locks|suffield|enfield|granby|bloomfield|hartford)\b", _v51_low(text), flags=re.I):
+            conv = hydrate_voice_conversation(p, call_sid)
+            conv["phone"] = p
+            reply = _voice_out_of_area_reply()
+            return _v50_force_closed_output(p, conv, reply, "residential_out_of_area_explicit_v52")
+    except Exception:
+        pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V52(phone, call_sid, text)
+
+    # If lower layers actually verified the address but left a stale "couldn't verify"
+    # spoken reply, replace the spoken prompt with the proper price gate.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+        reply = str(out.get("reply_to_customer") or "") if isinstance(out, dict) else ""
+        if _v52_stale_verify_reply(reply) and sched.get("address_verified"):
+            recovered = _v50_reply_after_explicit_address(conv, text)
+            try:
+                log_event("VOICE_V52_STALE_VERIFY_REPLY_RECOVERY", p, {"old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(recovered), "caller_text": _safe_monitor_text(text), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return _v51_output(conv, recovered, False)
+    except Exception as e:
+        try:
+            log_event("VOICE_V52_POST_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
