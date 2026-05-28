@@ -17091,3 +17091,221 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return out
+
+# =============================
+# v49 ADDRESS ASR HOTFIX LAYER
+# =============================
+# - Correct common voice-ASR street-name mistakes before address normalization.
+# - Specific live failure: "Dickerman" was heard/stored as "Tickerman" and the
+#   system looped even after caller gave town/state.
+# - This is intentionally narrow: only corrects close Dickerman variants when
+#   the text is address-like or tied to Windsor Locks / Windsor context.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V49 = process_prevolt_voice_turn
+
+
+def _v49_low(text: str) -> str:
+    try:
+        return (text or "").lower().strip()
+    except Exception:
+        return ""
+
+
+def _v49_apply_dickerman_asr_lexicon(text: str) -> tuple[str, bool]:
+    """Return text with safe Dickerman ASR repairs applied.
+
+    The correction is only applied when the input looks address-related. This
+    avoids globally rewriting random words, but catches phone-ASR variants like:
+      - Tickerman Ave
+      - Ticker man Ave
+      - Tikerman Avenue
+    """
+    original = text or ""
+    if not original:
+        return original, False
+    low = _v49_low(original)
+    address_like = bool(re.search(r"\b\d{1,6}\b", original)) or bool(re.search(r"\b(?:ave|avenue|st|street|road|rd|drive|dr|ln|lane)\b", low))
+    local_context = bool(re.search(r"\b(?:windsor locks|windsor|connecticut|ct)\b", low))
+    has_bad_variant = bool(re.search(r"\b(?:tickerman|tikerman|tikkerman|ticker\s+man|tiker\s+man|dicker\s+man)\b", low))
+    if not has_bad_variant:
+        return original, False
+    if not (address_like or local_context):
+        return original, False
+    fixed = re.sub(r"\b[Tt]ickerman\b", "Dickerman", original)
+    fixed = re.sub(r"\b[Tt]ikerman\b", "Dickerman", fixed)
+    fixed = re.sub(r"\b[Tt]ikkerman\b", "Dickerman", fixed)
+    fixed = re.sub(r"\b[Tt]icker\s+[Mm]an\b", "Dickerman", fixed)
+    fixed = re.sub(r"\b[Tt]iker\s+[Mm]an\b", "Dickerman", fixed)
+    fixed = re.sub(r"\b[Dd]icker\s+[Mm]an\b", "Dickerman", fixed)
+    return fixed, fixed != original
+
+
+def _v49_repair_sched_dickerman(conv: dict) -> bool:
+    sched = conv.setdefault("sched", {})
+    changed = False
+    for key in ("raw_address", "address_candidate", "normalized_address_text"):
+        val = sched.get(key)
+        if isinstance(val, str):
+            fixed, did = _v49_apply_dickerman_asr_lexicon(val)
+            if did:
+                sched[key] = fixed
+                changed = True
+    # Do not blindly mark verified. Just clear the bad loop state so Google can
+    # re-verify the corrected value.
+    if changed and not sched.get("address_verified"):
+        sched["address_missing"] = "confirm"
+        sched["address_candidate"] = sched.get("raw_address") or sched.get("address_candidate")
+    return changed
+
+
+def _v49_build_corrected_dickerman_candidate(conv: dict, caller_text: str) -> str | None:
+    """Build a usable corrected address candidate from caller text or sched."""
+    sched = conv.setdefault("sched", {})
+    fixed_text, did_text = _v49_apply_dickerman_asr_lexicon(caller_text or "")
+    pool = [fixed_text, sched.get("raw_address"), sched.get("address_candidate")]
+    for item in pool:
+        if not isinstance(item, str) or "dickerman" not in item.lower():
+            continue
+        # Prefer the explicit house number supplied by the caller/sched.
+        m_num = re.search(r"\b(\d{1,6})\b", item)
+        number = m_num.group(1) if m_num else ""
+        town = "Windsor Locks" if re.search(r"\bwindsor\s+locks\b", item, flags=re.I) else None
+        if not town:
+            # If the caller only says Dickerman Ave and the business origin is Windsor Locks,
+            # use that as a safe town hint for this known local street.
+            origin = str(os.environ.get("VOICE_DISPATCH_ORIGIN_ADDRESS") or os.environ.get("DISPATCH_ORIGIN_ADDRESS") or "")
+            if "dickerman" in origin.lower() and "windsor locks" in origin.lower():
+                town = "Windsor Locks"
+        state = "CT" if re.search(r"\b(?:ct|connecticut)\b", item, flags=re.I) else None
+        if not state:
+            origin = str(os.environ.get("VOICE_DISPATCH_ORIGIN_ADDRESS") or os.environ.get("DISPATCH_ORIGIN_ADDRESS") or "")
+            if "ct" in origin.lower() or "connecticut" in origin.lower() or "windsor locks" in origin.lower():
+                state = "CT"
+        if number and town and state:
+            return f"{number} Dickerman Ave, {town}, {state}"
+        if number:
+            return f"{number} Dickerman Ave"
+    return None
+
+
+def _v49_issue_needs_troubleshoot(conv: dict, caller_text: str = "") -> bool:
+    sched = conv.setdefault("sched", {})
+    issue_blob = " ".join([
+        str(caller_text or ""),
+        str(sched.get("last_customer_issue") or ""),
+        str(sched.get("voice_last_caller_text_norm") or ""),
+    ])
+    if sched.get("voice_last_intent_power_loss"):
+        return True
+    try:
+        return bool(_v47_power_loss_troubleshoot_text(issue_blob))
+    except Exception:
+        low = _v49_low(issue_blob)
+        return bool(re.search(r"\b(outlet|outlets|power|lights?)\b", low) and re.search(r"\b(not working|stopped working|no power|dead|troubleshoot|troubleshooting)\b", low))
+
+
+def _v49_after_address_verified_reply(conv: dict, caller_text: str) -> str:
+    sched = conv.setdefault("sched", {})
+    if _v49_issue_needs_troubleshoot(conv, caller_text) and not (_v47_hard_hazard(caller_text) if "_v47_hard_hazard" in globals() else False):
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        sched["awaiting_troubleshoot_price_confirm"] = True
+        sched["awaiting_eval_price_confirm"] = False
+        try:
+            return _v45_troubleshoot_price_gate(conv, caller_text)
+        except Exception:
+            return "The address is verified in our system. Troubleshoot and repair visits are $395. That covers sending one of our electricians out to diagnose the issue and repair it on site when possible. Does that work for you?"
+    sched["appointment_type"] = sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195"
+    conv["appointment_type"] = sched["appointment_type"]
+    sched["awaiting_eval_price_confirm"] = True
+    return "The address is verified in our system. We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step. Does that work for you?"
+
+
+def _v49_try_verify_corrected_dickerman(conv: dict, caller_text: str) -> str | None:
+    """If Dickerman was misheard as Tickerman, correct + verify before looping."""
+    sched = conv.setdefault("sched", {})
+    candidate = _v49_build_corrected_dickerman_candidate(conv, caller_text)
+    if not candidate:
+        return None
+    sched["raw_address"] = candidate
+    sched["address_candidate"] = candidate
+    try:
+        ok = _v47_apply_normalized_if_possible(conv, candidate)
+    except Exception:
+        ok = False
+    if not ok:
+        # Last local fallback: if caller supplied number + Windsor Locks + Dickerman,
+        # stop saying Tickerman and ask only for a confirmation/spelling of the street.
+        sched["address_verified"] = False
+        sched["address_missing"] = "confirm"
+        return f"I heard {candidate}, but I couldn’t verify that address. Please confirm the street name is Dickerman Avenue."
+    try:
+        _v48_sync_raw_address_from_normalized(conv)
+    except Exception:
+        pass
+    sched["address_verified"] = True
+    sched["address_missing"] = None
+    return _v49_after_address_verified_reply(conv, caller_text)
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    fixed_text, did_fix = _v49_apply_dickerman_asr_lexicon(caller_text or "")
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        sched_pre = conv_pre.setdefault("sched", {})
+        sched_pre["voice_last_caller_text_norm"] = fixed_text
+        sched_changed = _v49_repair_sched_dickerman(conv_pre)
+        # If the current turn is clearly a full corrected address reply, handle it now
+        # before older layers can repeat the Tickerman loop.
+        if did_fix or sched_changed or "dickerman" in _v49_low(fixed_text):
+            immediate = _v49_try_verify_corrected_dickerman(conv_pre, fixed_text)
+            if immediate and ("couldn’t verify" not in _v49_low(immediate) or "tickerman" in _v49_low(caller_text or "")):
+                try:
+                    log_event("VOICE_V49_DICKERMAN_ASR_PRE", p, {"caller_text": _safe_monitor_text(caller_text), "fixed_text": _safe_monitor_text(fixed_text), "reply": _safe_monitor_text(immediate), "call_sid": call_sid}, conv_pre)
+                except Exception:
+                    pass
+                return {"reply_to_customer": immediate, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": sched_pre.get("appointment_type") or conv_pre.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V49_DICKERMAN_PRE_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V49(phone, call_sid, fixed_text if did_fix else caller_text)
+
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+        _v49_repair_sched_dickerman(conv)
+        reply = str(out.get("reply_to_customer") or "")
+        reply_fixed, reply_changed = _v49_apply_dickerman_asr_lexicon(reply)
+        if reply_changed:
+            out["reply_to_customer"] = reply_fixed
+            conv["last_voice_reply"] = reply_fixed
+            reply = reply_fixed
+        # If old layer still produced the failed verification loop, override it.
+        if re.search(r"couldn[’']t verify", reply, flags=re.I) and ("dickerman" in _v49_low(fixed_text) or "tickerman" in _v49_low(reply)):
+            repaired = _v49_try_verify_corrected_dickerman(conv, fixed_text)
+            if repaired:
+                out["reply_to_customer"] = repaired
+                out["booking_created"] = False
+                out["end_call"] = False
+                out["pending_step"] = sched.get("pending_step")
+                out["appointment_type"] = sched.get("appointment_type") or conv.get("appointment_type")
+                try:
+                    log_event("VOICE_V49_DICKERMAN_ASR_POST", p, {"caller_text": _safe_monitor_text(caller_text), "fixed_text": _safe_monitor_text(fixed_text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(repaired), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+        # Never allow the assistant to speak the bad ASR street back to the caller.
+        if "tickerman" in _v49_low(str(out.get("reply_to_customer") or "")):
+            out["reply_to_customer"] = re.sub(r"\b[Tt]ickerman\b", "Dickerman", str(out.get("reply_to_customer") or ""))
+            conv["last_voice_reply"] = out["reply_to_customer"]
+    except Exception as e:
+        try:
+            log_event("VOICE_V49_POST_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
