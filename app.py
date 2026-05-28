@@ -3023,8 +3023,13 @@ def _voice_send_resume_sms_if_needed(phone: str, conv: dict, reason: str = "") -
         or sched.get("awaiting_emergency_confirm")
         or sched.get("emergency_approved")
     )
-    if emergency_resume and sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
+    address_verified = bool(sched.get("address_verified"))
+    if emergency_resume and not address_verified:
+        body = "This is Prevolt Electric. We got started over the phone. Please reply with the full address for the work, including the town and state."
+    elif emergency_resume and sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
         body = "This is Prevolt Electric. We got started over the phone. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Reply YES if you want us to dispatch someone now."
+    elif not address_verified or step == "need_address":
+        body = "This is Prevolt Electric. We got started over the phone. Please reply with the full address for the work, including the town and state."
     elif emergency_resume and step == "need_name":
         body = "This is Prevolt Electric. We got the emergency dispatch started over the phone. Please reply with your first and last name so we can finish booking."
     elif emergency_resume and step == "need_email":
@@ -3038,8 +3043,6 @@ def _voice_send_resume_sms_if_needed(phone: str, conv: dict, reason: str = "") -
         body = "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your first and last name so we can finish booking."
     elif step == "need_email":
         body = "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your email address so we can finish booking."
-    elif step == "need_address" or not (sched.get("raw_address") or sched.get("address_candidate")):
-        body = "This is Prevolt Electric. We got started over the phone. Please reply with the house number and street name for the work."
     elif step in {"need_date", "need_time"} or not (sched.get("scheduled_date") and sched.get("scheduled_time")):
         body = "This is Prevolt Electric. We got started over the phone. What day and time works best for you?"
     else:
@@ -3066,7 +3069,7 @@ def _voice_handoff_sms_body(conv: dict | None = None) -> str:
     sched = conv.setdefault("sched", {}) if isinstance(conv, dict) else {}
     profile = conv.setdefault("profile", {}) if isinstance(conv, dict) else {}
     step = (sched.get("pending_step") or "").strip().lower()
-    has_address = bool(sched.get("raw_address") or sched.get("address_candidate"))
+    has_address = bool(sched.get("address_verified"))
     has_slot = bool(sched.get("scheduled_date") and sched.get("scheduled_time"))
     has_name = bool(profile.get("active_first_name") or profile.get("first_name") or profile.get("name"))
     has_email = bool(profile.get("active_email") or profile.get("email") or sched.get("email"))
@@ -3076,8 +3079,12 @@ def _voice_handoff_sms_body(conv: dict | None = None) -> str:
         or sched.get("awaiting_emergency_confirm")
         or sched.get("emergency_approved")
     )
+    if emergency_handoff and not has_address:
+        return "This is Prevolt Electric. We got started over the phone. Please reply with the full address for the work, including the town and state."
     if emergency_handoff and sched.get("awaiting_emergency_confirm") and not sched.get("emergency_approved"):
         return "This is Prevolt Electric. We got started over the phone. We can send someone now, and arrival is usually within one to two hours. The emergency troubleshoot and repair visit is $395. Reply YES if you want us to dispatch someone now."
+    if not has_address or step == "need_address":
+        return "This is Prevolt Electric. We got started over the phone. Please reply with the full address for the work, including the town and state."
     if emergency_handoff and (step == "need_name" or not has_name):
         return "This is Prevolt Electric. We got the emergency dispatch started over the phone. Please reply with your first and last name so we can finish booking."
     if step == "need_name" or not has_name:
@@ -3086,8 +3093,6 @@ def _voice_handoff_sms_body(conv: dict | None = None) -> str:
         return "This is Prevolt Electric. We got the emergency dispatch started over the phone. Please reply with your email address so we can finish booking."
     if step == "need_email" or not has_email:
         return "This is Prevolt Electric. We got the appointment details started over the phone. Please reply with your email address so we can finish booking."
-    if not has_address or step == "need_address":
-        return "This is Prevolt Electric. We got started over the phone. Please reply with the house number and street name for the work."
     if not has_slot or step in {"need_date", "need_time"}:
         return "This is Prevolt Electric. We got started over the phone. What day and time works best for you?"
     return "This is Prevolt Electric. We got most of the appointment details started over the phone. Please reply with the electrical issue and any remaining details so we can finish booking."
@@ -14506,7 +14511,7 @@ def _v39_unverified_address_reply(conv: dict, caller_text: str) -> str:
     raw = _v39_candidate_with_town_state(str(sched.get("raw_address") or sched.get("address_candidate") or ""), caller_text, sched)
     raw = _v38_clean_addr_text(raw)
     if raw:
-        return f"I heard {raw}, but I couldn't verify that address. Can you repeat just the street name, or spell it?"
+        return "I couldn't verify that address. Please say the full address, including the town and state."
     return "I couldn't verify that address. Can you repeat the house number and street name?"
 
 
@@ -16523,8 +16528,44 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         reply = _voice_naturalize_reply(str(out.get("reply_to_customer") or "")) if "_voice_naturalize_reply" in globals() else str(out.get("reply_to_customer") or "")
         low_reply = _v46_low(reply)
 
-        # D) Force $395 scheduled troubleshoot for power-loss/outlet-failure language even if old layers chose $195.
+        # D) Force normal scheduled $395 troubleshoot for power-loss/outlet-failure language,
+        # but never skip address collection. Earlier layers sometimes stored the customer's issue
+        # text as an address candidate, then jumped to price/date. Fix that at the source.
         if _v46_power_loss_troubleshoot_text(caller_text) and not _v46_is_hard_hazard(caller_text):
+            sched["voice_last_intent_power_loss"] = True
+            sched["last_customer_issue"] = caller_text
+            sched["appointment_type"] = "TROUBLESHOOT_395"
+            conv["appointment_type"] = "TROUBLESHOOT_395"
+            sched["awaiting_emergency_confirm"] = False
+            sched["emergency_approved"] = False
+            sched["hard_emergency_detected"] = False
+
+            if not sched.get("address_verified"):
+                sched["raw_address"] = ""
+                sched["address_candidate"] = ""
+                sched["address_verified"] = False
+                sched["address_missing"] = "street"
+                sched["pending_step"] = "need_address"
+                sched["state"] = "waiting_for_address"
+                sched["awaiting_slot_offer_choice"] = False
+                sched["offered_slot_options"] = []
+                sched["awaiting_troubleshoot_price_confirm"] = False
+                sched["troubleshoot_price_accepted"] = False
+                sched["awaiting_eval_price_confirm"] = False
+                reply2 = "Got it. What is the full address for the work, including the town and state?"
+                out["reply_to_customer"] = _voice_naturalize_reply(reply2) if "_voice_naturalize_reply" in globals() else reply2
+                out["booking_created"] = False
+                out["manual_only"] = False
+                out["appointment_type"] = "TROUBLESHOOT_395"
+                out["pending_step"] = "need_address"
+                out["end_call"] = False
+                conv["last_voice_reply"] = out["reply_to_customer"]
+                try:
+                    log_event("VOICE_V46_POWER_LOSS_NEEDS_ADDRESS", p, {"caller_text": _safe_monitor_text(caller_text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(out["reply_to_customer"]), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+                return out
+
             already_395 = "395" in low_reply or "troubleshoot and repair" in low_reply
             if not sched.get("troubleshoot_price_accepted") and not already_395:
                 reply2 = _v45_troubleshoot_price_gate(conv, caller_text) if "_v45_troubleshoot_price_gate" in globals() else _v43_troubleshoot_price_prompt(conv, caller_text)
@@ -16797,11 +16838,34 @@ def _v47_repair_or_block_address(conv: dict, caller_text: str) -> str | None:
     if raw_existing and not _v47_address_verified_structured(conv):
         if _v47_apply_normalized_if_possible(conv, raw_existing):
             return None
+
+        # Do not read the customer's whole service issue back as though it was an address.
+        # Older layers can mistakenly store "outlets stopped working..." in raw_address.
+        existing_line, _existing_town, _existing_state = _v47_extract_address_candidate(raw_existing)
+        raw_looks_like_issue = (
+            _v47_power_loss_troubleshoot_text(raw_existing)
+            or bool(re.search(r"\b(?:outlets?|lights?|breaker|circuit|panel|troubleshoot|fix|repair|stopped working|not working)\b", _v47_low(raw_existing), flags=re.I))
+        )
+        if raw_looks_like_issue and not (line or existing_line):
+            sched["raw_address"] = ""
+            sched["address_candidate"] = ""
+            sched["address_verified"] = False
+            sched["address_missing"] = "street"
+            sched["pending_step"] = "need_address"
+            sched["state"] = "waiting_for_address"
+            sched["awaiting_slot_offer_choice"] = False
+            sched["offered_slot_options"] = []
+            return "Got it. What is the full address for the work, including the town and state?"
+
         sched["address_verified"] = False
         sched["address_missing"] = "confirm"
+        sched["pending_step"] = "need_address"
+        if str(sched.get("state") or "").lower() not in {"emergency"}:
+            sched["state"] = "waiting_for_address"
+        sched["awaiting_slot_offer_choice"] = False
+        sched["offered_slot_options"] = []
         if line or raw_existing:
-            heard = raw_existing
-            return f"I heard {heard}, but I couldn’t verify that address. Please say the full address, including the town and state."
+            return "I couldn’t verify that address yet. Please say the full address, including the town and state."
 
     return None
 
@@ -16858,7 +16922,7 @@ def _v47_handle_street_spelling_reply(conv: dict, caller_text: str) -> str | Non
     if not _v47_apply_normalized_if_possible(conv, raw):
         sched["address_verified"] = False
         sched["address_missing"] = "confirm"
-        conv["last_voice_reply"] = f"I heard {raw}, but I still couldn’t verify that address. Please say the full address, including the town and state."
+        conv["last_voice_reply"] = "I still couldn’t verify that address. Please say the full address, including the town and state."
         return conv["last_voice_reply"]
     # Address is good now; continue to correct price gate.
     if sched.get("voice_last_intent_power_loss") or _v47_power_loss_troubleshoot_text(str(sched.get("last_customer_issue") or "")):
@@ -17071,9 +17135,42 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             return out
 
         # If the customer described dead/nonworking outlets, force scheduled $395 troubleshoot unless hard hazard.
+        # Address must be collected and verified before price/date flow.
         if _v47_power_loss_troubleshoot_text(caller_text) and not _v47_hard_hazard(caller_text):
             sched["voice_last_intent_power_loss"] = True
             sched["last_customer_issue"] = caller_text
+            sched["appointment_type"] = "TROUBLESHOOT_395"
+            conv["appointment_type"] = "TROUBLESHOOT_395"
+            sched["awaiting_emergency_confirm"] = False
+            sched["emergency_approved"] = False
+            sched["hard_emergency_detected"] = False
+
+            if not sched.get("address_verified"):
+                sched["raw_address"] = ""
+                sched["address_candidate"] = ""
+                sched["address_verified"] = False
+                sched["address_missing"] = "street"
+                sched["pending_step"] = "need_address"
+                sched["state"] = "waiting_for_address"
+                sched["awaiting_slot_offer_choice"] = False
+                sched["offered_slot_options"] = []
+                sched["awaiting_troubleshoot_price_confirm"] = False
+                sched["troubleshoot_price_accepted"] = False
+                sched["awaiting_eval_price_confirm"] = False
+                reply2 = "Got it. What is the full address for the work, including the town and state?"
+                out["reply_to_customer"] = _voice_naturalize_reply(reply2) if "_voice_naturalize_reply" in globals() else reply2
+                out["booking_created"] = False
+                out["manual_only"] = False
+                out["appointment_type"] = "TROUBLESHOOT_395"
+                out["pending_step"] = "need_address"
+                out["end_call"] = False
+                conv["last_voice_reply"] = out["reply_to_customer"]
+                try:
+                    log_event("VOICE_V47_POWER_LOSS_NEEDS_ADDRESS", p, {"caller_text": _safe_monitor_text(caller_text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(out["reply_to_customer"]), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+                return out
+
             already_price = "395" in low_reply and "troubleshoot" in low_reply
             already_slot = bool(sched.get("awaiting_slot_offer_choice")) and ("which one" in low_reply or "works best" in low_reply)
             if not sched.get("troubleshoot_price_accepted") and not already_price and not already_slot:
@@ -17090,9 +17187,21 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
                     pass
                 return out
 
-        # If older layers still asked a generic scheduling question for troubleshoot, replace with the $395 gate.
+        # If older layers still asked a generic scheduling question for troubleshoot, replace it.
+        # If address is missing, ask address first; if address is verified, move to the $395 gate.
         if _v47_power_loss_troubleshoot_text(caller_text) and ("what day and time" in low_reply or "what time works" in low_reply or "get the scheduling" in low_reply):
-            reply2 = _v45_troubleshoot_price_gate(conv, caller_text) if "_v45_troubleshoot_price_gate" in globals() else "Troubleshoot and repair visits are $395. Does that work for you?"
+            if not sched.get("address_verified"):
+                sched["raw_address"] = ""
+                sched["address_candidate"] = ""
+                sched["address_verified"] = False
+                sched["address_missing"] = "street"
+                sched["pending_step"] = "need_address"
+                sched["state"] = "waiting_for_address"
+                sched["awaiting_slot_offer_choice"] = False
+                sched["offered_slot_options"] = []
+                reply2 = "Got it. What is the full address for the work, including the town and state?"
+            else:
+                reply2 = _v45_troubleshoot_price_gate(conv, caller_text) if "_v45_troubleshoot_price_gate" in globals() else "Troubleshoot and repair visits are $395. Does that work for you?"
             out["reply_to_customer"] = reply2
             out["booking_created"] = False
             out["end_call"] = False
@@ -17345,7 +17454,7 @@ def _v49_try_verify_corrected_dickerman(conv: dict, caller_text: str) -> str | N
         # stop saying Tickerman and ask only for a confirmation/spelling of the street.
         sched["address_verified"] = False
         sched["address_missing"] = "confirm"
-        return f"I heard {candidate}, but I couldn’t verify that address. Please confirm the street name is Dickerman Avenue."
+        return "I couldn’t verify that address yet. Please say the full address, including the town and state."
     try:
         _v48_sync_raw_address_from_normalized(conv)
     except Exception:
