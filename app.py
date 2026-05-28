@@ -17608,7 +17608,7 @@ def _v50_known_local_town(value: str | None, state: str | None = None) -> bool:
         "tolland", "farmington", "plainville", "bristol", "newington", "wethersfield",
         "glastonbury", "rocky hill", "cromwell", "berlin", "new britain", "west suffield",
     }
-    local_ma = {"longmeadow", "east longmeadow", "springfield", "west springfield", "agawam", "feeding hills"}
+    local_ma = {"longmeadow", "east longmeadow", "springfield", "west springfield", "agawam", "feeding hills", "ludlow", "chicopee", "holyoke", "palmer", "wilbraham"}
     if st == "CT":
         return town in local_ct
     if st == "MA":
@@ -17660,9 +17660,32 @@ def _v50_locality_matches(addr: dict | None, town: str | None, state: str | None
 
 
 def _v50_apply_explicit_customer_address(conv: dict, line: str, town: str, state: str, source: str = "customer_explicit_town_state_v50") -> None:
-    """Apply an explicit customer-provided address without letting old Google guesses win."""
+    """Apply an explicit customer-provided address without letting old Google guesses win.
+
+    v57: A town/state correction from the caller must also reopen a stale
+    residential_out_of_area closure. This prevents the Greenwich/Danbury-style
+    Google guess from staying locked after the customer corrects the town to a
+    valid CT/MA town such as Ludlow, Massachusetts.
+    """
     sched = conv.setdefault("sched", {})
     raw = f"{line}, {town}, {state}".strip(" ,")
+
+    # If a previous Google guess closed the thread as out-of-area, a later
+    # explicit customer correction wins. Reopen scheduling before applying the
+    # corrected address, then let the distance gate evaluate the corrected town.
+    if (str(sched.get("closed_reason") or "").startswith("residential_out_of_area")
+            or str(sched.get("state") or "").lower() == "closed"
+            or str(conv.get("thread_type") or "") == "closed_lost"):
+        sched["booking_allowed"] = True
+        sched["closed_reason"] = None
+        sched["manual_only"] = False
+        sched["voice_close_after_reply"] = False
+        sched["voice_booking_completed_close"] = False
+        sched["voice_resume_sms_sent"] = False
+        conv["thread_type"] = None
+        if str(sched.get("state") or "").lower() == "closed":
+            sched["state"] = "active"
+
     addr = None
     try:
         result = normalize_address(raw, forced_state=state)
@@ -17750,30 +17773,61 @@ def _v50_reply_after_explicit_address(conv: dict, caller_text: str) -> str:
 
 
 def _v50_customer_town_state_override(conv: dict, caller_text: str) -> str | None:
-    """When caller supplies town/state after a street-only address, override stale/guessed town."""
+    """When caller supplies town/state after a street-only address, override stale/guessed town.
+
+    v57: Do not require the town to be in the small hard-coded local-town list.
+    If the caller gives an explicit CT/MA town/state correction, apply that exact
+    town first and then run the normal distance/service-area gate. This is the
+    fix for calls like: "40 Arch Street, above" -> "Ludlow, Massachusetts",
+    where Google guessed "40 Arch Street, Greenwich, CT" before the caller
+    corrected the town.
+    """
     town, state = _v50_extract_town_state(caller_text)
     if not (town and state):
         return None
     line = _v50_street_line_from_sched_or_text(conv, caller_text)
     if not line:
         return None
-    # Explicit no-go towns still close. Local towns proceed. Unknown towns are left to old flow.
+
+    # Explicit no-go towns still close, but close only after using the caller's
+    # explicit town, never a stale guessed town.
     if _voice_is_out_of_area_town(town):
+        _v50_apply_explicit_customer_address(conv, line, town, state, "town_state_explicit_far_v57")
         return _voice_out_of_area_reply()
-    if not _v50_known_local_town(town, state):
-        # Unknown town: do not override, let the Google/distance layer decide.
-        return None
-    _v50_apply_explicit_customer_address(conv, line, town, state, "town_state_override_v50")
-    return _v50_reply_after_explicit_address(conv, caller_text)
+
+    # Any explicit CT/MA town/state correction wins over a stale Google guess.
+    # The corrected address still goes through _voice_residential_address_too_far
+    # inside _v50_reply_after_explicit_address.
+    if state in {"CT", "MA"}:
+        _v50_apply_explicit_customer_address(conv, line, town, state, "town_state_override_v57")
+        return _v50_reply_after_explicit_address(conv, caller_text)
+
+    # Non-CT/MA towns are outside the residential booking lane.
+    _v50_apply_explicit_customer_address(conv, line, town, state, "town_state_non_ctma_v57")
+    return _voice_out_of_area_reply()
 
 
 def _v50_force_closed_output(phone: str, conv: dict, reply: str, reason: str = "residential_out_of_area_address") -> dict:
-    """Return a final answer that cannot fall through into an old scheduling prompt."""
+    """Return a final answer that cannot fall through into an old scheduling prompt.
+
+    v57: If an older layer produced a mixed reply like
+    "Goodbye. What day and time works best for you?", trim everything after
+    Goodbye before closing the call.
+    """
     sched = conv.setdefault("sched", {})
     sched["awaiting_slot_offer_choice"] = False
     sched["offered_slot_options"] = []
     sched["pending_step"] = None
-    return _voice_close_with_reply(phone, conv, reply, reason)
+    sched["awaiting_eval_price_confirm"] = False
+    sched["awaiting_troubleshoot_price_confirm"] = False
+
+    cleaned = str(reply or "").strip()
+    m = re.search(r"(?is)^(.*?goodbye\.)", cleaned)
+    if m:
+        cleaned = m.group(1).strip()
+    if not cleaned:
+        cleaned = _voice_out_of_area_reply()
+    return _voice_close_with_reply(phone, conv, cleaned, reason)
 
 
 def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
@@ -17813,16 +17867,19 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         reply = str(out.get("reply_to_customer") or "")
         if "do not schedule residential repairs" in reply:
             town, state = _v50_extract_town_state(caller_text or "")
-            if town and state and _v50_known_local_town(town, state):
+            if town and state and state in {"CT", "MA"} and not _voice_is_out_of_area_town(town):
                 line = _v50_street_line_from_sched_or_text(conv, caller_text or "")
                 if line:
-                    _v50_apply_explicit_customer_address(conv, line, town, state, "post_close_recovery_v50")
+                    _v50_apply_explicit_customer_address(conv, line, town, state, "post_close_recovery_v57")
                     recovered = _v50_reply_after_explicit_address(conv, caller_text or "")
-                    out = {"reply_to_customer": recovered, "booking_created": False, "manual_only": False, "pending_step": conv.setdefault("sched", {}).get("pending_step"), "appointment_type": conv.setdefault("sched", {}).get("appointment_type") or conv.get("appointment_type"), "end_call": False}
+                    end_call = "do not schedule residential repairs" in str(recovered or "")
+                    out = {"reply_to_customer": recovered, "booking_created": False, "manual_only": False, "pending_step": conv.setdefault("sched", {}).get("pending_step"), "appointment_type": conv.setdefault("sched", {}).get("appointment_type") or conv.get("appointment_type"), "end_call": bool(end_call)}
                     try:
-                        log_event("VOICE_V50_PREVENTED_FALSE_OUT_OF_AREA", p, {"old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(recovered), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid}, conv)
+                        log_event("VOICE_V57_PREVENTED_STALE_OUT_OF_AREA_WITH_TOWN_CORRECTION", p, {"old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(recovered), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid}, conv)
                     except Exception:
                         pass
+                    if end_call:
+                        return _v50_force_closed_output(p, conv, recovered, "residential_out_of_area_corrected_address_v57")
                     return out
             # If it is truly out of area, make it final and clear slot state.
             return _v50_force_closed_output(p, conv, reply, "residential_out_of_area_address")
