@@ -12600,3 +12600,240 @@ def _voice_thinking_click_payload(duration_ms: int | None = None) -> str:
     # The original generator caps at 1800ms. Force at least 1400ms unless an explicit longer env is set.
     requested = max(1400, min(1800, requested))
     return _ORIG_VOICE_THINKING_CLICK_PAYLOAD_V32(requested)
+
+
+# =============================
+# v33 VOICE HOTFIX LAYER
+# =============================
+# Targets live failures observed after v32:
+# - first meaningful response could stop at the generic sentence
+#   "I can get your appointment scheduled here." with no actual next question.
+# - backend/OpenAI filler could still leak into phone output.
+# - processing cue only played once and then left dead air on slower turns.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V33 = process_prevolt_voice_turn
+_ORIG_HANDLE_REALTIME_FUNCTION_CALL_V33 = _handle_realtime_function_call
+_ORIG_VOICE_NATURALIZE_REPLY_V33 = _voice_naturalize_reply
+
+_V33_GENERIC_SCHEDULING_ONLY = re.compile(
+    r"^\s*(?:okay\.?\s*)?(?:i can help get this scheduled\.?|i can get your appointment scheduled here\.?)\s*$",
+    re.I,
+)
+
+_V33_EXTRA_FILLER_PATTERNS = [
+    r"\bOkay,?\s+let me get this set up with scheduling\.\s*",
+    r"\bOkay,?\s+let me get that address detail processed so we can keep going\.\s*",
+    r"\bNo problem\.\s+Let me get that updated so we can keep moving\.\s*",
+    r"\bOkay\.\s+Thanks\.\s+Let me run that through so we can keep moving\.\s*",
+    r"\bOkay,?\s+let me grab the next scheduling detail\.\s*",
+    r"\bOkay,?\s+let me check that timing for you\.\s*",
+    r"\bThanks,?\s+let me confirm that with your booking details\.\s*",
+    r"\bThanks,?\s+I'll use that email for the appointment details\.\s*",
+    r"\bLet me get that address detail processed[^.?!]*[.?!]\s*",
+    r"\bLet me run that through[^.?!]*[.?!]\s*",
+    r"\bLet me get this set up[^.?!]*[.?!]\s*",
+]
+
+
+def _v33_missing_field_prompt(conv: dict) -> str:
+    sched = (conv or {}).setdefault("sched", {})
+    pending = str(sched.get("pending_step") or "").lower()
+    state = str(sched.get("state") or "").lower()
+    missing = str(sched.get("address_missing") or "").lower()
+    raw_addr = str(sched.get("raw_address") or sched.get("address_candidate") or sched.get("normalized_address") or "").strip()
+
+    if pending == "need_address" or state == "waiting_for_address" or missing:
+        if missing in {"town", "city", "state"}:
+            return "Which town is it in, and is that Connecticut or Massachusetts?"
+        if missing == "confirm" and raw_addr:
+            return "Which town is it in, and is that Connecticut or Massachusetts?"
+        return "What's the house number and street name for the work?"
+
+    if pending == "need_name" or state == "waiting_for_name":
+        profile = (conv or {}).setdefault("profile", {})
+        first = profile.get("active_first_name") or profile.get("first_name")
+        last = profile.get("active_last_name") or profile.get("last_name")
+        if first and not last:
+            return "What's your last name?"
+        return "What's your first and last name?"
+
+    if pending == "need_email" or state == "waiting_for_email":
+        return "What's the best email address for the appointment?"
+
+    if pending in {"need_date", "need_time"} or state == "waiting_for_date":
+        return "What day and time works best for you?"
+
+    return "What's the house number and street name for the work?"
+
+
+def _v33_has_customer_facing_question(text: str) -> bool:
+    t = str(text or "").strip()
+    if "?" in t:
+        return True
+    low = _intent_text(t) if "_intent_text" in globals() else t.lower()
+    return any(p in low for p in [
+        "what is", "what's", "which one", "which town", "what day", "what time",
+        "does that work", "do you want", "is this for", "can you", "please provide",
+    ])
+
+
+def _v33_fix_generic_reply(conv: dict, reply: str) -> str:
+    r = str(reply or "").strip()
+    sched = (conv or {}).setdefault("sched", {})
+    if _V33_GENERIC_SCHEDULING_ONLY.match(r):
+        return "I can get your appointment scheduled here. " + _v33_missing_field_prompt(conv)
+    # If the reply has the scheduling opener but no actual question, force the missing field.
+    if re.search(r"\bI can get your appointment scheduled here\.?\s*$", r, flags=re.I) and not _v33_has_customer_facing_question(r):
+        return re.sub(r"\.?\s*$", ". ", r).strip() + " " + _v33_missing_field_prompt(conv)
+    # If backend already left us in a pending step but the spoken reply is not actionable, append the next question.
+    if not sched.get("booking_created") and not sched.get("manual_only") and not _v33_has_customer_facing_question(r):
+        pending = str(sched.get("pending_step") or "").lower()
+        state = str(sched.get("state") or "").lower()
+        if pending.startswith("need_") or state.startswith("waiting_for_"):
+            prompt = _v33_missing_field_prompt(conv)
+            if prompt and prompt.lower() not in r.lower():
+                if not r:
+                    return prompt
+                return r.rstrip(" .") + ". " + prompt
+    return r
+
+
+def _voice_naturalize_reply(reply: str) -> str:
+    r = _ORIG_VOICE_NATURALIZE_REPLY_V33(reply or "")
+    changed = True
+    while changed:
+        old = r
+        for pat in _V33_EXTRA_FILLER_PATTERNS:
+            r = re.sub(pat, "", r, flags=re.I)
+        changed = (r != old)
+    r = re.sub(r"\bI can help get this scheduled\.\s*I can get your appointment scheduled here\.", "I can get your appointment scheduled here.", r, flags=re.I)
+    r = re.sub(r"\bI can help get this scheduled\.\s*", "I can get your appointment scheduled here. ", r, flags=re.I)
+    r = re.sub(r"\s+", " ", r).strip()
+    return r
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    conv = hydrate_voice_conversation((phone or "").replace("whatsapp:", "").strip(), call_sid)
+    output = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V33(phone, call_sid, caller_text)
+    try:
+        # Re-run name repairs after the base logic, then force an actionable phone reply.
+        try:
+            if "_v32_apply_name_repairs" in globals():
+                _v32_apply_name_repairs(conv, caller_text)
+        except Exception:
+            pass
+        sched = conv.setdefault("sched", {})
+        reply = _voice_naturalize_reply(str(output.get("reply_to_customer") or ""))
+        reply = _v33_fix_generic_reply(conv, reply)
+        output["reply_to_customer"] = reply
+        conv["last_voice_reply"] = reply
+        # If this patch has supplied a real next question, the call must remain open.
+        if not sched.get("booking_created") and not output.get("booking_created"):
+            output["end_call"] = False
+    except Exception as e:
+        try:
+            log_event("VOICE_V33_POSTPROCESS_ERROR", phone, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid}, conv)
+        except Exception:
+            pass
+    return output
+
+
+def _v33_start_thinking_loop(twilio_ws, stream_sid: str, phone: str, call_sid: str, stop_evt) -> None:
+    """Keep a gentle processing cue going during longer backend/tool turns.
+
+    The cue is intentionally short and repeated only while the function/tool turn
+    is active. It is stopped before the assistant response is requested, so it
+    should not overlap the spoken answer.
+    """
+    if not (VOICE_AGENT_THINKING_SOUND_ENABLED and twilio_ws is not None and stream_sid):
+        return
+    next_send = 0.0
+    while not stop_evt.is_set():
+        now = time.time()
+        if now >= next_send:
+            try:
+                _send_twilio_media(twilio_ws, stream_sid, _voice_thinking_click_payload(1400))
+                try:
+                    log_event("VOICE_THINKING_SOUND_SENT", phone, {"reason": "processing_loop", "call_sid": call_sid, "stream_sid": stream_sid})
+                except Exception:
+                    pass
+            except Exception:
+                return
+            next_send = now + 1.15
+        stop_evt.wait(0.08)
+
+
+def _handle_realtime_function_call(openai_ws, phone: str, call_sid: str, item: dict, handled_call_ids: set | None = None, twilio_ws=None, stream_sid: str = "") -> bool:
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return False
+    if (item.get("name") or "") != "prevolt_os_turn":
+        return False
+    call_id = item.get("call_id") or item.get("id") or ""
+    if handled_call_ids is not None and call_id:
+        if call_id in handled_call_ids:
+            return True
+        handled_call_ids.add(call_id)
+    try:
+        args = json.loads(item.get("arguments") or "{}")
+    except Exception:
+        args = {}
+
+    stop_evt = threading.Event()
+    cue_thread = None
+    if twilio_ws is not None and stream_sid and VOICE_AGENT_THINKING_SOUND_ENABLED:
+        cue_thread = threading.Thread(target=_v33_start_thinking_loop, args=(twilio_ws, stream_sid, phone, call_sid, stop_evt), daemon=True)
+        cue_thread.start()
+
+    try:
+        output = process_prevolt_voice_turn(phone, call_sid, args.get("caller_text") or "")
+    finally:
+        # Let the last cue tail keep playing briefly so the caller hears continuity,
+        # then stop before we ask OpenAI/Twilio to speak the actual answer.
+        time.sleep(0.12)
+        stop_evt.set()
+
+    exact_reply = _voice_to_sms_text(str(output.get("reply_to_customer") or "Sorry, can you say that again?"))
+    booking_final = bool(output.get("end_call") and output.get("booking_created"))
+
+    try:
+        _send_openai_event(openai_ws, {
+            "type": "conversation.item.create",
+            "item": {"type": "function_call_output", "call_id": call_id, "output": json.dumps(output)},
+        })
+    except Exception:
+        pass
+
+    if booking_final and "_voice_call_update_with_final_twiml" in globals() and _voice_call_update_with_final_twiml(call_sid, exact_reply, phone):
+        try:
+            conv = hydrate_voice_conversation(phone, call_sid)
+            conv.setdefault("sched", {})["voice_close_after_reply"] = True
+            conv.setdefault("sched", {})["voice_final_twiML_sent"] = True
+        except Exception:
+            pass
+        return True
+
+    if output.get("end_call"):
+        try:
+            sched_local = hydrate_voice_conversation(phone, call_sid).setdefault("sched", {})
+            sched_local["voice_close_after_reply"] = True
+            sched_local["voice_waiting_for_final_audio_done"] = True
+        except Exception:
+            pass
+
+    _send_openai_event(openai_ws, {
+        "type": "response.create",
+        "response": {
+            "output_modalities": ["audio"],
+            "tool_choice": "none",
+            "instructions": (
+                "Say ONLY this exact phone reply, word for word, including every question in it, then stop speaking. "
+                "Do not say anything before it. Do not say you are checking, thinking, waiting, routing, processing, or finishing. "
+                "Speak at a natural medium pace. Do not slow down or add dramatic pauses at commas. "
+                "Do not add any acknowledgement, greeting, filler phrase, or extra question. "
+                "Do not stop after the first clause or first sentence; speak the complete exact reply. "
+                "Exact reply: " + json.dumps(exact_reply)
+            ),
+        },
+    })
+    return True
+
