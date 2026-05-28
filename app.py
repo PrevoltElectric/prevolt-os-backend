@@ -16160,3 +16160,330 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return out
+
+
+# =============================
+# v46 STABILIZATION HOTFIX LAYER
+# =============================
+# Targets live v45 failures:
+# - "outlets stopped working tonight" was being routed to the $195 evaluation visit instead of
+#   the $395 scheduled troubleshoot/repair visit.
+# - After the customer accepted the $195 evaluation price, older layers could repeat the $195 prompt
+#   instead of offering the stored appointment options.
+# - Email confirmation could repeat after the customer said yes.
+# - The voice layer could advance to email before getting the last name.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V46 = process_prevolt_voice_turn
+
+
+def _v46_low(text: str) -> str:
+    try:
+        return _intent_text(text or "")
+    except Exception:
+        return str(text or "").lower()
+
+
+def _v46_is_hard_hazard(text: str) -> bool:
+    try:
+        return bool(_v45_hard_hazard(text))
+    except Exception:
+        try:
+            return bool(_v42_hard_hazard_text(text))
+        except Exception:
+            return bool(re.search(r"\b(smoke|smoking|fire|flames?|burning|burnt|sparking|sparked|arcing|hot\s+to\s+the\s+touch|panel\s+hot|water\s+in\s+(?:the\s+)?panel)\b", _v46_low(text), flags=re.I))
+
+
+def _v46_power_loss_troubleshoot_text(text: str) -> bool:
+    """Scheduled troubleshoot/repair detector. Does not treat generic power loss as emergency dispatch."""
+    low = _v46_low(text)
+    if not low or _v46_is_hard_hazard(low):
+        return False
+    patterns = [
+        r"\btroubleshoot(?:ing|ed)?\b",
+        r"\bdiagnos(?:e|ing|tic)\b",
+        r"\bpower\s+issues?\b",
+        r"\b(?:outlets?|receptacles?|plugs?)\s+(?:that\s+)?(?:do\s+not|don't|dont|won't|wont)\s+(?:work|have\s+power)\b",
+        r"\b(?:outlets?|receptacles?|plugs?)\s+(?:are\s+)?(?:dead|not\s+working|without\s+power|no\s+power)\b",
+        r"\b(?:outlets?|receptacles?|plugs?)\s+(?:that\s+)?(?:stopped|stop|quit|went\s+out)\s+(?:working|work)\b",
+        r"\b(?:few|couple|some|several)?\s*(?:outlets?|receptacles?|plugs?)\s+(?:stopped|quit|went\s+out)\b",
+        r"\b(?:lost|no)\s+power\s+(?:to|at|in)\s+(?:a\s+few\s+|some\s+|several\s+)?(?:outlets?|rooms?|circuits?)\b",
+        r"\b(?:lights?|fixtures?)\s+(?:do\s+not|don't|dont|won't|wont|not)\s+(?:work|turn\s+on)\b",
+        r"\b(?:lights?|fixtures?)\s+(?:stopped|stop|quit|went\s+out)\s+(?:working|work)?\b",
+        r"\bbreaker(?:s)?\s+(?:tripping|keeps?\s+tripping|won't\s+reset|wont\s+reset)\b",
+    ]
+    return any(re.search(p, low, flags=re.I) for p in patterns)
+
+
+def _v46_is_eval_price_prompt(reply: str) -> bool:
+    low = _v46_low(reply)
+    return bool(("195" in low or "on site evaluation" in low or "onsite evaluation" in low or "evaluation visit" in low) and "does that work" in low)
+
+
+def _v46_is_email_confirm_prompt(reply: str) -> bool:
+    low = _v46_low(reply)
+    return bool("i heard" in low and "is that correct" in low and ("gmail" in low or " at " in low or " dot " in low or "email" in low))
+
+
+def _v46_name_status(conv: dict) -> tuple[str, str]:
+    profile = conv.setdefault("profile", {})
+    try:
+        first = _voice_profile_first_name(profile)
+    except Exception:
+        first = str(profile.get("active_first_name") or profile.get("first_name") or "").strip()
+    try:
+        last = _voice_profile_last_name(profile)
+    except Exception:
+        last = str(profile.get("active_last_name") or profile.get("last_name") or "").strip()
+    return first, last
+
+
+def _v46_require_last_name_reply(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    first, last = _v46_name_status(conv)
+    sched["pending_step"] = "need_name"
+    sched["state"] = "waiting_for_name"
+    if first and not last:
+        return f"{first}, what is your last name?"
+    return "What's your first and last name?"
+
+
+def _v46_offer_eval_slots(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    sched["appointment_type"] = "EVAL_195"
+    conv["appointment_type"] = "EVAL_195"
+    sched["awaiting_eval_price_confirm"] = False
+    sched["eval_price_accepted"] = True
+    sched["awaiting_troubleshoot_price_confirm"] = False
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    sched["pending_step"] = "need_date"
+    sched["state"] = "waiting_for_date"
+    try:
+        reply = _v42_slot_offer_reply_for(conv, "EVAL_195")
+    except Exception:
+        reply = "Great. What weekday and time work best for you?"
+    conv["last_voice_reply"] = reply
+    return reply
+
+
+def _v46_eval_price_declined(conv: dict) -> str:
+    sched = conv.setdefault("sched", {})
+    sched["awaiting_eval_price_confirm"] = False
+    sched["eval_price_accepted"] = False
+    sched["closed_reason"] = "declined_eval_price"
+    sched["voice_close_after_reply"] = True
+    reply = "No problem. We will not schedule the visit right now. Thank you for calling Prevolt Electric. Goodbye."
+    conv["last_voice_reply"] = reply
+    return reply
+
+
+def _v46_hold_eval_price_gate(conv: dict, reply: str) -> None:
+    sched = conv.setdefault("sched", {})
+    sched["appointment_type"] = sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195"
+    conv["appointment_type"] = sched["appointment_type"]
+    if "TROUBLESHOOT" not in str(sched.get("appointment_type") or "").upper():
+        sched["appointment_type"] = "EVAL_195"
+        conv["appointment_type"] = "EVAL_195"
+        sched["awaiting_eval_price_confirm"] = True
+        sched["eval_price_accepted"] = False
+        sched["awaiting_slot_offer_choice"] = False
+        sched["pending_step"] = "need_date"
+        sched["state"] = "waiting_for_date"
+        conv["last_voice_reply"] = reply
+
+
+def _v46_email_confirm_yes(conv: dict, phone: str) -> dict | None:
+    sched = conv.setdefault("sched", {})
+    pending = str(sched.get("voice_pending_email") or sched.get("pending_email") or "").strip().lower()
+    if not pending:
+        return None
+    try:
+        out = _v36_confirmed_email_save_and_book(phone, conv, pending)
+    except Exception:
+        try:
+            out = _voice_save_confirmed_email_and_maybe_book_v31(phone, conv, pending)
+        except Exception:
+            return None
+    sched["voice_email_confirmed"] = True
+    sched["voice_awaiting_email_confirm"] = False
+    sched["voice_pending_email"] = None
+    reply = _voice_naturalize_reply(str(out.get("reply_to_customer") or "")) if "_voice_naturalize_reply" in globals() else str(out.get("reply_to_customer") or "")
+    # Hard stop: after a yes to email confirmation, do not repeat the email confirmation prompt.
+    if _v46_is_email_confirm_prompt(reply):
+        first, last = _v46_name_status(conv)
+        if not last:
+            reply = _v46_require_last_name_reply(conv)
+            out["booking_created"] = False
+            out["end_call"] = False
+            out["pending_step"] = "need_name"
+        elif not (sched.get("scheduled_date") and sched.get("scheduled_time")):
+            try:
+                reply = _v42_slot_offer_reply_for(conv, sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195")
+            except Exception:
+                reply = "Thanks. What day and time works best?"
+            out["booking_created"] = False
+            out["end_call"] = False
+            out["pending_step"] = sched.get("pending_step")
+        else:
+            reply = "Thanks. I'll finish booking that now."
+            out["end_call"] = False
+    out["reply_to_customer"] = reply
+    conv["last_voice_reply"] = reply
+    return out
+
+
+def _v46_cleanup_reply_against_state(conv: dict, reply: str) -> str:
+    sched = conv.setdefault("sched", {})
+    first, last = _v46_name_status(conv)
+    low = _v46_low(reply)
+    # Do not let the voice layer ask for email until the last name is actually present.
+    if first and not last and ("best email" in low or "email address" in low or "@" in reply):
+        return _v46_require_last_name_reply(conv)
+    # Avoid combined prompts like "what is your last name? what's the best email..."
+    if first and not last and "last name" in low and ("best email" in low or "email address" in low):
+        return _v46_require_last_name_reply(conv)
+    return reply
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+
+    # A) Highest priority: email confirmation. If the caller says yes, never let lower layers
+    # repeat the same email confirmation question.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        sched_pre = conv_pre.setdefault("sched", {})
+        last_reply_pre = str(conv_pre.get("last_voice_reply") or sched_pre.get("last_voice_reply") or "")
+        awaiting_email_confirm = bool(sched_pre.get("voice_awaiting_email_confirm")) or (_v46_is_email_confirm_prompt(last_reply_pre) and bool(sched_pre.get("voice_pending_email")))
+        if awaiting_email_confirm and _v45_yes(caller_text):
+            out = _v46_email_confirm_yes(conv_pre, p)
+            if out:
+                try:
+                    log_event("VOICE_V46_EMAIL_CONFIRM_ACCEPTED", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(out.get("reply_to_customer")), "call_sid": call_sid}, conv_pre)
+                except Exception:
+                    pass
+                return out
+    except Exception as e:
+        try:
+            log_event("VOICE_V46_EMAIL_PRE_INTERCEPT_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    # B) Evaluation price-confirm lane. This prevents the repeated $195 prompt after "yes".
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        sched_pre = conv_pre.setdefault("sched", {})
+        last_reply_pre = str(conv_pre.get("last_voice_reply") or sched_pre.get("last_voice_reply") or "")
+        awaiting_eval = bool(sched_pre.get("awaiting_eval_price_confirm")) or (_v46_is_eval_price_prompt(last_reply_pre) and "TROUBLESHOOT" not in str(sched_pre.get("appointment_type") or conv_pre.get("appointment_type") or "").upper())
+        if awaiting_eval:
+            if _v45_no(caller_text):
+                reply = _v46_eval_price_declined(conv_pre)
+                return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": "EVAL_195", "end_call": True}
+            if _v45_yes(caller_text) or (_v42_availability_request_text(caller_text) if "_v42_availability_request_text" in globals() else False):
+                reply = _v46_offer_eval_slots(conv_pre)
+                try:
+                    log_event("VOICE_V46_EVAL_PRICE_ACCEPTED_OFFER_SLOTS", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv_pre)
+                except Exception:
+                    pass
+                return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": "EVAL_195", "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V46_EVAL_PRE_INTERCEPT_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    # C) Slot choice still remains above the older layers; reuse v45's direct handler.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        slot_reply = _v45_any_offered_slot_choice_fast_path(conv_pre, caller_text) if "_v45_any_offered_slot_choice_fast_path" in globals() else None
+        if slot_reply:
+            slot_reply = _voice_naturalize_reply(slot_reply) if "_voice_naturalize_reply" in globals() else slot_reply
+            slot_reply = _v46_cleanup_reply_against_state(conv_pre, slot_reply)
+            conv_pre["last_voice_reply"] = slot_reply
+            try:
+                log_event("VOICE_V46_OFFERED_SLOT_DIRECT", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(slot_reply), "call_sid": call_sid}, conv_pre)
+            except Exception:
+                pass
+            return {"reply_to_customer": slot_reply, "booking_created": False, "manual_only": False, "pending_step": conv_pre.setdefault("sched", {}).get("pending_step"), "appointment_type": conv_pre.setdefault("sched", {}).get("appointment_type") or conv_pre.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V46_SLOT_PRE_INTERCEPT_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V46(phone, call_sid, caller_text)
+
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+        reply = _voice_naturalize_reply(str(out.get("reply_to_customer") or "")) if "_voice_naturalize_reply" in globals() else str(out.get("reply_to_customer") or "")
+        low_reply = _v46_low(reply)
+
+        # D) Force $395 scheduled troubleshoot for power-loss/outlet-failure language even if old layers chose $195.
+        if _v46_power_loss_troubleshoot_text(caller_text) and not _v46_is_hard_hazard(caller_text):
+            already_395 = "395" in low_reply or "troubleshoot and repair" in low_reply
+            if not sched.get("troubleshoot_price_accepted") and not already_395:
+                reply2 = _v45_troubleshoot_price_gate(conv, caller_text) if "_v45_troubleshoot_price_gate" in globals() else _v43_troubleshoot_price_prompt(conv, caller_text)
+                out["reply_to_customer"] = _voice_naturalize_reply(reply2) if "_voice_naturalize_reply" in globals() else reply2
+                out["booking_created"] = False
+                out["manual_only"] = False
+                out["appointment_type"] = "TROUBLESHOOT_395"
+                out["pending_step"] = sched.get("pending_step")
+                out["end_call"] = False
+                try:
+                    log_event("VOICE_V46_POWER_LOSS_FORCED_395", p, {"caller_text": _safe_monitor_text(caller_text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(out["reply_to_customer"]), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+                return out
+
+        # E) If the reply is a $195 gate, remember that the next yes means offer slots, not repeat price.
+        if _v46_is_eval_price_prompt(reply) and "TROUBLESHOOT" not in str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper():
+            _v46_hold_eval_price_gate(conv, reply)
+            out["appointment_type"] = "EVAL_195"
+            out["pending_step"] = sched.get("pending_step")
+            out["end_call"] = False
+
+        # F) If lower layers still repeated $195 after a yes, replace it with slot options.
+        last_reply = str(conv.get("last_voice_reply") or sched.get("last_voice_reply") or "")
+        if _v45_yes(caller_text) and _v46_is_eval_price_prompt(reply) and (_v46_is_eval_price_prompt(last_reply) or sched.get("awaiting_eval_price_confirm")):
+            reply2 = _v46_offer_eval_slots(conv)
+            out["reply_to_customer"] = reply2
+            out["booking_created"] = False
+            out["manual_only"] = False
+            out["appointment_type"] = "EVAL_195"
+            out["pending_step"] = sched.get("pending_step")
+            out["end_call"] = False
+            try:
+                log_event("VOICE_V46_SUPPRESSED_DUPLICATE_EVAL_PRICE", p, {"caller_text": _safe_monitor_text(caller_text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(reply2), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return out
+
+        # G) Never ask for email before a required last name.
+        cleaned = _v46_cleanup_reply_against_state(conv, str(out.get("reply_to_customer") or reply))
+        if cleaned != (out.get("reply_to_customer") or reply):
+            out["reply_to_customer"] = cleaned
+            out["booking_created"] = False
+            out["end_call"] = False
+            out["pending_step"] = conv.setdefault("sched", {}).get("pending_step")
+            conv["last_voice_reply"] = cleaned
+            try:
+                log_event("VOICE_V46_HELD_EMAIL_UNTIL_LAST_NAME", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(cleaned), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+
+        # H) Final email-confirm duplication guard.
+        if _v45_yes(caller_text) and _v46_is_email_confirm_prompt(str(out.get("reply_to_customer") or "")):
+            out2 = _v46_email_confirm_yes(conv, p)
+            if out2:
+                return out2
+    except Exception as e:
+        try:
+            log_event("VOICE_V46_POST_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
