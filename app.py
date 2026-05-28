@@ -6260,18 +6260,28 @@ def apply_partial_address_reply(sched: dict, inbound_text: str) -> bool:
 
     set_raw_address_safe(sched, re.sub(r"\s+,", ",", merged).strip(" ,"))
 
-    # Best effort normalization immediately so the thread advances instead of re-asking.
-    forced_state = state if state in {"CT", "MA"} else None
+    # v58: Do not let Google invent the missing town/state from a partial address.
+    # Only normalize after the caller supplied a real town/state or a known local town.
     try:
-        result = normalize_address(sched["raw_address"], forced_state=forced_state)
-        if isinstance(result, tuple) and len(result) >= 2:
-            status, addr_struct = result[0], result[1]
-            if status == "ok" and isinstance(addr_struct, dict):
-                sched["normalized_address"] = addr_struct
-        elif isinstance(result, dict):
-            sched["normalized_address"] = result
-    except Exception as e:
-        print("[WARN] apply_partial_address_reply normalize failed:", repr(e))
+        allowed, safe_raw, forced_state, town, why = _v58_prepare_address_for_maps(sched["raw_address"])
+    except Exception:
+        allowed, safe_raw, forced_state, town, why = False, None, None, None, "v58_guard_error"
+
+    if allowed and safe_raw:
+        set_raw_address_safe(sched, safe_raw)
+        try:
+            result = normalize_address(safe_raw, forced_state=forced_state)
+            if isinstance(result, tuple) and len(result) >= 2:
+                status, addr_struct = result[0], result[1]
+                if status == "ok" and isinstance(addr_struct, dict) and _v58_locality_ok(addr_struct, town, forced_state):
+                    sched["normalized_address"] = addr_struct
+            elif isinstance(result, dict) and _v58_locality_ok(result, town, forced_state):
+                sched["normalized_address"] = result
+        except Exception as e:
+            print("[WARN] apply_partial_address_reply normalize failed:", repr(e))
+    else:
+        sched["address_verified"] = False
+        sched["address_missing"] = "state" if city and not state else "confirm"
 
     update_address_assembly_state(sched)
     return True
@@ -14057,30 +14067,175 @@ def _v38_normalize_attempt(raw: str, forced_state: str | None = None) -> dict | 
     return None
 
 
+
+
+
+# VOICE_V58_NO_PARTIAL_GOOGLE_GUESS: Google validation is allowed only after caller-supplied town/state.
+# =============================
+# Voice stabilization v58 — no Google guessing on street-only partial addresses
+# =============================
+# Root cause fixed:
+# A caller could give a partial/noisy address such as "40 Arch Street, above".
+# Older layers would let Google Geocoding guess a complete address like
+# Greenwich, CT before the caller supplied the town/state. That stale guess
+# could then close a valid lead as out-of-area.
+#
+# v58 rule:
+# Google Maps may validate/normalize a customer address, but it may not invent
+# the missing town/state for voice scheduling. If the caller gives street-only
+# or a noisy partial address, the system must ask for the town/state first.
+
+
+def _v58_clean_town_candidate(value: str | None) -> str | None:
+    town = " ".join(str(value or "").replace("\n", " ").split()).strip(" ,.")
+    if not town:
+        return None
+
+    low = re.sub(r"[^a-z0-9 ]+", " ", town.lower())
+    low = re.sub(r"\s+", " ", low).strip()
+
+    # Words that commonly get captured from natural speech but are not towns.
+    junk = {
+        "above", "upstairs", "downstairs", "basement", "apartment", "apt", "unit",
+        "home", "house", "work", "quote", "estimate", "repair", "fix", "fixed",
+        "outlet", "outlets", "light", "lights", "panel", "breaker", "circuit",
+        "someone", "somebody", "today", "tomorrow", "tonight", "please",
+    }
+    if low in junk:
+        return None
+    if any(word in low.split() for word in {"quote", "estimate", "repair", "fix", "outlet", "outlets", "panel", "breaker"}):
+        return None
+
+    return " ".join(w.capitalize() for w in town.split())
+
+
+def _v58_state_from_any_text(value: str | None) -> str | None:
+    low = _intent_text(value or "") if "_intent_text" in globals() else str(value or "").lower()
+    if re.search(r"\b(?:ct|connecticut|c t)\b", low):
+        return "CT"
+    if re.search(r"\b(?:ma|massachusetts|mass|m a)\b", low):
+        return "MA"
+    return None
+
+
+def _v58_known_state_for_town(town: str | None) -> str | None:
+    town_clean = _v58_clean_town_candidate(town)
+    if not town_clean:
+        return None
+
+    try:
+        if "_v50_known_local_town" in globals():
+            if _v50_known_local_town(town_clean, "CT"):
+                return "CT"
+            if _v50_known_local_town(town_clean, "MA"):
+                return "MA"
+            if _v50_known_local_town(town_clean, None):
+                # Fall through to the older town detector if the state is not obvious.
+                pass
+    except Exception:
+        pass
+
+    try:
+        if "_v47_known_ct_town" in globals():
+            st = _v47_known_ct_town(town_clean)
+            if st in {"CT", "MA"}:
+                return st
+    except Exception:
+        pass
+
+    return None
+
+
+def _v58_prepare_address_for_maps(raw_address: str | None) -> tuple[bool, str | None, str | None, str | None, str]:
+    """Return (allowed, safe_raw, forced_state, town, reason).
+
+    allowed is True only when the raw address includes:
+    - a house number and street, and
+    - a caller-supplied town/state or a known local town hint.
+
+    This prevents Google from guessing the missing town/state.
+    """
+    raw = " ".join(str(raw_address or "").replace("\n", " ").split()).strip(" ,.")
+    if not raw:
+        return False, None, None, None, "empty"
+
+    try:
+        line, town, state = _v47_extract_address_candidate(raw)
+    except Exception:
+        line, town, state = None, None, None
+
+    if not line:
+        try:
+            line = extract_service_address_from_text(raw)
+        except Exception:
+            line = None
+
+    if not line or not _address_has_house_number_and_street(line):
+        return False, None, None, None, "no_house_number_and_street"
+
+    town = _v58_clean_town_candidate(town)
+
+    # If the raw address explicitly contains CT/MA, preserve that state.
+    state = state or _v58_state_from_any_text(raw)
+
+    # If town is known local but state was omitted, infer only from the known town list.
+    if town and not state:
+        state = _v58_known_state_for_town(town)
+
+    # If state is present but town is not, still do not let Google pick the town.
+    if not town:
+        return False, None, state, None, "missing_town"
+
+    # If town is unknown and there is no state, do not geocode.
+    if not state:
+        return False, None, None, town, "unknown_town_without_state"
+
+    safe_raw = f"{line}, {town}, {state}"
+    return True, safe_raw, state, town, "customer_locality_present"
+
+
+def _v58_locality_ok(addr: dict | None, town: str | None, state: str | None) -> bool:
+    if not isinstance(addr, dict):
+        return False
+    if not town or not state:
+        return False
+    try:
+        if "_v50_locality_matches" in globals():
+            return bool(_v50_locality_matches(addr, town, state))
+    except Exception:
+        pass
+
+    a_town = re.sub(r"[^a-z0-9 ]+", " ", str(addr.get("locality") or "").lower()).strip()
+    want = re.sub(r"[^a-z0-9 ]+", " ", str(town or "").lower()).strip()
+    a_state = str(addr.get("administrative_district_level_1") or "").upper().strip()
+    return bool(a_town and want and a_town == want and a_state == str(state or "").upper().strip())
+
+
 def _v38_google_resolve_partial_address(raw_address: str) -> tuple[dict | None, str]:
     """
-    Resolve a partial address using Google Geocoding.
+    Resolve a customer address using Google Geocoding, but do not let Google
+    invent the missing town/state for voice scheduling.
 
-    Rules:
-      - Direct geocode can win if it returns a complete CT/MA street address.
-      - Otherwise, try CT and MA constrained geocodes.
-      - Accept only a single unique CT/MA match that still matches the raw street line.
-      - If CT and MA both produce plausible distinct matches, ask for state instead of guessing.
+    v58: A street-only or noisy partial address must return a "needs town/state"
+    reason instead of guessing one complete Google result.
     """
     raw = _v38_clean_addr_text(raw_address)
     if not raw or not _address_has_house_number_and_street(raw):
         return None, "not_house_number_and_street"
 
+    try:
+        allowed, safe_raw, forced_state, town, why = _v58_prepare_address_for_maps(raw)
+    except Exception:
+        allowed, safe_raw, forced_state, town, why = False, None, None, None, "v58_guard_error"
+
+    if not allowed:
+        return None, f"needs_customer_town_state:{why}"
+
     candidates: list[dict] = []
 
-    direct = _v38_normalize_attempt(raw, None)
-    if direct and (direct.get("administrative_district_level_1") or "").upper() in {"CT", "MA"} and _v38_raw_line_matches_normalized(raw, direct):
-        candidates.append(direct)
-
-    for st in ("CT", "MA"):
-        forced = _v38_normalize_attempt(raw, st)
-        if forced and (forced.get("administrative_district_level_1") or "").upper() == st and _v38_raw_line_matches_normalized(raw, forced):
-            candidates.append(forced)
+    forced = _v38_normalize_attempt(safe_raw or raw, forced_state)
+    if forced and _v38_raw_line_matches_normalized(safe_raw or raw, forced) and _v58_locality_ok(forced, town, forced_state):
+        candidates.append(forced)
 
     unique: dict[tuple[str, str, str, str], dict] = {}
     for c in candidates:
@@ -14088,17 +14243,9 @@ def _v38_google_resolve_partial_address(raw_address: str) -> tuple[dict | None, 
 
     vals = list(unique.values())
     if len(vals) == 1:
-        return vals[0], "unique_google_match"
+        return vals[0], "customer_locality_google_match"
 
-    if len(vals) > 1:
-        # If direct and forced produced duplicates of the same address, unique would be 1.
-        # Multiple remaining results means the same partial address may exist in both CT and MA,
-        # so keep the confirmation question.
-        return None, "ambiguous_ct_ma_matches"
-
-    return None, "no_google_match"
-
-
+    return None, "no_customer_locality_google_match"
 def _v38_apply_normalized_address(conv: dict, addr: dict, source: str) -> None:
     sched = conv.setdefault("sched", {})
     sched["normalized_address"] = dict(addr)
@@ -14126,6 +14273,12 @@ def _v38_should_maps_resolve(conv: dict, reply: str | None = None) -> bool:
         return False
     raw = _v38_clean_addr_text(sched.get("raw_address") or sched.get("address_candidate") or "")
     if not raw or not _address_has_house_number_and_street(raw):
+        return False
+    try:
+        allowed, _safe_raw, _forced_state, _town, _why = _v58_prepare_address_for_maps(raw)
+        if not allowed:
+            return False
+    except Exception:
         return False
     if reply and not _v37_is_town_question(reply):
         return False
@@ -16785,27 +16938,46 @@ def _v47_extract_address_candidate(text: str) -> tuple[str | None, str | None, s
 
 
 def _v47_apply_normalized_if_possible(conv: dict, raw: str) -> bool:
+    """Normalize only when the customer supplied a real town/state or known local town.
+
+    v58: Do not geocode street-only/noisy partial addresses. Ask for town/state first.
+    """
     if not raw:
         return False
+
     try:
-        addr, reason = _v38_google_resolve_partial_address(raw)
-        if addr and _v47_complete_addr_struct(addr):
-            _v38_apply_normalized_address(conv, addr, "v47_google")
+        allowed, safe_raw, forced_state, town, why = _v58_prepare_address_for_maps(raw)
+    except Exception:
+        allowed, safe_raw, forced_state, town, why = False, None, None, None, "v58_guard_error"
+
+    if not allowed:
+        try:
+            sched = conv.setdefault("sched", {})
+            sched["address_verified"] = False
+            sched["address_missing"] = "state" if why in {"missing_town", "unknown_town_without_state"} else "confirm"
+        except Exception:
+            pass
+        return False
+
+    # First use the guarded Google resolver. It now refuses street-only guesses.
+    try:
+        addr, reason = _v38_google_resolve_partial_address(safe_raw or raw)
+        if addr and _v47_complete_addr_struct(addr) and _v58_locality_ok(addr, town, forced_state):
+            _v38_apply_normalized_address(conv, addr, "v47_google_v58")
             return True
     except Exception:
         pass
-    # Direct fallback through normalize_address, useful in tests and for full town/state strings.
-    for forced in (None, "CT", "MA"):
-        try:
-            result = normalize_address(raw, forced_state=forced) if forced else normalize_address(raw)
-            if isinstance(result, tuple) and len(result) >= 2 and result[0] == "ok" and _v47_complete_addr_struct(result[1]):
-                _v38_apply_normalized_address(conv, result[1], "v47_normalize")
-                return True
-        except Exception:
-            continue
+
+    # Direct forced-state fallback. Accept only if Google preserves the caller's town/state.
+    try:
+        result = normalize_address(safe_raw or raw, forced_state=forced_state)
+        if isinstance(result, tuple) and len(result) >= 2 and result[0] == "ok" and _v47_complete_addr_struct(result[1]) and _v58_locality_ok(result[1], town, forced_state):
+            _v38_apply_normalized_address(conv, result[1], "v47_normalize_v58")
+            return True
+    except Exception:
+        pass
+
     return False
-
-
 def _v47_repair_or_block_address(conv: dict, caller_text: str) -> str | None:
     """Repair bad partial addresses or block the flow from treating them as verified."""
     sched = conv.setdefault("sched", {})
