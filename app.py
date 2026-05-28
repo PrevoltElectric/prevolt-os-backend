@@ -16487,3 +16487,607 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
         except Exception:
             pass
     return out
+
+
+# =============================
+# v47 STABILIZATION HOTFIX LAYER
+# =============================
+# Targets v46 live failures:
+# - False address verification like "54 Bloomfield Ave, in Windsor".
+# - Spelled street-name corrections being ignored after the assistant asked for spelling.
+# - Outlet / power-loss troubleshoot calls falling into the $195 evaluation lane.
+# - Customer custom date/time requests after offered slots silently falling back to an offered slot.
+# - Duplicate email confirmation after the customer says yes.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V47 = process_prevolt_voice_turn
+
+
+def _v47_low(text: str) -> str:
+    try:
+        return _intent_text(text or "")
+    except Exception:
+        return str(text or "").lower()
+
+
+def _v47_yes(text: str) -> bool:
+    try:
+        return bool(_v45_yes(text))
+    except Exception:
+        return bool(re.search(r"\b(yes|yeah|yep|ok|okay|sure|sounds good|that works|correct)\b", _v47_low(text), flags=re.I))
+
+
+def _v47_no(text: str) -> bool:
+    try:
+        return bool(_v45_no(text))
+    except Exception:
+        return bool(re.search(r"\b(no|nope|nah|incorrect|wrong|not correct|never mind)\b", _v47_low(text), flags=re.I))
+
+
+def _v47_hard_hazard(text: str) -> bool:
+    try:
+        return bool(_v46_is_hard_hazard(text))
+    except Exception:
+        return bool(re.search(r"\b(smoke|smoking|fire|flames?|burning|burnt|sparking|sparked|arcing|hot\s+to\s+the\s+touch|panel\s+hot|water\s+in\s+(?:the\s+)?panel)\b", _v47_low(text), flags=re.I))
+
+
+def _v47_power_loss_troubleshoot_text(text: str) -> bool:
+    """Broad but non-emergency troubleshoot detector for dead outlets/lights/power issues."""
+    low = _v47_low(text)
+    if not low or _v47_hard_hazard(low):
+        return False
+    try:
+        if _v46_power_loss_troubleshoot_text(text):
+            return True
+    except Exception:
+        pass
+    patterns = [
+        r"\btroubleshoot(?:ing|ed)?\b",
+        r"\bdiagnos(?:e|ing|tic)\b",
+        r"\bpower\s+issues?\b",
+        r"\b(?:outlets?|receptacles?|plugs?)\s+(?:that\s+)?(?:aren'?t|arent|isn'?t|isnt|are\s+not|not|don'?t|dont|do\s+not|won'?t|wont)\s+(?:work|working|have\s+power)\b",
+        r"\b(?:outlets?|receptacles?|plugs?)\s+(?:are\s+)?(?:dead|not\s+working|without\s+power|no\s+power)\b",
+        r"\b(?:outlets?|receptacles?|plugs?)\s+(?:that\s+)?(?:stopped|stop|quit|went\s+out)\s+(?:working|work)\b",
+        r"\b(?:couple|few|some|several)\s+(?:outlets?|receptacles?|plugs?)\s+(?:that\s+)?(?:aren'?t|arent|don'?t|dont|do\s+not|not|stopped|dead|no\s+power)\b",
+        r"\b(?:lost|no)\s+power\s+(?:to|at|in)\s+(?:a\s+few\s+|some\s+|several\s+|couple\s+)?(?:outlets?|rooms?|circuits?)\b",
+        r"\b(?:lights?|fixtures?)\s+(?:aren'?t|arent|don'?t|dont|do\s+not|not|won'?t|wont)\s+(?:work|working|turn\s+on)\b",
+        r"\bbreaker(?:s)?\s+(?:tripping|keeps?\s+tripping|won'?t\s+reset|wont\s+reset)\b",
+    ]
+    return any(re.search(p, low, flags=re.I) for p in patterns)
+
+
+def _v47_complete_addr_struct(a: dict | None) -> bool:
+    try:
+        return bool(_v38_complete_addr_struct(a))
+    except Exception:
+        return bool(isinstance(a, dict) and (a.get("address_line_1") or "").strip() and (a.get("locality") or "").strip() and (a.get("administrative_district_level_1") or "").strip() and (a.get("postal_code") or "").strip())
+
+
+def _v47_address_verified_structured(conv: dict) -> bool:
+    sched = conv.setdefault("sched", {})
+    if not sched.get("address_verified"):
+        return False
+    if _v47_complete_addr_struct(sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None):
+        return True
+    raw = str(sched.get("raw_address") or sched.get("address") or "").strip()
+    # Block the known bad false-positive format from v46.
+    if re.search(r",\s*in\s+", raw, flags=re.I):
+        return False
+    # If no normalized struct exists, still require explicit CT/MA and a town-looking comma.
+    return bool(re.search(r"^\d{1,6}\b", raw) and re.search(r",\s*[^,]+,\s*(CT|MA)\b", raw, flags=re.I))
+
+
+def _v47_state_from_text(text: str) -> str | None:
+    low = _v47_low(text)
+    if re.search(r"\b(ct|connecticut)\b", low):
+        return "CT"
+    if re.search(r"\b(ma|massachusetts)\b", low):
+        return "MA"
+    return None
+
+
+def _v47_known_ct_town(town: str) -> str | None:
+    low = _v47_low(town)
+    ct_towns = {
+        "windsor", "windsor locks", "east windsor", "south windsor", "suffield", "enfield", "granby", "east granby",
+        "hartford", "east hartford", "west hartford", "bloomfield", "simsbury", "avon", "farmington", "canton",
+        "ellington", "vernon", "manchester", "glastonbury", "newington", "wethersfield", "rocky hill", "plainville", "bristol",
+    }
+    ma_towns = {"springfield", "west springfield", "agawam", "longmeadow", "east longmeadow", "westfield", "chicopee", "holyoke", "northampton"}
+    if low in ct_towns:
+        return "CT"
+    if low in ma_towns:
+        return "MA"
+    return None
+
+
+def _v47_extract_address_candidate(text: str) -> tuple[str | None, str | None, str | None]:
+    """Return (street_line, town, state) from natural speech like '54 Bloomfield Ave in Windsor'."""
+    s = " ".join(str(text or "").replace("\n", " ").split())
+    # Cut common service/problem tails so 'in Windsor and I have outlets...' does not become the town.
+    s2 = re.split(r"\b(?:and\s+i\b|and\s+we\b|because\b|with\b|for\b|looking\b|hoping\b|need\b|have\b)", s, maxsplit=1, flags=re.I)[0]
+    m = re.search(
+        r"\b(?P<num>\d{1,6})\s+(?P<street>[A-Za-z][A-Za-z0-9 .'-]{1,45}?)\s+(?P<typ>ave(?:nue)?|st(?:reet)?|rd|road|dr(?:ive)?|ln|lane|ct|court|blvd|boulevard|way|pl|place|circle|cir|terrace|ter)\b(?:\s*(?:,|in|at)\s*(?P<town>[A-Za-z][A-Za-z .'-]{1,35}))?",
+        s2,
+        flags=re.I,
+    )
+    if not m:
+        try:
+            cand = extract_service_address_from_text(text)
+            if cand:
+                return cand, None, _v47_state_from_text(text)
+        except Exception:
+            pass
+        return None, None, None
+    typ_raw = m.group("typ") or ""
+    typ_map = {
+        "avenue": "Ave", "ave": "Ave", "street": "St", "st": "St", "road": "Rd", "rd": "Rd", "drive": "Dr", "dr": "Dr",
+        "lane": "Ln", "ln": "Ln", "court": "Ct", "ct": "Ct", "boulevard": "Blvd", "blvd": "Blvd", "circle": "Cir", "cir": "Cir",
+        "terrace": "Ter", "ter": "Ter", "place": "Pl", "pl": "Pl", "way": "Way",
+    }
+    typ = typ_map.get(typ_raw.lower(), typ_raw.title())
+    street_words = " ".join(m.group("street").split()).title()
+    line = f"{m.group('num')} {street_words} {typ}".strip()
+    town = m.group("town")
+    if town:
+        town = re.sub(r"\b(ct|connecticut|ma|massachusetts)\b", "", town, flags=re.I).strip(" ,.")
+        # Keep town sane.
+        town = " ".join(town.split()[:3]).title()
+    state = _v47_state_from_text(text) or (_v47_known_ct_town(town or "") if town else None)
+    return line, town, state
+
+
+def _v47_apply_normalized_if_possible(conv: dict, raw: str) -> bool:
+    if not raw:
+        return False
+    try:
+        addr, reason = _v38_google_resolve_partial_address(raw)
+        if addr and _v47_complete_addr_struct(addr):
+            _v38_apply_normalized_address(conv, addr, "v47_google")
+            return True
+    except Exception:
+        pass
+    # Direct fallback through normalize_address, useful in tests and for full town/state strings.
+    for forced in (None, "CT", "MA"):
+        try:
+            result = normalize_address(raw, forced_state=forced) if forced else normalize_address(raw)
+            if isinstance(result, tuple) and len(result) >= 2 and result[0] == "ok" and _v47_complete_addr_struct(result[1]):
+                _v38_apply_normalized_address(conv, result[1], "v47_normalize")
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _v47_repair_or_block_address(conv: dict, caller_text: str) -> str | None:
+    """Repair bad partial addresses or block the flow from treating them as verified."""
+    sched = conv.setdefault("sched", {})
+    if _v47_address_verified_structured(conv):
+        return None
+
+    line, town, state = _v47_extract_address_candidate(caller_text)
+    # Reuse stored town hint if present.
+    if not town:
+        town = sched.get("voice_town_hint") or sched.get("town_hint") or sched.get("locality")
+    if not state and town:
+        state = _v47_known_ct_town(town)
+    raw_parts = []
+    if line:
+        raw_parts.append(line)
+        if town:
+            raw_parts.append(str(town).strip())
+        if state:
+            raw_parts.append(str(state).strip())
+        raw = ", ".join([p for p in raw_parts if p])
+        if _v47_apply_normalized_if_possible(conv, raw):
+            sched["address_verified"] = True
+            sched["address_missing"] = None
+            return None
+        # Store a clean candidate, but do not call it verified.
+        sched["raw_address"] = raw
+        sched["address_candidate"] = raw
+
+    raw_existing = str(sched.get("raw_address") or sched.get("address_candidate") or "").strip()
+    if raw_existing and not _v47_address_verified_structured(conv):
+        if _v47_apply_normalized_if_possible(conv, raw_existing):
+            return None
+        sched["address_verified"] = False
+        sched["address_missing"] = "confirm"
+        if line or raw_existing:
+            heard = raw_existing
+            return f"I heard {heard}, but I couldn’t verify that address. Please say the full address, including the town and state."
+
+    return None
+
+
+def _v47_spelled_word(text: str) -> str | None:
+    raw = str(text or "").strip()
+    cleaned = re.sub(r"\b(as in|for)\b.*", "", raw, flags=re.I).strip()
+    tokens = re.findall(r"[A-Za-z]", cleaned)
+    # Treat B-L-O-O-M-F-I-E-L-D or B L O O M F I E L D as spelling only if mostly single letters/separators.
+    if len(tokens) >= 3:
+        no_sep = re.sub(r"[A-Za-z\s\-.]", "", cleaned)
+        if not no_sep:
+            return "".join(tokens).title()
+    return None
+
+
+def _v47_last_reply_asked_street_spelling(conv: dict) -> bool:
+    sched = conv.setdefault("sched", {})
+    last = str(conv.get("last_voice_reply") or sched.get("last_voice_reply") or "")
+    low = _v47_low(last)
+    return "repeat just the street" in low or "spell it" in low or "couldn t verify that address" in low or "couldn't verify that address" in low
+
+
+def _v47_handle_street_spelling_reply(conv: dict, caller_text: str) -> str | None:
+    if not _v47_last_reply_asked_street_spelling(conv):
+        return None
+    sched = conv.setdefault("sched", {})
+    word = _v47_spelled_word(caller_text)
+    if not word:
+        # Maybe caller repeated the full street line instead of spelling.
+        line, town, state = _v47_extract_address_candidate(caller_text)
+    else:
+        old = str(sched.get("raw_address") or sched.get("address_candidate") or "")
+        m_num = re.search(r"\b(\d{1,6})\b", old)
+        number = m_num.group(1) if m_num else None
+        m_type = re.search(r"\b(ave|avenue|st|street|rd|road|dr|drive|ln|lane|ct|court|blvd|boulevard|way|pl|place)\b", old, flags=re.I)
+        typ = m_type.group(1) if m_type else "Ave"
+        typ = {"avenue":"Ave","ave":"Ave","street":"St","st":"St","road":"Rd","rd":"Rd","drive":"Dr","dr":"Dr","lane":"Ln","ln":"Ln","court":"Ct","ct":"Ct","boulevard":"Blvd","blvd":"Blvd","place":"Pl","pl":"Pl","way":"Way"}.get(typ.lower(), typ.title())
+        town = None
+        state = None
+        # Pull town/state from old candidate or captured hint.
+        old_clean = old.replace(", in ", ", ")
+        parts = [p.strip() for p in old_clean.split(",") if p.strip()]
+        if len(parts) >= 2:
+            town = parts[1]
+        town = town or sched.get("voice_town_hint") or sched.get("town_hint")
+        state = _v47_state_from_text(old) or (_v47_known_ct_town(town or "") if town else None)
+        line = f"{number} {word} {typ}" if number else None
+    if not line:
+        return None
+    raw = ", ".join([p for p in [line, town, state] if p])
+    sched["raw_address"] = raw
+    sched["address_candidate"] = raw
+    if not _v47_apply_normalized_if_possible(conv, raw):
+        sched["address_verified"] = False
+        sched["address_missing"] = "confirm"
+        conv["last_voice_reply"] = f"I heard {raw}, but I still couldn’t verify that address. Please say the full address, including the town and state."
+        return conv["last_voice_reply"]
+    # Address is good now; continue to correct price gate.
+    if sched.get("voice_last_intent_power_loss") or _v47_power_loss_troubleshoot_text(str(sched.get("last_customer_issue") or "")):
+        try:
+            reply = _v45_troubleshoot_price_gate(conv, caller_text)
+        except Exception:
+            reply = "The address is verified in our system. Troubleshoot and repair visits are $395. That covers sending one of our electricians out to diagnose the issue and repair it on site when possible. Does that work for you?"
+    else:
+        try:
+            reply = _v46_offer_eval_slots(conv) if sched.get("eval_price_accepted") else "The address is verified in our system. We start with a $195 on-site evaluation visit. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step. Does that work for you?"
+            sched["awaiting_eval_price_confirm"] = True
+        except Exception:
+            reply = "The address is verified in our system. We start with a $195 on-site evaluation visit. Does that work for you?"
+    conv["last_voice_reply"] = reply
+    return reply
+
+
+def _v47_custom_date_request_during_offers(conv: dict, caller_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    if not (sched.get("awaiting_slot_offer_choice") and (sched.get("offered_slot_options") or [])):
+        return None
+    requested_date = None
+    try:
+        requested_date = salvage_relative_date_from_text(caller_text)
+    except Exception:
+        requested_date = None
+    if not requested_date:
+        return None
+    option_dates = {str(o.get("date") or "").strip() for o in (sched.get("offered_slot_options") or []) if o.get("date")}
+    if requested_date in option_dates:
+        return None
+    # This is a custom date, not an offered-slot selection. Respect it.
+    explicit_time = None
+    try:
+        explicit_time = extract_explicit_time_from_text(caller_text)
+    except Exception:
+        explicit_time = None
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+    sched["appointment_type"] = appt
+    conv["appointment_type"] = appt
+    sched["scheduled_date"] = requested_date
+    sched["scheduled_time"] = explicit_time
+    if explicit_time:
+        sched["scheduled_time_source"] = "customer_explicit_custom_date_after_offer_v47"
+    else:
+        sched.pop("scheduled_time_source", None)
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["booking_created"] = False
+    sched["square_booking_id"] = None
+    sched["slot_choice_locked"] = False
+    sched["awaiting_emergency_confirm"] = False
+    sched["emergency_approved"] = False
+    try:
+        recompute_pending_step(conv.setdefault("profile", {}), sched)
+    except Exception:
+        pass
+    if not explicit_time:
+        sched["pending_step"] = "need_time"
+        reply = f"Got it. What time works for {_date_label_for_sms(requested_date)}?"
+    else:
+        # Move to identity/email collection without validating against offered fallback slots.
+        try:
+            reply = _v44_after_slot_prompt(conv)
+        except Exception:
+            reply = "What is your last name?"
+    conv["last_voice_reply"] = reply
+    return reply
+
+
+def _v47_offer_trouble_slots(conv: dict) -> str:
+    try:
+        return _v45_offer_troubleshoot_slots(conv)
+    except Exception:
+        sched = conv.setdefault("sched", {})
+        sched["appointment_type"] = "TROUBLESHOOT_395"
+        conv["appointment_type"] = "TROUBLESHOOT_395"
+        sched["awaiting_troubleshoot_price_confirm"] = False
+        sched["troubleshoot_price_accepted"] = True
+        return _v42_slot_offer_reply_for(conv, "TROUBLESHOOT_395") if "_v42_slot_offer_reply_for" in globals() else "Great. What day and time works best?"
+
+
+def _v47_email_confirm_yes_safe(conv: dict, phone: str) -> dict | None:
+    try:
+        return _v46_email_confirm_yes(conv, phone)
+    except Exception:
+        return None
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+
+    # 1) Street spelling correction must run before old layers ignore it.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        reply = _v47_handle_street_spelling_reply(conv_pre, caller_text)
+        if reply:
+            try:
+                log_event("VOICE_V47_STREET_SPELLING_REPAIRED", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv_pre)
+            except Exception:
+                pass
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": conv_pre.setdefault("sched", {}).get("pending_step"), "appointment_type": conv_pre.setdefault("sched", {}).get("appointment_type") or conv_pre.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V47_STREET_SPELLING_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    # 2) Email-confirm yes must never repeat the same email confirmation.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        sched_pre = conv_pre.setdefault("sched", {})
+        last_reply_pre = str(conv_pre.get("last_voice_reply") or sched_pre.get("last_voice_reply") or "")
+        if (_v46_is_email_confirm_prompt(last_reply_pre) or sched_pre.get("voice_awaiting_email_confirm")) and _v47_yes(caller_text):
+            out = _v47_email_confirm_yes_safe(conv_pre, p)
+            if out:
+                # If lower helper still returns an email confirmation prompt, replace it with booking progress/finalization.
+                if _v46_is_email_confirm_prompt(str(out.get("reply_to_customer") or "")):
+                    first, last = _v46_name_status(conv_pre)
+                    if first and not last:
+                        out["reply_to_customer"] = _v46_require_last_name_reply(conv_pre)
+                    elif not (sched_pre.get("scheduled_date") and sched_pre.get("scheduled_time")):
+                        out["reply_to_customer"] = _v42_slot_offer_reply_for(conv_pre, sched_pre.get("appointment_type") or conv_pre.get("appointment_type") or "EVAL_195") if "_v42_slot_offer_reply_for" in globals() else "Thanks. What day and time works best?"
+                    else:
+                        out["reply_to_customer"] = "Thanks. I’ll finish booking that now."
+                    out["booking_created"] = False
+                    out["end_call"] = False
+                try:
+                    log_event("VOICE_V47_EMAIL_CONFIRM_YES", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(out.get("reply_to_customer")), "call_sid": call_sid}, conv_pre)
+                except Exception:
+                    pass
+                return out
+    except Exception as e:
+        try:
+            log_event("VOICE_V47_EMAIL_CONFIRM_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    # 3) Price gate yes for troubleshoot must offer slots, before old layers can repeat price.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        sched_pre = conv_pre.setdefault("sched", {})
+        last_reply_pre = str(conv_pre.get("last_voice_reply") or sched_pre.get("last_voice_reply") or "")
+        awaiting_trouble_price = bool(sched_pre.get("awaiting_troubleshoot_price_confirm")) or ("395" in _v47_low(last_reply_pre) and "does that work" in _v47_low(last_reply_pre) and "troubleshoot" in _v47_low(last_reply_pre))
+        if awaiting_trouble_price:
+            if _v47_no(caller_text):
+                reply = _v45_decline_troubleshoot(conv_pre) if "_v45_decline_troubleshoot" in globals() else "No problem. We will not schedule the visit right now. Thank you for calling Prevolt Electric. Goodbye."
+                return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": "TROUBLESHOOT_395", "end_call": True}
+            if _v47_yes(caller_text) or (_v42_availability_request_text(caller_text) if "_v42_availability_request_text" in globals() else False):
+                reply = _v47_offer_trouble_slots(conv_pre)
+                try:
+                    log_event("VOICE_V47_TROUBLE_PRICE_ACCEPTED", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv_pre)
+                except Exception:
+                    pass
+                return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": sched_pre.get("pending_step"), "appointment_type": "TROUBLESHOOT_395", "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V47_TROUBLE_PRICE_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    # 4) Custom date/time after offered slots must be respected before offered-slot matching.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre["phone"] = p
+        reply = _v47_custom_date_request_during_offers(conv_pre, caller_text)
+        if reply:
+            try:
+                log_event("VOICE_V47_CUSTOM_DATE_AFTER_OFFER", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(reply), "call_sid": call_sid}, conv_pre)
+            except Exception:
+                pass
+            return {"reply_to_customer": reply, "booking_created": False, "manual_only": False, "pending_step": conv_pre.setdefault("sched", {}).get("pending_step"), "appointment_type": conv_pre.setdefault("sched", {}).get("appointment_type") or conv_pre.get("appointment_type"), "end_call": False}
+    except Exception as e:
+        try:
+            log_event("VOICE_V47_CUSTOM_DATE_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V47(phone, call_sid, caller_text)
+
+    # 5) Post-process guard rails.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        sched = conv.setdefault("sched", {})
+        reply = str(out.get("reply_to_customer") or "")
+        low_reply = _v47_low(reply)
+
+        # Remember issue type for later spelling/address correction turns.
+        if _v47_power_loss_troubleshoot_text(caller_text):
+            sched["voice_last_intent_power_loss"] = True
+            sched["last_customer_issue"] = caller_text
+
+        # If address is falsely verified or raw, repair it now or block the price gate.
+        addr_block_reply = _v47_repair_or_block_address(conv, caller_text)
+        if addr_block_reply:
+            out["reply_to_customer"] = addr_block_reply
+            out["booking_created"] = False
+            out["end_call"] = False
+            out["pending_step"] = sched.get("pending_step") or "need_address"
+            conv["last_voice_reply"] = addr_block_reply
+            try:
+                log_event("VOICE_V47_BLOCKED_UNSTRUCTURED_ADDRESS", p, {"caller_text": _safe_monitor_text(caller_text), "reply": _safe_monitor_text(addr_block_reply), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+            return out
+
+        # If the customer described dead/nonworking outlets, force scheduled $395 troubleshoot unless hard hazard.
+        if _v47_power_loss_troubleshoot_text(caller_text) and not _v47_hard_hazard(caller_text):
+            sched["voice_last_intent_power_loss"] = True
+            sched["last_customer_issue"] = caller_text
+            already_price = "395" in low_reply and "troubleshoot" in low_reply
+            already_slot = bool(sched.get("awaiting_slot_offer_choice")) and ("which one" in low_reply or "works best" in low_reply)
+            if not sched.get("troubleshoot_price_accepted") and not already_price and not already_slot:
+                reply2 = _v45_troubleshoot_price_gate(conv, caller_text) if "_v45_troubleshoot_price_gate" in globals() else "The address is verified in our system. Troubleshoot and repair visits are $395. That covers sending one of our electricians out to diagnose the issue and repair it on site when possible. Does that work for you?"
+                out["reply_to_customer"] = _voice_naturalize_reply(reply2) if "_voice_naturalize_reply" in globals() else reply2
+                out["booking_created"] = False
+                out["manual_only"] = False
+                out["appointment_type"] = "TROUBLESHOOT_395"
+                out["pending_step"] = sched.get("pending_step")
+                out["end_call"] = False
+                try:
+                    log_event("VOICE_V47_POWER_LOSS_FORCED_395", p, {"caller_text": _safe_monitor_text(caller_text), "old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(out["reply_to_customer"]), "call_sid": call_sid}, conv)
+                except Exception:
+                    pass
+                return out
+
+        # If older layers still asked a generic scheduling question for troubleshoot, replace with the $395 gate.
+        if _v47_power_loss_troubleshoot_text(caller_text) and ("what day and time" in low_reply or "what time works" in low_reply or "get the scheduling" in low_reply):
+            reply2 = _v45_troubleshoot_price_gate(conv, caller_text) if "_v45_troubleshoot_price_gate" in globals() else "Troubleshoot and repair visits are $395. Does that work for you?"
+            out["reply_to_customer"] = reply2
+            out["booking_created"] = False
+            out["end_call"] = False
+            out["appointment_type"] = "TROUBLESHOOT_395"
+            out["pending_step"] = sched.get("pending_step")
+            return out
+
+        # If the customer said yes to email confirm and old layer repeated it, suppress it.
+        if _v47_yes(caller_text) and _v46_is_email_confirm_prompt(str(out.get("reply_to_customer") or "")):
+            if sched.get("scheduled_date") and sched.get("scheduled_time"):
+                out["reply_to_customer"] = "Thanks. I’ll finish booking that now."
+                out["booking_created"] = False
+                out["end_call"] = False
+                conv["last_voice_reply"] = out["reply_to_customer"]
+                return out
+    except Exception as e:
+        try:
+            log_event("VOICE_V47_POST_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
+
+
+# =============================
+# v48 STABILIZATION HOTFIX LAYER
+# =============================
+# - Keep raw_address synchronized with a complete Google-normalized address.
+# - Remove "emergency dispatch" wording from normal scheduled troubleshoot bookings.
+
+_ORIG_PROCESS_PREVOLT_VOICE_TURN_V48 = process_prevolt_voice_turn
+
+
+def _v48_sync_raw_address_from_normalized(conv: dict) -> None:
+    sched = conv.setdefault("sched", {})
+    addr = sched.get("normalized_address") if isinstance(sched.get("normalized_address"), dict) else None
+    try:
+        complete = _v47_complete_addr_struct(addr)
+    except Exception:
+        complete = False
+    if not complete:
+        return
+    raw = (
+        f"{addr.get('address_line_1')}, {addr.get('locality')}, "
+        f"{addr.get('administrative_district_level_1')} {addr.get('postal_code')}"
+    ).strip(" ,")
+    if raw:
+        sched["raw_address"] = raw
+        sched["address_candidate"] = raw
+        sched["address_verified"] = True
+        sched["address_missing"] = None
+        sched["address_parts"] = {
+            "street": True,
+            "number": True,
+            "city": True,
+            "state": True,
+            "zip": True,
+            "source": "v48_sync_normalized",
+        }
+
+
+def _v48_is_true_emergency_context(conv: dict, caller_text: str = "") -> bool:
+    sched = conv.setdefault("sched", {})
+    if sched.get("emergency_approved") or sched.get("awaiting_emergency_confirm") or sched.get("hard_emergency_detected"):
+        return True
+    if _v47_hard_hazard(caller_text or sched.get("last_customer_issue") or sched.get("voice_last_caller_text_norm") or ""):
+        return True
+    return False
+
+
+def _v48_clean_final_reply(conv: dict, reply: str, caller_text: str = "") -> str:
+    if not reply:
+        return reply
+    sched = conv.setdefault("sched", {})
+    appt = str(sched.get("appointment_type") or conv.get("appointment_type") or "").upper()
+    if "TROUBLESHOOT" in appt and not _v48_is_true_emergency_context(conv, caller_text):
+        # Avoid telling a normal scheduled troubleshoot customer they are booked for emergency dispatch.
+        reply = re.sub(r"\s*for\s+emergency\s+dispatch\s+at\s+", " for ", reply, flags=re.I)
+        reply = re.sub(r"\s*for\s+emergency\s+dispatch\b", "", reply, flags=re.I)
+        reply = re.sub(r"\bemergency\s+dispatch\s+visit\b", "troubleshoot and repair visit", reply, flags=re.I)
+        reply = re.sub(r"\s+", " ", reply).strip()
+    return reply
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or "").replace("whatsapp:", "").strip()
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V48(phone, call_sid, caller_text)
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv["phone"] = p
+        _v48_sync_raw_address_from_normalized(conv)
+        reply = str(out.get("reply_to_customer") or "")
+        cleaned = _v48_clean_final_reply(conv, reply, caller_text)
+        if cleaned != reply:
+            out["reply_to_customer"] = cleaned
+            conv["last_voice_reply"] = cleaned
+            try:
+                log_event("VOICE_V48_CLEANED_FINAL_REPLY", p, {"old_reply": _safe_monitor_text(reply), "new_reply": _safe_monitor_text(cleaned), "call_sid": call_sid}, conv)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            log_event("VOICE_V48_POST_LAYER_ERROR", p, {"error": repr(e), "caller_text": _safe_monitor_text(caller_text), "call_sid": call_sid})
+        except Exception:
+            pass
+    return out
