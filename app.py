@@ -1876,21 +1876,30 @@ def hydrate_voice_conversation(phone: str, call_sid: str = "") -> dict:
     # Voice calls should get repeat-customer context immediately. Keep profile;
     # refresh it from Square so the assistant can confirm a saved address instead
     # of treating the caller like a new customer.
+    #
+    # LOG-ONLY DEDUPE:
+    # hydrate_voice_conversation() intentionally runs repeatedly during the live
+    # voice loop to keep booking memory stable. Do not reduce or gate those
+    # hydration calls here. Only prevent the monitor/log event from firing
+    # hundreds of times for the same call_sid.
     try:
         if phone and "hydrate_square_profile_by_phone" in globals():
             hydrate_square_profile_by_phone(profile, phone, force=is_new_voice_call)
-            try:
-                log_event("VOICE_SQUARE_PROFILE_READY", phone, {
-                    "call_sid": call_sid,
-                    "square_customer_id": profile.get("square_customer_id"),
-                    "addresses_count": len(profile.get("addresses") or []),
-                    "active_first_name": profile.get("active_first_name"),
-                    "active_last_name": profile.get("active_last_name"),
-                    "active_email_present": bool(profile.get("active_email")),
-                    "phone_variants_tried": _phone_lookup_variants(phone)[:6] if "_phone_lookup_variants" in globals() else [],
-                }, conv)
-            except Exception:
-                pass
+            profile_ready_log_key = call_sid or f"phone:{phone}"
+            if sched.get("voice_square_profile_ready_logged_call_sid") != profile_ready_log_key:
+                try:
+                    log_event("VOICE_SQUARE_PROFILE_READY", phone, {
+                        "call_sid": call_sid,
+                        "square_customer_id": profile.get("square_customer_id"),
+                        "addresses_count": len(profile.get("addresses") or []),
+                        "active_first_name": profile.get("active_first_name"),
+                        "active_last_name": profile.get("active_last_name"),
+                        "active_email_present": bool(profile.get("active_email")),
+                        "phone_variants_tried": _phone_lookup_variants(phone)[:6] if "_phone_lookup_variants" in globals() else [],
+                    }, conv)
+                    sched["voice_square_profile_ready_logged_call_sid"] = profile_ready_log_key
+                except Exception:
+                    pass
     except Exception as e:
         try:
             log_event("VOICE_SQUARE_HYDRATE_ERROR", phone, {"error": repr(e), "call_sid": call_sid})
