@@ -19962,3 +19962,453 @@ def _conversation_snapshot(phone: str, conv: dict) -> dict:
     snap["selected_lead_label"] = "Selected Lead Snapshot"
     snap["latest_event_label"] = "Latest System Event"
     return snap
+
+
+# =============================
+# v71 VOICE ADDRESS LOOP FIX + COMMAND CENTER EXPORT
+# =============================
+# Root fixes:
+# - The v60 voice partial-address path asked for town/state but did not persist
+#   the street line, so the next city/state answer could not be merged and the
+#   voice flow looped back to house number/street.
+# - Trust customer-spoken CT/MA full addresses enough to advance instead of
+#   repeatedly asking for town/street when Google parsing is imperfect.
+# - Add monitor export payloads so Command Center can copy/paste full logs.
+
+try:
+    _ORIG_PROCESS_PREVOLT_VOICE_TURN_V71 = process_prevolt_voice_turn
+except Exception:
+    _ORIG_PROCESS_PREVOLT_VOICE_TURN_V71 = None
+
+
+def _v71_norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", str(text or "").lower()).strip()
+
+
+def _v71_known_towns() -> dict[str, str]:
+    towns: dict[str, str] = {}
+    try:
+        for t in globals().get('_V69_CT_TOWNS', set()) or set():
+            towns[str(t).lower()] = 'CT'
+        for t in globals().get('_V69_MA_TOWNS', set()) or set():
+            towns[str(t).lower()] = 'MA'
+    except Exception:
+        pass
+    # Safe fallback for service-area towns repeatedly seen in live tests.
+    fallback_ct = [
+        'avon','berlin','bloomfield','bristol','canton','east granby','east hartford','east windsor','ellington','enfield','farmington','glastonbury','granby','hartford','manchester','new britain','newington','plainville','rocky hill','simsbury','south windsor','southington','suffield','tolland','vernon','west hartford','wethersfield','windsor','windsor locks'
+    ]
+    fallback_ma = ['agawam','chicopee','east longmeadow','feeding hills','holyoke','longmeadow','ludlow','monson','palmer','springfield','west springfield','westfield','wilbraham']
+    for t in fallback_ct:
+        towns.setdefault(t, 'CT')
+    for t in fallback_ma:
+        towns.setdefault(t, 'MA')
+    return towns
+
+
+def _v71_state_from_text(text: str) -> str | None:
+    low = _v71_norm(text)
+    if re.search(r"\b(?:ct|connecticut|c t)\b", low):
+        return 'CT'
+    if re.search(r"\b(?:ma|mass|massachusetts|m a)\b", low):
+        return 'MA'
+    return None
+
+
+def _v71_city_state_from_text(text: str) -> tuple[str | None, str | None]:
+    raw = str(text or "")
+    low = _v71_norm(raw)
+    state = _v71_state_from_text(raw)
+    towns = _v71_known_towns()
+    # Prefer longest town first so West Hartford wins over Hartford.
+    for town, town_state in sorted(towns.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if re.search(r"\b" + re.escape(town) + r"\b", low):
+            return " ".join(w.capitalize() for w in town.split()), state or town_state
+    # Common phrase: "the town is X" or "it's in X".
+    m = re.search(r"\b(?:town is|city is|in|at)\s+([A-Za-z][A-Za-z .'\-]{2,40})\s*(?:,|$|\b(?:ct|connecticut|ma|massachusetts|mass)\b)", raw, flags=re.I)
+    if m:
+        city = m.group(1).strip(" ,." )
+        # Trim accidental street words if the whole utterance was captured.
+        city = re.sub(r"^.*?\b(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|ct|court|circle|cir|way|blvd|boulevard|place|pl)\b\s+", "", city, flags=re.I).strip(" ,.")
+        if city:
+            return " ".join(w.capitalize() for w in city.split()), state
+    return None, state
+
+
+def _v71_line_from_text(text: str) -> str | None:
+    raw = " ".join(str(text or "").replace("\n", " ").split()).strip(" ,.")
+    if not raw:
+        return None
+    # Prefer the current address extractor because it already understands street suffixes.
+    try:
+        comps = v69_parse_address_components(raw) if 'v69_parse_address_components' in globals() else {}
+        if isinstance(comps, dict) and comps.get('line1'):
+            return str(comps.get('line1')).strip(" ,.")
+    except Exception:
+        pass
+    try:
+        addr = extract_service_address_from_text(raw)
+    except Exception:
+        addr = None
+    if addr:
+        try:
+            comps = v69_parse_address_components(addr) if 'v69_parse_address_components' in globals() else {}
+            if isinstance(comps, dict) and comps.get('line1'):
+                return str(comps.get('line1')).strip(" ,.")
+        except Exception:
+            pass
+        # Remove town/state tail if the extractor returned a complete address.
+        suffix = globals().get('_V69_STREET_SUFFIX_RE') or r"(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place|park)"
+        m = re.search(rf"\b(\d{{1,6}}(?:-\d{{1,6}})?[A-Za-z]?\s+[A-Za-z0-9.'#\- ]+?\b{suffix}\b)", addr, flags=re.I)
+        if m:
+            return " ".join(m.group(1).split()).strip(" ,.")
+    suffix = globals().get('_V69_STREET_SUFFIX_RE') or r"(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place|park)"
+    m = re.search(rf"\b(\d{{1,6}}(?:-\d{{1,6}})?[A-Za-z]?\s+[A-Za-z0-9.'#\- ]+?\b{suffix}\b)", raw, flags=re.I)
+    if m:
+        return " ".join(m.group(1).split()).strip(" ,.")
+    return None
+
+
+def _v71_collecting_voice_address(conv: dict) -> bool:
+    sched = conv.setdefault('sched', {})
+    if sched.get('address_verified'):
+        return False
+    pending = str(sched.get('pending_step') or '').lower()
+    state = str(sched.get('state') or '').lower()
+    missing = str(sched.get('address_missing') or '').lower()
+    last = _intent_text(conv.get('last_voice_reply') or '') if '_intent_text' in globals() else str(conv.get('last_voice_reply') or '').lower()
+    return bool(
+        pending == 'need_address'
+        or state == 'waiting_for_address'
+        or missing in {'street','number','city','state','city_state','confirm','zip'}
+        or 'address for the work' in last
+        or 'house number' in last
+        or 'town and state' in last
+        or 'what town' in last
+    )
+
+
+def _v71_set_partial_voice_address(conv: dict, line: str) -> None:
+    sched = conv.setdefault('sched', {})
+    line = " ".join(str(line or '').split()).strip(" ,.")
+    if not line:
+        return
+    sched['voice_partial_address_line'] = line
+    sched['raw_address'] = line
+    sched['address_candidate'] = line
+    comps = sched.setdefault('address_components', {})
+    if isinstance(comps, dict):
+        comps['line1'] = line
+        comps.setdefault('city', None)
+        comps.setdefault('state', None)
+        comps['verified_level'] = 'street_only_voice'
+    sched['address_verified'] = False
+    sched['address_missing'] = 'city_state'
+    sched['pending_step'] = 'need_address'
+    sched['state'] = 'waiting_for_address'
+
+
+def _v71_apply_trusted_voice_address(conv: dict, line: str, city: str, state: str, source: str = 'voice_v71') -> None:
+    sched = conv.setdefault('sched', {})
+    profile = conv.setdefault('profile', {})
+    line = " ".join(str(line or '').split()).strip(" ,.")
+    city = " ".join(str(city or '').split()).strip(" ,.")
+    state = (str(state or '').strip().upper() or _v71_state_from_text(city) or '').replace('CONNECTICUT', 'CT').replace('MASSACHUSETTS', 'MA')
+    if state.startswith('MASS'):
+        state = 'MA'
+    if state.startswith('CONN'):
+        state = 'CT'
+    full = ", ".join(x for x in [line, city, state] if x)
+    try:
+        set_raw_address_safe(sched, full)
+    except Exception:
+        sched['raw_address'] = full
+    sched['address_candidate'] = sched.get('raw_address') or full
+    sched['address_components'] = {
+        'line1': line or None,
+        'city': city or None,
+        'state': state or None,
+        'zip': None,
+        'unit': None,
+        'verified_level': source,
+    }
+    sched['normalized_address'] = {
+        'address_line_1': line,
+        'locality': city,
+        'administrative_district_level_1': state,
+        'postal_code': '',
+        'country': 'US',
+    }
+    sched['address_verified'] = True
+    sched['address_missing'] = None
+    sched['pending_step'] = None
+    sched['state'] = 'address_verified'
+    sched['voice_partial_address_line'] = None
+    sched['voice_town_hint'] = city or sched.get('voice_town_hint')
+    sched['voice_state_hint'] = state or sched.get('voice_state_hint')
+    try:
+        profile.setdefault('addresses', [])
+        if full and full not in profile['addresses']:
+            profile['addresses'].append(full)
+    except Exception:
+        pass
+    try:
+        recompute_pending_step(profile, sched)
+    except Exception:
+        pass
+    # The explicit trusted voice address wins over stale recompute or Google uncertainty.
+    sched['address_verified'] = True
+    sched['address_missing'] = None
+    if str(sched.get('pending_step') or '').lower() == 'need_address':
+        sched['pending_step'] = None
+
+
+def _v71_service_visit_price_reply(conv: dict) -> str:
+    sched = conv.setdefault('sched', {})
+    if not sched.get('appointment_type'):
+        sched['appointment_type'] = conv.get('appointment_type') or 'EVAL_195'
+    conv['appointment_type'] = sched.get('appointment_type') or 'EVAL_195'
+    sched['awaiting_eval_price_confirm'] = True
+    sched['price_disclosed'] = True
+    if not sched.get('scheduled_date'):
+        sched['pending_step'] = 'need_date'
+        sched['state'] = 'waiting_for_date'
+    return (
+        "Got it, I have the address. We start with a $195 service visit. "
+        "That covers sending an electrician out, reviewing the issue in person, "
+        "and handling straightforward troubleshooting or small repairs when possible. "
+        "If additional work or parts are needed, we’ll confirm before proceeding. Does that work for you?"
+    )
+
+
+def _v71_voice_output(conv: dict, reply: str, booking_created: bool = False, end_call: bool = False) -> dict:
+    sched = conv.setdefault('sched', {})
+    conv['last_voice_reply'] = reply
+    try:
+        conv.setdefault('voice_transcript', []).append({
+            'role': 'assistant',
+            'text': reply,
+            'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+    return {
+        'reply_to_customer': _voice_naturalize_reply(reply) if '_voice_naturalize_reply' in globals() else reply,
+        'booking_created': bool(booking_created),
+        'manual_only': bool(sched.get('manual_only')),
+        'pending_step': sched.get('pending_step'),
+        'appointment_type': sched.get('appointment_type') or conv.get('appointment_type'),
+        'end_call': bool(end_call),
+    }
+
+
+def _v71_handle_voice_address_turn(phone: str, conv: dict, caller_text: str) -> dict | None:
+    sched = conv.setdefault('sched', {})
+    text = str(caller_text or '').strip()
+    if not text:
+        return None
+    collecting = _v71_collecting_voice_address(conv)
+    line = _v71_line_from_text(text)
+    city, state = _v71_city_state_from_text(text)
+
+    # If the line contains a city/state tail, parse it from the full string.
+    try:
+        comps = v69_parse_address_components(text) if 'v69_parse_address_components' in globals() else {}
+        if isinstance(comps, dict):
+            line = comps.get('line1') or line
+            # Prefer the known-town scanner over broad address parsing; the broad
+            # parser can accidentally read the street tail as the city.
+            city = city or comps.get('city')
+            state = state or comps.get('state')
+    except Exception:
+        pass
+
+    # Full address in one utterance while address collection is active.
+    if line and city and state and (collecting or (('v69_looks_like_service_scope' in globals()) and v69_looks_like_service_scope(text))):
+        _v71_apply_trusted_voice_address(conv, line, city, state, 'voice_full_address_v71')
+        try:
+            too_far, minutes = _voice_residential_address_too_far(conv)
+            if too_far:
+                return _voice_close_with_reply(phone, conv, _voice_out_of_area_reply(minutes), 'residential_out_of_area_address_v71')
+        except Exception:
+            pass
+        try:
+            log_event('VOICE_V71_FULL_ADDRESS_ACCEPTED', phone, {'line': line, 'city': city, 'state': state, 'caller_text': _safe_monitor_text(text)}, conv)
+        except Exception:
+            pass
+        return _v71_voice_output(conv, _v71_service_visit_price_reply(conv), False, False)
+
+    # City/state answer after a stored street-only turn.
+    partial_line = str(sched.get('voice_partial_address_line') or '').strip(' ,.')
+    if not partial_line:
+        raw = str(sched.get('raw_address') or sched.get('address_candidate') or '').strip(' ,.')
+        if raw and _address_has_house_number_and_street(raw) and not _v71_city_state_from_text(raw)[0]:
+            partial_line = _v71_line_from_text(raw) or raw
+    if collecting and partial_line and (city or state) and not line:
+        if not city:
+            city = sched.get('voice_town_hint') or sched.get('address_components', {}).get('city') if isinstance(sched.get('address_components'), dict) else None
+        if not state and city:
+            state = _v71_known_towns().get(str(city).lower()) or _v71_state_from_text(city)
+        if city and state:
+            _v71_apply_trusted_voice_address(conv, partial_line, city, state, 'voice_partial_merge_v71')
+            try:
+                log_event('VOICE_V71_PARTIAL_ADDRESS_MERGED', phone, {'line': partial_line, 'city': city, 'state': state, 'caller_text': _safe_monitor_text(text)}, conv)
+            except Exception:
+                pass
+            return _v71_voice_output(conv, _v71_service_visit_price_reply(conv), False, False)
+        if state and not city:
+            sched['voice_state_hint'] = state
+            return _v71_voice_output(conv, 'Thanks. What town is that in?', False, False)
+
+    # Street-only answer. Persist it before asking for town/state. This is the loop fix.
+    if collecting and line and not (city and state):
+        _v71_set_partial_voice_address(conv, line)
+        try:
+            log_event('VOICE_V71_STREET_ONLY_STORED', phone, {'line': line, 'caller_text': _safe_monitor_text(text)}, conv)
+        except Exception:
+            pass
+        return _v71_voice_output(conv, 'Thanks. What town and state is that in?', False, False)
+
+    return None
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or '').replace('whatsapp:', '').strip()
+    text = _voice_to_sms_text(caller_text or '') if '_voice_to_sms_text' in globals() else str(caller_text or '')
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre['phone'] = p
+        conv_pre['last_voice_customer_text'] = text
+        conv_pre.setdefault('sched', {})['last_voice_customer_text'] = text
+        # Keep the raw voice turn visible in Command Center even if a pre-intercept returns.
+        conv_pre.setdefault('voice_transcript', []).append({
+            'role': 'customer',
+            'text': text,
+            'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat(),
+            'source': 'v71_pre',
+        })
+        pre = _v71_handle_voice_address_turn(p, conv_pre, text)
+        if pre:
+            return pre
+    except Exception as e:
+        try:
+            log_event('VOICE_V71_PRE_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V71(phone, call_sid, text) if _ORIG_PROCESS_PREVOLT_VOICE_TURN_V71 else {'reply_to_customer': 'Sorry, can you say that again?', 'booking_created': False, 'manual_only': False, 'end_call': False}
+
+    # Post-guard: if lower layers still ask for address after we now have a stored
+    # street/town context, replace the loop with the missing piece or the price gate.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv['phone'] = p
+        sched = conv.setdefault('sched', {})
+        reply = str(out.get('reply_to_customer') or '') if isinstance(out, dict) else ''
+        low_reply = _intent_text(reply) if '_intent_text' in globals() else reply.lower()
+        if re.search(r'house number|street name|what town|town and state|full address|address for the work', low_reply, flags=re.I):
+            # If address verified, never ask for address again.
+            if sched.get('address_verified'):
+                fixed = _v71_service_visit_price_reply(conv)
+                try:
+                    log_event('VOICE_V71_SUPPRESSED_STALE_ADDRESS_PROMPT', p, {'old_reply': _safe_monitor_text(reply), 'new_reply': _safe_monitor_text(fixed), 'call_sid': call_sid}, conv)
+                except Exception:
+                    pass
+                return _v71_voice_output(conv, fixed, False, False)
+            partial_line = str(sched.get('voice_partial_address_line') or '').strip(' ,.')
+            if partial_line:
+                fixed = 'Thanks. What town and state is that in?'
+                try:
+                    log_event('VOICE_V71_REPLACED_ADDRESS_LOOP_WITH_TOWN_STATE', p, {'line': partial_line, 'old_reply': _safe_monitor_text(reply), 'call_sid': call_sid}, conv)
+                except Exception:
+                    pass
+                return _v71_voice_output(conv, fixed, False, False)
+    except Exception as e:
+        try:
+            log_event('VOICE_V71_POST_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+    return out
+
+
+def _v71_get_monitor_events_for_phone(phone: str, limit: int = 1000) -> list[dict]:
+    init_monitor_db()
+    phone = (phone or '').replace('whatsapp:', '').strip()
+    items: list[dict] = []
+    try:
+        with _monitor_connect() as conn:
+            rows = conn.execute(
+                'SELECT id, ts, event_type, phone, payload_json FROM monitor_events WHERE phone = ? ORDER BY id DESC LIMIT ?',
+                (phone, max(1, min(2000, int(limit or 1000)))),
+            ).fetchall()
+        for row in rows:
+            payload = {}
+            try:
+                payload = json.loads(row['payload_json'] or '{}')
+            except Exception:
+                payload = {}
+            items.append({'id': row['id'], 'ts': row['ts'], 'event_type': row['event_type'], 'phone': row['phone'], 'payload': payload})
+    except Exception:
+        pass
+    return items
+
+
+def _v71_conversation_export_payload(phone: str, conv: dict | None = None) -> dict:
+    phone = _cc_phone(phone) if '_cc_phone' in globals() else str(phone or '')
+    conv = conv if isinstance(conv, dict) else conversations.get(phone, {})
+    if not isinstance(conv, dict):
+        conv = {}
+    try:
+        snapshot = _conversation_snapshot(phone, conv)
+    except Exception:
+        snapshot = {}
+    return {
+        'ok': True,
+        'phone': phone,
+        'generated_at': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat(),
+        'selected_lead_snapshot': snapshot,
+        'voice_transcript': conv.get('voice_transcript') or [],
+        'cleaned_transcript': conv.get('cleaned_transcript') or '',
+        'last_voice_customer_text': conv.get('last_voice_customer_text') or conv.get('sched', {}).get('last_voice_customer_text'),
+        'last_voice_reply': conv.get('last_voice_reply') or '',
+        'last_sms_body': conv.get('last_sms_body') or '',
+        'notes': conv.get('notes') or [],
+        'raw_conversation': conv,
+        'events_desc': _v71_get_monitor_events_for_phone(phone, 1000),
+    }
+
+
+@app.route('/monitor/conversation/export', methods=['GET'])
+def monitor_conversation_export_v71():
+    if not _command_center_authorized():
+        return _command_center_auth_error()
+    phone = _cc_phone(request.args.get('phone') or '')
+    if not phone:
+        return {'ok': False, 'error': 'missing_phone'}, 400
+    conv = conversations.get(phone)
+    if not isinstance(conv, dict):
+        return {'ok': False, 'error': 'conversation_not_found', 'phone': phone}, 404
+    return _v71_conversation_export_payload(phone, conv), 200
+
+
+# Extend the Command Center snapshot with voice troubleshooting context.
+try:
+    _ORIG_CONVERSATION_SNAPSHOT_V71 = _conversation_snapshot
+except Exception:
+    _ORIG_CONVERSATION_SNAPSHOT_V71 = None
+
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    snap = _ORIG_CONVERSATION_SNAPSHOT_V71(phone, conv) if _ORIG_CONVERSATION_SNAPSHOT_V71 else {}
+    try:
+        sched = (conv or {}).get('sched') or {}
+        transcript = (conv or {}).get('voice_transcript') or []
+        snap['last_voice_customer_text'] = (conv or {}).get('last_voice_customer_text') or sched.get('last_voice_customer_text')
+        snap['last_voice_reply'] = (conv or {}).get('last_voice_reply')
+        snap['voice_turn_count'] = sched.get('voice_customer_turn_count')
+        snap['voice_meaningful_turns'] = sched.get('voice_meaningful_customer_turns')
+        snap['voice_partial_address_line'] = sched.get('voice_partial_address_line')
+        snap['voice_transcript_preview'] = transcript[-8:] if isinstance(transcript, list) else []
+    except Exception:
+        pass
+    return snap
