@@ -22006,3 +22006,459 @@ def maybe_create_square_booking(phone: str, convo: dict):
         except Exception:
             pass
     return _ORIG_V751_MAYBE_CREATE_SQUARE_BOOKING(phone, convo) if _ORIG_V751_MAYBE_CREATE_SQUARE_BOOKING else {'status': 'booking_function_missing'}
+
+
+# =============================
+# v76 — hard vacation blackout + voice email/slot guard
+# =============================
+# Live failures fixed from 2026-06-28 testing:
+# 1) Square/vacation block-off still allowed offered/custom slots during Kyle's vacation.
+#    v76 adds a fail-closed Prevolt blackout layer in addition to Square availability.
+# 2) Voice email confirmation kept looping on amy.m.boyko@gmail.com / amy.m.boyko.com.
+#    v76 accepts a valid spoken email as confirmed and repairs common Gmail speech parses.
+# 3) Voice could continue to name/email collection after a custom date/time that Square did
+#    not return as available. v76 blocks that stale selected slot before asking for name/email.
+
+try:
+    _ORIG_V76_PROCESS_PREVOLT_VOICE_TURN = process_prevolt_voice_turn
+except Exception:
+    _ORIG_V76_PROCESS_PREVOLT_VOICE_TURN = None
+try:
+    _ORIG_V76_V75_PARSE_MANUAL_BLACKOUT_RANGES = _v75_parse_manual_blackout_ranges
+except Exception:
+    _ORIG_V76_V75_PARSE_MANUAL_BLACKOUT_RANGES = None
+try:
+    _ORIG_V76_V72_EXTRACT_EMAIL = _v72_extract_email
+except Exception:
+    _ORIG_V76_V72_EXTRACT_EMAIL = None
+try:
+    _ORIG_V76_CONVERSATION_SNAPSHOT = _conversation_snapshot
+except Exception:
+    _ORIG_V76_CONVERSATION_SNAPSHOT = None
+try:
+    _ORIG_V76_BUILD_PRICE_AND_AVAILABILITY_PROMPT = build_price_and_availability_prompt
+except Exception:
+    _ORIG_V76_BUILD_PRICE_AND_AVAILABILITY_PROMPT = None
+
+# Kyle's already-scheduled vacation from current deployment/testing.
+# This is intentionally date-specific so it expires naturally after the trip.
+_V76_DEFAULT_BLACKOUT_RANGES = [('2026-06-22', '2026-07-06')]
+
+
+def _v76_parse_blackout_piece(piece: str) -> list[tuple[str, str]]:
+    s = str(piece or '').strip()
+    if not s:
+        return []
+    s = s.replace('–', ':').replace('—', ':').replace('to', ':')
+    pieces = [x.strip() for x in re.split(r'[:|]', s) if x.strip()]
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', s):
+        return [(s, s)]
+    if len(pieces) >= 2 and re.fullmatch(r'\d{4}-\d{2}-\d{2}', pieces[0]) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', pieces[1]):
+        return [(pieces[0], pieces[1])]
+    m = re.match(r'^(\d{4}-\d{2}-\d{2})\s*(?:\.\.|-+)\s*(\d{4}-\d{2}-\d{2})$', s)
+    if m:
+        return [(m.group(1), m.group(2))]
+    return []
+
+
+def _v76_env_blackout_ranges() -> list[tuple[str, str]]:
+    ranges = []
+    raw = ' '.join([
+        str(os.environ.get('PREVOLT_BLACKOUT_DATES') or ''),
+        str(os.environ.get('PREVOLT_DEFAULT_BLACKOUT_DATES') or ''),
+        str(os.environ.get('PREVOLT_VACATION_DATES') or ''),
+    ]).strip()
+    if raw:
+        for token in re.split(r'[,;\n]+', raw):
+            ranges.extend(_v76_parse_blackout_piece(token))
+    return ranges
+
+
+def _v76_merge_ranges(*groups) -> list[tuple[str, str]]:
+    seen = set()
+    out = []
+    for group in groups:
+        for start, end in group or []:
+            start = str(start or '').strip()
+            end = str(end or '').strip()
+            if not (re.fullmatch(r'\d{4}-\d{2}-\d{2}', start) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', end)):
+                continue
+            if end < start:
+                start, end = end, start
+            key = (start, end)
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+    return out
+
+
+def _v75_parse_manual_blackout_ranges() -> list[tuple[str, str]]:
+    """v76: fail-closed blackout layer used by every v75 slot filter/check."""
+    original = []
+    try:
+        if _ORIG_V76_V75_PARSE_MANUAL_BLACKOUT_RANGES:
+            original = _ORIG_V76_V75_PARSE_MANUAL_BLACKOUT_RANGES() or []
+    except Exception:
+        original = []
+    defaults = [] if str(os.environ.get('PREVOLT_DISABLE_DEFAULT_2026_VACATION_BLACKOUT') or '').strip().lower() in {'1', 'true', 'yes'} else list(_V76_DEFAULT_BLACKOUT_RANGES)
+    return _v76_merge_ranges(original, _v76_env_blackout_ranges(), defaults)
+
+
+def _v76_email_cleanup(text: str) -> str:
+    s = str(text or '').strip().lower()
+    if not s:
+        return ''
+    # Common STT spellings.
+    replacements = [
+        (r'\b at sign \b', '@'),
+        (r'\b at gmail\b', '@gmail'),
+        (r'\b at yahoo\b', '@yahoo'),
+        (r'\b at outlook\b', '@outlook'),
+        (r'\b at hotmail\b', '@hotmail'),
+        (r'\b at icloud\b', '@icloud'),
+        (r'\s+at\s+', '@'),
+        (r'\s+dot\s+', '.'),
+        (r'\s+period\s+', '.'),
+        (r'\s+underscore\s+', '_'),
+        (r'\s+dash\s+', '-'),
+        (r'\s+hyphen\s+', '-'),
+    ]
+    for pat, repl in replacements:
+        s = re.sub(pat, repl, s, flags=re.I)
+    s = re.sub(r'\s*@\s*', '@', s)
+    s = re.sub(r'\s*\.\s*', '.', s)
+    s = re.sub(r'\s+', '', s)
+    s = s.strip('.,;:!?')
+    return s
+
+
+def _v76_extract_email_candidates(text: str) -> list[str]:
+    raw = str(text or '')
+    cleaned = _v76_email_cleanup(raw)
+    candidates = []
+
+    # First trust the older extractor when it produces a valid email.
+    try:
+        if _ORIG_V76_V72_EXTRACT_EMAIL:
+            e0 = _ORIG_V76_V72_EXTRACT_EMAIL(raw)
+            if e0:
+                candidates.append(_v76_email_cleanup(e0))
+    except Exception:
+        pass
+    try:
+        e1 = v13_extract_email(raw)
+        if e1:
+            candidates.append(_v76_email_cleanup(e1))
+    except Exception:
+        pass
+
+    # Direct valid email in cleaned text.
+    for m in re.finditer(r'[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}', cleaned, flags=re.I):
+        candidates.append(m.group(0).lower())
+
+    # STT often drops the @ and hears "local.gmail.com".
+    # Convert local.gmail.com -> local@gmail.com for common email providers.
+    providers = 'gmail|yahoo|outlook|hotmail|icloud|aol|comcast|sbcglobal|protonmail'
+    m = re.search(rf'(?P<local>[a-z0-9._%+\-]{{2,}})\.(?P<provider>{providers})\.com\b', cleaned, flags=re.I)
+    if m:
+        local = m.group('local').strip('.')
+        provider = m.group('provider').lower()
+        if local and provider and not local.endswith(provider):
+            candidates.append(f'{local}@{provider}.com')
+
+    # STT sometimes hears "local gmail com" after whitespace was removed.
+    m2 = re.search(rf'(?P<local>[a-z0-9._%+\-]{{2,}})(?P<provider>{providers})\.com\b', cleaned, flags=re.I)
+    if m2:
+        local = m2.group('local').strip('.')
+        provider = m2.group('provider').lower()
+        if local and provider and not local.endswith(provider):
+            candidates.append(f'{local}@{provider}.com')
+
+    # Deduplicate and validate.
+    out = []
+    seen = set()
+    for c in candidates:
+        c = _v76_email_cleanup(c)
+        if re.fullmatch(r'[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}', c) and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _v76_extract_voice_email(text: str, pending: str = '') -> str | None:
+    pending = _v76_email_cleanup(pending or '')
+    candidates = _v76_extract_email_candidates(text)
+    if candidates:
+        # Prefer the candidate matching the pending domain/local when possible.
+        if pending and '@' in pending:
+            p_local, p_domain = pending.split('@', 1)
+            for c in candidates:
+                if c == pending:
+                    return pending
+            for c in candidates:
+                if '@' in c:
+                    c_local, c_domain = c.split('@', 1)
+                    if c_local == p_local or c_domain == p_domain:
+                        return c
+        return candidates[0]
+
+    # If the caller repeats an email-like value without @ (for example
+    # amy.m.boyko.com) while the pending email is amy.m.boyko@gmail.com, accept
+    # the pending email instead of looping.
+    if pending and '@' in pending:
+        p_local, _p_domain = pending.split('@', 1)
+        cleaned = _v76_email_cleanup(text)
+        localish = re.sub(r'\.com$', '', cleaned)
+        localish = re.sub(r'\.(gmail|yahoo|outlook|hotmail|icloud|aol)$', '', localish)
+        if localish == p_local or p_local in localish or localish in p_local:
+            return pending
+    return None
+
+
+def _v72_extract_email(text: str) -> str | None:
+    """v76 override: stronger voice/STT email parsing."""
+    return _v76_extract_voice_email(text or '')
+
+
+def _v76_slot_ok_for_voice(conv: dict) -> dict:
+    sched = conv.setdefault('sched', {})
+    d = str(sched.get('scheduled_date') or '').strip()
+    t = str(sched.get('scheduled_time') or '').strip()
+    if not (re.fullmatch(r'\d{4}-\d{2}-\d{2}', d) and re.fullmatch(r'\d{2}:\d{2}', t)):
+        return {'ok': True, 'reason': 'no_selected_slot'}
+    try:
+        return _v75_exact_square_slot_available(d, t, 'EVAL_195')
+    except Exception as e:
+        return {'ok': False, 'reason': 'slot_check_exception', 'error': repr(e)}
+
+
+def _v76_reply_for_blocked_slot(phone: str, conv: dict, check: dict) -> dict:
+    sched = conv.setdefault('sched', {})
+    d = str(sched.get('scheduled_date') or '').strip()
+    t = str(sched.get('scheduled_time') or '').strip()
+    reason = (check or {}).get('reason') or 'slot_unavailable'
+    try:
+        _v75_clear_selected_slot(sched, reason=reason)
+    except Exception:
+        sched['scheduled_time'] = None
+        sched['slot_blocked_reason'] = reason
+    sched['pending_step'] = 'need_date'
+    sched['state'] = 'waiting_for_date'
+    sched['awaiting_slot_offer_choice'] = False
+    sched['offered_slot_options'] = []
+    try:
+        slots = get_next_available_slots('EVAL_195', limit=3, days_ahead=30)
+    except Exception:
+        slots = []
+    if slots:
+        sched['awaiting_slot_offer_choice'] = True
+        sched['offered_slot_options'] = slots[:3]
+        msg = f"That time is not showing as available on our calendar. I have {_format_slot_options(slots[:3])}. Which one works best?"
+    else:
+        msg = 'That time is not showing as available on our calendar. Please text us here and we will finish scheduling manually.'
+    try:
+        log_event('VOICE_SLOT_BLOCKED_V76', phone, {'date': d, 'time': t, 'reason': reason, 'available_count': (check or {}).get('available_count')}, conv)
+    except Exception:
+        pass
+    try:
+        msg = _voice_naturalize_reply(msg)
+        conv.setdefault('voice_transcript', []).append({'role': 'assistant', 'source': 'v76', 'text': msg, 'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat()})
+        conv['last_voice_reply'] = msg
+    except Exception:
+        pass
+    return {'reply_to_customer': msg, 'booking_created': False, 'manual_only': False, 'pending_step': sched.get('pending_step'), 'appointment_type': 'EVAL_195', 'end_call': False}
+
+
+def _v76_reply_is_collecting_contact(reply: str) -> bool:
+    low = _intent_text(reply or '')
+    return any(p in low for p in [
+        'first and last name', 'what is your name', "what's your name", 'last name',
+        'best email address', 'email address for the appointment', 'is that correct',
+        'you are all set', 'on the schedule', 'confirmation text shortly'
+    ])
+
+
+def _v76_accept_email_and_continue(phone: str, conv: dict, email: str) -> dict:
+    sched = conv.setdefault('sched', {})
+    email = _v76_email_cleanup(email)
+    # Never let email confirmation book a blocked/unavailable slot.
+    check = _v76_slot_ok_for_voice(conv)
+    if check and not check.get('ok'):
+        return _v76_reply_for_blocked_slot(phone, conv, check)
+    try:
+        out = _v72_confirm_email_and_continue(phone, conv, email)
+    except Exception as e:
+        try:
+            v13_save_email(conv, email)
+            out = maybe_create_square_booking(phone, conv)
+        except Exception:
+            out = {'reply_to_customer': 'Thanks. I have your email saved. Please text us here if you do not receive a confirmation.', 'booking_created': False, 'manual_only': False, 'pending_step': None, 'end_call': False}
+        try:
+            log_event('VOICE_EMAIL_ACCEPT_V76_FALLBACK', phone, {'email': email, 'error': repr(e)}, conv)
+        except Exception:
+            pass
+    sched['voice_email_confirmed'] = True
+    sched['voice_awaiting_email_confirm'] = False
+    sched['voice_pending_email'] = None
+    sched['pending_email'] = None
+    # If the called helper returned a plain booking result, turn it into voice output.
+    if isinstance(out, dict) and 'reply_to_customer' in out:
+        reply = str(out.get('reply_to_customer') or '')
+    else:
+        reply = ''
+    if not reply or 'is that correct' in _intent_text(reply):
+        try:
+            reply = _voice_finalize_booking_reply(conv, '')
+        except Exception:
+            reply = 'You are all set. You will receive a confirmation text shortly.'
+    try:
+        reply = _voice_naturalize_reply(reply)
+        conv.setdefault('voice_transcript', []).append({'role': 'assistant', 'source': 'v76_email_accept', 'text': reply, 'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat()})
+        conv['last_voice_reply'] = reply
+    except Exception:
+        pass
+    return {'reply_to_customer': reply, 'booking_created': bool(sched.get('booking_created') and sched.get('square_booking_id')), 'manual_only': bool(sched.get('manual_only')), 'pending_step': sched.get('pending_step'), 'appointment_type': 'EVAL_195', 'end_call': bool(sched.get('voice_close_after_reply') or sched.get('booking_created'))}
+
+
+def _v76_handle_email_pre_voice(phone: str, call_sid: str, caller_text: str) -> dict | None:
+    conv = hydrate_voice_conversation(phone, call_sid)
+    conv['phone'] = phone
+    sched = conv.setdefault('sched', {})
+    profile = conv.setdefault('profile', {})
+    step = str(sched.get('pending_step') or '').lower()
+    state = str(sched.get('state') or '').lower()
+    pending = str(sched.get('voice_pending_email') or sched.get('pending_email') or profile.get('active_email') or profile.get('email') or '').strip().lower()
+    email_context = bool(
+        sched.get('voice_awaiting_email_confirm')
+        or step in {'need_email', 'need_email_confirm', 'confirm_email'}
+        or state in {'waiting_for_email', 'waiting_for_email_confirm'}
+        or ('email' in _intent_text(conv.get('last_voice_reply') or ''))
+    )
+    if not email_context:
+        return None
+
+    try:
+        conv.setdefault('voice_transcript', []).append({'role': 'customer', 'source': 'v76_pre', 'text': caller_text, 'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat()})
+        conv['last_voice_customer_text'] = caller_text
+    except Exception:
+        pass
+
+    if pending and _v72_yes(caller_text):
+        return _v76_accept_email_and_continue(phone, conv, pending)
+
+    incoming = _v76_extract_voice_email(caller_text, pending=pending)
+    if incoming:
+        # In voice, a valid email spoken during email collection is enough.
+        # Do not re-confirm forever; save it and continue booking.
+        return _v76_accept_email_and_continue(phone, conv, incoming)
+
+    if pending and _v72_no(caller_text):
+        sched['voice_awaiting_email_confirm'] = False
+        sched['voice_email_confirmed'] = False
+        sched['voice_pending_email'] = None
+        sched['pending_email'] = None
+        sched['pending_step'] = 'need_email'
+        sched['state'] = 'waiting_for_email'
+        reply = 'No problem. Please say the corrected email address slowly, or text it to us after the call.'
+        try:
+            reply = _voice_naturalize_reply(reply)
+            conv.setdefault('voice_transcript', []).append({'role': 'assistant', 'source': 'v76', 'text': reply, 'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat()})
+            conv['last_voice_reply'] = reply
+        except Exception:
+            pass
+        return {'reply_to_customer': reply, 'booking_created': False, 'manual_only': False, 'pending_step': 'need_email', 'appointment_type': 'EVAL_195', 'end_call': False}
+    return None
+
+
+def build_price_and_availability_prompt(conv: dict, appt_type: str = 'EVAL_195') -> str:
+    """v76: availability prompt must not offer blackout/vacation dates."""
+    conv = conv if isinstance(conv, dict) else {}
+    sched = conv.setdefault('sched', {})
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    sched['booking_allowed'] = True
+    try:
+        slots = get_next_available_slots('EVAL_195', limit=3, days_ahead=30)
+    except Exception as e:
+        print('[WARN] v76 availability prompt slot lookup failed:', repr(e))
+        slots = []
+    if slots:
+        sched['awaiting_slot_offer_choice'] = True
+        sched['offered_slot_options'] = [_v74_coerce_slot_option(s) for s in slots[:3]] if '_v74_coerce_slot_option' in globals() else slots[:3]
+        opts = _format_slot_options(sched['offered_slot_options'])
+        return f"{_V74_SERVICE_VISIT_TEXT} If that works for you, we have {opts}. Which one works best?"
+    sched['awaiting_slot_offer_choice'] = False
+    sched['offered_slot_options'] = []
+    return f"{_V74_SERVICE_VISIT_TEXT} If that works for you, please text us here and we will finish scheduling manually."
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    """v76 wrapper: email accept + fail-closed slot validation around the full voice turn."""
+    p = normalize_phone(phone) if 'normalize_phone' in globals() else phone
+    # Email collection/confirmation gets first priority so older v60/v72 wrappers do not loop.
+    try:
+        pre_email = _v76_handle_email_pre_voice(p, call_sid, caller_text or '')
+        if pre_email:
+            try:
+                log_event('VOICE_EMAIL_ACCEPTED_V76', p, {'caller_text': _safe_monitor_text(caller_text), 'reply': _safe_monitor_text(pre_email.get('reply_to_customer')), 'call_sid': call_sid}, hydrate_voice_conversation(p, call_sid))
+            except Exception:
+                pass
+            return pre_email
+    except Exception as e:
+        try:
+            log_event('VOICE_EMAIL_ACCEPT_V76_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(caller_text), 'call_sid': call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_V76_PROCESS_PREVOLT_VOICE_TURN(phone, call_sid, caller_text) if _ORIG_V76_PROCESS_PREVOLT_VOICE_TURN else {'reply_to_customer': 'Sorry, can you say that again?', 'booking_created': False, 'manual_only': False, 'end_call': False}
+
+    # After older logic runs, do not let a blocked/unavailable selected slot advance
+    # into name/email collection or final confirmation.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv['phone'] = p
+        sched = conv.setdefault('sched', {})
+        reply = str((out or {}).get('reply_to_customer') or '')
+        check = _v76_slot_ok_for_voice(conv)
+        if check and not check.get('ok') and not (sched.get('booking_created') and sched.get('square_booking_id')):
+            if _v76_reply_is_collecting_contact(reply) or str(sched.get('pending_step') or '').lower() in {'need_name', 'need_email', 'need_email_confirm', 'confirm_email'}:
+                return _v76_reply_for_blocked_slot(p, conv, check)
+        # If older logic still generated an email confirmation prompt after the
+        # caller just gave a valid email, accept it and continue immediately.
+        incoming = _v76_extract_voice_email(caller_text or '', pending=str(sched.get('voice_pending_email') or ''))
+        if incoming and 'is that correct' in _intent_text(reply or ''):
+            return _v76_accept_email_and_continue(p, conv, incoming)
+    except Exception as e:
+        try:
+            log_event('VOICE_POST_GUARD_V76_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(caller_text), 'call_sid': call_sid})
+        except Exception:
+            pass
+    return out
+
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    snap = _ORIG_V76_CONVERSATION_SNAPSHOT(phone, conv) if _ORIG_V76_CONVERSATION_SNAPSHOT else {}
+    try:
+        sched = (conv or {}).get('sched') or {}
+        snap['v76_blackout_email_slot_guard_active'] = True
+        snap['manual_blackout_ranges'] = _v75_parse_manual_blackout_ranges()
+        snap['voice_pending_email'] = sched.get('voice_pending_email') or sched.get('pending_email')
+        snap['voice_email_confirmed'] = bool(sched.get('voice_email_confirmed'))
+        if sched.get('scheduled_date') and sched.get('scheduled_time'):
+            snap['last_slot_square_check'] = _v76_slot_ok_for_voice(conv or {})
+    except Exception:
+        pass
+    return snap
+
+
+def _v76_selftest() -> dict:
+    return {
+        'active': True,
+        'blackouts': _v75_parse_manual_blackout_ranges(),
+        'july_6_blocked': _v75_date_is_manual_blackout('2026-07-06'),
+        'gmail_repair': _v76_extract_voice_email('amy dot m dot boyko gmail dot com'),
+        'gmail_repair_2': _v76_extract_voice_email('amy.m.boyko.gmail.com'),
+        'pending_local_repair': _v76_extract_voice_email('amy.m.boyko.com', pending='amy.m.boyko@gmail.com'),
+    }
