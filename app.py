@@ -20412,3 +20412,433 @@ def _conversation_snapshot(phone: str, conv: dict) -> dict:
     except Exception:
         pass
     return snap
+
+
+# =============================
+# v72 VOICE EMAIL CONFIRM LOOP FIX + BETTER RESUME SMS
+# =============================
+# Live failure fixed:
+# - Voice had all booking details and heard an email, then kept asking
+#   "I have <email>. Is that correct?" when the caller repeated the same email
+#   or the stream dropped before a clean yes/no was recognized.
+# - A dropped call at need_email_confirm sent the generic "remaining details" SMS
+#   instead of asking the customer to confirm/correct the email.
+#
+# Design:
+# - Treat a repeated identical email while waiting for confirmation as confirmation.
+# - If the caller gives a different email while waiting for confirmation, replace
+#   the pending email and confirm the corrected one once.
+# - If the caller says something unclear like "hello", repeat the confirmation
+#   instruction instead of asking them to say the whole email again.
+# - Include voice_pending_email / email-confirm state in Command Center snapshots.
+
+try:
+    _ORIG_PROCESS_PREVOLT_VOICE_TURN_V72 = process_prevolt_voice_turn
+except Exception:
+    _ORIG_PROCESS_PREVOLT_VOICE_TURN_V72 = None
+
+try:
+    _ORIG_VOICE_SEND_RESUME_SMS_IF_NEEDED_V72 = _voice_send_resume_sms_if_needed
+except Exception:
+    _ORIG_VOICE_SEND_RESUME_SMS_IF_NEEDED_V72 = None
+
+try:
+    _ORIG_VOICE_HANDOFF_SMS_BODY_V72 = _voice_handoff_sms_body
+except Exception:
+    _ORIG_VOICE_HANDOFF_SMS_BODY_V72 = None
+
+try:
+    _ORIG_CONVERSATION_SNAPSHOT_V72 = _conversation_snapshot
+except Exception:
+    _ORIG_CONVERSATION_SNAPSHOT_V72 = None
+
+
+def _v72_low(text: str) -> str:
+    try:
+        return _intent_text(text or '')
+    except Exception:
+        return str(text or '').lower()
+
+
+def _v72_extract_email(text: str) -> str | None:
+    try:
+        e = v13_extract_email(text or '')
+    except Exception:
+        e = None
+    if not e:
+        m = re.search(r"[a-z0-9._%+\-]+\s*(?:@| at )\s*[a-z0-9.\-]+\s*(?:\.| dot )\s*[a-z]{2,}", str(text or ''), flags=re.I)
+        if m:
+            e = m.group(0)
+    if not e:
+        return None
+    e = str(e).strip().lower()
+    e = re.sub(r"\s+at\s+", "@", e, flags=re.I)
+    e = re.sub(r"\s+dot\s+", ".", e, flags=re.I)
+    e = re.sub(r"\s+", "", e)
+    return e if re.fullmatch(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", e) else None
+
+
+def _v72_yes(text: str) -> bool:
+    try:
+        if _v45_yes(text):
+            return True
+    except Exception:
+        pass
+    low = _v72_low(text)
+    return bool(re.search(r"\b(yes|yeah|yep|yup|correct|that is correct|that's correct|right|sounds good|ok|okay|that works|it is)\b", low, flags=re.I))
+
+
+def _v72_no(text: str) -> bool:
+    try:
+        if _v45_no(text):
+            return True
+    except Exception:
+        pass
+    low = _v72_low(text)
+    return bool(re.search(r"\b(no|nope|nah|wrong|incorrect|not correct|not right|change it|different email)\b", low, flags=re.I))
+
+
+def _v72_same_email(a: str | None, b: str | None) -> bool:
+    return bool(a and b and str(a).strip().lower() == str(b).strip().lower())
+
+
+def _v72_speak_email(email: str) -> str:
+    try:
+        return _v36_spell_email_for_voice(email)
+    except Exception:
+        try:
+            return _voice_speak_email_v31(email)
+        except Exception:
+            return str(email or '')
+
+
+def _v72_plain_email_for_sms(email: str) -> str:
+    return str(email or '').strip().lower()
+
+
+def _v72_pending_email(conv: dict) -> str:
+    sched = conv.setdefault('sched', {})
+    profile = conv.setdefault('profile', {})
+    candidates = [
+        sched.get('voice_pending_email'),
+        sched.get('pending_email'),
+        sched.get('email'),
+        profile.get('active_email'),
+        profile.get('email'),
+        _v72_extract_email(conv.get('last_voice_customer_text') or ''),
+        _v72_extract_email(sched.get('last_voice_customer_text') or ''),
+    ]
+    for c in candidates:
+        e = _v72_extract_email(str(c or '')) if c else None
+        if e:
+            return e
+    return ''
+
+
+def _v72_email_confirm_active(conv: dict) -> bool:
+    sched = conv.setdefault('sched', {})
+    step = str(sched.get('pending_step') or '').lower()
+    state = str(sched.get('state') or '').lower()
+    last_reply = str(conv.get('last_voice_reply') or sched.get('last_voice_reply') or '')
+    return bool(
+        sched.get('voice_awaiting_email_confirm')
+        or step in {'need_email_confirm', 'confirm_email', 'email_confirm'}
+        or state in {'waiting_for_email_confirm', 'need_email_confirm'}
+        or (('is that correct' in _v72_low(last_reply) or 'is this correct' in _v72_low(last_reply)) and _v72_pending_email(conv))
+    )
+
+
+def _v72_set_email_confirm_state(conv: dict, email: str) -> None:
+    sched = conv.setdefault('sched', {})
+    email = _v72_plain_email_for_sms(email)
+    sched['voice_pending_email'] = email
+    sched['pending_email'] = email
+    sched['voice_awaiting_email_confirm'] = True
+    sched['voice_email_confirmed'] = False
+    sched['pending_step'] = 'need_email_confirm'
+    sched['state'] = 'waiting_for_email_confirm'
+
+
+def _v72_email_confirm_prompt(email: str, unclear: bool = False) -> str:
+    spoken = _v72_speak_email(email)
+    if unclear:
+        return f"I heard {spoken}. Please say yes if that is correct, or say the corrected email address."
+    return f"I heard {spoken}. Is that correct?"
+
+
+def _v72_append_voice_assistant(conv: dict, reply: str) -> None:
+    try:
+        conv.setdefault('voice_transcript', []).append({
+            'role': 'assistant',
+            'text': reply,
+            'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat(),
+            'source': 'v72',
+        })
+    except Exception:
+        pass
+    conv['last_voice_reply'] = reply
+    try:
+        conv.setdefault('sched', {})['last_voice_reply'] = reply
+    except Exception:
+        pass
+
+
+def _v72_append_voice_customer_once(conv: dict, text: str) -> None:
+    try:
+        transcript = conv.setdefault('voice_transcript', [])
+        if not transcript or transcript[-1].get('role') != 'customer' or transcript[-1].get('text') != text:
+            transcript.append({
+                'role': 'customer',
+                'text': text,
+                'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat(),
+                'source': 'v72_pre',
+            })
+    except Exception:
+        pass
+    conv['last_voice_customer_text'] = text
+    try:
+        conv.setdefault('sched', {})['last_voice_customer_text'] = text
+    except Exception:
+        pass
+
+
+def _v72_reply_out(conv: dict, reply: str, *, booking_created: bool = False, pending_step: str | None = None, end_call: bool = False) -> dict:
+    sched = conv.setdefault('sched', {})
+    reply = _voice_naturalize_reply(reply) if '_voice_naturalize_reply' in globals() else str(reply or '')
+    _v72_append_voice_assistant(conv, reply)
+    return {
+        'reply_to_customer': reply,
+        'booking_created': bool(booking_created),
+        'manual_only': bool(sched.get('manual_only')),
+        'pending_step': pending_step if pending_step is not None else sched.get('pending_step'),
+        'appointment_type': sched.get('appointment_type') or conv.get('appointment_type'),
+        'end_call': bool(end_call),
+    }
+
+
+def _v72_confirm_email_and_continue(phone: str, conv: dict, email: str) -> dict:
+    sched = conv.setdefault('sched', {})
+    email = _v72_plain_email_for_sms(email)
+    try:
+        out = _v36_confirmed_email_save_and_book(phone, conv, email)
+    except Exception:
+        try:
+            out = _voice_save_confirmed_email_and_maybe_book_v31(phone, conv, email)
+        except Exception as e:
+            try:
+                log_event('VOICE_V72_EMAIL_CONFIRM_SAVE_ERROR', phone, {'error': repr(e), 'email': email}, conv)
+            except Exception:
+                pass
+            v13_save_email(conv, email)
+            out = {'reply_to_customer': 'Thanks. I have the email confirmed. I will finish booking that now.', 'booking_created': False, 'manual_only': False, 'pending_step': None, 'end_call': False}
+    sched['voice_email_confirmed'] = True
+    sched['voice_awaiting_email_confirm'] = False
+    sched['voice_pending_email'] = None
+    sched['pending_email'] = None
+    # If all required details are now present, do not leave the lead in an old
+    # pending state. Some lower layers recompute stale need_address/need_email after
+    # booking attempts even when the address is explicitly verified.
+    if sched.get('address_verified') and sched.get('scheduled_date') and sched.get('scheduled_time'):
+        if str(sched.get('pending_step') or '').lower() in {'need_email', 'need_email_confirm', 'confirm_email', 'need_address'}:
+            sched['pending_step'] = None
+        if str(sched.get('state') or '').lower() in {'waiting_for_email', 'waiting_for_email_confirm', 'need_email_confirm', 'waiting_for_address', 'address_verified'}:
+            sched['state'] = 'active'
+    reply = str((out or {}).get('reply_to_customer') or '')
+    # Never repeat the email-confirm question after confirmation.
+    if _v46_is_email_confirm_prompt(reply) if '_v46_is_email_confirm_prompt' in globals() else ('is that correct' in _v72_low(reply) and 'email' in _v72_low(reply)):
+        if sched.get('address_verified') and sched.get('scheduled_date') and sched.get('scheduled_time'):
+            reply = 'Thanks. I have the email confirmed. I will finish booking that now.'
+        else:
+            try:
+                reply = choose_next_prompt_from_state(conv, inbound_text='')
+            except Exception:
+                reply = 'Thanks. What else is needed for the appointment?'
+    reply = _voice_naturalize_reply(reply) if '_voice_naturalize_reply' in globals() else reply
+    (out or {})['reply_to_customer'] = reply
+    (out or {})['pending_step'] = sched.get('pending_step')
+    conv['last_voice_reply'] = reply
+    try:
+        sched['last_voice_reply'] = reply
+    except Exception:
+        pass
+    return out or {'reply_to_customer': reply, 'booking_created': False, 'manual_only': False, 'pending_step': sched.get('pending_step'), 'appointment_type': sched.get('appointment_type') or conv.get('appointment_type'), 'end_call': False}
+
+
+def _v72_handle_email_confirm_voice_turn(phone: str, conv: dict, caller_text: str) -> dict | None:
+    sched = conv.setdefault('sched', {})
+    if not _v72_email_confirm_active(conv):
+        return None
+    text = str(caller_text or '').strip()
+    incoming_email = _v72_extract_email(text)
+    pending = _v72_pending_email(conv)
+
+    # Caller repeated the same email while we were waiting for yes/no. In voice,
+    # that is almost always an implicit confirmation, not a reason to ask again.
+    if incoming_email and pending and _v72_same_email(incoming_email, pending):
+        out = _v72_confirm_email_and_continue(phone, conv, pending)
+        try:
+            log_event('VOICE_V72_EMAIL_REPEAT_ACCEPTED_AS_CONFIRMATION', phone, {'email': pending, 'caller_text': _safe_monitor_text(text)}, conv)
+        except Exception:
+            pass
+        return out
+
+    # Caller supplied a corrected/different email. Store it and confirm once.
+    if incoming_email and (not pending or not _v72_same_email(incoming_email, pending)):
+        _v72_set_email_confirm_state(conv, incoming_email)
+        reply = _v72_email_confirm_prompt(incoming_email)
+        try:
+            log_event('VOICE_V72_EMAIL_CORRECTION_CAPTURED', phone, {'old_email': pending, 'new_email': incoming_email, 'caller_text': _safe_monitor_text(text)}, conv)
+        except Exception:
+            pass
+        return _v72_reply_out(conv, reply, booking_created=False, pending_step='need_email_confirm', end_call=False)
+
+    if _v72_yes(text) and pending:
+        out = _v72_confirm_email_and_continue(phone, conv, pending)
+        try:
+            log_event('VOICE_V72_EMAIL_YES_ACCEPTED', phone, {'email': pending, 'caller_text': _safe_monitor_text(text)}, conv)
+        except Exception:
+            pass
+        return out
+
+    if _v72_no(text):
+        sched['voice_awaiting_email_confirm'] = False
+        sched['voice_email_confirmed'] = False
+        sched['voice_pending_email'] = None
+        sched['pending_email'] = None
+        sched['pending_step'] = 'need_email'
+        sched['state'] = 'waiting_for_email'
+        reply = 'No problem. Please say the corrected email address slowly.'
+        try:
+            log_event('VOICE_V72_EMAIL_CONFIRM_REJECTED', phone, {'caller_text': _safe_monitor_text(text), 'old_email': pending}, conv)
+        except Exception:
+            pass
+        return _v72_reply_out(conv, reply, booking_created=False, pending_step='need_email', end_call=False)
+
+    # Unclear utterance while waiting for confirmation. Do not loop by asking for
+    # the whole email again; ask for yes or a corrected email.
+    if pending:
+        reply = _v72_email_confirm_prompt(pending, unclear=True)
+        try:
+            log_event('VOICE_V72_EMAIL_CONFIRM_UNCLEAR', phone, {'email': pending, 'caller_text': _safe_monitor_text(text)}, conv)
+        except Exception:
+            pass
+        return _v72_reply_out(conv, reply, booking_created=False, pending_step='need_email_confirm', end_call=False)
+
+    sched['pending_step'] = 'need_email'
+    sched['state'] = 'waiting_for_email'
+    return _v72_reply_out(conv, 'Please say the best email address for the appointment.', booking_created=False, pending_step='need_email', end_call=False)
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or '').replace('whatsapp:', '').strip()
+    text = _voice_to_sms_text(caller_text or '') if '_voice_to_sms_text' in globals() else str(caller_text or '')
+
+    # Highest priority above all older voice layers: email confirm is a small
+    # deterministic state machine. Do not let the general LLM path handle it.
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre['phone'] = p
+        _v72_append_voice_customer_once(conv_pre, text)
+        pre = _v72_handle_email_confirm_voice_turn(p, conv_pre, text)
+        if pre:
+            return pre
+    except Exception as e:
+        try:
+            log_event('VOICE_V72_EMAIL_PRE_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V72(phone, call_sid, text) if _ORIG_PROCESS_PREVOLT_VOICE_TURN_V72 else {'reply_to_customer': 'Sorry, can you say that again?', 'booking_created': False, 'manual_only': False, 'end_call': False}
+
+    # Post-guard: if an older layer created a confirmation prompt, make sure the
+    # canonical state says need_email_confirm so resume SMS and the Command Center
+    # know exactly what is happening.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv['phone'] = p
+        sched = conv.setdefault('sched', {})
+        reply = str((out or {}).get('reply_to_customer') or '')
+        incoming_email = _v72_extract_email(text)
+        if incoming_email and ('is that correct' in _v72_low(reply) or (('_v46_is_email_confirm_prompt' in globals()) and _v46_is_email_confirm_prompt(reply))):
+            _v72_set_email_confirm_state(conv, incoming_email)
+            out['pending_step'] = 'need_email_confirm'
+            conv['last_voice_reply'] = reply
+            sched['last_voice_reply'] = reply
+            try:
+                log_event('VOICE_V72_EMAIL_CONFIRM_STATE_SET', p, {'email': incoming_email, 'reply': _safe_monitor_text(reply), 'call_sid': call_sid}, conv)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            log_event('VOICE_V72_EMAIL_POST_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+    return out
+
+
+def _v72_email_resume_sms_body(conv: dict) -> str | None:
+    if not isinstance(conv, dict):
+        return None
+    if not _v72_email_confirm_active(conv):
+        return None
+    email = _v72_pending_email(conv)
+    if email:
+        return f"This is Prevolt Electric. We got the appointment almost finished over the phone. Please reply YES to confirm {email}, or reply with the corrected email address."
+    return "This is Prevolt Electric. We got the appointment almost finished over the phone. Please reply with the best email address for the appointment."
+
+
+def _voice_send_resume_sms_if_needed(phone: str, conv: dict, reason: str = '') -> None:
+    # Special-case need_email_confirm before the older generic resume SMS.
+    try:
+        if not VOICE_AGENT_HANGUP_SMS_ENABLED:
+            return
+        if not phone or not (twilio_client and TWILIO_FROM_NUMBER):
+            return
+        sched = conv.setdefault('sched', {})
+        if sched.get('booking_created') or sched.get('voice_resume_sms_sent') or sched.get('voice_intro_sms_sent') or sched.get('manual_only'):
+            return
+        body = _v72_email_resume_sms_body(conv)
+        if body:
+            msg = twilio_client.messages.create(body=body, from_=TWILIO_FROM_NUMBER, to=phone)
+            sched['voice_resume_sms_sent'] = True
+            sched['voice_resume_sms_reason'] = reason
+            sched['voice_resume_sms_sid'] = getattr(msg, 'sid', None)
+            conv['last_sms_body'] = body
+            try:
+                log_event('VOICE_V72_EMAIL_CONFIRM_RESUME_SMS_SENT', phone, {'sid': getattr(msg, 'sid', None), 'reason': reason, 'body': body, 'call_sid': conv.get('last_call_sid')}, conv)
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        try:
+            conv.setdefault('sched', {})['voice_resume_sms_error'] = repr(e)
+            log_event('VOICE_V72_EMAIL_CONFIRM_RESUME_SMS_FAILED', phone, {'error': repr(e), 'reason': reason}, conv)
+        except Exception:
+            pass
+        return
+    if _ORIG_VOICE_SEND_RESUME_SMS_IF_NEEDED_V72:
+        return _ORIG_VOICE_SEND_RESUME_SMS_IF_NEEDED_V72(phone, conv, reason)
+    return None
+
+
+def _voice_handoff_sms_body(conv: dict | None = None) -> str:
+    body = _v72_email_resume_sms_body(conv or {})
+    if body:
+        return body
+    if _ORIG_VOICE_HANDOFF_SMS_BODY_V72:
+        return _ORIG_VOICE_HANDOFF_SMS_BODY_V72(conv)
+    return "This is Prevolt Electric. We got started over the phone. Please reply here so we can finish getting you on the schedule."
+
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    snap = _ORIG_CONVERSATION_SNAPSHOT_V72(phone, conv) if _ORIG_CONVERSATION_SNAPSHOT_V72 else {}
+    try:
+        sched = (conv or {}).get('sched') or {}
+        snap['voice_email_confirm_active'] = _v72_email_confirm_active(conv or {})
+        snap['voice_pending_email'] = sched.get('voice_pending_email') or sched.get('pending_email')
+        snap['voice_email_confirmed'] = bool(sched.get('voice_email_confirmed'))
+        if snap.get('voice_email_confirm_active') and snap.get('pending_step') in {None, '', 'need_email'}:
+            snap['pending_step'] = 'need_email_confirm'
+    except Exception:
+        pass
+    return snap
