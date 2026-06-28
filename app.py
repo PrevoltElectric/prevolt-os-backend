@@ -22462,3 +22462,601 @@ def _v76_selftest() -> dict:
         'gmail_repair_2': _v76_extract_voice_email('amy.m.boyko.gmail.com'),
         'pending_local_repair': _v76_extract_voice_email('amy.m.boyko.com', pending='amy.m.boyko@gmail.com'),
     }
+
+
+# =============================
+# v77 — voice price consent + offered-slot matching + clean address prompt
+# =============================
+# Live failures fixed from 2026-06-28 testing:
+# 1) Voice sometimes asked: "What’s the street number on <customer scope>?".
+#    v77 short-circuits first service-scope turns into a clean address request.
+# 2) After the $195 service-visit explanation, the voice reply sometimes stopped
+#    without asking for consent. v77 uses a single required consent sentence.
+# 3) If the caller chose an offered slot by saying "Tuesday July 7th 9 AM", older
+#    date parsing could misread it as Tuesday June 30, then the v76 guard rejected
+#    it. v77 matches against the actual offered_slot_options before generic date parsing.
+# 4) If the caller asks for a blackout/vacation day after offered slots, the bot
+#    re-offers available Square slots instead of asking for a time on the bad day.
+
+try:
+    _ORIG_V77_PROCESS_PREVOLT_VOICE_TURN = process_prevolt_voice_turn
+except Exception:
+    _ORIG_V77_PROCESS_PREVOLT_VOICE_TURN = None
+try:
+    _ORIG_V77_V71_SERVICE_VISIT_PRICE_REPLY = _v71_service_visit_price_reply
+except Exception:
+    _ORIG_V77_V71_SERVICE_VISIT_PRICE_REPLY = None
+try:
+    _ORIG_V77_CONVERSATION_SNAPSHOT = _conversation_snapshot
+except Exception:
+    _ORIG_V77_CONVERSATION_SNAPSHOT = None
+
+_V77_SERVICE_VISIT_CONSENT_TEXT = (
+    "We start with a $195 service visit. That covers sending an electrician out, "
+    "reviewing the issue in person, and handling straightforward troubleshooting or small repairs when possible. "
+    "If additional work or parts are needed, we’ll confirm before proceeding. "
+    "Does that work for you? This is the first step to getting your install or repair looked at."
+)
+
+
+def _v77_low(text: str) -> str:
+    try:
+        return _intent_text(text or "")
+    except Exception:
+        return str(text or "").lower()
+
+
+def _v77_voice_out(phone: str, conv: dict, reply: str, *, source: str = 'v77', pending_step: str | None = None, end_call: bool = False) -> dict:
+    sched = conv.setdefault('sched', {})
+    if pending_step is not None:
+        sched['pending_step'] = pending_step
+    try:
+        reply = _voice_naturalize_reply(reply) if '_voice_naturalize_reply' in globals() else reply
+    except Exception:
+        pass
+    try:
+        conv.setdefault('voice_transcript', []).append({
+            'role': 'assistant',
+            'source': source,
+            'text': reply,
+            'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat(),
+        })
+        conv['last_voice_reply'] = reply
+        sched['last_voice_reply'] = reply
+    except Exception:
+        pass
+    return {
+        'reply_to_customer': reply,
+        'booking_created': bool(sched.get('booking_created') and sched.get('square_booking_id')),
+        'manual_only': bool(sched.get('manual_only')),
+        'pending_step': sched.get('pending_step'),
+        'appointment_type': 'EVAL_195',
+        'end_call': bool(end_call),
+    }
+
+
+def _v77_remember_customer_voice(conv: dict, caller_text: str, source: str = 'v77_pre') -> None:
+    try:
+        conv.setdefault('voice_transcript', []).append({
+            'role': 'customer',
+            'source': source,
+            'text': str(caller_text or ''),
+            'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat(),
+        })
+        conv['last_voice_customer_text'] = str(caller_text or '')
+    except Exception:
+        pass
+
+
+def _v77_yes(text: str) -> bool:
+    low = _v77_low(text)
+    try:
+        return bool(_v72_yes(text))
+    except Exception:
+        return bool(re.search(r"\b(yes|yeah|yep|correct|that works|sounds good|okay|ok|sure|lets do it|let's do it)\b", low, flags=re.I))
+
+
+def _v77_no(text: str) -> bool:
+    low = _v77_low(text)
+    try:
+        return bool(_v72_no(text))
+    except Exception:
+        return bool(re.search(r"\b(no|nope|nah|not correct|wrong|does not work|doesn't work|too much|no thanks)\b", low, flags=re.I))
+
+
+def _v77_has_full_or_partial_address(text: str) -> bool:
+    try:
+        if _v71_line_from_text(text):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(extract_service_address_from_text(text))
+    except Exception:
+        return False
+
+
+def _v77_looks_like_initial_service_scope(text: str) -> bool:
+    low = _v77_low(text)
+    if not low or _v77_has_full_or_partial_address(text):
+        return False
+    if len(low.split()) > 32:
+        # Still allow normal spoken service requests, but avoid swallowing long stories.
+        pass
+    strong_patterns = [
+        r"\bneed\s+(?:an?\s+)?electrician\b",
+        r"\blooking\s+to\s+have\s+(?:an?\s+)?electrician\b",
+        r"\boutlets?\s+(?:stopped|stop|not|aren'?t|arent|isn'?t|isnt|dead|no\s+power)",
+        r"\blights?\s+(?:stopped|not|aren'?t|arent|isn'?t|isnt|dead)",
+        r"\bservice\s+upgrade\b",
+        r"\bpanel\s+upgrade\b",
+        r"\bev\s+charger\b",
+        r"\bhot\s+tub\b",
+        r"\binstall\b.*\b(outlet|switch|light|fan|charger|panel|service)\b",
+        r"\breplace\b.*\b(outlet|switch|light|fan|breaker|panel)\b",
+    ]
+    if any(re.search(p, low, flags=re.I) for p in strong_patterns):
+        return True
+    try:
+        return bool(('v69_looks_like_service_scope' in globals()) and v69_looks_like_service_scope(text))
+    except Exception:
+        return False
+
+
+def _v77_needs_address_now(conv: dict) -> bool:
+    sched = conv.setdefault('sched', {})
+    if sched.get('address_verified'):
+        return False
+    pending = str(sched.get('pending_step') or '').lower()
+    state = str(sched.get('state') or '').lower()
+    missing = str(sched.get('address_missing') or '').lower()
+    return bool(pending in {'', 'need_address', 'none'} or state in {'', 'waiting_for_address'} or missing in {'', 'street', 'number', 'city_state', 'state', 'city'})
+
+
+def _v77_initial_scope_address_prompt(phone: str, conv: dict, caller_text: str) -> dict | None:
+    if not _v77_needs_address_now(conv):
+        return None
+    if not _v77_looks_like_initial_service_scope(caller_text):
+        return None
+    sched = conv.setdefault('sched', {})
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    sched['pending_step'] = 'need_address'
+    sched['state'] = 'waiting_for_address'
+    sched['address_missing'] = 'street'
+    sched['booking_allowed'] = True
+    # Preserve the actual customer request for Square notes, but do not use it inside the address question.
+    try:
+        sched.setdefault('customer_request', str(caller_text or '').strip())
+        sched.setdefault('scope_raw', str(caller_text or '').strip())
+    except Exception:
+        pass
+    reply = "I can get your appointment scheduled here. What is the full address for the work, including the town and state?"
+    try:
+        log_event('VOICE_V77_CLEAN_INITIAL_ADDRESS_PROMPT', phone, {'caller_text': _safe_monitor_text(caller_text), 'reply': reply}, conv)
+    except Exception:
+        pass
+    return _v77_voice_out(phone, conv, reply, source='v77_initial_address', pending_step='need_address', end_call=False)
+
+
+def _v71_service_visit_price_reply(conv: dict) -> str:
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    sched = conv.setdefault('sched', {}) if isinstance(conv, dict) else {}
+    try:
+        sched['awaiting_eval_price_confirm'] = True
+        sched['eval_price_accepted'] = False
+        sched['price_disclosed'] = True
+        sched['pending_step'] = 'need_date'
+        sched['state'] = 'waiting_for_date'
+        sched['awaiting_slot_offer_choice'] = False
+    except Exception:
+        pass
+    return _V77_SERVICE_VISIT_CONSENT_TEXT
+
+
+def _v77_price_consent_needed(conv: dict) -> bool:
+    sched = conv.setdefault('sched', {})
+    if sched.get('awaiting_eval_price_confirm'):
+        return True
+    last = _v77_low(conv.get('last_voice_reply') or sched.get('last_voice_reply') or '')
+    return ('$195 service visit' in last and 'does that work' in last and not sched.get('eval_price_accepted'))
+
+
+def _v77_offer_current_slots(phone: str, conv: dict, prefix: str = 'Great.') -> dict:
+    sched = conv.setdefault('sched', {})
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    sched['awaiting_eval_price_confirm'] = False
+    sched['eval_price_accepted'] = True
+    sched['price_disclosed'] = True
+    sched['pending_step'] = 'need_date'
+    sched['state'] = 'waiting_for_date'
+    try:
+        slots = get_next_available_slots('EVAL_195', limit=3, days_ahead=30)
+    except Exception:
+        slots = []
+    slots = [_v74_coerce_slot_option(s) for s in (slots or [])] if '_v74_coerce_slot_option' in globals() else (slots or [])
+    if slots:
+        sched['awaiting_slot_offer_choice'] = True
+        sched['offered_slot_options'] = slots[:3]
+        sched['scheduled_date'] = None
+        sched['scheduled_time'] = None
+        sched.pop('scheduled_time_source', None)
+        sched['slot_blocked_reason'] = None
+        reply = f"{prefix} We have {_format_slot_options(slots[:3])}. Which one works best?"
+    else:
+        sched['awaiting_slot_offer_choice'] = False
+        sched['offered_slot_options'] = []
+        reply = "Thanks. I’m not seeing clean openings on the live calendar right now. Please text us here and we will finish scheduling manually."
+    try:
+        log_event('VOICE_V77_PRICE_ACCEPTED_OFFER_SLOTS', phone, {'reply': _safe_monitor_text(reply)}, conv)
+    except Exception:
+        pass
+    return _v77_voice_out(phone, conv, reply, source='v77_offer_slots', pending_step='need_date', end_call=False)
+
+
+def _v77_handle_price_consent(phone: str, conv: dict, caller_text: str) -> dict | None:
+    if not _v77_price_consent_needed(conv):
+        return None
+    if _v77_yes(caller_text):
+        return _v77_offer_current_slots(phone, conv, 'Great.')
+    if _v77_no(caller_text):
+        sched = conv.setdefault('sched', {})
+        sched['awaiting_eval_price_confirm'] = False
+        sched['eval_price_accepted'] = False
+        sched['closed_reason'] = 'declined_195_service_visit'
+        conv['thread_type'] = 'closed_lost'
+        sched['pending_step'] = None
+        sched['state'] = 'closed_lost'
+        reply = "No problem. We’ll stop the scheduling messages."
+        try:
+            log_event('VOICE_V77_PRICE_DECLINED', phone, {'caller_text': _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+        return _v77_voice_out(phone, conv, reply, source='v77_price_declined', end_call=True)
+    return _v77_voice_out(phone, conv, _V77_SERVICE_VISIT_CONSENT_TEXT, source='v77_repeat_price', pending_step='need_date', end_call=False)
+
+
+def _v77_ordinal_choice(text: str) -> int | None:
+    low = _v77_low(text)
+    mapping = {
+        '1': 0, 'one': 0, 'first': 0, 'option 1': 0, 'number 1': 0,
+        '2': 1, 'two': 1, 'second': 1, 'option 2': 1, 'number 2': 1,
+        '3': 2, 'three': 2, 'third': 2, 'option 3': 2, 'number 3': 2,
+    }
+    if low in mapping:
+        return mapping[low]
+    for phrase, idx in mapping.items():
+        if len(phrase) > 1 and re.search(r"\b" + re.escape(phrase) + r"\b", low):
+            return idx
+    return None
+
+
+def _v77_slot_words(slot: dict) -> dict:
+    d = str(slot.get('date') or '')
+    t = str(slot.get('time') or '')
+    try:
+        dt = datetime.strptime(d, '%Y-%m-%d')
+    except Exception:
+        dt = None
+    words = {'date': d, 'time': t, 'weekday': '', 'weekday_short': '', 'month': '', 'month_short': '', 'day': '', 'label_low': _v77_low(slot.get('label') or '')}
+    if dt:
+        words['weekday'] = dt.strftime('%A').lower()
+        words['weekday_short'] = dt.strftime('%a').lower()
+        words['month'] = dt.strftime('%B').lower()
+        words['month_short'] = dt.strftime('%b').lower()
+        words['day'] = str(dt.day)
+    try:
+        words['human_time'] = _v77_low(humanize_time(t)) if 'humanize_time' in globals() else t
+    except Exception:
+        words['human_time'] = t
+    return words
+
+
+def _v77_text_mentions_slot_date(text: str, slot: dict) -> bool:
+    low = _v77_low(text)
+    w = _v77_slot_words(slot)
+    if not w.get('date'):
+        return False
+    day = re.escape(w.get('day') or '')
+    # ISO date or slash dates.
+    try:
+        dt = datetime.strptime(w['date'], '%Y-%m-%d')
+        slash1 = f"{dt.month}/{dt.day}"
+        slash2 = f"{dt.month}-{dt.day}"
+        if slash1 in low or slash2 in low or w['date'] in low:
+            return True
+    except Exception:
+        pass
+    month_hit = bool(w.get('month') and re.search(r"\b" + re.escape(w['month']) + r"\b", low)) or bool(w.get('month_short') and re.search(r"\b" + re.escape(w['month_short']) + r"\b", low))
+    day_hit = bool(day and re.search(r"\b" + day + r"(?:st|nd|rd|th)?\b", low))
+    weekday_hit = bool(w.get('weekday') and re.search(r"\b" + re.escape(w['weekday']) + r"\b", low))
+    # Month+day is a strong exact date. Weekday alone is handled separately only when unique.
+    return bool(month_hit and day_hit) or bool(weekday_hit and month_hit and (day_hit or not re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\b", low)))
+
+
+def _v77_text_mentions_slot_time(text: str, slot: dict) -> bool:
+    low = _v77_low(text)
+    t = str(slot.get('time') or '')
+    if not t:
+        return False
+    try:
+        hh, mm = [int(x) for x in t.split(':')[:2]]
+        hour12 = hh % 12 or 12
+        ampm = 'am' if hh < 12 else 'pm'
+        variants = {
+            f"{hour12} {ampm}", f"{hour12}{ampm}", f"{hour12}:00 {ampm}", f"{hour12}:00{ampm}",
+            f"{hh}:{mm:02d}", f"{hour12}" if ampm in low else '',
+        }
+        return any(v and re.search(r"\b" + re.escape(v) + r"\b", low) for v in variants)
+    except Exception:
+        return t in low
+
+
+def _v77_match_offered_slot(conv: dict, caller_text: str) -> dict | None:
+    sched = conv.setdefault('sched', {})
+    options = [s for s in (sched.get('offered_slot_options') or []) if isinstance(s, dict)]
+    if not (sched.get('awaiting_slot_offer_choice') and options):
+        return None
+    low = _v77_low(caller_text)
+    if not low:
+        return None
+    idx = _v77_ordinal_choice(caller_text)
+    if idx is not None and 0 <= idx < len(options):
+        return options[idx]
+
+    # Strong direct match against the label text.
+    for slot in options:
+        label = _v77_low(slot.get('label') or '')
+        if label and (label in low or low in label) and len(low.split()) >= 2:
+            return slot
+
+    # Month/day or full date match, with optional time.
+    date_matches = [slot for slot in options if _v77_text_mentions_slot_date(caller_text, slot)]
+    if len(date_matches) == 1:
+        # If a time is spoken, make sure it matches the offered time.
+        if re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", low, flags=re.I):
+            if _v77_text_mentions_slot_time(caller_text, date_matches[0]):
+                return date_matches[0]
+            return None
+        return date_matches[0]
+
+    # Unique weekday match only if exactly one offered slot has that weekday.
+    weekday_matches = []
+    for slot in options:
+        w = _v77_slot_words(slot)
+        if w.get('weekday') and re.search(r"\b" + re.escape(w['weekday']) + r"\b", low):
+            weekday_matches.append(slot)
+    if len(weekday_matches) == 1:
+        return weekday_matches[0]
+
+    # Time-only match only when the offered times are unique. If all offered options
+    # are 9 AM, "9 AM" is ambiguous and should not select a date by accident.
+    time_matches = [slot for slot in options if _v77_text_mentions_slot_time(caller_text, slot)]
+    if len(time_matches) == 1:
+        return time_matches[0]
+    return None
+
+
+def _v77_accept_offered_slot(phone: str, conv: dict, slot: dict, caller_text: str) -> dict:
+    sched = conv.setdefault('sched', {})
+    slot = _v74_coerce_slot_option(slot) if '_v74_coerce_slot_option' in globals() else dict(slot)
+    d = str(slot.get('date') or '').strip()
+    t = str(slot.get('time') or '').strip()
+    # Never allow offered-slot acceptance on a blackout date.
+    if ('_v75_date_is_manual_blackout' in globals()) and _v75_date_is_manual_blackout(d):
+        return _v77_offer_current_slots(phone, conv, 'That date is blocked off on our calendar.')
+    sched['appointment_type'] = 'EVAL_195'
+    conv['appointment_type'] = 'EVAL_195'
+    sched['scheduled_date'] = d
+    sched['scheduled_time'] = t
+    sched['scheduled_time_source'] = 'offered_slot_v77'
+    sched['awaiting_slot_offer_choice'] = False
+    sched['offered_slot_options'] = []
+    sched['slot_blocked_reason'] = None
+    sched['booking_created'] = False
+    sched['square_booking_id'] = None
+    sched['final_confirmation_sent'] = False
+    sched['final_confirmation_accepted'] = False
+    sched['last_final_confirmation_key'] = None
+    sched['slot_choice_locked'] = True
+    sched['v77_selected_from_offered_slot'] = True
+    sched['v77_selected_offered_slot'] = slot
+    sched['v75_exact_availability'] = slot
+    sched['pending_step'] = 'need_name'
+    sched['state'] = 'waiting_for_name'
+    label = slot.get('label') or (_humanize_slot_label(d, t) if '_humanize_slot_label' in globals() else f"{d} at {t}")
+    reply = f"Great, I have {label}. What's your first and last name?"
+    try:
+        log_event('VOICE_V77_OFFERED_SLOT_ACCEPTED', phone, {'caller_text': _safe_monitor_text(caller_text), 'slot': slot}, conv)
+    except Exception:
+        pass
+    return _v77_voice_out(phone, conv, reply, source='v77_offered_slot', pending_step='need_name', end_call=False)
+
+
+def _v77_requested_date_from_text(text: str) -> str | None:
+    # Prefer explicit month/day over weekday salvage so "Tuesday July 7th" never becomes nearby Tuesday.
+    raw = str(text or '')
+    low = _v77_low(raw)
+    months = {m.lower(): i for i, m in enumerate(['January','February','March','April','May','June','July','August','September','October','November','December'], start=1)}
+    months.update({m[:3].lower(): i for m, i in list(months.items()) if len(m) > 3})
+    m = re.search(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b", low, flags=re.I)
+    if m:
+        mon = months.get(m.group(1)[:3].lower()) or months.get(m.group(1).lower())
+        day = int(m.group(2))
+        try:
+            now = _local_now() if '_local_now' in globals() else datetime.now(_v75_local_tz() if '_v75_local_tz' in globals() else timezone.utc)
+            year = now.year
+            dt = datetime(year, mon, day)
+            if dt.date() < now.date():
+                dt = datetime(year + 1, mon, day)
+            return dt.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    try:
+        return salvage_relative_date_from_text(raw)
+    except Exception:
+        return None
+
+
+def _v77_handle_offered_slot_turn(phone: str, conv: dict, caller_text: str) -> dict | None:
+    sched = conv.setdefault('sched', {})
+    if not (sched.get('awaiting_slot_offer_choice') and (sched.get('offered_slot_options') or [])):
+        return None
+    slot = _v77_match_offered_slot(conv, caller_text)
+    if slot:
+        return _v77_accept_offered_slot(phone, conv, slot, caller_text)
+
+    # If they asked for a date that is not one of the offered options, validate it
+    # before asking for a time. This prevents blackout/vacation dates from moving forward.
+    requested_date = _v77_requested_date_from_text(caller_text)
+    if requested_date:
+        if ('_v75_date_is_manual_blackout' in globals()) and _v75_date_is_manual_blackout(requested_date):
+            return _v77_offer_current_slots(phone, conv, 'That date is blocked off on our calendar.')
+        try:
+            day_slots = search_square_availability_for_day(requested_date, 'EVAL_195')
+        except Exception:
+            day_slots = []
+        if not day_slots:
+            return _v77_offer_current_slots(phone, conv, 'That date is not showing as available on our calendar.')
+        # If the requested date is available but not in the current three choices,
+        # offer actual slots on that date instead of asking an open-ended time.
+        sched['awaiting_slot_offer_choice'] = True
+        sched['offered_slot_options'] = day_slots[:3]
+        sched['scheduled_date'] = None
+        sched['scheduled_time'] = None
+        sched.pop('scheduled_time_source', None)
+        reply = f"For {_date_label_for_sms(requested_date) if '_date_label_for_sms' in globals() else requested_date}, I have {_format_slot_options(day_slots[:3])}. Which one works best?"
+        return _v77_voice_out(phone, conv, reply, source='v77_date_slots', pending_step='need_date', end_call=False)
+
+    # Time-only while multiple offered slots share that time is ambiguous.
+    if re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", _v77_low(caller_text), flags=re.I):
+        opts = _format_slot_options(sched.get('offered_slot_options') or [])
+        return _v77_voice_out(phone, conv, f"I have {opts}. Which one works best?", source='v77_time_ambiguous', pending_step='need_date', end_call=False)
+    return None
+
+
+def _v77_fix_price_reply(reply: str, conv: dict) -> str:
+    low = _v77_low(reply)
+    service_low = _v77_low(_V74_SERVICE_VISIT_TEXT) if '_V74_SERVICE_VISIT_TEXT' in globals() else '$195 service visit'
+    # If the reply is the bare v74 service text, add the missing consent ask.
+    if '$195 service visit' in low and 'which one works best' not in low and 'what date' not in low and 'what time' not in low:
+        if 'does that work' not in low:
+            try:
+                sched = conv.setdefault('sched', {})
+                sched['awaiting_eval_price_confirm'] = True
+                sched['eval_price_accepted'] = False
+                sched['price_disclosed'] = True
+                sched['pending_step'] = 'need_date'
+                sched['state'] = 'waiting_for_date'
+                sched['awaiting_slot_offer_choice'] = False
+            except Exception:
+                pass
+            return _V77_SERVICE_VISIT_CONSENT_TEXT
+    # Clean the bad address prompt if an older layer still generated it.
+    if 'street number on' in low or 'house number on' in low:
+        return "I can get your appointment scheduled here. What is the full address for the work, including the town and state?"
+    return reply
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    """v77 wrapper: deterministic voice state machine before older generic layers."""
+    p = normalize_phone(phone) if 'normalize_phone' in globals() else (phone or '').replace('whatsapp:', '').strip()
+    text = str(caller_text or '').strip()
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre['phone'] = p
+        try:
+            _v74_normalize_conv_to_195(conv_pre)
+        except Exception:
+            pass
+        _v77_remember_customer_voice(conv_pre, text, source='v77_pre')
+
+        # A) Price consent must be handled before older layers can repeat the price.
+        price = _v77_handle_price_consent(p, conv_pre, text)
+        if price:
+            return price
+
+        # B) Offered-slot selection must be matched against the stored Square options
+        # before generic date parsing can misread "Tuesday July 7th".
+        offered = _v77_handle_offered_slot_turn(p, conv_pre, text)
+        if offered:
+            return offered
+
+        # C) Clean first service-scope turn. Prevent "street number on <scope>".
+        initial = _v77_initial_scope_address_prompt(p, conv_pre, text)
+        if initial:
+            return initial
+    except Exception as e:
+        try:
+            log_event('VOICE_V77_PRE_LAYER_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_V77_PROCESS_PREVOLT_VOICE_TURN(phone, call_sid, caller_text) if _ORIG_V77_PROCESS_PREVOLT_VOICE_TURN else {'reply_to_customer': 'Sorry, can you say that again?', 'booking_created': False, 'manual_only': False, 'end_call': False}
+
+    # Final reply cleanup after older layers run.
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv['phone'] = p
+        sched = conv.setdefault('sched', {})
+        try:
+            _v74_normalize_conv_to_195(conv)
+        except Exception:
+            pass
+        reply = str((out or {}).get('reply_to_customer') or '')
+        fixed = _v77_fix_price_reply(reply, conv)
+        if fixed != reply:
+            out['reply_to_customer'] = _voice_naturalize_reply(fixed) if '_voice_naturalize_reply' in globals() else fixed
+            out['booking_created'] = False
+            out['end_call'] = False
+            out['pending_step'] = sched.get('pending_step')
+            conv['last_voice_reply'] = out['reply_to_customer']
+            sched['last_voice_reply'] = out['reply_to_customer']
+            try:
+                log_event('VOICE_V77_REPLY_CLEANED', p, {'old_reply': _safe_monitor_text(reply), 'new_reply': _safe_monitor_text(out['reply_to_customer']), 'call_sid': call_sid}, conv)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            log_event('VOICE_V77_POST_LAYER_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+    return out
+
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    snap = _ORIG_V77_CONVERSATION_SNAPSHOT(phone, conv) if _ORIG_V77_CONVERSATION_SNAPSHOT else {}
+    try:
+        sched = (conv or {}).get('sched') or {}
+        snap['v77_voice_price_slot_fix_active'] = True
+        snap['v77_selected_from_offered_slot'] = bool(sched.get('v77_selected_from_offered_slot'))
+        snap['eval_price_accepted'] = bool(sched.get('eval_price_accepted'))
+        snap['awaiting_eval_price_confirm'] = bool(sched.get('awaiting_eval_price_confirm'))
+    except Exception:
+        pass
+    return snap
+
+
+def _v77_selftest() -> dict:
+    fake = {'sched': {'awaiting_slot_offer_choice': True, 'offered_slot_options': [
+        {'date': '2026-07-07', 'time': '09:00', 'label': 'Tuesday, July 7 at 9:00 AM'},
+        {'date': '2026-07-08', 'time': '09:00', 'label': 'Wednesday, July 8 at 9:00 AM'},
+        {'date': '2026-07-09', 'time': '09:00', 'label': 'Thursday, July 9 at 9:00 AM'},
+    ]}}
+    return {
+        'active': True,
+        'price_prompt_has_consent': 'Does that work for you' in _V77_SERVICE_VISIT_CONSENT_TEXT,
+        'match_tuesday_july_7': (_v77_match_offered_slot(fake, 'Tuesday July 7th 9 AM') or {}).get('date'),
+        'match_july_7': (_v77_match_offered_slot(fake, 'July 7') or {}).get('date'),
+        'ambiguous_9am_none': _v77_match_offered_slot(fake, '9 AM') is None,
+        'initial_scope_detected': _v77_looks_like_initial_service_scope('I was looking to have an electrician come out and take a look at my outlets that stopped working'),
+        'monday_blackout': _v75_date_is_manual_blackout('2026-06-29') if '_v75_date_is_manual_blackout' in globals() else None,
+    }
