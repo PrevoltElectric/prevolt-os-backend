@@ -1876,30 +1876,21 @@ def hydrate_voice_conversation(phone: str, call_sid: str = "") -> dict:
     # Voice calls should get repeat-customer context immediately. Keep profile;
     # refresh it from Square so the assistant can confirm a saved address instead
     # of treating the caller like a new customer.
-    #
-    # LOG-ONLY DEDUPE:
-    # hydrate_voice_conversation() intentionally runs repeatedly during the live
-    # voice loop to keep booking memory stable. Do not reduce or gate those
-    # hydration calls here. Only prevent the monitor/log event from firing
-    # hundreds of times for the same call_sid.
     try:
         if phone and "hydrate_square_profile_by_phone" in globals():
             hydrate_square_profile_by_phone(profile, phone, force=is_new_voice_call)
-            profile_ready_log_key = call_sid or f"phone:{phone}"
-            if sched.get("voice_square_profile_ready_logged_call_sid") != profile_ready_log_key:
-                try:
-                    log_event("VOICE_SQUARE_PROFILE_READY", phone, {
-                        "call_sid": call_sid,
-                        "square_customer_id": profile.get("square_customer_id"),
-                        "addresses_count": len(profile.get("addresses") or []),
-                        "active_first_name": profile.get("active_first_name"),
-                        "active_last_name": profile.get("active_last_name"),
-                        "active_email_present": bool(profile.get("active_email")),
-                        "phone_variants_tried": _phone_lookup_variants(phone)[:6] if "_phone_lookup_variants" in globals() else [],
-                    }, conv)
-                    sched["voice_square_profile_ready_logged_call_sid"] = profile_ready_log_key
-                except Exception:
-                    pass
+            try:
+                log_event("VOICE_SQUARE_PROFILE_READY", phone, {
+                    "call_sid": call_sid,
+                    "square_customer_id": profile.get("square_customer_id"),
+                    "addresses_count": len(profile.get("addresses") or []),
+                    "active_first_name": profile.get("active_first_name"),
+                    "active_last_name": profile.get("active_last_name"),
+                    "active_email_present": bool(profile.get("active_email")),
+                    "phone_variants_tried": _phone_lookup_variants(phone)[:6] if "_phone_lookup_variants" in globals() else [],
+                }, conv)
+            except Exception:
+                pass
     except Exception as e:
         try:
             log_event("VOICE_SQUARE_HYDRATE_ERROR", phone, {"error": repr(e), "call_sid": call_sid})
@@ -6413,6 +6404,18 @@ def incoming_sms():
         inbound_text = lsa_customer_message
         inbound_low = inbound_text.lower().strip()
 
+    # V69: clean copied Google/LSA wrapper junk before any state logic sees it.
+    try:
+        if "v69_clean_inbound_payload" in globals():
+            inbound_text = v69_clean_inbound_payload(inbound_text)
+            inbound_low = inbound_text.lower().strip()
+    except Exception as e:
+        print("[WARN] v69 inbound cleaner failed:", repr(e))
+
+    # V69: define retry guards before the manual-only path, which also uses them.
+    inbound_fingerprint = re.sub(r"\s+", " ", inbound_low).strip()
+    now_ts = time.time()
+
     try:
         log_event("SMS_IN", phone, {"sid": inbound_sid, "body": _safe_monitor_text(inbound_text)})
     except Exception:
@@ -6563,6 +6566,41 @@ def incoming_sms():
     # Emergency flags (used by incoming_sms patch logic too)
     sched.setdefault("awaiting_emergency_confirm", False)
     sched.setdefault("emergency_approved", False)
+
+    # V69 Command Center resolver:
+    # Merge out-of-order name/address/date/time/scope data before any old pending_step branch.
+    try:
+        if "v69_pre_response_state_resolver" in globals():
+            v69_resolver_reply = v69_pre_response_state_resolver(conv, inbound_text, phone=phone)
+        else:
+            v69_resolver_reply = None
+    except Exception as e:
+        print("[WARN] v69 pre-response resolver failed:", repr(e))
+        v69_resolver_reply = None
+
+    if v69_resolver_reply == "__SUPPRESS__":
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        try:
+            log_event("V69_PRE_RESPONSE_SUPPRESSED", phone, {"body": _safe_monitor_text(inbound_text)}, conv)
+        except Exception:
+            pass
+        return Response(str(MessagingResponse()), mimetype="text/xml")
+
+    if v69_resolver_reply:
+        v69_resolver_reply = v69_polish_sms_body(v69_resolver_reply) if "v69_polish_sms_body" in globals() else v69_resolver_reply
+        conv["last_inbound_sid"] = inbound_sid
+        conv["last_inbound_fingerprint"] = inbound_fingerprint
+        conv["last_inbound_fingerprint_ts"] = now_ts
+        conv["last_sms_body"] = v69_resolver_reply
+        try:
+            log_event("V69_PRE_RESPONSE_REPLY", phone, {"body": _safe_monitor_text(v69_resolver_reply)}, conv)
+        except Exception:
+            pass
+        tw = MessagingResponse()
+        tw.message(v69_resolver_reply)
+        return Response(str(tw), mimetype="text/xml")
 
     # Customer hard-stop and correction gates run before every pending_step handler.
     hard_stop_reason = detect_customer_hard_stop(inbound_text)
@@ -7329,6 +7367,12 @@ def incoming_sms():
         except Exception:
             pass
         return Response(str(MessagingResponse()), mimetype="text/xml")
+
+    try:
+        if "v69_polish_sms_body" in globals():
+            sms_body = v69_polish_sms_body(sms_body)
+    except Exception as e:
+        print("[WARN] v69 final sms polish failed:", repr(e))
 
     conv["last_inbound_sid"] = inbound_sid
     conv["last_inbound_fingerprint"] = inbound_fingerprint
@@ -19200,3 +19244,721 @@ def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> d
             pass
 
     return out
+
+
+# =============================
+# v69 COMMAND CENTER STATE RESOLVER + FAILURE-SIM HOTFIX LAYER
+# =============================
+# This layer addresses the Command Center screenshot failures without disturbing
+# the older voice/SMS layers. It intentionally wraps existing helpers instead of
+# deleting them:
+#   1. pre-response state resolver for out-of-order customer data
+#   2. address component merge and verification
+#   3. hard-stop / manual interruption detection
+#   4. scope classification before booking
+#   5. improved $195 wording
+#   6. date/time/window parsing for real scheduling replies
+#   7. combined name/address/date/time extraction
+#   8. closed/manual reason normalization
+#   9. LSA wrapper cleanup + monitor snapshot clarity
+
+_ORIG_V69_extract_service_address_from_text = extract_service_address_from_text
+_ORIG_V69_update_address_assembly_state = update_address_assembly_state
+_ORIG_V69_extract_explicit_time_from_text = extract_explicit_time_from_text
+_ORIG_V69_salvage_relative_date_from_text = salvage_relative_date_from_text
+_ORIG_V69_detect_customer_hard_stop = detect_customer_hard_stop
+_ORIG_V69_apply_customer_hard_stop = apply_customer_hard_stop
+_ORIG_V69_looks_like_vendor_sales_or_spam = looks_like_vendor_sales_or_spam
+_ORIG_V69_detect_non_service_thread_type = detect_non_service_thread_type
+_ORIG_V69_build_price_and_availability_prompt = build_price_and_availability_prompt
+_ORIG_V69_build_address_prompt = build_address_prompt
+_ORIG_V69_prevolt_eval_price_line = prevolt_eval_price_line
+_ORIG_V69_sanitize_sms_body = sanitize_sms_body
+_ORIG_V69_interruption_answer_and_return_prompt = interruption_answer_and_return_prompt
+_ORIG_V69_monitor_state_label = _monitor_state_label
+_ORIG_V69_conversation_snapshot = _conversation_snapshot
+
+_V69_CT_TOWNS = {
+    "avon", "berlin", "bloomfield", "bristol", "canton", "east granby", "east hartford",
+    "east windsor", "ellington", "enfield", "farmington", "glastonbury", "granby",
+    "hartford", "manchester", "new britain", "newington", "plainville", "rocky hill",
+    "simsbury", "south windsor", "southington", "suffield", "tolland", "vernon",
+    "west hartford", "wethersfield", "windsor", "windsor locks",
+}
+_V69_MA_TOWNS = {
+    "agawam", "chicopee", "east longmeadow", "feeding hills", "holyoke", "longmeadow",
+    "ludlow", "monson", "palmer", "springfield", "west springfield", "westfield", "wilbraham",
+}
+_V69_STREET_SUFFIX_RE = r"(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|ct|court|cir|circle|blvd|boulevard|way|pkwy|parkway|ter|terrace|pl|place|park)"
+_V69_STOP_TAIL_RE = re.compile(
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|late\s+am|early\s+pm|morning|afternoon|evening|noon|at\s+\d|from\s+\d|after\s+\d|before\s+\d|\d{1,2}:\d{2}|anytime|any\s+time|quote|please|thank|thanks|do\s+you|can\s+you|would\s+you|will\s+you|how\s+much|bill|cost|price)\b",
+    flags=re.I,
+)
+
+
+def v69_clean_inbound_payload(text: str) -> str:
+    """Strip Google/LSA wrapper noise while preserving customer-authored content."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    s = raw.replace("\r", "\n")
+    # Google notification forwards often paste a full footer after the address/message.
+    s = re.split(r"\s*>\s*Google\s*>|\s*>\s*LLC\s*>|\bGoogle\s+LLC\b|\b1600\s+Amphitheatre\s+Parkway\b|\bYou've received this mandatory service announcement\b", s, maxsplit=1, flags=re.I)[0].strip()
+    m = re.search(r"\bMessage:\s*(.+)$", s, flags=re.I | re.S)
+    if m:
+        s = m.group(1).strip()
+    s = re.split(r"\b(?:Reply here|Replies to this number|respond via LSA dashboard|https://g\.co/homeservices|Local Services request on Google)\b", s, maxsplit=1, flags=re.I)[0].strip()
+    s = re.sub(r"\s+", " ", s).strip(" >")
+    return s or raw
+
+
+def v69_polish_sms_body(body: str) -> str:
+    """Final customer-facing wording cleanup, especially for the old $195 phrase."""
+    s = " ".join(str(body or "").split()).strip()
+    if not s:
+        return s
+    replacements = [
+        (
+            r"We start with a \$195 on-site evaluation visit\. That covers sending one of our electricians out, reviewing the work in person, checking what is needed, and putting together the next step\. ?",
+            "We start with a $195 service visit. That covers sending an electrician out, reviewing the issue in person, and handling straightforward troubleshooting or small repairs when possible. If additional work or parts are needed, we’ll confirm before proceeding. ",
+        ),
+        (
+            r"The on-site evaluation visit is \$195\. ?",
+            "The service visit is $195. ",
+        ),
+        (
+            r"\$195 on-site evaluation visit",
+            "$195 service visit",
+        ),
+        (
+            r"on-site evaluation visit",
+            "service visit",
+        ),
+    ]
+    for pat, repl in replacements:
+        s = re.sub(pat, repl, s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def prevolt_eval_price_line(appt_type: str) -> str:
+    appt = (appt_type or "").upper()
+    if "TROUBLESHOOT" in appt:
+        return "Troubleshoot and repair visits are $395."
+    if "INSPECTION" in appt:
+        return "The whole-home inspection is $395."
+    return "We start with a $195 service visit. That covers sending an electrician out, reviewing the issue in person, and handling straightforward troubleshooting or small repairs when possible. If additional work or parts are needed, we’ll confirm before proceeding."
+
+
+def sanitize_sms_body(s: str, *, booking_created: bool) -> str:
+    return v69_polish_sms_body(_ORIG_V69_sanitize_sms_body(s, booking_created=booking_created))
+
+
+def build_price_and_availability_prompt(conv: dict, appt_type: str = "EVAL_195") -> str:
+    sched = (conv or {}).setdefault("sched", {}) if isinstance(conv, dict) else {}
+    appt = (appt_type or sched.get("appointment_type") or "EVAL_195").upper()
+    if not sched.get("appointment_type"):
+        sched["appointment_type"] = appt
+    if isinstance(conv, dict):
+        conv["appointment_type"] = sched.get("appointment_type") or appt
+    sched["booking_allowed"] = True
+    try:
+        slots = get_next_available_slots(appt, limit=3)
+    except Exception as e:
+        print("[WARN] v69 price prompt slot lookup failed:", repr(e))
+        slots = []
+    if "TROUBLESHOOT" in appt:
+        intro = "We have availability to come and take a look. Troubleshoot and repair visits are $395."
+    elif "INSPECTION" in appt:
+        intro = "We have availability to come and take a look. The whole-home inspection is $395."
+    else:
+        intro = prevolt_eval_price_line(appt)
+    if slots:
+        sched["awaiting_slot_offer_choice"] = True
+        sched["offered_slot_options"] = slots[:3]
+        opts = format_command_center_slot_list(slots)
+        return f"{intro} If that sounds good, we have {opts}. Which one works best for you?"
+    return f"{intro} If that sounds good, what weekday and time work best for you?"
+
+
+def v69_state_from_text(text: str) -> str | None:
+    low = _intent_text(text or "")
+    if re.search(r"\b(?:ct|connecticut|conn)\b", low):
+        return "CT"
+    if re.search(r"\b(?:ma|mass|massachusetts)\b", low):
+        return "MA"
+    return None
+
+
+def v69_known_town_state(town: str) -> str | None:
+    t = re.sub(r"[^a-z ]+", " ", str(town or "").lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    if t in _V69_CT_TOWNS:
+        return "CT"
+    if t in _V69_MA_TOWNS:
+        return "MA"
+    return None
+
+
+def v69_title_town(town: str) -> str:
+    return " ".join(w.capitalize() for w in str(town or "").split())
+
+
+def v69_extract_service_address_from_text(text: str) -> str | None:
+    raw = " ".join(str(text or "").replace("\n", " ").split()).strip()
+    if not raw:
+        return None
+    raw = v69_clean_inbound_payload(raw)
+    raw_no_phone = re.sub(r"\b\+?1?\s*\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b", " ", raw)
+    # Unit can appear before or after town. Build from line + a cleaned tail;
+    # do not let the line group swallow date/time words.
+    pattern = re.compile(
+        rf"\b(?P<line>\d{{1,6}}(?:-\d{{1,6}})?[A-Za-z]?\s+[A-Za-z0-9.'#\- ]+?\b{_V69_STREET_SUFFIX_RE}\b)(?P<tail>[^.;!?]*)",
+        flags=re.I,
+    )
+    candidates = []
+    for m in pattern.finditer(raw_no_phone):
+        line = (m.group("line") or "").strip(" ,.;")
+        tail = (m.group("tail") or "")
+        cut = _V69_STOP_TAIL_RE.search(tail)
+        if cut:
+            tail = tail[:cut.start()]
+        tail = tail.strip(" ,.;")
+        candidate = scrub_non_address_tail((line + (", " + tail if tail else "")).strip(" ,.;"))
+        if candidate and _address_has_house_number_and_street(candidate):
+            candidates.append(candidate)
+    if candidates:
+        # Prefer the longest cleaned candidate that remains sane.
+        return max(candidates, key=len).strip(" ,.;")
+    try:
+        old = _ORIG_V69_extract_service_address_from_text(text)
+        return scrub_non_address_tail(old) if old else None
+    except Exception:
+        return None
+
+
+def extract_service_address_from_text(text: str) -> str | None:
+    return v69_extract_service_address_from_text(text)
+
+
+def v69_parse_address_components(raw: str) -> dict:
+    s = scrub_non_address_tail(" ".join(str(raw or "").replace("\n", " ").split()).strip(" ,.;"))
+    out = {"line1": None, "city": None, "state": None, "zip": None, "unit": None, "verified_level": "none"}
+    if not s:
+        return out
+    unit_match = re.search(r"\b(?:apt|apartment|unit|suite|ste|#)\s*([A-Za-z0-9\-]+)\b", s, flags=re.I)
+    if unit_match:
+        out["unit"] = unit_match.group(1).upper()
+    m = re.match(rf"^(?P<line1>\d{{1,6}}(?:-\d{{1,6}})?[A-Za-z]?\s+.+?\b{_V69_STREET_SUFFIX_RE}\b)(?P<tail>.*)$", s, flags=re.I)
+    if not m:
+        # route without number
+        m2 = re.match(rf"^(?P<line1>.+?\b{_V69_STREET_SUFFIX_RE}\b)(?P<tail>.*)$", s, flags=re.I)
+        if m2:
+            out["line1"] = m2.group("line1").strip(" ,.;")
+            out["verified_level"] = "street_no_number"
+        return out
+    line1 = m.group("line1").strip(" ,.;")
+    tail = (m.group("tail") or "").strip(" ,.;")
+    # Remove unit text from line/tail for cleaner city parsing.
+    line1 = re.sub(r"\b(?:apt|apartment|unit|suite|ste|#)\s*[A-Za-z0-9\-]+\b", "", line1, flags=re.I).strip(" ,.;")
+    tail = re.sub(r"\b(?:apt|apartment|unit|suite|ste|#)\s*[A-Za-z0-9\-]+\b", "", tail, flags=re.I).strip(" ,.;")
+    out["line1"] = line1
+    z = re.search(r"\b(\d{5}(?:-\d{4})?)\b", tail)
+    if z:
+        out["zip"] = z.group(1)
+        tail = (tail[:z.start()] + " " + tail[z.end():]).strip(" ,.;")
+    st = v69_state_from_text(tail)
+    if st:
+        out["state"] = st
+        tail = re.sub(r"\b(?:CT|C\.?T\.?|Connecticut|Conn\.?|MA|M\.?A\.?|Mass\.?|Massachusetts)\b", " ", tail, flags=re.I).strip(" ,.;")
+    # Clean punctuation and common noise. Whatever remains after line1 is likely town.
+    tail = re.sub(r"\s+", " ", tail.replace(",", " ")).strip(" ,.;")
+    if tail:
+        # Keep only a short town-looking fragment.
+        tail = re.split(r"\b(?:please|thank|thanks|quote|cost|price|bill|what|when|where|how|do|does|can|could|would|will)\b", tail, maxsplit=1, flags=re.I)[0].strip(" ,.;")
+        if tail and not looks_like_non_address_fragment(tail) and not re.search(r"\d", tail) and len(tail.split()) <= 4:
+            out["city"] = v69_title_town(tail)
+    if out["city"] and not out["state"]:
+        out["state"] = v69_known_town_state(out["city"])
+    if out["line1"] and out["city"] and out["state"]:
+        out["verified_level"] = "street_city_state"
+    elif out["line1"] and out["city"]:
+        out["verified_level"] = "street_city"
+    elif out["line1"]:
+        out["verified_level"] = "street_only"
+    return out
+
+
+def v69_merge_address_components(sched: dict, inbound_text: str = "") -> None:
+    raw = scrub_non_address_tail((sched.get("raw_address") or sched.get("address_candidate") or "").strip())
+    if raw:
+        set_raw_address_safe(sched, raw)
+    comp = v69_parse_address_components(raw)
+    existing = sched.get("address_components") or {}
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    for key, value in comp.items():
+        if value:
+            merged[key] = value
+    sched["address_components"] = merged
+
+
+def update_address_assembly_state(sched: dict) -> None:
+    _ORIG_V69_update_address_assembly_state(sched)
+    try:
+        raw = scrub_non_address_tail((sched.get("raw_address") or sched.get("address_candidate") or "").strip())
+        if raw:
+            sched["raw_address"] = raw
+            sched["address_candidate"] = raw
+        comp = v69_parse_address_components(raw)
+        sched["address_components"] = comp
+        line1 = comp.get("line1") or ""
+        city = comp.get("city") or ""
+        state = comp.get("state") or ""
+        zipc = comp.get("zip") or ""
+        has_num_street = bool(line1 and _address_has_house_number_and_street(line1))
+        if has_num_street and city and state:
+            sched["address_verified"] = True
+            sched["address_missing"] = None
+            sched["address_parts"] = {
+                "street": True, "number": True, "city": True, "state": True, "zip": bool(zipc), "unit": bool(comp.get("unit")), "source": "v69_components"
+            }
+            sched["normalized_address"] = {
+                "address_line_1": line1,
+                "address_line_2": (f"Unit {comp.get('unit')}" if comp.get("unit") else ""),
+                "locality": city,
+                "administrative_district_level_1": state,
+                "postal_code": zipc or "",
+                "country": "US",
+            }
+            return
+        if has_num_street and city and not state:
+            sched["address_verified"] = False
+            sched["address_missing"] = "state"
+            sched["address_parts"] = {"street": True, "number": True, "city": True, "state": False, "zip": bool(zipc), "source": "v69_components_need_state"}
+            return
+        if has_num_street and not city:
+            sched["address_verified"] = False
+            sched["address_missing"] = "confirm"
+            sched["address_parts"] = {"street": True, "number": True, "city": False, "state": bool(state), "zip": bool(zipc), "source": "v69_components_need_city"}
+            return
+        if line1 and not _address_has_house_number_and_street(line1):
+            sched["address_verified"] = False
+            sched["address_missing"] = "number"
+            return
+    except Exception as e:
+        print("[WARN] v69 address assembly failed:", repr(e))
+
+
+def build_address_prompt(sched: dict) -> str:
+    update_address_assembly_state(sched)
+    missing = (sched.get("address_missing") or "").strip().lower()
+    comp = sched.get("address_components") or {}
+    candidate = (sched.get("address_candidate") or sched.get("raw_address") or "").strip()
+    if missing == "state" and comp.get("city"):
+        return f"Is {comp.get('city')} in Connecticut or Massachusetts?"
+    if missing == "confirm" and comp.get("line1"):
+        return "What town and state is that in?"
+    return _ORIG_V69_build_address_prompt(sched)
+
+
+def extract_explicit_time_from_text(text: str) -> str | None:
+    s = _intent_text(text or "")
+    if not s:
+        return None
+    if re.search(r"\b(noon|midday)\b", s):
+        return "12:00"
+    # Explicit AM/PM.
+    m = re.search(r"\b(?:at|around|about|from|after|before|by)?\s*(\d{1,2})(?::([0-5]\d))?\s*([ap])\s*m\b", s, flags=re.I)
+    if m:
+        hh = int(m.group(1)); mm = int(m.group(2) or "00"); ap = m.group(3).lower()
+        if hh == 12:
+            hh = 0
+        if ap == "p":
+            hh += 12
+        if 0 <= hh <= 23:
+            return f"{hh:02d}:{mm:02d}"
+    # HH:MM without marker in scheduling context. Business default: 1-5 PM, 6-11 AM, 12 noon.
+    m = re.search(r"\b(?:at|around|about|from|after|before|by)?\s*(\d{1,2}):([0-5]\d)\b", s)
+    if m and not re.search(r"\b\d{1,2}:\d{2}\s*(?:volt|v|amp|a)\b", s):
+        hh = int(m.group(1)); mm = int(m.group(2))
+        if 1 <= hh <= 5:
+            hh += 12
+        elif hh == 12:
+            hh = 12
+        if 0 <= hh <= 23:
+            return f"{hh:02d}:{mm:02d}"
+    # Shorthand "Tuesday 1", "from 1 on", "after 2".
+    m = re.search(r"\b(?:at|around|about|from|after|before|by)\s+(\d{1,2})(?::([0-5]\d))?\b", s)
+    if not m and re.fullmatch(r"\s*\d{1,2}\s*", s):
+        m = re.match(r"\s*(\d{1,2})\s*", s)
+    if m:
+        hh = int(m.group(1)); mm = int(m.group(2) or "00") if m.lastindex and m.lastindex >= 2 else 0
+        if 1 <= hh <= 5:
+            hh += 12
+        elif hh == 12:
+            hh = 12
+        if 0 <= hh <= 23:
+            return f"{hh:02d}:{mm:02d}"
+    # Last resort: original, except reject 01:00/02:00 for business-context HH:MM ambiguity.
+    try:
+        old = _ORIG_V69_extract_explicit_time_from_text(text)
+        if old and re.search(r"\b\d{1,2}:\d{2}\b", s) and old.startswith("0"):
+            hh = int(old.split(":", 1)[0])
+            mm = int(old.split(":", 1)[1])
+            if 1 <= hh <= 5:
+                return f"{hh + 12:02d}:{mm:02d}"
+        return old
+    except Exception:
+        return None
+
+
+def v69_time_window_from_text(text: str) -> str | None:
+    low = _intent_text(text or "")
+    if not low:
+        return None
+    if "late am" in low or "late morning" in low:
+        if "early pm" in low or "early afternoon" in low:
+            return "late_am_or_early_pm"
+        return "late_am"
+    if "morning" in low:
+        return "morning"
+    if "afternoon" in low or "early pm" in low:
+        return "afternoon"
+    if re.search(r"\b(?:m\s*w\s*f|mon\s*wed\s*fri|monday\s+wednesday\s+friday)\b", low):
+        return "mwf"
+    return None
+
+
+def salvage_relative_date_from_text(inbound_text: str) -> str | None:
+    low = _loose_text(inbound_text)
+    if not low:
+        return None
+    # Common abbreviations from text replies: M W F / T Thu.
+    # Only choose a date when the customer names a specific day, not a broad recurring preference.
+    if re.search(r"\b(?:m\s*w\s*f|monday\s+wednesday\s+friday|mon\s+wed\s+fri)\b", low):
+        return None
+    if re.search(r"\b(?:tuesday\s+and\s+thursday|t\s+th|tu\s+th)\b", low):
+        return None
+    try:
+        return _ORIG_V69_salvage_relative_date_from_text(inbound_text)
+    except Exception:
+        return None
+
+
+def v69_extract_person_name_from_mixed_text(text: str, address: str | None = None) -> tuple[str | None, str | None]:
+    s = v69_clean_inbound_payload(text)
+    if address:
+        idx = s.lower().find(address.lower())
+        if idx >= 0:
+            s = s[:idx]
+    # "Name is Kim Kamay" / "Kim Kamay 99 Alden..."
+    s = re.sub(r"\b(?:my name is|name is|this is|i am|i'm)\b", " ", s, flags=re.I)
+    s = re.sub(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|morning|afternoon|evening|at|from|after|before|quote|please|thanks|thank|need|looking|replace|repair|install|outlet|switch|breaker|light|fan|charger|meter|update|agent|sales|call)\b.*$", " ", s, flags=re.I)
+    if any(ch.isdigit() for ch in s) or "@" in s:
+        s = re.sub(r"\d.*$", " ", s)
+    s = re.sub(r"[^A-Za-z'\-\s]", " ", s)
+    parts = [p for p in s.split() if p]
+    stop_names = {"ok", "okay", "yes", "no", "thanks", "thank", "agent", "sales", "meter", "update"}
+    parts = [p for p in parts if p.lower() not in stop_names]
+    if len(parts) >= 2 and len(parts) <= 4:
+        first = parts[0].capitalize()
+        last = " ".join(p.capitalize() for p in parts[1:])
+        return first, last
+    return None, None
+
+
+def v69_capture_name_email_address_schedule(conv: dict, inbound_text: str) -> None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    text = v69_clean_inbound_payload(inbound_text)
+    # Email
+    email = v13_extract_email(text) if "v13_extract_email" in globals() else None
+    if email:
+        profile["active_email"] = email
+        profile["email"] = email
+        sched["email"] = email
+    # Address
+    addr = extract_service_address_from_text(text)
+    if addr:
+        existing = scrub_non_address_tail(str(sched.get("raw_address") or ""))
+        if not existing or not sched.get("address_verified") or _address_has_house_number_and_street(addr):
+            set_raw_address_safe(sched, addr)
+            try:
+                if (sched.get("raw_address") or addr) not in profile.setdefault("addresses", []):
+                    profile["addresses"].append(sched.get("raw_address") or addr)
+            except Exception:
+                pass
+    # City/state fragments that arrive after a street.
+    try:
+        apply_partial_address_reply(sched, text)
+    except Exception:
+        pass
+    update_address_assembly_state(sched)
+    # Name after address extraction, so combined messages do not get missed.
+    if not (get_active_first_name(profile) and get_active_last_name(profile)):
+        fn, ln = v69_extract_person_name_from_mixed_text(text, sched.get("raw_address") or addr)
+        if fn and ln:
+            profile["active_first_name"] = fn
+            profile["active_last_name"] = ln
+            profile["first_name"] = fn
+            profile["last_name"] = ln
+            profile["identity_source"] = "v69_combined_message"
+    # Date/time/window.
+    d = salvage_relative_date_from_text(text)
+    t = extract_explicit_time_from_text(text)
+    window = v69_time_window_from_text(text)
+    if d:
+        sched["scheduled_date"] = d
+    if t:
+        sched["scheduled_time"] = t
+        sched["scheduled_time_source"] = "customer_explicit"
+    if window:
+        sched["preferred_time_window"] = window
+    # Appointment type fallback for actual service leads.
+    if not sched.get("appointment_type") and v69_scope_kind(text) not in {"spam_vendor", "manual_commercial", "possible_non_electrical", "not_ready"}:
+        if v69_looks_like_service_scope(text):
+            sched["appointment_type"] = "EVAL_195"
+            conv["appointment_type"] = "EVAL_195"
+    recompute_pending_step(profile, sched)
+
+
+def v69_looks_like_service_scope(text: str) -> bool:
+    low = _intent_text(text or "")
+    return bool(re.search(r"\b(?:electric|electrical|outlet|plug|switch|panel|breaker|light|lighting|fan|charger|ev|wire|wiring|power|hot tub|dryer|meter|inspection|inspect|repair|replace|install|quote|estimate|remodel|generator)\b", low))
+
+
+def v69_scope_kind(text: str) -> str:
+    low = _intent_text(text or "")
+    if looks_like_vendor_sales_or_spam(text):
+        return "spam_vendor"
+    if re.search(r"\b(?:speak to representative|speak to a representative|agent|representative|human|real person)\b", low):
+        return "manual_requested"
+    if re.search(r"\b(?:do not own|don't own|dont own|not own|no access|cannot access|can't access|cant access|house to be purchased|not purchased yet)\b", low):
+        return "not_ready"
+    if re.search(r"\b(?:commercial|my shop|my store|business|restaurant|office|tenant|landlord|property manager|apartment building)\b", low) and re.search(r"\b(?:inspection|walkthrough|walk through|bid|proposal|project|tenant account)\b", low):
+        return "manual_commercial"
+    if re.search(r"\b(?:generator|generac)\b", low) and re.search(r"\b(?:low oil|oil pressure|engine|won't start|wont start)\b", low):
+        return "possible_non_electrical"
+    if re.search(r"\b(?:breaker keeps tripping|tripping|spark|burning|smoke|shocked|shock)\b", low):
+        return "safety_troubleshooting"
+    if re.search(r"\b(?:meter update|meter bank|service change|panel upgrade|dryer|ev charger|hot tub|remodel|new circuit|outdoor light|ceiling fan|dimmer|fuse|box changed|box changed out|outlet|plug|switch|light)\b", low):
+        return "normal_service"
+    return "unknown"
+
+
+def looks_like_vendor_sales_or_spam(*parts) -> bool:
+    low = _intent_text(*parts)
+    if re.fullmatch(r"(?:sales call|agent|vendor|spam|solicitor)", low or ""):
+        return True
+    if "sales call from liveswitch" in low or "liveswitch" in low:
+        return True
+    return _ORIG_V69_looks_like_vendor_sales_or_spam(*parts)
+
+
+def detect_customer_hard_stop(text: str) -> str | None:
+    low = _intent_text(text or "")
+    if not low:
+        return None
+    if re.search(r"\b(?:forget it|never mind|nevermind|cancel|disregard|stop|no thanks|no thank you|pass|i'll pass|ill pass|keep you posted|i will keep you posted|i'll keep you in mind|ill keep you in mind)\b", low):
+        return "customer_withdrew"
+    if re.search(r"\$?195\s*(?:is|was)?\s*too\s+much|too expensive|price is too high|cost is too high", low):
+        return "customer_declined_price"
+    if re.search(r"\b(?:asap|preferably tomorrow|need this done tomorrow|need it tomorrow|need it done asap|earliest availability is too late)\b", low) and re.search(r"\b(?:unfortunately|need|preferably|asap|tomorrow)\b", low):
+        return "customer_needed_sooner_than_available"
+    if re.search(r"\b(?:do not own|don't own|dont own|not own|no access|don't have access|dont have access|not at the moment|house to be purchased)\b", low):
+        return "pre_purchase_no_access"
+    try:
+        return _ORIG_V69_detect_customer_hard_stop(text)
+    except Exception:
+        return None
+
+
+def apply_customer_hard_stop(conv: dict, reason: str, inbound_text: str = "") -> str:
+    sched = conv.setdefault("sched", {})
+    conv["thread_type"] = "closed_lost"
+    sched["customer_hard_stop"] = True
+    sched["booking_allowed"] = False
+    sched["pending_step"] = None
+    sched["manual_only"] = False
+    sched["follow_up_due"] = False
+    sched["awaiting_slot_offer_choice"] = False
+    sched["offered_slot_options"] = []
+    sched["last_slot_unavailable_message"] = None
+    sched["closed_reason"] = reason or "customer_hard_stop"
+    sched["closed_text"] = _safe_monitor_text(inbound_text, 240)
+    if reason == "customer_declined_price":
+        return "No problem. We’ll close this out for now."
+    if reason == "customer_needed_sooner_than_available":
+        return "Understood. We don’t have an opening that soon, so we’ll close this out for now. Keep us in mind for future projects."
+    if reason == "pre_purchase_no_access":
+        return "No problem. Once you have access to the property, message us here and we can pick it back up."
+    return "No problem. We’ll stop the scheduling messages."
+
+
+def detect_non_service_thread_type(conv: dict, inbound_text: str = "", category: str | None = None, cleaned_text: str | None = None) -> str | None:
+    kind = v69_scope_kind(" ".join(str(x or "") for x in [inbound_text, category, cleaned_text]))
+    if kind == "spam_vendor":
+        return "vendor_sales_or_spam"
+    if kind in {"manual_requested", "manual_commercial", "possible_non_electrical"}:
+        return "manual_only"
+    return _ORIG_V69_detect_non_service_thread_type(conv, inbound_text, category, cleaned_text)
+
+
+def v69_manual_or_closed_reply(conv: dict, inbound_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    kind = v69_scope_kind(inbound_text)
+    if kind == "spam_vendor":
+        clear_service_booking_state_for_non_service(conv, "vendor_sales_or_spam")
+        sched["closed_reason"] = "spam_vendor_sales_call"
+        return "__SUPPRESS__"
+    if kind == "manual_requested":
+        clear_service_booking_state_for_non_service(conv, "manual_only")
+        sched["manual_reason"] = "manual_requested"
+        sched["closed_reason"] = "manual_requested"
+        return "Thanks, we got your message. One of our team members will call you back."
+    if kind == "manual_commercial":
+        clear_service_booking_state_for_non_service(conv, "manual_only")
+        sched["manual_reason"] = "commercial_review_needed"
+        sched["closed_reason"] = "commercial_review_needed"
+        return "Got it. Since this is commercial, our office will review the details before scheduling and follow up with the next step."
+    if kind == "possible_non_electrical":
+        clear_service_booking_state_for_non_service(conv, "manual_only")
+        sched["manual_reason"] = "possible_non_electrical_generator_issue"
+        sched["closed_reason"] = "possible_non_electrical_generator_issue"
+        return "Got it. Low oil pressure on a generator may need a generator service technician rather than an electrical visit. Our office will review the details before scheduling."
+    return None
+
+
+def v69_offer_slots_for_time_window(conv: dict, inbound_text: str) -> str | None:
+    sched = conv.setdefault("sched", {})
+    window = v69_time_window_from_text(inbound_text)
+    if not window:
+        return None
+    requested_date = salvage_relative_date_from_text(inbound_text) or sched.get("scheduled_date")
+    appt = (sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195").upper()
+    sched["appointment_type"] = appt
+    conv["appointment_type"] = appt
+    if not requested_date:
+        sched["preferred_time_window"] = window
+        sched["pending_step"] = "need_date"
+        return "Got it. What weekday works best for that time window?"
+    sched["scheduled_date"] = requested_date
+    try:
+        slots = search_square_availability_for_day(requested_date, appt)
+    except Exception:
+        slots = []
+    def in_window(t: str) -> bool:
+        try:
+            hh, mm = [int(x) for x in str(t).split(":")[:2]]
+            minutes = hh * 60 + mm
+        except Exception:
+            return False
+        if window == "morning":
+            return 9*60 <= minutes < 12*60
+        if window == "late_am":
+            return 10*60 <= minutes < 12*60
+        if window == "afternoon":
+            return 12*60 <= minutes <= 16*60
+        if window == "late_am_or_early_pm":
+            return 10*60 <= minutes <= 14*60
+        return True
+    filtered = [s for s in slots if in_window(str(s.get("time") or ""))]
+    if filtered:
+        sched["awaiting_slot_offer_choice"] = True
+        sched["offered_slot_options"] = filtered[:3]
+        sched["scheduled_time"] = None
+        sched.pop("scheduled_time_source", None)
+        return f"For {_date_label_for_sms(requested_date)}, I have {format_command_center_slot_list(filtered[:3])}. Which one works best?"
+    sched["scheduled_time"] = None
+    sched["pending_step"] = "need_time"
+    return f"Got it. What exact time works for {_date_label_for_sms(requested_date)}?"
+
+
+def v69_pre_response_state_resolver(conv: dict, inbound_text: str, phone: str = "") -> str | None:
+    profile = conv.setdefault("profile", {})
+    sched = conv.setdefault("sched", {})
+    cleaned = v69_clean_inbound_payload(inbound_text)
+    if cleaned != inbound_text:
+        sched["last_clean_customer_message"] = cleaned
+        inbound_text = cleaned
+
+    before_pending = (sched.get("pending_step") or "").strip()
+    before_verified = bool(sched.get("address_verified"))
+    before_raw = scrub_non_address_tail(str(sched.get("raw_address") or ""))
+
+    # Always absorb newest facts before deciding what to ask next.
+    v69_capture_name_email_address_schedule(conv, inbound_text)
+    try:
+        log_event("V69_STATE_RESOLVED", phone or conv.get("phone") or "", {"body": _safe_monitor_text(inbound_text), "snapshot": _conversation_snapshot(phone or conv.get("phone") or "", conv)}, conv)
+    except Exception:
+        pass
+
+    # Hard stop / manual / non-service classification.
+    hs = detect_customer_hard_stop(inbound_text)
+    if hs:
+        return apply_customer_hard_stop(conv, hs, inbound_text)
+    manual_reply = v69_manual_or_closed_reply(conv, inbound_text)
+    if manual_reply:
+        return manual_reply
+
+    # Ambiguous time windows get concrete matching slots instead of repeating "what time".
+    window_reply = v69_offer_slots_for_time_window(conv, inbound_text)
+    if window_reply:
+        return window_reply
+
+    # If a customer gave all obvious booking fields in one text, skip duplicate questions.
+    update_address_assembly_state(sched)
+    recompute_pending_step(profile, sched)
+
+    now_raw = scrub_non_address_tail(str(sched.get("raw_address") or ""))
+    address_just_resolved = bool(sched.get("address_verified")) and (
+        not before_verified or now_raw.lower() != before_raw.lower() or before_pending == "need_address"
+    )
+
+    # After an address/town-state fragment completes the address, do not fall through
+    # to Step 4/model. Move to the controlled price + slot handoff immediately.
+    if (
+        address_just_resolved
+        and (sched.get("appointment_type") or conv.get("appointment_type"))
+        and not sched.get("scheduled_date")
+        and not sched.get("scheduled_time")
+    ):
+        return build_price_and_availability_prompt(conv, sched.get("appointment_type") or conv.get("appointment_type") or "EVAL_195")
+
+    # If address is now verified and the old pending step was still need_address, clear it.
+    if sched.get("address_verified") and sched.get("pending_step") == "need_address":
+        recompute_pending_step(profile, sched)
+
+    # When we captured a time/date and already have the name, never ask for name again.
+    if sched.get("scheduled_date") and sched.get("scheduled_time") and sched.get("address_verified"):
+        if get_active_first_name(profile) and get_active_last_name(profile) and not get_active_email(profile):
+            return "What is the best email address for the appointment?"
+
+    return None
+
+
+def interruption_answer_and_return_prompt(conv: dict, inbound_text: str, *, allow_post_booking: bool = False) -> str | None:
+    ans = _ORIG_V69_interruption_answer_and_return_prompt(conv, inbound_text, allow_post_booking=allow_post_booking)
+    return v69_polish_sms_body(ans) if ans else ans
+
+
+def _monitor_state_label(conv: dict) -> str:
+    sched = (conv or {}).get("sched") or {}
+    reason = (sched.get("closed_reason") or sched.get("manual_reason") or "").strip()
+    if reason:
+        if reason in {"spam_vendor_sales_call", "customer_declined_price", "customer_needed_sooner_than_available", "pre_purchase_no_access", "customer_withdrew"}:
+            return "closed"
+        if reason in {"manual_requested", "commercial_review_needed", "possible_non_electrical_generator_issue"}:
+            return "manual"
+    return _ORIG_V69_monitor_state_label(conv)
+
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    snap = _ORIG_V69_conversation_snapshot(phone, conv)
+    sched = (conv or {}).get("sched") or {}
+    snap["status_reason"] = sched.get("closed_reason") or sched.get("manual_reason") or sched.get("last_ai_reason")
+    snap["address_components"] = sched.get("address_components") or {}
+    snap["clean_customer_message"] = sched.get("last_clean_customer_message")
+    snap["selected_lead_label"] = "Selected Lead Snapshot"
+    snap["latest_event_label"] = "Latest System Event"
+    return snap
