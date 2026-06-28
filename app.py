@@ -21211,3 +21211,366 @@ def _conversation_snapshot(phone: str, conv: dict) -> dict:
     except Exception:
         pass
     return snap
+
+# =============================
+# v74 — Always $195 service visit
+# =============================
+# Current business rule from Kyle: remove the $395 troubleshoot/emergency visit
+# from customer-facing booking. Everything that proceeds through automated
+# scheduling should use the $195 evaluation/service visit Square variation.
+#
+# This patch is intentionally high-priority and placed at the end of the file so
+# it overrides every older v40-v73 troubleshoot/395 lane without rewriting the
+# rest of Prevolt OS.
+
+try:
+    _ORIG_V74_MAP_APPT_TO_VARIATION = map_appointment_type_to_variation
+except Exception:
+    _ORIG_V74_MAP_APPT_TO_VARIATION = None
+try:
+    _ORIG_V74_MAYBE_CREATE_SQUARE_BOOKING = maybe_create_square_booking
+except Exception:
+    _ORIG_V74_MAYBE_CREATE_SQUARE_BOOKING = None
+try:
+    _ORIG_V74_GET_NEXT_AVAILABLE_SLOTS = get_next_available_slots
+except Exception:
+    _ORIG_V74_GET_NEXT_AVAILABLE_SLOTS = None
+try:
+    _ORIG_V74_SEARCH_SQUARE_AVAILABILITY_FOR_DAY = search_square_availability_for_day
+except Exception:
+    _ORIG_V74_SEARCH_SQUARE_AVAILABILITY_FOR_DAY = None
+try:
+    _ORIG_V74_PROCESS_PREVOLT_VOICE_TURN = process_prevolt_voice_turn
+except Exception:
+    _ORIG_V74_PROCESS_PREVOLT_VOICE_TURN = None
+try:
+    _ORIG_V74_CONVERSATION_SNAPSHOT = _conversation_snapshot
+except Exception:
+    _ORIG_V74_CONVERSATION_SNAPSHOT = None
+try:
+    _ORIG_V74_PREVOLT_EVAL_PRICE_LINE = prevolt_eval_price_line
+except Exception:
+    _ORIG_V74_PREVOLT_EVAL_PRICE_LINE = None
+try:
+    _ORIG_V74_BUILD_PRICE_AND_AVAILABILITY_PROMPT = build_price_and_availability_prompt
+except Exception:
+    _ORIG_V74_BUILD_PRICE_AND_AVAILABILITY_PROMPT = None
+try:
+    _ORIG_V74_V61_BOOKING_ALERT_TYPE_LABEL = _v61_booking_alert_type_label
+except Exception:
+    _ORIG_V74_V61_BOOKING_ALERT_TYPE_LABEL = None
+try:
+    _ORIG_V74_IS_NON_EMERGENCY_APPT = _is_non_emergency_appt
+except Exception:
+    _ORIG_V74_IS_NON_EMERGENCY_APPT = None
+try:
+    _ORIG_V74_V42_SLOT_OFFER_REPLY_FOR = _v42_slot_offer_reply_for
+except Exception:
+    _ORIG_V74_V42_SLOT_OFFER_REPLY_FOR = None
+try:
+    _ORIG_V74_V42_TROUBLESHOOT_PRICE_PROMPT = _v42_troubleshoot_price_prompt
+except Exception:
+    _ORIG_V74_V42_TROUBLESHOOT_PRICE_PROMPT = None
+try:
+    _ORIG_V74_V43_TROUBLESHOOT_PRICE_PROMPT = _v43_troubleshoot_price_prompt
+except Exception:
+    _ORIG_V74_V43_TROUBLESHOOT_PRICE_PROMPT = None
+try:
+    _ORIG_V74_V45_TROUBLESHOOT_PRICE_GATE = _v45_troubleshoot_price_gate
+except Exception:
+    _ORIG_V74_V45_TROUBLESHOOT_PRICE_GATE = None
+try:
+    _ORIG_V74_V71_SERVICE_VISIT_PRICE_REPLY = _v71_service_visit_price_reply
+except Exception:
+    _ORIG_V74_V71_SERVICE_VISIT_PRICE_REPLY = None
+
+_V74_SERVICE_VISIT_TEXT = (
+    "We start with a $195 service visit. That covers sending an electrician out, "
+    "reviewing the issue in person, and handling straightforward troubleshooting or small repairs when possible. "
+    "If additional work or parts are needed, we’ll confirm before proceeding."
+)
+
+
+def _v74_coerce_appointment_type(value: str | None = None) -> str:
+    """Single source of truth for automated appointment type after v74."""
+    return "EVAL_195"
+
+
+def _v74_coerce_slot_option(slot: dict) -> dict:
+    if not isinstance(slot, dict):
+        return slot
+    out = dict(slot)
+    try:
+        out["service_variation_id"] = SERVICE_VARIATION_EVAL_ID
+        out["service_variation_version"] = SERVICE_VARIATION_EVAL_VERSION
+        out["duration_minutes"] = out.get("duration_minutes") or 60
+        out["team_member_id"] = out.get("team_member_id") or SQUARE_TEAM_MEMBER_ID
+    except Exception:
+        pass
+    return out
+
+
+def _v74_normalize_conv_to_195(conv: dict | None) -> dict | None:
+    """Remove stale troubleshoot/395 state before any prompt or Square booking."""
+    if not isinstance(conv, dict):
+        return conv
+    sched = conv.setdefault("sched", {})
+    conv["appointment_type"] = "EVAL_195"
+    sched["appointment_type"] = "EVAL_195"
+
+    # Clear legacy price/emergency gates that would otherwise ask the customer to
+    # accept $395 or allow weekend/after-hours emergency behavior.
+    for key in (
+        "awaiting_troubleshoot_price_confirm",
+        "troubleshoot_price_accepted",
+        "awaiting_emergency_confirm",
+        "emergency_approved",
+        "emergency_dispatch_approved",
+        "urgent_dispatch_approved",
+        "awaiting_dispatch_confirm",
+    ):
+        if key in sched:
+            sched[key] = False
+
+    # If older logic already created offered slots with the troubleshoot service
+    # variation embedded, replace those embedded Square service ids with the $195
+    # eval/service visit variation.
+    try:
+        opts = sched.get("offered_slot_options") or []
+        if isinstance(opts, list) and opts:
+            sched["offered_slot_options"] = [_v74_coerce_slot_option(o) for o in opts]
+    except Exception:
+        pass
+    return conv
+
+
+def _v74_sanitize_395_text(text: str | None) -> str:
+    s = str(text or "")
+    if not s:
+        return s
+
+    # Replace old troubleshoot/emergency price language with the current service
+    # visit policy. Keep existing slot options intact when they were already appended.
+    old_price_patterns = [
+        r"Troubleshoot and repair visits are \$395\.?",
+        r"The troubleshoot and repair visit is \$395\.?",
+        r"The emergency troubleshoot and repair visit is \$395\.?",
+        r"Emergency troubleshoot and repair visits are \$395\.?",
+        r"The \$395 covers the troubleshoot and repair visit itself\.?",
+        r"The \$395 is the troubleshoot and repair visit[^.?!]*[.?!]?",
+        r"Whole-home inspections are \$395[^.?!]*[.?!]?",
+        r"The whole-home inspection is \$395\.?",
+    ]
+    for pat in old_price_patterns:
+        s = re.sub(pat, _V74_SERVICE_VISIT_TEXT, s, flags=re.I)
+
+    # Remove emergency-dispatch wording when it is only tied to the now-retired
+    # $395 lane. The automation should book normal $195 service visits.
+    s = re.sub(
+        r"This sounds urgent\.\s*We can send someone now,? and arrival is usually within (?:one|1) to (?:two|2) hours\.\s*",
+        "",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(
+        r"We can send someone now,? and arrival is usually within (?:one|1) to (?:two|2) hours\.\s*",
+        "",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(r"\bDo you want us to dispatch someone now\??", "Does that work for you?", s, flags=re.I)
+    s = re.sub(r"\bReply YES if you want us to dispatch someone now\.?", "Reply YES if that works for you.", s, flags=re.I)
+    s = re.sub(r"\$395", "$195", s)
+    s = re.sub(r"\b395\b", "195", s)
+    s = re.sub(r"\bTROUBLESHOOT_195\b", "EVAL_195", s, flags=re.I)
+    s = re.sub(r"\bTROUBLESHOOT_395\b", "EVAL_195", s, flags=re.I)
+    s = re.sub(r"\bTroubleshoot and Repair\b", "Service Visit", s, flags=re.I)
+    s = re.sub(r"\bemergency dispatch\b", "service visit", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def map_appointment_type_to_variation(appt: str):
+    """v74: every automated booking uses the $195 eval/service variation."""
+    return SERVICE_VARIATION_EVAL_ID, SERVICE_VARIATION_EVAL_VERSION
+
+
+def _is_non_emergency_appt(sched: dict) -> bool:
+    """v74: there is no automated emergency/$395 lane."""
+    return True
+
+
+def prevolt_eval_price_line(appt_type: str) -> str:
+    return _V74_SERVICE_VISIT_TEXT
+
+
+def _v61_booking_alert_type_label(appt_type: str | None) -> str:
+    return "$195 Service Visit"
+
+
+def _v71_service_visit_price_reply(conv: dict) -> str:
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    return _V74_SERVICE_VISIT_TEXT
+
+
+def build_price_and_availability_prompt(conv: dict, appt_type: str = "EVAL_195") -> str:
+    conv = conv if isinstance(conv, dict) else {}
+    sched = conv.setdefault("sched", {})
+    _v74_normalize_conv_to_195(conv)
+    sched["booking_allowed"] = True
+    try:
+        slots = get_next_available_slots("EVAL_195", limit=3)
+    except Exception as e:
+        print("[WARN] v74 build_price_and_availability_prompt slot lookup failed:", repr(e))
+        slots = []
+    if slots:
+        sched["awaiting_slot_offer_choice"] = True
+        sched["offered_slot_options"] = [_v74_coerce_slot_option(s) for s in slots[:3]]
+        opts = format_command_center_slot_list(sched["offered_slot_options"])
+        return f"{_V74_SERVICE_VISIT_TEXT} If that works for you, we have {opts}. Which one works best?"
+    return f"{_V74_SERVICE_VISIT_TEXT} If that works for you, what date and time are you available?"
+
+
+def search_square_availability_for_day(date_str: str, appointment_type: str) -> list[dict]:
+    if _ORIG_V74_SEARCH_SQUARE_AVAILABILITY_FOR_DAY:
+        slots = _ORIG_V74_SEARCH_SQUARE_AVAILABILITY_FOR_DAY(date_str, "EVAL_195")
+    else:
+        slots = []
+    return [_v74_coerce_slot_option(s) for s in (slots or [])]
+
+
+def get_next_available_slots(appointment_type: str, limit: int = 3, days_ahead: int = 14) -> list[dict]:
+    if _ORIG_V74_GET_NEXT_AVAILABLE_SLOTS:
+        slots = _ORIG_V74_GET_NEXT_AVAILABLE_SLOTS("EVAL_195", limit=limit, days_ahead=days_ahead)
+    else:
+        slots = []
+    return [_v74_coerce_slot_option(s) for s in (slots or [])]
+
+
+def _v42_slot_offer_reply_for(conv: dict, appt: str) -> str:
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    if _ORIG_V74_V42_SLOT_OFFER_REPLY_FOR:
+        return _v74_sanitize_395_text(_ORIG_V74_V42_SLOT_OFFER_REPLY_FOR(conv, "EVAL_195"))
+    return build_price_and_availability_prompt(conv, "EVAL_195")
+
+
+def _v42_troubleshoot_price_prompt(conv: dict, caller_text: str = "") -> str:
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    return _V74_SERVICE_VISIT_TEXT + " Does that work for you?"
+
+
+def _v43_troubleshoot_price_prompt(conv: dict, caller_text: str = "") -> str:
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    return _V74_SERVICE_VISIT_TEXT + " Does that work for you?"
+
+
+def _v45_troubleshoot_price_gate(conv: dict, caller_text: str = "") -> str:
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    return _V74_SERVICE_VISIT_TEXT + " Does that work for you?"
+
+
+def maybe_create_square_booking(phone: str, convo: dict):
+    """v74 booking guard: force $195 eval variation and labels before Square."""
+    try:
+        _v74_normalize_conv_to_195(convo)
+        sched = convo.setdefault("sched", {})
+        sched["appointment_type"] = "EVAL_195"
+        convo["appointment_type"] = "EVAL_195"
+        # Ensure exact-slot validation does not treat the appointment as the old
+        # emergency/troubleshoot bypass lane.
+        if sched.get("scheduled_time") and not sched.get("scheduled_time_source"):
+            sched["scheduled_time_source"] = "customer_explicit_or_offered_slot_v74"
+    except Exception:
+        pass
+    result = _ORIG_V74_MAYBE_CREATE_SQUARE_BOOKING(phone, convo) if _ORIG_V74_MAYBE_CREATE_SQUARE_BOOKING else {"status": "booking_function_missing"}
+    try:
+        _v74_normalize_conv_to_195(convo)
+    except Exception:
+        pass
+    return result
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or '').replace('whatsapp:', '').strip()
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre['phone'] = p
+        _v74_normalize_conv_to_195(conv_pre)
+    except Exception:
+        pass
+
+    out = _ORIG_V74_PROCESS_PREVOLT_VOICE_TURN(phone, call_sid, caller_text) if _ORIG_V74_PROCESS_PREVOLT_VOICE_TURN else {
+        'reply_to_customer': 'Sorry, can you say that again?',
+        'booking_created': False,
+        'manual_only': False,
+        'end_call': False,
+    }
+
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv['phone'] = p
+        _v74_normalize_conv_to_195(conv)
+        if isinstance(out, dict):
+            out['appointment_type'] = 'EVAL_195'
+            if out.get('reply_to_customer'):
+                out['reply_to_customer'] = _v74_sanitize_395_text(out.get('reply_to_customer'))
+            # If an older layer still answered with a pure dispatch/$395 question,
+            # replace it with the current $195 scheduling handoff.
+            low_reply = _intent_text(out.get('reply_to_customer') or '') if '_intent_text' in globals() else str(out.get('reply_to_customer') or '').lower()
+            if ('$395' in low_reply or 'dispatch someone now' in low_reply or 'troubleshoot and repair visits are' in low_reply):
+                out['reply_to_customer'] = build_price_and_availability_prompt(conv, 'EVAL_195')
+                out['booking_created'] = False
+                out['end_call'] = False
+            try:
+                log_event('VOICE_V74_ALWAYS_195_NORMALIZED', p, {'reply': _safe_monitor_text(out.get('reply_to_customer')), 'call_sid': call_sid}, conv)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            log_event('VOICE_V74_ALWAYS_195_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(caller_text), 'call_sid': call_sid})
+        except Exception:
+            pass
+    return out
+
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    snap = _ORIG_V74_CONVERSATION_SNAPSHOT(phone, conv) if _ORIG_V74_CONVERSATION_SNAPSHOT else {}
+    try:
+        _v74_normalize_conv_to_195(conv)
+        snap['appointment_type'] = 'EVAL_195'
+        snap['appointment_type_label'] = '$195 Service Visit'
+        snap['v74_always_195_active'] = True
+        if snap.get('square_appointment_note_preview'):
+            snap['square_appointment_note_preview'] = _v74_sanitize_395_text(snap.get('square_appointment_note_preview'))
+    except Exception:
+        pass
+    return snap
+
+
+def _v74_selftest() -> dict:
+    """Small deterministic smoke test used by deploy/debug scripts."""
+    c = {'sched': {'appointment_type': 'TROUBLESHOOT_395', 'offered_slot_options': [{'date': '2026-07-06', 'time': '10:00'}]}, 'profile': {}}
+    _v74_normalize_conv_to_195(c)
+    return {
+        'appointment_type': c['sched'].get('appointment_type'),
+        'variation_id': map_appointment_type_to_variation('TROUBLESHOOT_395')[0],
+        'alert_label': _v61_booking_alert_type_label('TROUBLESHOOT_395'),
+        'price_line': prevolt_eval_price_line('TROUBLESHOOT_395'),
+        'sanitized': _v74_sanitize_395_text('Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?'),
+    }
+
