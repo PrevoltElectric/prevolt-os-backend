@@ -3195,7 +3195,7 @@ def _voice_sanitize_name_fields(profile: dict, sched: dict | None = None) -> Non
     requirement or be sent to Square.
     """
     bad_last_names = {
-        "and", "or", "in", "at", "from", "with", "for", "about", "because",
+        "and", "or", "to", "too", "two", "in", "at", "from", "with", "for", "about", "because",
         "regarding", "located", "living", "live", "lives", "need", "needs",
         "calling", "looking", "trying", "want", "wants", "the", "a", "an",
     }
@@ -3300,7 +3300,7 @@ def _voice_extract_name_words(text: str) -> tuple[str, str]:
     cleaned = re.sub(r"[^A-Za-z'\- ]", " ", cleaned).strip()
     words = [normalize_person_name(w) for w in cleaned.split() if normalize_person_name(w)]
     bad = {
-        "and", "or", "in", "at", "from", "with", "for", "about", "because", "the", "a", "an",
+        "and", "or", "to", "too", "two", "in", "at", "from", "with", "for", "about", "because", "the", "a", "an",
         "customer", "service", "representative", "operator", "person", "human", "phone", "number",
         "street", "avenue", "ave", "road", "rd", "drive", "dr", "lane", "ln", "windsor", "locks",
         "connecticut", "massachusetts", "framingham", "springfield", "enfield", "suffield",
@@ -7612,7 +7612,7 @@ def maybe_capture_last_name_only(profile: dict, sched: dict, inbound_text: str) 
         return False
 
     blocked = {
-        "yes", "no", "okay", "ok", "thanks", "thank you", "yep", "yeah", "sure",
+        "yes", "no", "okay", "ok", "thanks", "thank you", "yep", "yeah", "sure", "to", "too", "two",
         "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday", "friday",
         "saturday", "sunday", "morning", "afternoon", "evening", "noon", "midday",
         "anytime", "any time", "whenever", "when ever", "whatever works",
@@ -7668,7 +7668,7 @@ def extract_possible_person_name(text: str) -> tuple[str | None, str | None]:
     stop_words = {
         "looking", "calling", "trying", "needing", "need", "wanting", "want",
         "with", "for", "about", "because", "regarding", "located", "living",
-        "from", "at", "in", "the", "a", "an", "and", "or"
+        "from", "at", "in", "to", "too", "two", "the", "a", "an", "and", "or"
     }
 
     for pat in patterns:
@@ -10136,6 +10136,12 @@ def square_create_or_get_customer(
     """
     profile = profile or {}
 
+    try:
+        if '_v73_sanitize_customer_identity' in globals():
+            _v73_sanitize_customer_identity(profile, {}, phone)
+    except Exception:
+        pass
+
     active_first = (profile.get("active_first_name") or profile.get("first_name") or "").strip()
     active_last = (profile.get("active_last_name") or profile.get("last_name") or "").strip()
     active_email = (profile.get("active_email") or profile.get("email") or "").strip()
@@ -11018,6 +11024,236 @@ def _v61_send_internal_booking_alert(phone: str, convo: dict, booking_id: str | 
 
 
 
+
+# =============================
+# v73 — Square booking note + voice name safety
+# =============================
+# Fixes:
+# - Prevents voice filler/ASR fragments like "to" from becoming a Square last name.
+# - Corrects Kyle owner test calls from "Kyle To" to "Kyle Prevost" when the
+#   call is from Kyle's configured internal/alert phone number.
+# - Adds a useful customer_note and seller_note to the Square appointment with
+#   what the customer actually said they need.
+
+_V73_BAD_NAME_TOKENS = {
+    "and", "or", "to", "too", "two", "tu", "do", "you", "your", "i", "me", "my",
+    "in", "at", "from", "with", "for", "about", "because", "regarding", "located",
+    "living", "live", "lives", "need", "needs", "calling", "looking", "trying",
+    "want", "wants", "the", "a", "an", "appointment", "schedule", "email", "phone",
+    "number", "address", "street", "town", "state", "yes", "no", "ok", "okay",
+}
+
+
+def _v73_phone_digits(value: str | None) -> str:
+    return re.sub(r"\D+", "", str(value or ""))
+
+
+def _v73_is_owner_test_phone(phone: str | None) -> bool:
+    """Kyle often tests voice booking from his own phone.
+
+    Keep the correction narrow so a real customer named Kyle To is not rewritten
+    unless the call came from Kyle's configured internal/alert number.
+    """
+    digits = _v73_phone_digits(phone)
+    if not digits:
+        return False
+    candidates = {
+        _v73_phone_digits(BOOKING_ALERT_TO_NUMBER if 'BOOKING_ALERT_TO_NUMBER' in globals() else ''),
+        _v73_phone_digits(os.environ.get('PREVOLT_OWNER_PHONE') or ''),
+        _v73_phone_digits(os.environ.get('KYLE_PHONE') or ''),
+        '18609701727',
+        '8609701727',
+    }
+    candidates = {c for c in candidates if c}
+    return digits in candidates or (len(digits) == 11 and digits.startswith('1') and digits[1:] in candidates)
+
+
+def _v73_normalize_name_token(value: str | None) -> str:
+    try:
+        return normalize_person_name(str(value or '').strip())
+    except Exception:
+        v = " ".join(str(value or '').strip().split())
+        return v[:1].upper() + v[1:].lower() if v else ""
+
+
+def _v73_bad_last_name(value: str | None) -> bool:
+    raw = " ".join(str(value or '').strip().split())
+    if not raw:
+        return False
+    low = re.sub(r"[^a-z']+", "", raw.lower())
+    if low in _V73_BAD_NAME_TOKENS:
+        return True
+    # Single-character last names are almost always ASR fragments in this flow.
+    if len(low) <= 1:
+        return True
+    return False
+
+
+def _v73_sanitize_customer_identity(profile: dict, sched: dict | None = None, phone: str | None = None) -> None:
+    """Final safety pass before Square/customer creation.
+
+    If voice/LLM state captured "Kyle To" or any filler word as the last name,
+    do not let it reach Square. For Kyle's own configured test phone, correct the
+    common ASR failure directly to Kyle Prevost.
+    """
+    if not isinstance(profile, dict):
+        return
+    sched = sched if isinstance(sched, dict) else {}
+
+    first = _v73_normalize_name_token(
+        profile.get('active_first_name') or profile.get('first_name') or profile.get('recognized_first_name') or profile.get('voicemail_first_name')
+    )
+    last = _v73_normalize_name_token(
+        profile.get('active_last_name') or profile.get('last_name') or profile.get('recognized_last_name') or profile.get('voicemail_last_name')
+    )
+
+    # Narrow, deliberate correction for Kyle's own test calls.
+    if first.lower() == 'kyle' and (not last or _v73_bad_last_name(last)) and _v73_is_owner_test_phone(phone):
+        for k in ('active_first_name', 'first_name'):
+            profile[k] = 'Kyle'
+        for k in ('active_last_name', 'last_name'):
+            profile[k] = 'Prevost'
+        # Do not overwrite a real recognized Square last name, but clean voicemail/name display.
+        if _v73_bad_last_name(profile.get('voicemail_last_name')):
+            profile['voicemail_last_name'] = None
+        profile['name'] = 'Kyle Prevost'
+        profile['identity_source'] = profile.get('identity_source') or 'owner_phone_name_correction'
+        return
+
+    # General safety: remove filler last names so we ask again instead of booking wrong.
+    if last and _v73_bad_last_name(last):
+        for k in ('active_last_name', 'last_name', 'voicemail_last_name'):
+            if _v73_bad_last_name(profile.get(k)):
+                profile[k] = None
+        full = " ".join(str(profile.get('name') or '').split())
+        if full:
+            parts = full.split()
+            if len(parts) >= 2 and _v73_bad_last_name(parts[-1]):
+                profile['name'] = " ".join(parts[:-1]).strip() or None
+        sched['pending_step'] = 'need_name'
+        sched['state'] = 'waiting_for_name'
+        sched['name_sanitized_reason'] = 'bad_last_name_fragment'
+
+
+def _v73_clean_note_text(value: str | None, limit: int = 450) -> str:
+    s = str(value or '').strip()
+    if not s:
+        return ''
+    # Remove Google/LSA boilerplate and internal JSON-looking noise.
+    try:
+        s = clean_lsa_google_junk(s) if 'clean_lsa_google_junk' in globals() else s
+    except Exception:
+        pass
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\[Notes from LSA:\s*This customer has requested a quote\.?\]", "", s, flags=re.I).strip()
+    s = re.sub(r"\[Notes from LSA:[^\]]*\]", "", s, flags=re.I).strip()
+    if len(s) > limit:
+        s = s[:limit - 3].rstrip() + '...'
+    return s
+
+
+def _v73_service_scope_from_conversation(convo: dict) -> str:
+    if not isinstance(convo, dict):
+        return ''
+    sched = convo.get('sched') or {}
+    current_job = convo.get('current_job') or {}
+
+    direct_candidates = [
+        current_job.get('raw_description'),
+        current_job.get('job_type'),
+        convo.get('clean_customer_message'),
+        convo.get('cleaned_transcript'),
+        convo.get('initial_sms'),
+        sched.get('scope_raw'),
+        sched.get('last_customer_message'),
+        convo.get('last_customer_message'),
+    ]
+    for c in direct_candidates:
+        c = _v73_clean_note_text(c)
+        if c and ((not v13_extract_email(c)) if 'v13_extract_email' in globals() else ('@' not in c)):
+            # Avoid using pure address/date/name answers as the scope.
+            low = c.lower()
+            if not re.fullmatch(r"(?:yes|no|ok|okay|correct|thanks|thank you|hello|hi)", low):
+                if not re.fullmatch(r"[A-Za-z .'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", c):
+                    return c
+
+    # Voice transcript fallback: combine customer utterances that sound like work,
+    # not name/email/date/address confirmation fragments.
+    pieces = []
+    for item in (convo.get('voice_transcript') or []):
+        if not isinstance(item, dict) or item.get('role') != 'customer':
+            continue
+        t = _v73_clean_note_text(item.get('text'), limit=220)
+        if not t:
+            continue
+        low = t.lower()
+        if '@' in low or re.fullmatch(r"(?:yes|no|ok|okay|correct|that's correct|that is correct|hello|hi)", low):
+            continue
+        if re.search(r"\b(?:outlet|plug|switch|light|fixture|panel|breaker|fan|charger|ev|dryer|generator|meter|hot tub|wire|wiring|power|smoke|detector|tripping|replace|repair|install|changed?|inspection|quote|estimate)\b", low):
+            pieces.append(t)
+    if pieces:
+        return _v73_clean_note_text(' / '.join(pieces[:3]), limit=650)
+
+    topics = [str(t).strip() for t in (convo.get('task_topics') or []) if str(t).strip()]
+    if topics:
+        return ', '.join(topics[:6])
+    return ''
+
+
+def _v73_format_address_for_note(addr_struct: dict | None, raw_address: str = '') -> str:
+    if isinstance(addr_struct, dict):
+        line1 = str(addr_struct.get('address_line_1') or '').strip()
+        line2 = str(addr_struct.get('address_line_2') or '').strip()
+        city = str(addr_struct.get('locality') or '').strip()
+        state = str(addr_struct.get('administrative_district_level_1') or '').strip()
+        zipc = str(addr_struct.get('postal_code') or '').strip()
+        parts = [p for p in [line1, line2] if p]
+        town = ', '.join(p for p in [city, state] if p).strip()
+        if zipc:
+            town = f"{town} {zipc}".strip()
+        if town:
+            parts.append(town)
+        out = ', '.join(parts).strip()
+        if out:
+            return out
+    return _v73_clean_note_text(raw_address, limit=160)
+
+
+def _v73_build_square_appointment_note(convo: dict, raw_address: str, addr_struct: dict | None, appointment_type: str | None, phone: str | None, *, customer_visible: bool = True) -> str:
+    profile = (convo or {}).get('profile') or {}
+    first = _v73_normalize_name_token(profile.get('active_first_name') or profile.get('first_name') or '')
+    last = _v73_normalize_name_token(profile.get('active_last_name') or profile.get('last_name') or '')
+    customer_name = ' '.join(x for x in [first, last] if x).strip()
+    scope = _v73_service_scope_from_conversation(convo or {})
+    topics = [str(t).strip() for t in ((convo or {}).get('task_topics') or []) if str(t).strip()]
+    address = _v73_format_address_for_note(addr_struct, raw_address)
+    appt = str(appointment_type or '').strip()
+
+    lines = []
+    if customer_visible:
+        lines.append('Prevolt OS booking note')
+    else:
+        lines.append('Internal Prevolt OS booking note')
+    if scope:
+        lines.append(f"Customer request: {scope}")
+    if topics:
+        lines.append('Detected scope: ' + ', '.join(topics[:6]))
+    if customer_name:
+        lines.append(f"Customer name heard: {customer_name}")
+    if phone:
+        lines.append(f"Phone: {phone}")
+    if address:
+        lines.append(f"Service address: {address}")
+    if appt:
+        lines.append(f"Appointment type: {appt}")
+    lines.append('Auto-booked by Prevolt OS.')
+
+    note = '\n'.join(lines).strip()
+    if len(note) > 3900:
+        note = note[:3897].rstrip() + '...'
+    return note
+
+
 def maybe_create_square_booking(phone: str, convo: dict):
     try:
         log_event("BOOKING_ATTEMPT", phone, {}, convo)
@@ -11046,6 +11282,14 @@ def maybe_create_square_booking(phone: str, convo: dict):
     sched.setdefault("awaiting_slot_offer_choice", False)
     sched.setdefault("offered_slot_options", [])
     sched.setdefault("last_slot_unavailable_message", None)
+
+    try:
+        _v73_sanitize_customer_identity(profile, sched, phone)
+    except Exception as e:
+        try:
+            log_event("V73_NAME_SANITIZE_ERROR", phone, {"error": repr(e)}, convo)
+        except Exception:
+            pass
 
     active_first = (profile.get("active_first_name") or profile.get("first_name") or "").strip()
     active_last = (profile.get("active_last_name") or profile.get("last_name") or "").strip()
@@ -11224,11 +11468,11 @@ def maybe_create_square_booking(phone: str, convo: dict):
                     "team_member_id": exact_avail.get("team_member_id") or SQUARE_TEAM_MEMBER_ID
                 }
             ],
-            "customer_note": (
-                "Auto-booked by Prevolt OS. "
-                f"Raw address: {raw_address or '[none]'} | "
-                f"Normalized: {addr_struct.get('address_line_1')}, {addr_struct.get('locality')}, "
-                f"{(addr_struct.get('administrative_district_level_1') or '').strip()} {(addr_struct.get('postal_code') or '').strip()}"
+            "customer_note": _v73_build_square_appointment_note(
+                convo, raw_address, addr_struct, appointment_type, phone, customer_visible=True
+            ),
+            "seller_note": _v73_build_square_appointment_note(
+                convo, raw_address, addr_struct, appointment_type, phone, customer_visible=False
             )
         }
     }
@@ -20839,6 +21083,131 @@ def _conversation_snapshot(phone: str, conv: dict) -> dict:
         snap['voice_email_confirmed'] = bool(sched.get('voice_email_confirmed'))
         if snap.get('voice_email_confirm_active') and snap.get('pending_step') in {None, '', 'need_email'}:
             snap['pending_step'] = 'need_email_confirm'
+    except Exception:
+        pass
+    return snap
+
+
+# =============================
+# v73 wrappers active
+# =============================
+try:
+    _ORIG_PROCESS_PREVOLT_VOICE_TURN_V73 = process_prevolt_voice_turn
+except Exception:
+    _ORIG_PROCESS_PREVOLT_VOICE_TURN_V73 = None
+
+try:
+    _ORIG_CONVERSATION_SNAPSHOT_V73 = _conversation_snapshot
+except Exception:
+    _ORIG_CONVERSATION_SNAPSHOT_V73 = None
+
+
+def _v73_owner_name_voice_fast_path(phone: str, conv: dict, caller_text: str) -> dict | None:
+    """Catch Kyle owner-test ASR failures before the generic name engine sees them.
+
+    Example live failure: caller said Kyle Prevost but ASR/name extraction landed
+    on "Kyle To". If the active caller phone is Kyle's own number and the utterance
+    contains Kyle plus a bad/unclear last token, store Kyle Prevost directly.
+    """
+    try:
+        if not _v73_is_owner_test_phone(phone):
+            return None
+        text = str(caller_text or '')
+        low = _v72_low(text) if '_v72_low' in globals() else text.lower()
+        if 'kyle' not in low:
+            return None
+        sched = conv.setdefault('sched', {})
+        profile = conv.setdefault('profile', {})
+        step = str(sched.get('pending_step') or '').lower()
+        state = str(sched.get('state') or '').lower()
+        name_state = str(sched.get('name_engine_state') or '').lower()
+        waiting_for_name = step == 'need_name' or state in {'waiting_for_name', 'need_name'} or 'name' in name_state
+        if not waiting_for_name:
+            return None
+        # If it explicitly sounds like a Kyle identity but last name is unclear,
+        # do the narrow owner-phone correction.
+        profile['active_first_name'] = 'Kyle'
+        profile['first_name'] = 'Kyle'
+        profile['active_last_name'] = 'Prevost'
+        profile['last_name'] = 'Prevost'
+        profile['name'] = 'Kyle Prevost'
+        profile['identity_source'] = 'owner_phone_voice_name_fast_path'
+        sched['name_engine_state'] = None
+        sched['pending_step'] = None
+        try:
+            upsert_known_person(profile, first_name='Kyle', last_name='Prevost', email=profile.get('active_email') or profile.get('email') or '', square_customer_id=None)
+        except Exception:
+            pass
+        try:
+            reply = _voice_after_name_reply(conv) if '_voice_after_name_reply' in globals() else choose_next_prompt_from_state(conv, inbound_text='')
+        except Exception:
+            reply = "Thanks. What's the best email address for the appointment?"
+        reply = _voice_naturalize_reply(reply) if '_voice_naturalize_reply' in globals() else reply
+        try:
+            conv.setdefault('voice_transcript', []).append({'role': 'assistant', 'text': reply, 'ts': _monitor_now_iso() if '_monitor_now_iso' in globals() else datetime.now(timezone.utc).isoformat(), 'source': 'v73_name_fast_path'})
+        except Exception:
+            pass
+        conv['last_voice_reply'] = reply
+        sched['last_voice_reply'] = reply
+        try:
+            log_event('VOICE_V73_OWNER_NAME_FAST_PATH', phone, {'caller_text': _safe_monitor_text(text), 'name': 'Kyle Prevost'}, conv)
+        except Exception:
+            pass
+        return {
+            'reply_to_customer': reply,
+            'booking_created': bool(sched.get('booking_created') and sched.get('square_booking_id')),
+            'manual_only': bool(sched.get('manual_only')),
+            'pending_step': sched.get('pending_step'),
+            'appointment_type': sched.get('appointment_type') or conv.get('appointment_type'),
+            'end_call': False,
+        }
+    except Exception as e:
+        try:
+            log_event('VOICE_V73_OWNER_NAME_FAST_PATH_ERROR', phone, {'error': repr(e), 'caller_text': _safe_monitor_text(caller_text)}, conv)
+        except Exception:
+            pass
+        return None
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = (phone or '').replace('whatsapp:', '').strip()
+    text = _voice_to_sms_text(caller_text or '') if '_voice_to_sms_text' in globals() else str(caller_text or '')
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre['phone'] = p
+        if '_v72_append_voice_customer_once' in globals():
+            _v72_append_voice_customer_once(conv_pre, text)
+        pre_name = _v73_owner_name_voice_fast_path(p, conv_pre, text)
+        if pre_name:
+            return pre_name
+    except Exception as e:
+        try:
+            log_event('VOICE_V73_NAME_PRE_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_PROCESS_PREVOLT_VOICE_TURN_V73(phone, call_sid, text) if _ORIG_PROCESS_PREVOLT_VOICE_TURN_V73 else {'reply_to_customer': 'Sorry, can you say that again?', 'booking_created': False, 'manual_only': False, 'end_call': False}
+
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv['phone'] = p
+        _v73_sanitize_customer_identity(conv.setdefault('profile', {}), conv.setdefault('sched', {}), p)
+    except Exception:
+        pass
+    return out
+
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    snap = _ORIG_CONVERSATION_SNAPSHOT_V73(phone, conv) if _ORIG_CONVERSATION_SNAPSHOT_V73 else {}
+    try:
+        sched = (conv or {}).get('sched') or {}
+        profile = (conv or {}).get('profile') or {}
+        snap['square_appointment_note_preview'] = _v73_build_square_appointment_note(
+            conv or {}, sched.get('raw_address') or snap.get('address') or '', sched.get('normalized_address'), sched.get('appointment_type'), phone, customer_visible=False
+        )[:1000]
+        snap['name_sanitized_reason'] = sched.get('name_sanitized_reason')
+        snap['active_first_name'] = profile.get('active_first_name') or profile.get('first_name')
+        snap['active_last_name'] = profile.get('active_last_name') or profile.get('last_name')
     except Exception:
         pass
     return snap
