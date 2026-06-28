@@ -23060,3 +23060,386 @@ def _v77_selftest() -> dict:
         'initial_scope_detected': _v77_looks_like_initial_service_scope('I was looking to have an electrician come out and take a look at my outlets that stopped working'),
         'monday_blackout': _v75_date_is_manual_blackout('2026-06-29') if '_v75_date_is_manual_blackout' in globals() else None,
     }
+
+
+
+# =============================
+# v78 — voice relative-date correction, name guard, and better wording
+# =============================
+# Live failures fixed from 2026-06-28 testing:
+# 1) "this Tuesday" / "tomorrow" must be treated as actual requested dates,
+#    not matched to a later offered weekday.
+# 2) If the caller corrects the selected slot while we are asking for their name,
+#    do not save "No Tuesday" / "No No" as the customer name.
+# 3) Do not say "calendar is blocked" to customers. Say there is no availability
+#    for that date and offer the first available choices.
+# 4) Put the value statement before the consent question in the $195 service text.
+
+try:
+    _ORIG_V78_PROCESS_PREVOLT_VOICE_TURN = process_prevolt_voice_turn
+except Exception:
+    _ORIG_V78_PROCESS_PREVOLT_VOICE_TURN = None
+try:
+    _ORIG_V78_V77_HANDLE_OFFERED_SLOT_TURN = _v77_handle_offered_slot_turn
+except Exception:
+    _ORIG_V78_V77_HANDLE_OFFERED_SLOT_TURN = None
+try:
+    _ORIG_V78_V77_MATCH_OFFERED_SLOT = _v77_match_offered_slot
+except Exception:
+    _ORIG_V78_V77_MATCH_OFFERED_SLOT = None
+try:
+    _ORIG_V78_V77_OFFER_CURRENT_SLOTS = _v77_offer_current_slots
+except Exception:
+    _ORIG_V78_V77_OFFER_CURRENT_SLOTS = None
+try:
+    _ORIG_V78_V77_ACCEPT_OFFERED_SLOT = _v77_accept_offered_slot
+except Exception:
+    _ORIG_V78_V77_ACCEPT_OFFERED_SLOT = None
+try:
+    _ORIG_V78_V71_SERVICE_VISIT_PRICE_REPLY = _v71_service_visit_price_reply
+except Exception:
+    _ORIG_V78_V71_SERVICE_VISIT_PRICE_REPLY = None
+try:
+    _ORIG_V78_CONVERSATION_SNAPSHOT = _conversation_snapshot
+except Exception:
+    _ORIG_V78_CONVERSATION_SNAPSHOT = None
+
+_V78_NO_AVAILABILITY_PREFIX = "We do not have availability for that date."
+_V78_SERVICE_VISIT_CONSENT_TEXT = (
+    "We start with a $195 service visit. That covers sending an electrician out, "
+    "reviewing the issue in person, and handling straightforward troubleshooting or small repairs when possible. "
+    "If additional work or parts are needed, we’ll confirm before proceeding. "
+    "This is the best way to get your install or repair looked at. Does that work for you?"
+)
+
+# The v77 helpers reference this global directly, so update it in place.
+try:
+    _V77_SERVICE_VISIT_CONSENT_TEXT = _V78_SERVICE_VISIT_CONSENT_TEXT
+except Exception:
+    pass
+
+
+def _v78_low(text: str) -> str:
+    try:
+        return _intent_text(text or "")
+    except Exception:
+        return str(text or "").strip().lower()
+
+
+def _v78_clean_unavailable_prefix(prefix: str | None) -> str:
+    raw = str(prefix or "").strip()
+    if not raw:
+        return raw
+    low = _v78_low(raw)
+    bad_bits = [
+        "blocked off on our calendar",
+        "calendar is blocked",
+        "blocked on our calendar",
+        "manual blackout",
+        "blackout",
+        "not showing as available on our calendar",
+        "not returned by square availability",
+    ]
+    if any(bit in low for bit in bad_bits):
+        return _V78_NO_AVAILABILITY_PREFIX
+    return raw
+
+
+def _v78_local_today():
+    try:
+        return (_local_now() if '_local_now' in globals() else datetime.now(_v75_local_tz() if '_v75_local_tz' in globals() else timezone.utc)).date()
+    except Exception:
+        return datetime.now(timezone.utc).date()
+
+
+def _v78_weekday_index(name: str) -> int | None:
+    name = (name or '').strip().lower()[:3]
+    mapping = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6}
+    return mapping.get(name)
+
+
+def _v78_this_weekday_date(text: str) -> str | None:
+    """Resolve only strongly relative phrases like 'this Tuesday' and 'tomorrow'."""
+    low = _v78_low(text)
+    if not low:
+        return None
+    today = _v78_local_today()
+    if re.search(r"\b(today|this morning|this afternoon)\b", low):
+        return today.strftime('%Y-%m-%d')
+    if re.search(r"\b(tomorrow|tmrw|tmr|next day)\b", low):
+        return (today + timedelta(days=1)).strftime('%Y-%m-%d')
+    # Important: only 'this <weekday>' or 'this coming <weekday>' means current-week relative.
+    m = re.search(r"\b(?:this|this\s+coming)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", low, flags=re.I)
+    if not m:
+        return None
+    wd = _v78_weekday_index(m.group(1))
+    if wd is None:
+        return None
+    delta = (wd - today.weekday()) % 7
+    # If someone says "this Monday" on Monday, treat it as today, not next week.
+    return (today + timedelta(days=delta)).strftime('%Y-%m-%d')
+
+
+def _v78_is_slot_dispute_or_schedule_correction(text: str) -> bool:
+    low = _v78_low(text)
+    if not low:
+        return False
+    if _v78_this_weekday_date(text):
+        return True
+    if re.match(r"^(no|nope|nah|wrong|not that|not this|incorrect)\b", low):
+        if re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|am|pm|\d{1,2}(?::\d{2})?)\b", low):
+            return True
+    if re.search(r"\b(what about|can we do|could we do|do you have|is there|instead)\b", low) and re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|am|pm|\d{1,2}(?::\d{2})?)\b", low):
+        return True
+    return False
+
+
+def _v78_clear_bad_name_if_schedule_correction(conv: dict) -> None:
+    sched = conv.setdefault('sched', {})
+    profile = conv.setdefault('profile', {})
+    # If a correction phrase was accidentally used as a name, clear it.
+    joined = _v78_low(" ".join(str(x or '') for x in [profile.get('active_first_name'), profile.get('active_last_name'), sched.get('active_first_name'), sched.get('active_last_name'), sched.get('name')]))
+    if not joined:
+        return
+    bad_name_tokens = {'no', 'nope', 'nah', 'this', 'tuesday', 'monday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'today', 'tomorrow'}
+    toks = set(re.findall(r"[a-z]+", joined))
+    if toks and toks.issubset(bad_name_tokens):
+        for key in ['active_first_name', 'active_last_name', 'first_name', 'last_name', 'name']:
+            profile.pop(key, None)
+            sched.pop(key, None)
+        sched['name_sanitized_reason'] = 'v78_schedule_correction_not_name'
+
+
+def _v78_handle_unavailable_requested_date(phone: str, conv: dict, requested_date: str, caller_text: str) -> dict:
+    sched = conv.setdefault('sched', {})
+    sched['scheduled_date'] = None
+    sched['scheduled_time'] = None
+    sched.pop('scheduled_time_source', None)
+    sched['slot_choice_locked'] = False
+    sched['slot_blocked_reason'] = 'no_availability_for_requested_date'
+    sched['pending_step'] = 'need_date'
+    sched['state'] = 'waiting_for_date'
+    sched['awaiting_slot_offer_choice'] = True
+    _v78_clear_bad_name_if_schedule_correction(conv)
+    try:
+        log_event('VOICE_V78_REQUESTED_DATE_UNAVAILABLE', phone, {
+            'caller_text': _safe_monitor_text(caller_text),
+            'requested_date': requested_date,
+        }, conv)
+    except Exception:
+        pass
+    return _v77_offer_current_slots(phone, conv, _V78_NO_AVAILABILITY_PREFIX)
+
+
+def _v78_offer_slots_for_requested_date(phone: str, conv: dict, requested_date: str, caller_text: str) -> dict:
+    sched = conv.setdefault('sched', {})
+    if ('_v75_date_is_manual_blackout' in globals()) and _v75_date_is_manual_blackout(requested_date):
+        return _v78_handle_unavailable_requested_date(phone, conv, requested_date, caller_text)
+    try:
+        day_slots = search_square_availability_for_day(requested_date, 'EVAL_195')
+    except Exception:
+        day_slots = []
+    if not day_slots:
+        return _v78_handle_unavailable_requested_date(phone, conv, requested_date, caller_text)
+    day_slots = [_v74_coerce_slot_option(s) for s in day_slots[:3]] if '_v74_coerce_slot_option' in globals() else day_slots[:3]
+    sched['awaiting_slot_offer_choice'] = True
+    sched['offered_slot_options'] = day_slots[:3]
+    sched['scheduled_date'] = None
+    sched['scheduled_time'] = None
+    sched.pop('scheduled_time_source', None)
+    sched['pending_step'] = 'need_date'
+    sched['state'] = 'waiting_for_date'
+    label = _date_label_for_sms(requested_date) if '_date_label_for_sms' in globals() else requested_date
+    reply = f"For {label}, I have {_format_slot_options(day_slots[:3])}. Which one works best?"
+    return _v77_voice_out(phone, conv, reply, source='v78_date_slots', pending_step='need_date', end_call=False)
+
+
+def _v77_offer_current_slots(phone: str, conv: dict, prefix: str = 'Great.') -> dict:
+    clean = _v78_clean_unavailable_prefix(prefix)
+    if _ORIG_V78_V77_OFFER_CURRENT_SLOTS:
+        return _ORIG_V78_V77_OFFER_CURRENT_SLOTS(phone, conv, clean)
+    return _v77_voice_out(phone, conv, "What day and time works best?", source='v78_offer_fallback', pending_step='need_date', end_call=False)
+
+
+def _v71_service_visit_price_reply(conv: dict) -> str:
+    try:
+        _v74_normalize_conv_to_195(conv)
+    except Exception:
+        pass
+    sched = conv.setdefault('sched', {}) if isinstance(conv, dict) else {}
+    try:
+        sched['awaiting_eval_price_confirm'] = True
+        sched['eval_price_accepted'] = False
+        sched['price_disclosed'] = True
+        sched['pending_step'] = 'need_date'
+        sched['state'] = 'waiting_for_date'
+        sched['awaiting_slot_offer_choice'] = False
+    except Exception:
+        pass
+    return _V78_SERVICE_VISIT_CONSENT_TEXT
+
+
+def _v77_match_offered_slot(conv: dict, caller_text: str) -> dict | None:
+    # Do not let 'this Tuesday' match a later offered Tuesday. Validate the actual relative date first.
+    if _v78_this_weekday_date(caller_text):
+        return None
+    if _ORIG_V78_V77_MATCH_OFFERED_SLOT:
+        return _ORIG_V78_V77_MATCH_OFFERED_SLOT(conv, caller_text)
+    return None
+
+
+def _v77_accept_offered_slot(phone: str, conv: dict, slot: dict, caller_text: str) -> dict:
+    slot = _v74_coerce_slot_option(slot) if '_v74_coerce_slot_option' in globals() else dict(slot or {})
+    d = str(slot.get('date') or '').strip()
+    if ('_v75_date_is_manual_blackout' in globals()) and _v75_date_is_manual_blackout(d):
+        return _v77_offer_current_slots(phone, conv, _V78_NO_AVAILABILITY_PREFIX)
+    if _ORIG_V78_V77_ACCEPT_OFFERED_SLOT:
+        return _ORIG_V78_V77_ACCEPT_OFFERED_SLOT(phone, conv, slot, caller_text)
+    return _v77_voice_out(phone, conv, "Great. What's your first and last name?", source='v78_accept_fallback', pending_step='need_name', end_call=False)
+
+
+def _v77_handle_offered_slot_turn(phone: str, conv: dict, caller_text: str) -> dict | None:
+    sched = conv.setdefault('sched', {})
+    if not (sched.get('awaiting_slot_offer_choice') and (sched.get('offered_slot_options') or [])):
+        return None
+    # Strong relative phrases are validated before offered-slot matching.
+    requested_relative = _v78_this_weekday_date(caller_text)
+    if requested_relative:
+        return _v78_offer_slots_for_requested_date(phone, conv, requested_relative, caller_text)
+    if _ORIG_V78_V77_HANDLE_OFFERED_SLOT_TURN:
+        out = _ORIG_V78_V77_HANDLE_OFFERED_SLOT_TURN(phone, conv, caller_text)
+        # Clean old customer-facing wording if the original handler returned it.
+        if out and isinstance(out, dict):
+            r = str(out.get('reply_to_customer') or '')
+            clean = r.replace('That date is blocked off on our calendar.', _V78_NO_AVAILABILITY_PREFIX)
+            clean = clean.replace('That date is not showing as available on our calendar.', _V78_NO_AVAILABILITY_PREFIX)
+            if clean != r:
+                out['reply_to_customer'] = clean
+                conv['last_voice_reply'] = clean
+                sched['last_voice_reply'] = clean
+        return out
+    return None
+
+
+def _v78_handle_name_step_schedule_correction(phone: str, conv: dict, caller_text: str) -> dict | None:
+    sched = conv.setdefault('sched', {})
+    pending = str(sched.get('pending_step') or '').lower()
+    state = str(sched.get('state') or '').lower()
+    if pending not in {'need_name', 'waiting_for_name'} and state not in {'waiting_for_name'}:
+        return None
+    if not _v78_is_slot_dispute_or_schedule_correction(caller_text):
+        return None
+    requested = _v78_this_weekday_date(caller_text) or _v77_requested_date_from_text(caller_text)
+    if requested:
+        # They are correcting the appointment date/time, not giving a name.
+        _v78_clear_bad_name_if_schedule_correction(conv)
+        return _v78_offer_slots_for_requested_date(phone, conv, requested, caller_text)
+    _v78_clear_bad_name_if_schedule_correction(conv)
+    return _v77_offer_current_slots(phone, conv, "No problem. Let's choose a different appointment time.")
+
+
+def _v78_fix_price_reply(reply: str, conv: dict) -> str:
+    r = str(reply or '')
+    low = _v78_low(r)
+    if '$195 service visit' in low and 'which one works best' not in low and 'what date' not in low and 'what time' not in low:
+        if 'does that work' not in low or 'best way to get your install or repair looked at' not in low:
+            try:
+                sched = conv.setdefault('sched', {})
+                sched['awaiting_eval_price_confirm'] = True
+                sched['eval_price_accepted'] = False
+                sched['price_disclosed'] = True
+                sched['pending_step'] = 'need_date'
+                sched['state'] = 'waiting_for_date'
+                sched['awaiting_slot_offer_choice'] = False
+            except Exception:
+                pass
+            return _V78_SERVICE_VISIT_CONSENT_TEXT
+    r = r.replace('That date is blocked off on our calendar.', _V78_NO_AVAILABILITY_PREFIX)
+    r = r.replace('That date is not showing as available on our calendar.', _V78_NO_AVAILABILITY_PREFIX)
+    r = r.replace('blocked off on our calendar', 'not available')
+    return r
+
+
+def process_prevolt_voice_turn(phone: str, call_sid: str, caller_text: str) -> dict:
+    p = normalize_phone(phone) if 'normalize_phone' in globals() else (phone or '').replace('whatsapp:', '').strip()
+    text = str(caller_text or '').strip()
+    try:
+        conv_pre = hydrate_voice_conversation(p, call_sid)
+        conv_pre['phone'] = p
+        try:
+            _v74_normalize_conv_to_195(conv_pre)
+        except Exception:
+            pass
+        # If we're asking for a name and the caller is actually correcting the slot,
+        # handle it before any name fast-path can save the correction as the name.
+        correction = _v78_handle_name_step_schedule_correction(p, conv_pre, text)
+        if correction:
+            try:
+                _v77_remember_customer_voice(conv_pre, text, source='v78_name_step_schedule_correction')
+            except Exception:
+                pass
+            return correction
+    except Exception as e:
+        try:
+            log_event('VOICE_V78_PRE_NAME_CORRECTION_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+
+    out = _ORIG_V78_PROCESS_PREVOLT_VOICE_TURN(phone, call_sid, caller_text) if _ORIG_V78_PROCESS_PREVOLT_VOICE_TURN else {'reply_to_customer': 'Sorry, can you say that again?', 'booking_created': False, 'manual_only': False, 'end_call': False}
+    try:
+        conv = hydrate_voice_conversation(p, call_sid)
+        conv['phone'] = p
+        sched = conv.setdefault('sched', {})
+        reply = str((out or {}).get('reply_to_customer') or '')
+        fixed = _v78_fix_price_reply(reply, conv)
+        if fixed != reply:
+            out['reply_to_customer'] = _voice_naturalize_reply(fixed) if '_voice_naturalize_reply' in globals() else fixed
+            out['booking_created'] = False
+            out['end_call'] = False
+            out['pending_step'] = sched.get('pending_step')
+            conv['last_voice_reply'] = out['reply_to_customer']
+            sched['last_voice_reply'] = out['reply_to_customer']
+            try:
+                log_event('VOICE_V78_REPLY_CLEANED', p, {'old_reply': _safe_monitor_text(reply), 'new_reply': _safe_monitor_text(out['reply_to_customer']), 'call_sid': call_sid}, conv)
+            except Exception:
+                pass
+        try:
+            save_conversation(p, conv)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            log_event('VOICE_V78_POST_LAYER_ERROR', p, {'error': repr(e), 'caller_text': _safe_monitor_text(text), 'call_sid': call_sid})
+        except Exception:
+            pass
+    return out
+
+
+def _conversation_snapshot(conv: dict) -> dict:
+    snap = _ORIG_V78_CONVERSATION_SNAPSHOT(conv) if _ORIG_V78_CONVERSATION_SNAPSHOT else {}
+    try:
+        sched = (conv or {}).setdefault('sched', {})
+        snap['v78_voice_slot_name_wording_fix_active'] = True
+        snap['v78_no_availability_wording'] = _V78_NO_AVAILABILITY_PREFIX
+        snap['v78_price_prompt'] = _V78_SERVICE_VISIT_CONSENT_TEXT
+        # If a prior bug saved a schedule correction as a name, make it visible in diagnostics.
+        nm = _v78_low(snap.get('name') or sched.get('name') or '')
+        snap['v78_name_looks_like_schedule_correction'] = bool(nm and set(re.findall(r'[a-z]+', nm)).issubset({'no','nope','nah','this','tuesday','monday','wednesday','thursday','friday','saturday','sunday','today','tomorrow'}))
+    except Exception:
+        pass
+    return snap
+
+
+def _v78_selftest() -> dict:
+    fake = {'sched': {'awaiting_slot_offer_choice': True, 'offered_slot_options': [
+        {'date': '2026-07-07', 'time': '09:00', 'label': 'Tuesday, July 7 at 9:00 AM'},
+        {'date': '2026-07-08', 'time': '09:00', 'label': 'Wednesday, July 8 at 9:00 AM'},
+        {'date': '2026-07-09', 'time': '09:00', 'label': 'Thursday, July 9 at 9:00 AM'},
+    ]}}
+    return {
+        'price_prompt_order': _V78_SERVICE_VISIT_CONSENT_TEXT.endswith('Does that work for you?'),
+        'no_calendar_blocked_words': 'blocked off on our calendar' not in _v78_clean_unavailable_prefix('That date is blocked off on our calendar.').lower(),
+        'this_tuesday_not_offered_match': _v77_match_offered_slot(fake, 'No, this Tuesday.') is None,
+        'july_7_still_matches': (_v77_match_offered_slot(fake, 'Tuesday July 7th 9 AM') or {}).get('date') == '2026-07-07',
+        'schedule_correction_detected': _v78_is_slot_dispute_or_schedule_correction('No, this Tuesday.'),
+    }
