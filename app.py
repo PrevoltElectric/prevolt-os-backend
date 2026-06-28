@@ -21574,3 +21574,435 @@ def _v74_selftest() -> dict:
         'sanitized': _v74_sanitize_395_text('Troubleshoot and repair visits are $395. Do you want us to dispatch someone now?'),
     }
 
+
+
+# ===================================================
+# V75 PATCH — Square blocked time / vacation protection
+# ===================================================
+# Problem found in live testing: the older booking path could create a Square
+# booking from an exact date/time as long as there was no overlapping Square
+# booking. That was not strict enough for vacation/block-off periods, because a
+# blocked staff calendar can be unavailable without appearing as a customer
+# booking conflict. V75 makes Square availability the booking gate.
+
+_V75_BLOCKED_TIME_PATCH_ACTIVE = True
+_ORIG_V75_SEARCH_SQUARE_AVAILABILITY_FOR_DAY = search_square_availability_for_day if 'search_square_availability_for_DAY_MISSING' not in globals() else None
+_ORIG_V75_GET_NEXT_AVAILABLE_SLOTS = get_next_available_slots if 'get_next_available_slots' in globals() else None
+_ORIG_V75_SQUARE_SLOT_HAS_EXISTING_BOOKING = square_slot_has_existing_booking if 'square_slot_has_existing_booking' in globals() else None
+_ORIG_V75_MAYBE_HANDLE_EXACT_SLOT_BEFORE_STEP4 = maybe_handle_exact_slot_before_step4 if 'maybe_handle_exact_slot_before_step4' in globals() else None
+_ORIG_V75_MAYBE_CREATE_SQUARE_BOOKING = maybe_create_square_booking if 'maybe_create_square_booking' in globals() else None
+_ORIG_V75_VOICE_APPLY_OFFERED_SLOT_FAST_PATH = _voice_apply_offered_slot_fast_path if '_voice_apply_offered_slot_fast_path' in globals() else None
+_ORIG_V75_CONVERSATION_SNAPSHOT = _conversation_snapshot if '_conversation_snapshot' in globals() else None
+
+
+def _v75_local_tz():
+    try:
+        return ZoneInfo("America/New_York") if ZoneInfo else timezone.utc
+    except Exception:
+        return timezone.utc
+
+
+def _v75_iso_to_local_dt(value: str):
+    raw = str(value or '').strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith('Z'):
+            return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(_v75_local_tz())
+        return datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(_v75_local_tz())
+    except Exception:
+        return None
+
+
+def _v75_slot_key(date_str: str, time_str: str) -> tuple[str, str]:
+    return (str(date_str or '').strip(), str(time_str or '').strip())
+
+
+def _v75_parse_manual_blackout_ranges() -> list[tuple[str, str]]:
+    """Optional fail-safe for known vacation periods.
+
+    Set one of these env vars if Square's own calendar block is ever not visible
+    through the Bookings availability API:
+      PREVOLT_BLACKOUT_DATES=2026-06-22:2026-07-06,2026-07-24
+      PREVOLT_BLOCKED_DATES=2026-06-22..2026-07-06
+      PREVOLT_VACATION_DATES=2026-06-22 to 2026-07-06
+
+    The code does not require this env var; it is only a backup safety lock.
+    """
+    raw = (
+        os.environ.get('PREVOLT_BLACKOUT_DATES')
+        or os.environ.get('PREVOLT_BLOCKED_DATES')
+        or os.environ.get('PREVOLT_VACATION_DATES')
+        or ''
+    )
+    ranges = []
+    for part in re.split(r"[,;\n]+", raw):
+        s = (part or '').strip()
+        if not s:
+            continue
+        pieces = [p.strip() for p in re.split(r"\s*(?:\.\.|:|to|through|-)\s*", s, maxsplit=1, flags=re.I) if p.strip()]
+        # Date ranges contain hyphens inside YYYY-MM-DD, so the broad split above can
+        # over-split. Repair the common single-date/range cases first.
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})\s*(?:\.\.|:|to|through)\s*(\d{4}-\d{2}-\d{2})$", s, flags=re.I)
+        if m:
+            ranges.append((m.group(1), m.group(2)))
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            ranges.append((s, s))
+            continue
+        if len(pieces) >= 2 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", pieces[0]) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", pieces[1]):
+            ranges.append((pieces[0], pieces[1]))
+    return ranges
+
+
+def _v75_date_is_manual_blackout(date_str: str) -> bool:
+    d = str(date_str or '').strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return False
+    for start, end in _v75_parse_manual_blackout_ranges():
+        if start <= d <= end:
+            return True
+    return False
+
+
+def _v75_filter_square_slots(slots: list[dict], *, date_hint: str | None = None) -> list[dict]:
+    """Remove slots that Prevolt should never offer."""
+    out = []
+    seen = set()
+    now = _local_now() if '_local_now' in globals() else datetime.now(_v75_local_tz())
+    for raw in slots or []:
+        if not isinstance(raw, dict):
+            continue
+        s = _v74_coerce_slot_option(raw) if '_v74_coerce_slot_option' in globals() else dict(raw)
+        d = str(s.get('date') or date_hint or '').strip()
+        t = str(s.get('time') or '').strip()
+        if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and re.fullmatch(r"\d{2}:\d{2}", t)):
+            continue
+        if _v75_date_is_manual_blackout(d):
+            continue
+        try:
+            if is_weekend(d):
+                continue
+        except Exception:
+            pass
+        try:
+            if not is_within_normal_hours(t):
+                continue
+        except Exception:
+            pass
+        try:
+            slot_dt = datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M").replace(tzinfo=_v75_local_tz())
+            if slot_dt <= now:
+                continue
+        except Exception:
+            pass
+        key = (d, t)
+        if key in seen:
+            continue
+        seen.add(key)
+        s['date'] = d
+        s['time'] = t
+        s['label'] = s.get('label') or _humanize_slot_label(d, t)
+        out.append(s)
+    return out
+
+
+def search_square_availability_for_day(date_str: str, appointment_type: str) -> list[dict]:
+    """v75: Square availability is the source of truth for offered slots."""
+    date_str = str(date_str or '').strip()
+    if _v75_date_is_manual_blackout(date_str):
+        try:
+            print('[BLOCKED] Manual Prevolt blackout date:', date_str)
+        except Exception:
+            pass
+        return []
+    try:
+        slots = _ORIG_V75_SEARCH_SQUARE_AVAILABILITY_FOR_DAY(date_str, 'EVAL_195') if _ORIG_V75_SEARCH_SQUARE_AVAILABILITY_FOR_DAY else []
+    except Exception as e:
+        print('[WARN] v75 Square availability failed closed:', date_str, repr(e))
+        return []
+    return _v75_filter_square_slots(slots, date_hint=date_str)
+
+
+def get_next_available_slots(appointment_type: str, limit: int = 3, days_ahead: int = 21) -> list[dict]:
+    """v75: only return slots currently returned by Square availability search."""
+    collected = []
+    seen_days = set()
+    try:
+        now_local = _local_now()
+    except Exception:
+        now_local = datetime.now(_v75_local_tz())
+
+    for offset in range(0, int(days_ahead or 21) + 1):
+        target_day = now_local.date() + timedelta(days=offset)
+        target_date = target_day.strftime('%Y-%m-%d')
+        if target_date in seen_days or _v75_date_is_manual_blackout(target_date):
+            continue
+        try:
+            if target_day.weekday() >= 5:
+                continue
+        except Exception:
+            pass
+        slots = search_square_availability_for_day(target_date, 'EVAL_195')
+        valid = _v75_filter_square_slots(slots, date_hint=target_date)
+        if not valid:
+            continue
+        # Keep one per day so customers get choices across days.
+        chosen = valid[0]
+        seen_days.add(target_date)
+        collected.append(chosen)
+        if len(collected) >= int(limit or 3):
+            break
+    return collected
+
+
+def _v75_list_any_square_booking_overlap(date_str: str, time_str: str, duration_minutes: int = 60) -> bool:
+    """Additional conflict check: treat any non-cancelled Square booking object as blocking.
+
+    Older logic only blocked statuses it recognized as active. This is intentionally
+    stricter because Square calendar block-off records may not look like normal
+    customer bookings in every account/API version.
+    """
+    if not (date_str and time_str and SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
+        return False
+    req_start, req_end = _requested_local_interval(date_str, time_str, duration_minutes)
+    if not (req_start and req_end):
+        return False
+    start_at_min, start_at_max = _local_day_range_to_utc(date_str)
+    if not (start_at_min and start_at_max):
+        return False
+    params = {
+        'location_id': SQUARE_LOCATION_ID,
+        'team_member_id': SQUARE_TEAM_MEMBER_ID,
+        'start_at_min': start_at_min,
+        'start_at_max': start_at_max,
+        'limit': 100,
+    }
+    try:
+        resp = requests.get('https://connect.squareup.com/v2/bookings', headers=square_headers(), params=params, timeout=12)
+        if resp.status_code not in (200, 201):
+            print('[WARN] v75 list bookings overlap check failed:', resp.status_code, resp.text[:300])
+            return False
+        bookings = (resp.json() or {}).get('bookings') or []
+        for booking in bookings:
+            if not isinstance(booking, dict):
+                continue
+            status = (booking.get('status') or '').upper()
+            if any(tok in status for tok in ('CANCEL', 'CANCELED', 'NO_SHOW')):
+                continue
+            start_raw = booking.get('start_at') or ''
+            existing_start = _v75_iso_to_local_dt(start_raw)
+            if not existing_start:
+                continue
+            segs = booking.get('appointment_segments') or []
+            durations = []
+            if isinstance(segs, list) and segs:
+                for seg in segs:
+                    if not isinstance(seg, dict):
+                        continue
+                    team_member_id = (seg.get('team_member_id') or '').strip()
+                    if team_member_id and team_member_id != SQUARE_TEAM_MEMBER_ID:
+                        continue
+                    try:
+                        durations.append(int(seg.get('duration_minutes') or duration_minutes or 60))
+                    except Exception:
+                        durations.append(duration_minutes or 60)
+            if not durations:
+                durations = [duration_minutes or 60]
+            for dur in durations:
+                existing_end = existing_start + timedelta(minutes=dur)
+                if req_start < existing_end and req_end > existing_start:
+                    print('[BLOCKED] v75 Square booking/block overlaps requested slot:', booking.get('id'), start_raw, status)
+                    return True
+    except Exception as e:
+        print('[WARN] v75 any-booking overlap exception:', repr(e))
+    return False
+
+
+def square_slot_has_existing_booking(date_str: str, time_str: str, appointment_type: str, duration_minutes: int = 60) -> bool:
+    if _v75_date_is_manual_blackout(date_str):
+        return True
+    try:
+        if _ORIG_V75_SQUARE_SLOT_HAS_EXISTING_BOOKING and _ORIG_V75_SQUARE_SLOT_HAS_EXISTING_BOOKING(date_str, time_str, 'EVAL_195', duration_minutes=duration_minutes):
+            return True
+    except Exception as e:
+        print('[WARN] v75 original conflict check error:', repr(e))
+    return _v75_list_any_square_booking_overlap(date_str, time_str, duration_minutes=duration_minutes)
+
+
+def _v75_exact_square_slot_available(date_str: str, time_str: str, appointment_type: str = 'EVAL_195') -> dict:
+    """Fail-closed exact-slot validation against Square availability."""
+    d, t = _v75_slot_key(date_str, time_str)
+    if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and re.fullmatch(r"\d{2}:\d{2}", t)):
+        return {'ok': False, 'reason': 'invalid_slot'}
+    if _v75_date_is_manual_blackout(d):
+        return {'ok': False, 'reason': 'manual_blackout'}
+    try:
+        if is_weekend(d):
+            return {'ok': False, 'reason': 'weekend_blocked'}
+        if not is_within_normal_hours(t):
+            return {'ok': False, 'reason': 'outside_hours'}
+    except Exception:
+        pass
+    if not (SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID and SQUARE_TEAM_MEMBER_ID):
+        return {'ok': False, 'reason': 'square_not_configured'}
+    try:
+        if square_slot_has_existing_booking(d, t, 'EVAL_195', duration_minutes=60):
+            return {'ok': False, 'reason': 'square_booking_or_block_overlap'}
+    except Exception as e:
+        return {'ok': False, 'reason': 'conflict_check_exception', 'error': repr(e)}
+    try:
+        avails = search_square_availability_for_day(d, 'EVAL_195')
+    except Exception as e:
+        return {'ok': False, 'reason': 'availability_exception', 'error': repr(e)}
+    exact = None
+    for slot in avails or []:
+        if str(slot.get('date') or '').strip() == d and str(slot.get('time') or '').strip() == t:
+            exact = slot
+            break
+    if not exact:
+        return {'ok': False, 'reason': 'not_returned_by_square_availability', 'available_count': len(avails or [])}
+    return {'ok': True, 'reason': 'square_available', 'slot': exact}
+
+
+def _v75_slot_unavailable_message(sched: dict, date_str: str, time_str: str, reason: str = 'slot_unavailable') -> str:
+    result = build_slot_unavailable_result(sched, date_str, time_str, 'EVAL_195', reason=reason)
+    msg = result.get('message') if isinstance(result, dict) else None
+    if msg:
+        return msg
+    return 'That time is not showing as available on our calendar. What other day or time works for you?'
+
+
+def _v75_clear_selected_slot(sched: dict, *, reason: str):
+    sched['scheduled_time'] = None
+    sched.pop('scheduled_time_source', None)
+    sched['booking_created'] = False
+    sched['square_booking_id'] = None
+    sched['final_confirmation_sent'] = False
+    sched['final_confirmation_accepted'] = False
+    sched['last_final_confirmation_key'] = None
+    sched['slot_blocked_reason'] = reason
+    sched['slot_choice_locked'] = False
+
+
+def maybe_handle_exact_slot_before_step4(conv: dict, phone: str, inbound_text: str) -> str | None:
+    """v75: never accept an exact slot unless Square availability returns it now."""
+    sched = conv.setdefault('sched', {})
+    try:
+        explicit_time = extract_explicit_time_from_text(inbound_text)
+        requested_date = salvage_relative_date_from_text(inbound_text)
+        if explicit_time and not requested_date:
+            stored_date = (sched.get('scheduled_date') or '').strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stored_date):
+                requested_date = stored_date
+        if explicit_time and requested_date:
+            sched['appointment_type'] = 'EVAL_195'
+            conv['appointment_type'] = 'EVAL_195'
+            check = _v75_exact_square_slot_available(requested_date, explicit_time, 'EVAL_195')
+            if not check.get('ok'):
+                _v75_clear_selected_slot(sched, reason=check.get('reason') or 'not_available')
+                try:
+                    log_event('SQUARE_SLOT_BLOCKED_V75', phone, {'date': requested_date, 'time': explicit_time, 'reason': check.get('reason'), 'caller_text': _safe_monitor_text(inbound_text)}, conv)
+                except Exception:
+                    pass
+                return _v75_slot_unavailable_message(sched, requested_date, explicit_time, check.get('reason') or 'not_available')
+    except Exception as e:
+        print('[WARN] v75 exact slot guard failed closed:', repr(e))
+        return 'I’m having trouble checking the live Square calendar. Please text us here and we’ll finish scheduling manually.'
+
+    return _ORIG_V75_MAYBE_HANDLE_EXACT_SLOT_BEFORE_STEP4(conv, phone, inbound_text) if _ORIG_V75_MAYBE_HANDLE_EXACT_SLOT_BEFORE_STEP4 else None
+
+
+def maybe_create_square_booking(phone: str, convo: dict):
+    """v75 final booking gate: Square availability must show the exact slot."""
+    sched = convo.setdefault('sched', {})
+    try:
+        _v74_normalize_conv_to_195(convo)
+    except Exception:
+        pass
+    scheduled_date = (sched.get('scheduled_date') or '').strip()
+    scheduled_time = (sched.get('scheduled_time') or '').strip()
+    if scheduled_date and scheduled_time:
+        check = _v75_exact_square_slot_available(scheduled_date, scheduled_time, 'EVAL_195')
+        if not check.get('ok'):
+            _v75_clear_selected_slot(sched, reason=check.get('reason') or 'not_available')
+            try:
+                log_event('BOOKING_BLOCKED_BY_SQUARE_AVAILABILITY_V75', phone, {'date': scheduled_date, 'time': scheduled_time, 'reason': check.get('reason'), 'available_count': check.get('available_count')}, convo)
+            except Exception:
+                pass
+            return build_slot_unavailable_result(
+                sched,
+                scheduled_date,
+                scheduled_time,
+                'EVAL_195',
+                reason=check.get('reason') or 'not_available',
+            )
+        # Reuse the exact Square availability segment data when the older create
+        # function builds the payload, if a future patch chooses to read it.
+        sched['v75_exact_availability'] = check.get('slot') or {}
+    return _ORIG_V75_MAYBE_CREATE_SQUARE_BOOKING(phone, convo) if _ORIG_V75_MAYBE_CREATE_SQUARE_BOOKING else {'status': 'booking_function_missing'}
+
+
+def _voice_apply_offered_slot_fast_path(conv: dict, caller_text: str) -> str | None:
+    """v75 voice guard: validate an offered-slot selection before collecting name/email."""
+    before_date = (conv.setdefault('sched', {}).get('scheduled_date') or '').strip()
+    before_time = (conv.setdefault('sched', {}).get('scheduled_time') or '').strip()
+    reply = _ORIG_V75_VOICE_APPLY_OFFERED_SLOT_FAST_PATH(conv, caller_text) if _ORIG_V75_VOICE_APPLY_OFFERED_SLOT_FAST_PATH else None
+    sched = conv.setdefault('sched', {})
+    d = (sched.get('scheduled_date') or '').strip()
+    t = (sched.get('scheduled_time') or '').strip()
+    if d and t and (d != before_date or t != before_time or sched.get('scheduled_time_source') == 'offered_slot') and not sched.get('booking_created'):
+        check = _v75_exact_square_slot_available(d, t, 'EVAL_195')
+        if not check.get('ok'):
+            _v75_clear_selected_slot(sched, reason=check.get('reason') or 'not_available')
+            try:
+                log_event('VOICE_OFFERED_SLOT_BLOCKED_BY_SQUARE_V75', conv.get('phone') or '', {'date': d, 'time': t, 'reason': check.get('reason'), 'caller_text': _safe_monitor_text(caller_text)}, conv)
+            except Exception:
+                pass
+            msg = _v75_slot_unavailable_message(sched, d, t, check.get('reason') or 'not_available')
+            try:
+                return _voice_naturalize_reply(msg)
+            except Exception:
+                return msg
+    return reply
+
+
+def _conversation_snapshot(phone: str, conv: dict) -> dict:
+    snap = _ORIG_V75_CONVERSATION_SNAPSHOT(phone, conv) if _ORIG_V75_CONVERSATION_SNAPSHOT else {}
+    try:
+        sched = conv.setdefault('sched', {})
+        snap['v75_square_blocked_time_guard_active'] = True
+        snap['slot_blocked_reason'] = sched.get('slot_blocked_reason')
+        snap['manual_blackout_ranges'] = _v75_parse_manual_blackout_ranges()
+        if sched.get('scheduled_date') and sched.get('scheduled_time'):
+            snap['last_slot_square_check'] = _v75_exact_square_slot_available(sched.get('scheduled_date'), sched.get('scheduled_time'), 'EVAL_195')
+    except Exception:
+        pass
+    return snap
+
+
+def _v75_selftest() -> dict:
+    return {
+        'active': True,
+        'manual_blackout_ranges': _v75_parse_manual_blackout_ranges(),
+        'map_eval': map_appointment_type_to_variation('EVAL_195')[0],
+        'always_195': prevolt_eval_price_line('TROUBLESHOOT_395'),
+    }
+
+# V75.1 — preserve v73 owner/test-name cleanup even when a blocked slot stops before booking.
+_ORIG_V751_MAYBE_CREATE_SQUARE_BOOKING = maybe_create_square_booking if 'maybe_create_square_booking' in globals() else None
+
+def maybe_create_square_booking(phone: str, convo: dict):
+    try:
+        sched = convo.setdefault('sched', {})
+        profile = convo.setdefault('profile', {})
+        if '_v73_sanitize_customer_identity' in globals():
+            _v73_sanitize_customer_identity(profile, sched, phone)
+        if '_v74_normalize_conv_to_195' in globals():
+            _v74_normalize_conv_to_195(convo)
+    except Exception as e:
+        try:
+            print('[WARN] v75.1 pre-book sanitize failed:', repr(e))
+        except Exception:
+            pass
+    return _ORIG_V751_MAYBE_CREATE_SQUARE_BOOKING(phone, convo) if _ORIG_V751_MAYBE_CREATE_SQUARE_BOOKING else {'status': 'booking_function_missing'}
